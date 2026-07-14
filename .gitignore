@@ -1,0 +1,12 @@
+.venv/
+.*.custback-generations/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+*.tgz
+*.whl
+*.tar.gz
+debug.txt
+uninstall.log

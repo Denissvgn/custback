@@ -1,0 +1,39 @@
+{
+  "name": "custback",
+  "version": "0.3.0",
+  "description": "Virtual camera with background replacement for meeting apps (Ubuntu / macOS)",
+  "license": "MIT",
+  "bin": {
+    "custback": "packaging/npm/custback.js"
+  },
+  "scripts": {
+    "postinstall": "node packaging/npm/install.js",
+    "test": "node --test packaging/npm/test/*.test.js",
+    "doctor": "node packaging/npm/custback.js doctor",
+    "release:check": "node scripts/release/verify-release.js",
+    "prepack": "node scripts/release/verify-release.js --prepack"
+  },
+  "files": [
+    "packaging/npm/*.js",
+    "src/**/*.py",
+    "config/*.yaml",
+    "scripts/*.sh",
+    "scripts/release/*.js",
+    "examples/*.py",
+    "pyproject.toml"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "virtual-camera",
+    "background-replacement",
+    "webcam",
+    "v4l2loopback",
+    "obs"
+  ]
+}

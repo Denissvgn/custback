@@ -1,0 +1,1346 @@
+"""Authenticated API tests with a live synthetic pipeline.
+
+HTTP requests use an async ASGI transport directly.  This covers both the
+old-httpx and new-httpx2 Starlette dependency paths without relying on
+AnyIO's blocking portal, which is unavailable in some restricted runtimes.
+"""
+
+import asyncio
+import contextlib
+import errno
+import os
+import stat
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import numpy as np
+import pytest
+
+pytest.importorskip("fastapi")
+cv2 = pytest.importorskip("cv2")
+
+import starlette
+from fastapi import HTTPException, Request
+
+if int(starlette.__version__.split(".", 1)[0]) >= 1:
+    from httpx2 import ASGITransport, AsyncClient
+else:  # Starlette < 1 uses the original httpx client contract.
+    from httpx import ASGITransport, AsyncClient
+
+from custback.api.security import SecurityPolicy
+import custback.api.server as server_mod
+from custback.api.server import _UploadLimits, _UploadStore, create_app
+from custback.config import AppConfig, RuntimeConfig
+from custback.hub import FrameHub
+from custback.pipeline import Pipeline
+
+
+TOKEN = "test-api-token-which-is-at-least-32-characters"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+ORIGIN = "http://testserver"
+
+
+async def _with_event_loop_heartbeat(awaitable):
+    """Keep restricted selectors polling while worker-thread callbacks finish."""
+
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        return await awaitable
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def run_async(awaitable):
+    # Avoid asyncio.run()'s blocking default-executor shutdown: the managed
+    # sandbox cannot wake a selector that is waiting for that cross-thread
+    # shutdown callback. CI and production do not need this harness.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_with_event_loop_heartbeat(awaitable))
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+@dataclass
+class Stack:
+    app: object
+    runtime: RuntimeConfig
+    hub: FrameHub
+    pipeline: Pipeline
+    upload_dir: object
+
+    async def arequest(self, method: str, path: str, **kwargs):
+        transport = ASGITransport(app=self.app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.request(method, path, **kwargs)
+
+    def request(self, method: str, path: str, **kwargs):
+        return run_async(self.arequest(method, path, **kwargs))
+
+    def get(self, path: str, **kwargs):
+        return self.request("GET", path, **kwargs)
+
+    def post(self, path: str, **kwargs):
+        return self.request("POST", path, **kwargs)
+
+    def patch(self, path: str, **kwargs):
+        return self.request("PATCH", path, **kwargs)
+
+    def delete(self, path: str, **kwargs):
+        return self.request("DELETE", path, **kwargs)
+
+
+class WebSocketClosed(Exception):
+    def __init__(self, code: int, reason: str = ""):
+        self.code = code
+        self.reason = reason
+        super().__init__(f"WebSocket closed with {code}: {reason}")
+
+
+class ASGIWebSocket:
+    """Small deterministic WebSocket peer for exercising the ASGI app."""
+
+    def __init__(self, app, url: str, headers: dict[str, str] | None = None):
+        self.app = app
+        self.url = url
+        self.headers = headers or {}
+        self.incoming: asyncio.Queue = asyncio.Queue()
+        self.outgoing: asyncio.Queue = asyncio.Queue()
+        self.task: asyncio.Task | None = None
+
+    async def _receive(self):
+        return await self.incoming.get()
+
+    async def _send(self, message):
+        await self.outgoing.put(message)
+
+    async def connect(self):
+        parsed = urlsplit(self.url)
+        headers = {"host": "testserver", **self.headers}
+        scope = {
+            "type": "websocket",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1",
+            "scheme": "ws",
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 12345),
+            "root_path": "",
+            "path": parsed.path,
+            "raw_path": parsed.path.encode(),
+            "query_string": parsed.query.encode(),
+            "headers": [
+                (name.lower().encode(), value.encode())
+                for name, value in headers.items()
+            ],
+            "subprotocols": [],
+            "state": {},
+            "extensions": {},
+        }
+        self.task = asyncio.create_task(
+            self.app(scope, self._receive, self._send)
+        )
+        await self.incoming.put({"type": "websocket.connect"})
+        message = await asyncio.wait_for(self.outgoing.get(), 2.0)
+        if message["type"] == "websocket.close":
+            await self._finish()
+            raise WebSocketClosed(message.get("code", 1000), message.get("reason", ""))
+        assert message["type"] == "websocket.accept", message
+        return self
+
+    async def send_bytes(self, data: bytes):
+        await self.incoming.put({"type": "websocket.receive", "bytes": data})
+
+    async def send_text(self, data: str):
+        await self.incoming.put({"type": "websocket.receive", "text": data})
+
+    async def receive_bytes(self) -> bytes:
+        message = await asyncio.wait_for(self.outgoing.get(), 3.0)
+        if message["type"] == "websocket.close":
+            raise WebSocketClosed(message.get("code", 1000), message.get("reason", ""))
+        assert message["type"] == "websocket.send", message
+        return message["bytes"]
+
+    async def receive_close(self) -> WebSocketClosed:
+        # The independent sender may already have queued a camera frame before
+        # the receiver validates our bad payload. Drain those frames until the
+        # protocol close arrives.
+        for _ in range(10):
+            try:
+                await self.receive_bytes()
+            except WebSocketClosed as closed:
+                return closed
+        raise AssertionError("server did not close after an invalid payload")
+
+    async def _finish(self):
+        if self.task is None:
+            return
+        if not self.task.done():
+            await self.incoming.put({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(self.task, 2.0)
+
+    async def close(self):
+        await self._finish()
+
+
+@pytest.fixture()
+def stack(tmp_path):
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {"synthetic": True, "width": 128, "height": 72, "fps": 60},
+            "background": {"mode": "color", "color": [200, 30, 30]},
+            "segmentation": {"backend": "heuristic"},
+            "output": {"backend": "null", "fps": 60},
+            "api": {"ws_max_bytes": 1024},
+        }
+    )
+    runtime = RuntimeConfig(cfg)
+    hub = FrameHub()
+    pipeline = Pipeline(runtime, hub)
+    pipeline.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and hub.output.latest()[0] is None:
+        time.sleep(0.02)
+    security = SecurityPolicy.for_bind(
+        TOKEN,
+        "testserver",
+        80,
+        allowed_origins=[ORIGIN],
+        extra_hosts=["testserver"],
+    )
+    upload_dir = tmp_path / "uploads"
+    app = create_app(
+        runtime, hub, pipeline, security=security, upload_dir=upload_dir
+    )
+    yield Stack(app, runtime, hub, pipeline, upload_dir)
+    pipeline.stop()
+
+
+def test_every_data_route_requires_auth(stack):
+    for path in ("/status", "/config", "/backgrounds", "/video/snapshot.jpg", "/docs"):
+        response = stack.get(path)
+        assert response.status_code == 401, path
+        assert response.headers["www-authenticate"] == "Bearer"
+        assert response.headers["x-config-version"] == "0"
+
+    upload = stack.post(
+        "/background/image",
+        files={"file": ("private.png", b"not-public", "image/png")},
+    )
+    assert upload.status_code == 401
+    assert not stack.upload_dir.exists()
+
+
+def test_unauthenticated_root_exposes_only_login_shell(stack):
+    response = stack.get("/")
+    assert response.status_code == 401
+    assert "custback login" in response.text
+    assert "/video/mjpeg" not in response.text
+
+
+def test_status_and_config_with_bearer(stack):
+    status = stack.get("/status", headers=AUTH)
+    assert status.status_code == 200
+    assert status.json()["frames_out"] >= 1
+    assert status.json()["mode"] == "color"
+    config = stack.get("/config", headers=AUTH)
+    assert config.json()["background"]["mode"] == "color"
+    assert "token" not in config.json()["api"]
+
+
+def test_exact_origin_is_enforced_even_with_token(stack):
+    rejected = stack.get(
+        "/status", headers={**AUTH, "Origin": "https://evil.example"}
+    )
+    assert rejected.status_code == 403
+    allowed = stack.get("/status", headers={**AUTH, "Origin": ORIGIN})
+    assert allowed.status_code == 200
+
+    duplicate_host = stack.get(
+        "/status",
+        headers=[
+            ("Host", "testserver"),
+            ("Host", "evil.example"),
+            ("Authorization", f"Bearer {TOKEN}"),
+        ],
+    )
+    assert duplicate_host.status_code == 403
+
+
+def test_browser_session_cookie(stack):
+    async def scenario():
+        transport = ASGITransport(app=stack.app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            denied = await client.post(
+                "/auth/session",
+                json={"token": "x" * 40},
+                headers={"Origin": ORIGIN},
+            )
+            assert denied.status_code == 401
+            created = await client.post(
+                "/auth/session",
+                json={"token": TOKEN},
+                headers={"Origin": ORIGIN},
+            )
+            assert created.status_code == 204
+            assert created.cookies.get("custback_session")
+            assert (await client.get("/status")).status_code == 200
+            assert (await client.delete("/auth/session")).status_code == 204
+            assert (await client.get("/status")).status_code == 401
+
+    run_async(scenario())
+
+
+def test_browser_session_rejects_undeclared_body_fields(stack):
+    response = stack.post(
+        "/auth/session",
+        json={"token": TOKEN, "unexpected": "not accepted"},
+        headers={"Origin": ORIGIN},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_content"
+
+
+def test_hot_patch_returns_committed_version_header(stack):
+    response = stack.patch(
+        "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
+    )
+    assert response.status_code == 200
+    assert response.json()["config"]["background"]["mode"] == "passthrough"
+    assert response.json()["config_version"] == 1
+    assert response.headers["x-config-version"] == "1"
+    assert stack.runtime.read().config.background.mode == "passthrough"
+
+    config = stack.get("/config", headers=AUTH)
+    assert config.headers["x-config-version"] == "1"
+    assert config.json()["background"]["mode"] == "passthrough"
+
+
+def test_noop_patch_preserves_config_version(stack):
+    response = stack.patch(
+        "/config", json={"background": {"mode": "color"}}, headers=AUTH
+    )
+    assert response.status_code == 200
+    assert response.json()["config_version"] == 0
+    assert response.headers["x-config-version"] == "0"
+
+
+def test_restart_only_patch_is_409_and_atomic(stack):
+    response = stack.patch(
+        "/config",
+        json={"camera": {"width": 64}, "background": {"mode": "passthrough"}},
+        headers=AUTH,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "restart_required"
+    assert response.json()["detail"]["fields"] == ["camera.width"]
+    current = stack.runtime.read()
+    assert current.version == 0
+    assert current.config.camera.width == 128
+    assert current.config.background.mode == "color"
+
+
+def test_invalid_patch_is_422(stack):
+    response = stack.patch(
+        "/config", json={"background": {"mode": "bogus"}}, headers=AUTH
+    )
+    assert response.status_code == 422
+    assert stack.runtime.read().config.background.mode == "color"
+
+    malformed = stack.patch("/config", json=["not", "an", "object"], headers=AUTH)
+    assert malformed.status_code == 422
+    assert malformed.json()["detail"]["code"] == "invalid_content"
+
+
+def test_invalid_config_response_never_echoes_sensitive_input(stack):
+    secret = "do-not-reflect-this-token-value-0123456789"
+    response = stack.patch(
+        "/config",
+        json={"api": {"token": secret}},
+        headers=AUTH,
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_config"
+    assert secret not in response.text
+    assert "configuration validation failed" in response.text
+
+
+def test_pathological_json_number_is_stable_422(stack):
+    body = b'{"background":{"blur_kernel":' + (b"9" * 5000) + b"}}"
+    response = stack.patch(
+        "/config",
+        content=body,
+        headers={**AUTH, "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_content"
+
+
+def test_unavailable_reconfiguration_is_standardized_503(stack, monkeypatch):
+    # The class is defined in pipeline.py; expose the same class-name contract
+    # through the coordinator method without mutating runtime state.
+    from custback.pipeline import ReconfigurationUnavailable
+
+    def unavailable(*_args, **_kwargs):
+        raise ReconfigurationUnavailable("pipeline unavailable")
+
+    monkeypatch.setattr(stack.pipeline, "apply_config_patch", unavailable)
+    response = stack.patch(
+        "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "reconfiguration_unavailable"
+    assert response.headers["x-config-version"] == "0"
+
+
+def test_snapshot_returns_jpeg(stack):
+    response = stack.get("/video/snapshot.jpg", headers=AUTH)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.content[:2] == b"\xff\xd8"
+
+
+def test_upload_image_validates_and_switches_mode(stack, tmp_path):
+    image_path = tmp_path / "office.png"
+    assert cv2.imwrite(str(image_path), np.full((40, 40, 3), 77, np.uint8))
+    with image_path.open("rb") as handle:
+        response = stack.post(
+            "/background/image",
+            files={"file": ("office.png", handle, "image/png")},
+            headers=AUTH,
+        )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["width"] == body["height"] == 40
+    assert body["original_name"] == "office.png"
+    assert (stack.upload_dir / body["id"]).is_file()
+    background = stack.runtime.read().config.background
+    assert background.mode == "image"
+    assert Path(background.image_path).name == body["id"]
+
+
+def test_upload_is_hidden_until_preflight_and_atomic_activation(
+    stack, tmp_path, monkeypatch
+):
+    image_path = tmp_path / "staged.png"
+    assert cv2.imwrite(str(image_path), np.zeros((20, 20, 3), np.uint8))
+    payload = image_path.read_bytes()
+    entered = threading.Event()
+    release = threading.Event()
+    original = stack.pipeline.apply_staged_config_patch
+
+    def delayed_apply(*args, **kwargs):
+        entered.set()
+        assert release.wait(2.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        stack.pipeline, "apply_staged_config_patch", delayed_apply
+    )
+
+    async def scenario():
+        request = asyncio.create_task(
+            stack.arequest(
+                "POST",
+                "/background/image",
+                files={"file": ("staged.png", payload, "image/png")},
+                headers=AUTH,
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        names = sorted(path.name for path in stack.upload_dir.iterdir())
+        assert len(names) == 1
+        assert names[0].startswith(".upload-")
+        assert names[0].endswith(".png")
+        release.set()
+        response = await request
+        assert response.status_code == 201
+        assert sorted(path.name for path in stack.upload_dir.iterdir()) == [
+            response.json()["id"]
+        ]
+
+    run_async(scenario())
+
+
+def test_cancelled_upload_does_not_delete_successfully_activated_asset(
+    stack, tmp_path, monkeypatch
+):
+    image_path = tmp_path / "cancelled.png"
+    assert cv2.imwrite(str(image_path), np.zeros((20, 20, 3), np.uint8))
+    payload = image_path.read_bytes()
+    entered = threading.Event()
+    release = threading.Event()
+    original = stack.pipeline.apply_staged_config_patch
+
+    def delayed_apply(*args, **kwargs):
+        entered.set()
+        assert release.wait(2.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(stack.pipeline, "apply_staged_config_patch", delayed_apply)
+
+    async def scenario():
+        request = asyncio.create_task(
+            stack.arequest(
+                "POST",
+                "/background/image",
+                files={"file": ("cancelled.png", payload, "image/png")},
+                headers=AUTH,
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        request.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    run_async(scenario())
+    deadline = time.monotonic() + 2.0
+    while (
+        time.monotonic() < deadline
+        and stack.runtime.read().config.background.mode != "image"
+    ):
+        time.sleep(0.01)
+    active = Path(stack.runtime.read().config.background.image_path)
+    assert stack.runtime.read().config.background.mode == "image"
+    assert active.is_file()
+
+
+def test_upload_rejects_extension_and_fake_content(stack):
+    bad_extension = stack.post(
+        "/background/image",
+        files={"file": ("evil.exe", b"MZ", "application/octet-stream")},
+        headers=AUTH,
+    )
+    assert bad_extension.status_code == 415
+    fake_image = stack.post(
+        "/background/image",
+        files={"file": ("fake.png", b"not an image", "image/png")},
+        headers=AUTH,
+    )
+    assert fake_image.status_code == 422
+    assert not list(stack.upload_dir.glob(".upload-*"))
+    assert stack.runtime.read().config.background.mode == "color"
+
+
+def test_valid_upload_is_removed_when_activation_fails(stack, tmp_path, monkeypatch):
+    image_path = tmp_path / "candidate.png"
+    assert cv2.imwrite(str(image_path), np.zeros((20, 20, 3), np.uint8))
+
+    def fail_candidate(_cfg, **_kwargs):
+        raise RuntimeError("candidate backdrop failed")
+
+    monkeypatch.setattr("custback.pipeline.create_backdrop", fail_candidate)
+    with image_path.open("rb") as handle:
+        response = stack.post(
+            "/background/image",
+            files={"file": ("candidate.png", handle, "image/png")},
+            headers=AUTH,
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "activation_failed"
+    assert list(stack.upload_dir.glob("*")) == []
+    assert stack.runtime.read().config.background.mode == "color"
+    assert stack.runtime.read().version == 0
+
+
+def test_failed_promotion_rollback_reclaims_uncommitted_final_asset(
+    stack, tmp_path, monkeypatch
+):
+    image_path = tmp_path / "rollback.png"
+    assert cv2.imwrite(str(image_path), np.zeros((20, 20, 3), np.uint8))
+    monkeypatch.setattr(
+        stack.pipeline,
+        "_install_activation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected install failure")
+        ),
+    )
+
+    def fail_rollback(_store, _staged, _final):
+        raise OSError(errno.ENOSPC, "rollback failed")
+
+    monkeypatch.setattr(_UploadStore, "rollback_promotion", fail_rollback)
+    with image_path.open("rb") as handle:
+        response = stack.post(
+            "/background/image",
+            files={"file": ("rollback.png", handle, "image/png")},
+            headers=AUTH,
+        )
+    assert response.status_code == 507
+    assert response.json()["detail"]["code"] == "insufficient_storage"
+    assert list(stack.upload_dir.glob("*")) == []
+    assert stack.runtime.read().version == 0
+    assert stack.runtime.read().config.background.mode == "color"
+
+
+def test_failed_upload_cleanup_retries_after_reconfiguration_recovers(
+    stack, tmp_path, monkeypatch
+):
+    from custback.pipeline import ReconfigurationUnavailable
+
+    image_path = tmp_path / "retry-cleanup.png"
+    assert cv2.imwrite(str(image_path), np.zeros((20, 20, 3), np.uint8))
+    original_mutation = stack.pipeline.apply_storage_mutation
+
+    def unavailable(*_args, **_kwargs):
+        raise ReconfigurationUnavailable("pipeline temporarily stalled")
+
+    monkeypatch.setattr(stack.pipeline, "apply_staged_config_patch", unavailable)
+    monkeypatch.setattr(stack.pipeline, "apply_storage_mutation", unavailable)
+    with image_path.open("rb") as handle:
+        response = stack.post(
+            "/background/image",
+            files={"file": ("retry-cleanup.png", handle, "image/png")},
+            headers=AUTH,
+        )
+    assert response.status_code == 503
+    assert list(stack.upload_dir.glob(".upload-*"))
+    assert stack.runtime.read().version == 0
+
+    monkeypatch.setattr(stack.pipeline, "apply_storage_mutation", original_mutation)
+    deadline = time.monotonic() + 3.0
+    while list(stack.upload_dir.glob(".upload-*")) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert list(stack.upload_dir.glob("*")) == []
+    assert stack.runtime.read().version == 0
+
+
+def test_delete_rejects_active_then_removes_inactive_background(stack, tmp_path):
+    image_path = tmp_path / "office.png"
+    assert cv2.imwrite(str(image_path), np.zeros((20, 20, 3), np.uint8))
+    with image_path.open("rb") as handle:
+        uploaded = stack.post(
+            "/background/image",
+            files={"file": ("office.png", handle, "image/png")},
+            headers=AUTH,
+        ).json()
+    identifier = uploaded["id"]
+    assert stack.delete(f"/backgrounds/{identifier}", headers=AUTH).status_code == 409
+    assert stack.patch(
+        "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
+    ).status_code == 200
+    deleted = stack.delete(f"/backgrounds/{identifier}", headers=AUTH)
+    assert deleted.status_code == 204
+    assert deleted.headers["x-config-version"] == "2"
+    assert stack.runtime.read().version == 2
+    assert not (stack.upload_dir / identifier).exists()
+
+
+def test_delete_and_reactivation_are_serialized_without_dangling_config(
+    stack, tmp_path
+):
+    image_path = tmp_path / "race.png"
+    assert cv2.imwrite(str(image_path), np.zeros((20, 20, 3), np.uint8))
+    with image_path.open("rb") as handle:
+        body = stack.post(
+            "/background/image",
+            files={"file": ("race.png", handle, "image/png")},
+            headers=AUTH,
+        ).json()
+    identifier = body["id"]
+    stored = stack.upload_dir / identifier
+    assert stack.patch(
+        "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
+    ).status_code == 200
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        deletion = pool.submit(
+            stack.delete, f"/backgrounds/{identifier}", headers=AUTH
+        )
+        activation = pool.submit(
+            stack.patch,
+            "/config",
+            json={
+                "background": {
+                    "mode": "image",
+                    "image_path": str(stored),
+                }
+            },
+            headers=AUTH,
+        )
+        responses = (deletion.result(5.0), activation.result(5.0))
+
+    assert responses[0].status_code in (204, 409)
+    assert responses[1].status_code in (200, 409, 422)
+    effective = stack.runtime.read().config.background
+    assert not (effective.mode == "image" and not Path(effective.image_path).is_file())
+
+
+def test_websocket_requires_auth_and_origin(stack):
+    async def scenario():
+        with pytest.raises(WebSocketClosed) as unauthenticated:
+            await ASGIWebSocket(stack.app, "/ws/frames?stream=raw").connect()
+        assert unauthenticated.value.code == 4401
+
+        with pytest.raises(WebSocketClosed) as bad_origin:
+            await ASGIWebSocket(
+                stack.app,
+                "/ws/frames?stream=raw",
+                headers={**AUTH, "Origin": "https://evil.example"},
+            ).connect()
+        assert bad_origin.value.code == 4403
+
+    run_async(scenario())
+
+
+def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
+    docs = stack.get("/docs", headers=AUTH)
+    assert docs.status_code == 200
+    assert "cdn" not in docs.text.lower()
+    assert "<script" not in docs.text.lower()
+    assert docs.headers["content-security-policy"]
+
+    schema = stack.get("/openapi.json", headers=AUTH).json()
+    assert "requestBody" in schema["paths"]["/auth/session"]["post"]
+    assert "requestBody" in schema["paths"]["/config"]["patch"]
+    get_config = schema["paths"]["/config"]["get"]
+    assert get_config["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]["$ref"].endswith("/AppConfig")
+    patch_schema = schema["paths"]["/config"]["patch"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
+    assert patch_schema["$ref"].endswith("/_ConfigPatchResponse")
+    for path in ("/background/image", "/background/video"):
+        operation = schema["paths"][path]["post"]
+        assert "multipart/form-data" in operation["requestBody"]["content"]
+        assert "201" in operation["responses"]
+        response_schema = operation["responses"]["201"]["content"][
+            "application/json"
+        ]["schema"]
+        assert response_schema["$ref"].endswith("/_UploadResponse")
+    assert schema["paths"]["/status"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]["$ref"].endswith("/_StatusResponse")
+    assert schema["paths"]["/backgrounds"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]["$ref"].endswith(
+        "/_BackgroundListResponse"
+    )
+    snapshot_content = schema["paths"]["/video/snapshot.jpg"]["get"][
+        "responses"
+    ]["200"]["content"]
+    assert set(snapshot_content) == {"image/jpeg"}
+    assert snapshot_content["image/jpeg"]["schema"]["format"] == "binary"
+    mjpeg_content = schema["paths"]["/video/mjpeg"]["get"]["responses"][
+        "200"
+    ]["content"]
+    assert set(mjpeg_content) == {"multipart/x-mixed-replace"}
+    assert mjpeg_content["multipart/x-mixed-replace"]["schema"][
+        "format"
+    ] == "binary"
+
+
+def test_websocket_round_trip(stack):
+    stack.pipeline.apply_config_patch({"background": {"mode": "remote"}})
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        try:
+            data = await websocket.receive_bytes()
+            frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            assert frame is not None and frame.shape == (72, 128, 3)
+
+            rendered = np.full_like(frame, (9, 9, 9))
+            ok, jpeg = cv2.imencode(".jpg", rendered)
+            assert ok
+            await websocket.send_bytes(jpeg.tobytes())
+
+            deadline = time.monotonic() + 5.0
+            while (
+                time.monotonic() < deadline
+                and stack.hub.remote_in.latest()[0] is None
+            ):
+                await asyncio.sleep(0.02)
+            assert stack.hub.remote_in.latest()[0] is not None
+        finally:
+            await websocket.close()
+
+    run_async(scenario())
+
+
+def test_websocket_rejects_text_and_wrong_dimensions(stack):
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        await websocket.send_text("not jpeg")
+        closed = await websocket.receive_close()
+        assert closed.code == 1003
+        await websocket.close()
+
+        wrong = np.zeros((10, 10, 3), np.uint8)
+        ok, jpeg = cv2.imencode(".jpg", wrong)
+        assert ok
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        await websocket.send_bytes(jpeg.tobytes())
+        closed = await websocket.receive_close()
+        assert closed.code == 1007
+        await websocket.close()
+
+    run_async(scenario())
+
+
+def test_websocket_rejects_frame_over_configured_limit(stack):
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        await websocket.send_bytes(b"x" * 1025)
+        closed = await websocket.receive_close()
+        assert closed.code == 1009
+        await websocket.close()
+
+    run_async(scenario())
+
+
+def _multipart_request(data: bytes, *, filename: str = "exact.png") -> Request:
+    boundary = b"custback-test-boundary"
+    body = (
+        b"--" + boundary + b"\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="'
+        + filename.encode()
+        + b'"\r\nContent-Type: image/png\r\n\r\n'
+        + data
+        + b"\r\n--" + boundary + b"--\r\n"
+    )
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/background/image",
+        "raw_path": b"/background/image",
+        "query_string": b"",
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 1),
+        "headers": [
+            (b"content-type", b"multipart/form-data; boundary=" + boundary),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    }
+    return Request(scope, receive)
+
+
+def test_upload_store_enforces_exact_byte_limit_and_private_mode(tmp_path):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    limits = _UploadLimits(
+        image_max_bytes=len(payload),
+        video_max_bytes=len(payload),
+        image_max_pixels=100,
+        storage_max_bytes=len(payload) * 2,
+        max_files=2,
+    )
+    store = _UploadStore(tmp_path / "exact", limits)
+    saved = run_async(store.save(_multipart_request(payload), "image"))
+    assert saved.size == len(payload)
+    assert stat.S_IMODE(saved.path.stat().st_mode) == 0o600
+
+    too_small = _UploadStore(
+        tmp_path / "small",
+        _UploadLimits(
+            image_max_bytes=len(payload) - 1,
+            video_max_bytes=len(payload),
+            image_max_pixels=100,
+            storage_max_bytes=len(payload) * 2,
+            max_files=2,
+        ),
+    )
+    with pytest.raises(HTTPException) as caught:
+        run_async(too_small.save(_multipart_request(payload), "image"))
+    assert caught.value.status_code == 413
+    assert not list((tmp_path / "small").glob("*"))
+
+
+def test_upload_store_establishes_mode_0600_with_restrictive_umask(tmp_path):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    directory = tmp_path / "private-mode"
+    directory.mkdir(mode=0o700)
+    store = _UploadStore(
+        directory,
+        _UploadLimits(
+            image_max_bytes=len(payload),
+            storage_max_bytes=len(payload),
+            max_files=1,
+        ),
+    )
+    previous = os.umask(0o777)
+    try:
+        saved = run_async(store.save(_multipart_request(payload), "image"))
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(saved.path.stat().st_mode) == 0o600
+
+
+def test_upload_store_accounts_actual_bytes_and_rejects_quota(tmp_path):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    store = _UploadStore(
+        tmp_path / "quota",
+        _UploadLimits(
+            image_max_bytes=len(payload) * 4,
+            video_max_bytes=len(payload) * 4,
+            image_max_pixels=100,
+            storage_max_bytes=len(payload),
+            max_files=5,
+        ),
+    )
+    run_async(store.save(_multipart_request(payload), "image"))
+    with pytest.raises(HTTPException) as caught:
+        run_async(store.save(_multipart_request(payload), "image"))
+    assert caught.value.status_code == 507
+    staged = list((tmp_path / "quota").glob(".upload-*.png"))
+    assert len(staged) == 1
+    assert not list((tmp_path / "quota").glob(".upload-*.part"))
+    assert not [
+        path
+        for path in (tmp_path / "quota").glob("*.png")
+        if not path.name.startswith(".upload-")
+    ]
+
+
+def test_crash_left_staged_upload_counts_toward_quota_and_is_reclaimed(tmp_path):
+    directory = tmp_path / "crash-quota"
+    directory.mkdir()
+    orphan = directory / (".upload-" + ("a" * 32) + ".png")
+    orphan.write_bytes(b"occupied")
+    store = _UploadStore(
+        directory,
+        _UploadLimits(
+            image_max_bytes=100,
+            video_max_bytes=100,
+            image_max_pixels=100,
+            storage_max_bytes=len(b"occupied"),
+            max_files=2,
+        ),
+    )
+    assert store._usage() == (len(b"occupied"), 1)
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    with pytest.raises(HTTPException) as caught:
+        run_async(store.save(_multipart_request(encoded.tobytes()), "image"))
+    assert caught.value.status_code == 507
+    assert orphan.exists()
+    store.cleanup_staged(AppConfig())
+    assert not orphan.exists()
+
+
+def test_upload_quota_reservation_is_atomic_under_race(tmp_path):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    store = _UploadStore(
+        tmp_path / "race-quota",
+        _UploadLimits(
+            image_max_bytes=len(payload),
+            video_max_bytes=len(payload),
+            image_max_pixels=100,
+            storage_max_bytes=len(payload),
+            max_files=2,
+        ),
+    )
+
+    def attempt():
+        try:
+            return run_async(store.save(_multipart_request(payload), "image"))
+        except HTTPException as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result(5.0) for future in (pool.submit(attempt), pool.submit(attempt))]
+    assert sorted(
+        201 if not isinstance(result, HTTPException) else result.status_code
+        for result in results
+    ) == [201, 507]
+    assert len(list((tmp_path / "race-quota").glob("*.png"))) == 1
+
+
+def test_upload_store_maps_disk_full_and_cleans_reservations(tmp_path, monkeypatch):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    store = _UploadStore(
+        tmp_path / "disk",
+        _UploadLimits(
+            image_max_bytes=len(payload),
+            video_max_bytes=len(payload),
+            image_max_pixels=100,
+            storage_max_bytes=len(payload),
+            max_files=1,
+        ),
+    )
+    monkeypatch.setattr(
+        server_mod.os,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(errno.ENOSPC, "full")),
+    )
+    with pytest.raises(HTTPException) as caught:
+        run_async(store.save(_multipart_request(payload), "image"))
+    assert caught.value.status_code == 507
+    assert store._reserved_files == 0
+    assert store._reserved_bytes == 0
+
+
+def test_upload_store_closes_raw_fd_when_private_mode_setup_fails(
+    tmp_path, monkeypatch
+):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    store = _UploadStore(
+        tmp_path / "fd-failure",
+        _UploadLimits(
+            image_max_bytes=len(payload),
+            video_max_bytes=len(payload),
+            image_max_pixels=100,
+            storage_max_bytes=len(payload),
+            max_files=1,
+        ),
+    )
+    opened = []
+
+    def fail_fchmod(descriptor, _mode):
+        opened.append(descriptor)
+        raise PermissionError(errno.EPERM, "mode change denied")
+
+    monkeypatch.setattr(server_mod.os, "fchmod", fail_fchmod)
+    with pytest.raises(HTTPException) as caught:
+        run_async(store.save(_multipart_request(payload), "image"))
+    assert caught.value.status_code == 507
+    assert len(opened) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(opened[0])
+    assert closed.value.errno == errno.EBADF
+    assert store._reserved_files == 0
+    assert store._reserved_bytes == 0
+
+
+def test_upload_fsync_does_not_block_the_event_loop(tmp_path, monkeypatch):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    store = _UploadStore(
+        tmp_path / "nonblocking-fsync",
+        _UploadLimits(
+            image_max_bytes=len(payload),
+            video_max_bytes=len(payload),
+            image_max_pixels=100,
+            storage_max_bytes=len(payload),
+            max_files=1,
+        ),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_fsync = server_mod.os.fsync
+
+    def slow_fsync(descriptor):
+        entered.set()
+        if not release.wait(2.0):
+            raise TimeoutError("the event loop could not release the fsync worker")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(server_mod.os, "fsync", slow_fsync)
+
+    async def scenario():
+        upload = asyncio.create_task(
+            store.save(_multipart_request(payload), "image")
+        )
+        try:
+            deadline = time.monotonic() + 1.0
+            while not entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert entered.is_set()
+            # Reaching another scheduling point while fsync is stalled proves
+            # the synchronous disk operation is not running on the ASGI loop.
+            await asyncio.sleep(0.01)
+            release.set()
+            return await upload
+        finally:
+            release.set()
+
+    saved = run_async(scenario())
+    assert saved.size == len(payload)
+
+
+@pytest.mark.parametrize("stage", ("reserve", "write", "fsync", "commit"))
+def test_upload_cancellation_waits_for_mutating_worker_and_cleans_ownership(
+    tmp_path, monkeypatch, stage
+):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    directory = tmp_path / f"cancel-{stage}"
+    store = _UploadStore(
+        directory,
+        _UploadLimits(
+            image_max_bytes=len(payload),
+            video_max_bytes=len(payload),
+            image_max_pixels=100,
+            storage_max_bytes=len(payload),
+            max_files=1,
+        ),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    if stage == "fsync":
+        owner, attribute = server_mod.os, "fsync"
+    else:
+        owner = store
+        attribute = {
+            "reserve": "_reserve_file",
+            "write": "_reserve_bytes",
+            "commit": "_commit",
+        }[stage]
+    original = getattr(owner, attribute)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        if not release.wait(2.0):
+            raise TimeoutError(f"cancelled upload did not release {stage} worker")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, attribute, blocked)
+
+    async def scenario():
+        upload = asyncio.create_task(
+            store.save(_multipart_request(payload), "image")
+        )
+        try:
+            deadline = time.monotonic() + 1.0
+            while not entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert entered.is_set(), f"upload did not reach {stage} worker"
+            upload.cancel()
+            await asyncio.sleep(0.02)
+            # Cancellation is deferred until the authoritative worker finishes;
+            # otherwise finally can race its quota and filesystem mutations.
+            assert not upload.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await upload
+        finally:
+            release.set()
+
+    run_async(scenario())
+    assert store._reserved_files == 0
+    assert store._reserved_bytes == 0
+    assert store._active_temps == set()
+    assert list(directory.iterdir()) == []
+
+
+def test_image_header_rejection_happens_before_opencv_decode(tmp_path, monkeypatch):
+    path = tmp_path / "forged.png"
+    path.write_bytes(b"not a real image")
+    store = _UploadStore(tmp_path, _UploadLimits())
+    monkeypatch.setattr(
+        server_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("OpenCV must not see a Pillow-rejected image")
+        ),
+    )
+    with pytest.raises(HTTPException) as caught:
+        store._validate(path, "image")
+    assert caught.value.status_code == 422
+
+
+def test_image_dimension_limit_is_checked_before_opencv_decode(tmp_path, monkeypatch):
+    path = tmp_path / "large.png"
+    assert cv2.imwrite(str(path), np.zeros((20, 20, 3), np.uint8))
+    store = _UploadStore(
+        tmp_path,
+        _UploadLimits(image_max_pixels=100),
+    )
+    monkeypatch.setattr(
+        server_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dimension rejection must precede OpenCV decode")
+        ),
+    )
+    with pytest.raises(HTTPException) as caught:
+        store._validate(path, "image")
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "image_dimensions_exceeded"
+
+
+def test_pillow_decompression_bomb_is_mapped_without_opencv_decode(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "bomb.png"
+    path.write_bytes(b"forged image header")
+    store = _UploadStore(tmp_path, _UploadLimits())
+    monkeypatch.setattr(
+        server_mod.Image,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            server_mod.Image.DecompressionBombError("too many pixels")
+        ),
+    )
+    monkeypatch.setattr(
+        server_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("OpenCV must not decode a decompression bomb")
+        ),
+    )
+    with pytest.raises(HTTPException) as caught:
+        store._validate(path, "image")
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "image_dimensions_exceeded"
+
+
+def test_websocket_jpeg_header_bomb_is_rejected_before_opencv(
+    monkeypatch
+):
+    monkeypatch.setattr(
+        server_mod.Image,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            server_mod.Image.DecompressionBombError("too many pixels")
+        ),
+    )
+    monkeypatch.setattr(
+        server_mod.cv2,
+        "imdecode",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("OpenCV must not decode a JPEG header bomb")
+        ),
+    )
+    assert server_mod._decode_jpeg(b"\xff\xd8forged", (128, 72)) is None
+
+
+def test_video_metadata_limit_is_checked_before_first_frame_decode(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "forged.mp4"
+    path.write_bytes(b"\x00\x00\x00\x18ftypisomcontainer")
+
+    class Capture:
+        read_called = False
+        released = False
+
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            if prop == server_mod.cv2.CAP_PROP_FRAME_WIDTH:
+                return 4096.0
+            if prop == server_mod.cv2.CAP_PROP_FRAME_HEIGHT:
+                return 2160.0
+            return 0.0
+
+        def read(self):
+            self.read_called = True
+            return True, np.zeros((1, 1, 3), np.uint8)
+
+        def release(self):
+            self.released = True
+
+    capture = Capture()
+    monkeypatch.setattr(server_mod.cv2, "VideoCapture", lambda _path: capture)
+    store = _UploadStore(tmp_path, _UploadLimits(video_max_width=3840))
+    with pytest.raises(HTTPException) as caught:
+        store._validate(path, "video")
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "video_dimensions_exceeded"
+    assert not capture.read_called
+    assert capture.released
+
+
+def test_video_later_frame_limit_rejects_the_whole_upload(tmp_path, monkeypatch):
+    path = tmp_path / "changing.mp4"
+    path.write_bytes(b"\x00\x00\x00\x18ftypisomcontainer")
+
+    class Capture:
+        def __init__(self):
+            self.frames = iter(
+                [
+                    np.zeros((4, 6, 3), np.uint8),
+                    np.zeros((5, 7, 3), np.uint8),
+                ]
+            )
+            self.released = False
+
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            if prop == server_mod.cv2.CAP_PROP_FRAME_WIDTH:
+                return 6.0
+            if prop == server_mod.cv2.CAP_PROP_FRAME_HEIGHT:
+                return 4.0
+            return 0.0
+
+        def read(self):
+            try:
+                return True, next(self.frames)
+            except StopIteration:
+                return False, None
+
+        def release(self):
+            self.released = True
+
+    capture = Capture()
+    monkeypatch.setattr(server_mod.cv2, "VideoCapture", lambda _path: capture)
+    store = _UploadStore(
+        tmp_path, _UploadLimits(video_max_width=6, video_max_height=4)
+    )
+    with pytest.raises(HTTPException) as caught:
+        store._validate(path, "video")
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "video_dimensions_exceeded"
+    assert capture.released

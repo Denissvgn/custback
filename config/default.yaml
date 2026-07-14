@@ -1,0 +1,69 @@
+# custback default configuration
+# Start with: custback -c config/default.yaml
+
+camera:
+  device: 0            # index, /dev/videoN, or capture URL
+  width: 1280
+  height: 720
+  fps: 30
+  mirror: false
+  synthetic: false     # true = built-in test pattern (no hardware needed)
+
+background:
+  # passthrough | blur | image | video | color | camera | remote
+  mode: blur
+  blur_strength: 31
+  image_path: ""       # static backdrop (mode: image)
+  video_path: ""       # looping live backdrop (mode: video)
+  camera_device: ""    # second camera or stream URL (mode: camera)
+  color: [18, 100, 32] # BGR (mode: color)
+  # Privacy-safe local output while a remote renderer is absent or stale.
+  # blur | image | video | color | camera (never passthrough or remote)
+  remote_fallback_mode: blur
+
+segmentation:
+  # auto picks the best available: rvm (matting, needs the [rvm] or [gpu]
+  # extra) > mediapipe > heuristic
+  backend: auto        # auto | rvm | mediapipe | heuristic | none
+  model_path: ""       # optional model override (.onnx for rvm, .tflite for mediapipe)
+  delegate: cpu        # cpu | gpu — mediapipe inference device; rvm picks
+                       # CUDA automatically when onnxruntime-gpu is installed
+  rvm_downsample: 0.0  # rvm internal resolution ratio, 0 = auto from frame size
+  threshold: 0.5
+  mask_blur: 7         # edge feathering (odd kernel, 0 = off)
+  edge_refine: true    # bounded marker-watershed snap within an 8 px band
+  mask_shift: 0        # grow (>0) / shrink (<0) mask by N px; -1..-2 removes halos
+  temporal_smoothing: 0.35  # flicker damping; motion still tracks instantly
+
+compositing:
+  light_wrap: 0.25     # 0..1, backdrop light bleeding into the person's edge
+  use_model_foreground: true  # rvm only: color-spill removal on hair/edges
+
+output:
+  backend: auto        # auto | pyvirtualcam | null (API-only)
+  device: ""           # e.g. /dev/video10 on Linux; empty = auto
+  fps: 30
+  preview: false       # on-screen window with the processed output (q/ESC quits)
+
+api:
+  enabled: true
+  host: 127.0.0.1
+  port: 8710
+  remote_timeout_ms: 250   # avatar-mode freshness before falling back
+  allow_non_loopback: false
+  # Loopback origins are derived from host/port when this is empty. Remote
+  # binds require explicit exact origins such as https://studio.example:8710.
+  allowed_origins: []
+  token_file: ~/.config/custback/api-token
+  session_ttl_s: 28800     # browser session lifetime: eight hours
+  tls_certfile: ""         # both TLS paths are mandatory for non-loopback
+  tls_keyfile: ""
+  ws_max_bytes: 16777216
+  uploads:
+    image_max_bytes: 20971520
+    video_max_bytes: 268435456
+    image_max_pixels: 16777216
+    video_max_width: 3840
+    video_max_height: 2160
+    storage_max_bytes: 2147483648
+    max_files: 100
