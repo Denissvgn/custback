@@ -34,7 +34,16 @@ except ImportError:  # python-multipart 0.0.9 minimum compatibility
 
 from .. import __version__
 from ..backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, VIDEO_EXTS
-from ..config import MODES, AppConfig, RuntimeConfig
+from ..config import (
+    MODES,
+    BackgroundConfig,
+    CameraConfig,
+    CompositingConfig,
+    OutputConfig,
+    RuntimeConfig,
+    SegmentationConfig,
+    UploadLimits,
+)
 from ..hub import FrameHub
 from .security import SESSION_COOKIE, SecurityPolicy
 
@@ -98,16 +107,6 @@ placeholder="API token" size="48" required><button>Sign in</button></form>
 let r=await fetch('/auth/session',{method:'POST',headers:{'content-type':'application/json'},
 body:JSON.stringify({token:token.value})});if(r.ok)location.reload();
 else error.textContent='Authentication failed';};</script>
-"""
-
-INDEX_HTML = """<!doctype html>
-<meta charset="utf-8"><title>custback</title>
-<style>body{font-family:sans-serif;background:#111;color:#eee;margin:2rem}
-img{max-width:100%;border-radius:8px}</style>
-<h1>custback preview</h1>
-<p>Processed virtual-camera output. Control via <code>PATCH /config</code>,
-docs at <a href="/docs" style="color:#8cf">/docs</a>.</p>
-<img src="/video/mjpeg" alt="live output">
 """
 
 DOCS_HTML = """<!doctype html>
@@ -201,13 +200,11 @@ def _state(runtime: RuntimeConfig):
 
 
 def _state_body(state) -> dict[str, Any]:
-    body = state.config.to_dict()
-    # The secret itself is never a config field; omit defensive aliases too.
-    api = body.get("api")
-    if isinstance(api, dict):
-        for key in ("token", "api_token", "bearer_token"):
-            api.pop(key, None)
-    return body
+    # Serialize through an explicit allow-list model so a future private field
+    # cannot leak merely because a manual deny-list was not updated.
+    return PublicAppConfig.model_validate(state.config.to_dict()).model_dump(
+        mode="python"
+    )
 
 
 def _upload_limits(runtime: RuntimeConfig) -> _UploadLimits:
@@ -253,8 +250,41 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
         return None
 
 
+class PublicApiConfig(BaseModel):
+    """Browser-safe API settings with credential/private-key paths omitted."""
+
+    enabled: bool
+    host: str
+    port: int
+    remote_timeout_ms: int
+    allow_non_loopback: bool
+    allowed_origins: tuple[str, ...]
+    session_ttl_s: int
+    tls_certfile: str
+    ws_max_bytes: int
+    uploads: UploadLimits
+
+
+class PublicAvatarRemoteConfig(BaseModel):
+    """Public proxy state; trust and credential locations stay operator-only."""
+
+    url: str
+    connect_timeout_s: float
+    read_timeout_s: float
+
+
+class PublicAppConfig(BaseModel):
+    camera: CameraConfig
+    background: BackgroundConfig
+    segmentation: SegmentationConfig
+    compositing: CompositingConfig
+    output: OutputConfig
+    api: PublicApiConfig
+    avatar: PublicAvatarRemoteConfig
+
+
 class _ConfigPatchResponse(BaseModel):
-    config: AppConfig
+    config: PublicAppConfig
     config_version: int
 
 
@@ -326,6 +356,9 @@ class _StatusResponse(BaseModel):
 class _BackgroundListResponse(BaseModel):
     files: list[str]
     modes: list[str]
+    # Absolute store directory, so clients can build config path patches
+    # for entries in ``files``.
+    directory: str
 
 
 def _decode_jpeg(data: bytes, expected_size: tuple[int, int]) -> np.ndarray | None:
@@ -1135,8 +1168,12 @@ def create_app(
     *,
     security: SecurityPolicy,
     upload_dir: Path | None = None,
+    avatar_client_factory: Any = None,
 ) -> FastAPI:
     """Create the authenticated API bound to the active pipeline coordinator."""
+
+    from ..avatar.store import ThumbnailCache
+    from .avatar_proxy import register_avatar_proxy
 
     if (
         not hasattr(coordinator, "apply_config_patch")
@@ -1153,6 +1190,8 @@ def create_app(
     store = _UploadStore(upload_dir or UPLOAD_DIR, _upload_limits(runtime))
     store.cleanup_staged(_state(runtime).config)
     cleanup_queue = _StagedCleanupQueue(runtime, coordinator, store)
+    thumbnails = ThumbnailCache()
+    register_avatar_proxy(app, runtime, client_factory=avatar_client_factory)
     default_openapi = app.openapi
 
     def authenticated_openapi():
@@ -1289,7 +1328,9 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
-        return INDEX_HTML
+        from .webui import WEBUI_HTML
+
+        return WEBUI_HTML
 
     @app.get("/docs", response_class=HTMLResponse, include_in_schema=False)
     async def docs() -> str:
@@ -1302,7 +1343,7 @@ def create_app(
             body, headers={"X-Config-Version": str(body["config_version"])}
         )
 
-    @app.get("/config", response_model=AppConfig)
+    @app.get("/config", response_model=PublicAppConfig)
     async def get_config() -> JSONResponse:
         state = _state(runtime)
         return JSONResponse(
@@ -1354,7 +1395,45 @@ def create_app(
                 and p.suffix.lower() in IMAGE_EXTS | VIDEO_EXTS
             )
         )
-        return {"files": files, "modes": list(MODES)}
+        return {
+            "files": files,
+            "modes": list(MODES),
+            "directory": str(store.directory),
+        }
+
+    @app.get(
+        "/backgrounds/{identifier}/thumbnail.jpg",
+        response_class=Response,
+        responses={200: {"content": {"image/jpeg": {}}}},
+    )
+    async def background_thumbnail(identifier: str) -> Response:
+        from ..avatar.store import StoreError, render_media_thumbnail
+
+        if (
+            not identifier
+            or identifier.startswith(".")
+            or os.path.basename(identifier.replace("\\", "/")) != identifier
+        ):
+            raise _error(404, "media_not_found", "no such stored file")
+        path = store.directory / identifier
+        suffix = path.suffix.lower()
+        kind = "image" if suffix in IMAGE_EXTS else "video"
+        if (
+            suffix not in IMAGE_EXTS | VIDEO_EXTS
+            or not path.is_file()
+            or path.is_symlink()
+        ):
+            raise _error(404, "media_not_found", "no such stored file")
+        stat_result = path.stat()
+        key = (str(path), stat_result.st_mtime_ns, stat_result.st_size)
+        cached = thumbnails.get(key)
+        if cached is None:
+            try:
+                cached = await asyncio.to_thread(render_media_thumbnail, path, kind)
+            except StoreError as exc:
+                raise _error(exc.status, exc.code, str(exc)) from exc
+            thumbnails.put(key, cached)
+        return Response(content=cached, media_type="image/jpeg")
 
     async def upload(request: Request, kind: str) -> JSONResponse:
         saved = await store.save(request, kind)
@@ -1546,18 +1625,25 @@ def create_app(
         ):
             await _deny_ws(ws, 403, 4403, "request origin or host rejected")
             return
-        if not security.authenticated(
-            authorizations[0] if authorizations else None,
+        authorization = authorizations[0] if authorizations else None
+        management_authenticated = security.authenticated(
+            authorization,
             ws.cookies.get(SESSION_COOKIE),
-        ):
-            await _deny_ws(ws, 401, 4401, "valid API token required")
+        )
+        renderer_authenticated = (
+            stream == "raw" and security.renderer_bearer_valid(authorization)
+        )
+        if not (management_authenticated or renderer_authenticated):
+            await _deny_ws(ws, 401, 4401, "valid route credential required")
             return
         if stream not in ("raw", "output"):
             await _deny_ws(ws, 400, 4400, "stream must be raw|output")
             return
 
         await ws.accept()
-        remote_session = hub.remote_client_connected()
+        remote_session = (
+            hub.remote_client_connected() if stream == "raw" else None
+        )
         slot = hub.raw if stream == "raw" else hub.output
         stop = asyncio.Event()
         ws_limit = int(getattr(_state(runtime).config.api, "ws_max_bytes", 16 * 1024**2))
@@ -1570,6 +1656,13 @@ def create_app(
                     await ws.send_bytes(await asyncio.to_thread(_encode_jpeg, frame))
 
         async def receiver() -> None:
+            if stream == "output":
+                while True:
+                    message = await ws.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        return
+                    await ws.close(code=1008, reason="output stream is read-only")
+                    return
             expected = _state(runtime).config.camera
             expected_size = (expected.width, expected.height)
             while True:
@@ -1588,6 +1681,7 @@ def create_app(
                 if frame is None:
                     await ws.close(code=1007, reason="invalid JPEG or frame dimensions")
                     return
+                assert remote_session is not None
                 hub.push_remote_frame(frame, remote_session)
 
         send_task = asyncio.create_task(sender())
@@ -1609,6 +1703,7 @@ def create_app(
             await asyncio.gather(
                 send_task, receive_task, return_exceptions=True
             )
-            hub.remote_client_disconnected(remote_session)
+            if remote_session is not None:
+                hub.remote_client_disconnected(remote_session)
 
     return app

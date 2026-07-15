@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "phase": 1,
+  "release_blocked": true,
+  "blockers": [
+    {"id": "SEC-01", "phase": 1, "status": "resolved", "title": "Avatar proxy SSRF and credential-file exfiltration", "regression": "tests/test_remediation_security.py"},
+    {"id": "TOKEN-01", "phase": 1, "status": "resolved", "title": "Proxy client token creation and upstream-auth mapping", "regression": "tests/test_remediation_security.py"},
+    {"id": "TRANS-01", "phase": 1, "status": "resolved", "title": "Non-loopback plaintext transports", "regression": "tests/test_remediation_security.py"},
+    {"id": "PRIV-01", "phase": 1, "status": "resolved", "title": "Remote startup and fallback privacy bypasses", "regression": "tests/test_remediation_security.py"},
+    {"id": "A2F-01", "phase": 4, "status": "open", "title": "Audio2Face dependency and protocol contract", "regression": "packaging/npm/test/remediation-phase0.test.js"},
+    {"id": "CFG-01", "phase": 2, "status": "open", "title": "Non-transactional avatar activation", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "CFG-02", "phase": 3, "status": "open", "title": "Non-recursive configuration merge patch", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "LIFE-01", "phase": 2, "status": "open", "title": "Render cancellation outlives resource ownership", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "LIFE-02", "phase": 2, "status": "open", "title": "Audio2Face blocked RPC survives close", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "STOR-01", "phase": 3, "status": "open", "title": "Avatar asset permissions are not private", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "STOR-02", "phase": 3, "status": "open", "title": "Incomplete staging, rig, and decoded-image limits", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "SEG-01", "phase": 3, "status": "open", "title": "Model acquisition blocks frame processing", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "SEG-02", "phase": 3, "status": "open", "title": "Auto backend ignores custom TFLite model", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "SEG-03", "phase": 3, "status": "resolved", "title": "Non-finite masks can reach output", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "RENDER-01", "phase": 3, "status": "open", "title": "Avatar alpha is multiplied twice", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "RENDER-02", "phase": 3, "status": "open", "title": "follow_pose is nonfunctional", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "API-01", "phase": 3, "status": "open", "title": "Streams exhaust the shared asyncio executor", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "NPM-01", "phase": 4, "status": "open", "title": "npm upgrade loses venv, generations, and extras", "regression": "packaging/npm/test/remediation-phase0.test.js"},
+    {"id": "PKG-01", "phase": 4, "status": "open", "title": "npm avatar command and documentation mismatch", "regression": "packaging/npm/test/remediation-phase0.test.js"},
+    {"id": "PKG-02", "phase": 4, "status": "open", "title": "Prepack and local tarball behavior are inconsistent", "regression": "packaging/npm/test/remediation-phase0.test.js"},
+    {"id": "DEPLOY-01", "phase": 4, "status": "open", "title": "Remote token and TLS deployment is incomplete", "regression": "packaging/npm/test/remediation-phase0.test.js"},
+    {"id": "MISC-01", "phase": 3, "status": "open", "title": "Failed camera backdrop leaks capture", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "MISC-02", "phase": 3, "status": "open", "title": "YAML, URL port, and CLI override validation gaps", "regression": "tests/test_remediation_runtime.py"},
+    {"id": "LICENSE-01", "phase": 4, "status": "open", "title": "Declared MIT artifacts omit license text", "regression": "packaging/npm/test/remediation-phase0.test.js"},
+    {"id": "PLATFORM-01", "phase": 4, "status": "open", "title": "Automatic Linux setup scope is overstated", "regression": "packaging/npm/test/remediation-phase0.test.js"},
+    {"id": "HYGIENE-01", "phase": 4, "status": "open", "title": "Generated ONNX Runtime profiles are not release-stale", "regression": "packaging/npm/test/remediation-phase0.test.js"}
+  ]
+}

@@ -29,6 +29,10 @@ function appPath(target = targetPath()) {
   return path.join(target, 'bin', 'custback');
 }
 
+function avatarPath(target = targetPath()) {
+  return path.join(target, 'bin', 'custback-avatar');
+}
+
 function pythonPath(target = targetPath()) {
   return path.join(target, 'bin', 'python');
 }
@@ -212,9 +216,21 @@ function main(argv = process.argv.slice(2)) {
       console.error('custback: bootstrap completed without a valid managed launcher');
       return 1;
     }
-    const result = spawnSync(appPath(target), argv, { stdio: 'inherit' });
+    // `custback avatar ...` runs the stage-2 avatar service from the same
+    // managed venv; every other command passes through to the main app.
+    let launcher = appPath(target);
+    let launchArgs = argv;
+    if (command === 'avatar') {
+      launcher = avatarPath(target);
+      launchArgs = argv.slice(1);
+      if (!fs.existsSync(launcher)) {
+        console.error('custback: this managed venv predates the avatar service; run: custback rebuild');
+        return 1;
+      }
+    }
+    const result = spawnSync(launcher, launchArgs, { stdio: 'inherit' });
     if (result.error) {
-      console.error(`custback: failed to launch ${appPath(target)}: ${result.error.message}`);
+      console.error(`custback: failed to launch ${launcher}: ${result.error.message}`);
       return 1;
     }
     return result.status ?? 1;
@@ -226,6 +242,7 @@ function main(argv = process.argv.slice(2)) {
 
 module.exports = {
   appPath,
+  avatarPath,
   bootstrap,
   doctor,
   hasCustbackCamera,

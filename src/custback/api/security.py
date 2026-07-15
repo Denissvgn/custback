@@ -12,17 +12,20 @@ import ipaddress
 import os
 import re
 import secrets
+import ssl
 import stat
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Literal, Mapping
 from urllib.parse import urlsplit
 
 
 TOKEN_ENV = "CUSTBACK_API_TOKEN"
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "custback" / "api-token"
+RENDERER_TOKEN_ENV = "CUSTBACK_RENDERER_TOKEN"
+DEFAULT_RENDERER_TOKEN_FILE = Path.home() / ".config" / "custback" / "renderer-token"
 SESSION_COOKIE = "custback_session"
 MIN_TOKEN_LENGTH = 32
 MAX_TOKEN_FILE_BYTES = 4096
@@ -31,6 +34,13 @@ MAX_BROWSER_SESSIONS = 1024
 _BEARER_TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/\-]+=*\Z")
 _DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+_OUTBOUND_SCHEMES = {
+    "http": (frozenset({"http", "https"}), frozenset({"http"})),
+    "websocket": (frozenset({"ws", "wss"}), frozenset({"ws"})),
+    "grpc": (frozenset({"grpc", "grpcs"}), frozenset({"grpc"})),
+}
+
+OutboundKind = Literal["http", "websocket", "grpc"]
 
 
 class SecurityConfigurationError(ValueError):
@@ -42,6 +52,18 @@ class ResolvedToken:
     value: str
     path: Path | None = None
     created: bool = False
+
+
+@dataclass(frozen=True)
+class OutboundEndpoint:
+    """Canonical outbound service endpoint validated at configuration time."""
+
+    url: str
+    scheme: str
+    host: str
+    port: int | None
+    authority: str
+    secure: bool
 
 
 def _validate_token(token: str) -> str:
@@ -59,24 +81,20 @@ def _validate_token(token: str) -> str:
     return token
 
 
-def resolve_api_token(
+def _resolve_token(
     token_file: str | Path | None = None,
     *,
     environ: Mapping[str, str] | None = None,
+    env_name: str,
+    default_file: Path,
+    create: bool,
 ) -> ResolvedToken:
-    """Resolve the master token from the environment or a mode-0600 file.
-
-    The environment wins so deployments can inject a secret without writing
-    it to the configuration file.  When no token exists, a strong token is
-    generated once in the configured/default file.
-    """
-
     env = os.environ if environ is None else environ
-    from_env = env.get(TOKEN_ENV)
+    from_env = env.get(env_name)
     if from_env:
         return ResolvedToken(_validate_token(from_env))
 
-    path = Path(token_file).expanduser() if token_file else DEFAULT_TOKEN_FILE
+    path = Path(token_file).expanduser() if token_file else default_file
     try:
         existing = path.lstat()
     except FileNotFoundError:
@@ -124,6 +142,11 @@ def resolve_api_token(
             raise SecurityConfigurationError(f"API token file {path} must be ASCII") from exc
         return ResolvedToken(_validate_token(value), path=path)
 
+    if not create:
+        raise SecurityConfigurationError(
+            f"required token file {path} does not exist and will not be created by a client"
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     token = secrets.token_urlsafe(32)
     flags = (
@@ -136,7 +159,13 @@ def resolve_api_token(
     try:
         fd = os.open(path, flags, 0o600)
     except FileExistsError:  # another process won the first-start race
-        return resolve_api_token(path, environ={})
+        return _resolve_token(
+            path,
+            environ={},
+            env_name=env_name,
+            default_file=default_file,
+            create=False,
+        )
     try:
         # A restrictive process umask may remove owner-write permission.  The
         # token contract is an exact private mode, so establish it explicitly.
@@ -154,6 +183,49 @@ def resolve_api_token(
             pass
         raise
     return ResolvedToken(token, path=path, created=True)
+
+
+def resolve_api_token(
+    token_file: str | Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> ResolvedToken:
+    """Resolve or provision the core management token.
+
+    This retains the original server-oriented first-start behavior. Outbound
+    clients should use a purpose-specific loader such as
+    :func:`resolve_renderer_token`, which never provisions a credential by
+    default.
+    """
+
+    return _resolve_token(
+        token_file,
+        environ=environ,
+        env_name=TOKEN_ENV,
+        default_file=DEFAULT_TOKEN_FILE,
+        create=True,
+    )
+
+
+def resolve_renderer_token(
+    token_file: str | Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    create: bool = False,
+) -> ResolvedToken:
+    """Resolve the frame-renderer credential, provisioning only when requested.
+
+    Avatar clients use the default fail-closed behavior. The core server may
+    pass ``create=True`` during explicit credential provisioning.
+    """
+
+    return _resolve_token(
+        token_file,
+        environ=environ,
+        env_name=RENDERER_TOKEN_ENV,
+        default_file=DEFAULT_RENDERER_TOKEN_FILE,
+        create=create,
+    )
 
 
 def _canonical_hostname(value: str) -> tuple[str, bool] | None:
@@ -205,6 +277,23 @@ def is_loopback_host(host: str) -> bool:
     normalized = normalize_bind_host(host)
     if normalized == "localhost":
         return True
+    if normalized is None:
+        return False
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def is_numeric_loopback_host(host: str) -> bool:
+    """Return true only for an IPv4 or IPv6 loopback literal.
+
+    DNS names such as ``localhost`` are intentionally excluded.  Outbound
+    plaintext policy must not rely on DNS resolution because an entry can be
+    rebound to a non-loopback destination after validation.
+    """
+
+    normalized = normalize_bind_host(host)
     if normalized is None:
         return False
     try:
@@ -296,6 +385,167 @@ def _parse_authority(value: str) -> tuple[str, bool, int | None] | None:
 def _format_authority(host: str, is_ipv6: bool, port: int | None = None) -> str:
     authority = f"[{host}]" if is_ipv6 else host
     return f"{authority}:{port}" if port is not None else authority
+
+
+def validate_outbound_endpoint(
+    value: str,
+    *,
+    kind: OutboundKind,
+    label: str = "outbound endpoint",
+    allow_empty: bool = False,
+    require_port: bool = False,
+) -> OutboundEndpoint | None:
+    """Validate and canonicalize a root HTTP, WebSocket, or gRPC URL.
+
+    Plaintext endpoints are permitted only for numeric loopback literals.
+    Secure endpoints may use strict DNS names or usable IP literals.  The
+    returned authority is suitable for clients such as gRPC that take
+    ``host:port`` separately from the transport scheme.
+    """
+
+    if not isinstance(value, str) or value != value.strip():
+        raise SecurityConfigurationError(f"{label} must be a trimmed URL")
+    if not value:
+        if allow_empty:
+            return None
+        raise SecurityConfigurationError(f"{label} must not be empty")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise SecurityConfigurationError(f"{label} contains control characters")
+    try:
+        parsed = urlsplit(value)
+        # Accessing ``port`` is deliberately eager: urllib otherwise leaves a
+        # malformed or out-of-range port latent until the network call.
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise SecurityConfigurationError(f"{label} has an invalid port or host") from exc
+
+    allowed, plaintext = _OUTBOUND_SCHEMES[kind]
+    scheme = parsed.scheme.lower()
+    if scheme not in allowed:
+        choices = " or ".join(f"{candidate}://" for candidate in sorted(allowed))
+        raise SecurityConfigurationError(f"{label} must use {choices}")
+    if (
+        not parsed.netloc
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise SecurityConfigurationError(
+            f"{label} must be a root URL without credentials, path, query, or fragment"
+        )
+    authority = _parse_authority(parsed.netloc)
+    if authority is None:
+        raise SecurityConfigurationError(f"{label} has an invalid host or port")
+    host, is_ipv6, authority_port = authority
+    if parsed_port != authority_port:  # defensive consistency check
+        raise SecurityConfigurationError(f"{label} has an invalid port")
+    if require_port and authority_port is None:
+        raise SecurityConfigurationError(f"{label} must include an explicit port")
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and (
+        address.is_unspecified
+        or address.is_multicast
+        or address.is_link_local
+        or (address.is_reserved and not address.is_loopback)
+    ):
+        raise SecurityConfigurationError(f"{label} uses an unsafe destination address")
+    if scheme in plaintext and not is_numeric_loopback_host(host):
+        raise SecurityConfigurationError(
+            f"{label} may use {scheme}:// only with a numeric loopback address"
+        )
+
+    normalized_authority = _format_authority(host, is_ipv6, authority_port)
+    return OutboundEndpoint(
+        url=f"{scheme}://{normalized_authority}",
+        scheme=scheme,
+        host=host,
+        port=authority_port,
+        authority=normalized_authority,
+        secure=scheme not in plaintext,
+    )
+
+
+def validate_client_tls(
+    endpoint: OutboundEndpoint | None,
+    *,
+    ca_file: str = "",
+    certfile: str = "",
+    keyfile: str = "",
+    label: str = "outbound endpoint",
+) -> None:
+    """Validate TLS trust and optional mutual-TLS file configuration."""
+
+    if bool(certfile) != bool(keyfile):
+        raise SecurityConfigurationError(
+            f"{label} TLS certificate and private key must be configured together"
+        )
+    configured = bool(ca_file or certfile or keyfile)
+    if endpoint is None:
+        if configured:
+            raise SecurityConfigurationError(
+                f"{label} TLS files require a configured secure endpoint"
+            )
+        return
+    if configured and not endpoint.secure:
+        raise SecurityConfigurationError(
+            f"{label} TLS files cannot be used with a plaintext endpoint"
+        )
+    for path_label, value in (
+        ("CA bundle", ca_file),
+        ("client certificate", certfile),
+        ("client private key", keyfile),
+    ):
+        if value and not Path(value).expanduser().is_file():
+            raise SecurityConfigurationError(
+                f"{label} TLS {path_label} does not exist"
+            )
+
+
+def create_client_ssl_context(
+    endpoint: OutboundEndpoint,
+    *,
+    ca_file: str = "",
+    certfile: str = "",
+    keyfile: str = "",
+    label: str = "outbound endpoint",
+) -> ssl.SSLContext | None:
+    """Build a verified client context, or return ``None`` for loopback plaintext."""
+
+    validate_client_tls(
+        endpoint,
+        ca_file=ca_file,
+        certfile=certfile,
+        keyfile=keyfile,
+        label=label,
+    )
+    if not endpoint.secure:
+        return None
+    try:
+        context = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH,
+            cafile=str(Path(ca_file).expanduser()) if ca_file else None,
+        )
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        if certfile:
+            context.load_cert_chain(
+                certfile=str(Path(certfile).expanduser()),
+                keyfile=str(Path(keyfile).expanduser()),
+            )
+    except (OSError, ssl.SSLError) as exc:
+        # These helpers are also reached while validating authenticated PATCH
+        # candidates. Never reflect operator filesystem paths through a public
+        # ValidationError response.
+        raise SecurityConfigurationError(
+            f"{label} TLS material could not be loaded or verified"
+        ) from exc
+    return context
 
 
 def canonical_origin(origin: str) -> str | None:
@@ -406,12 +656,19 @@ class SecurityPolicy:
     token: str
     allowed_origins: frozenset[str]
     allowed_hosts: frozenset[str]
+    renderer_token: str | None = None
     secure_cookie: bool = False
     session_ttl_s: int = 8 * 60 * 60
     sessions: SessionStore = field(init=False)
 
     def __post_init__(self) -> None:
         self.token = _validate_token(self.token)
+        if self.renderer_token is not None:
+            self.renderer_token = _validate_token(self.renderer_token)
+            if secrets.compare_digest(self.renderer_token, self.token):
+                raise SecurityConfigurationError(
+                    "renderer token must be distinct from the management token"
+                )
         if (
             not isinstance(self.session_ttl_s, int)
             or isinstance(self.session_ttl_s, bool)
@@ -453,6 +710,7 @@ class SecurityPolicy:
         tls: bool = False,
         session_ttl_s: int = 8 * 60 * 60,
         extra_hosts: tuple[str, ...] | list[str] = (),
+        renderer_token: str | None = None,
     ) -> "SecurityPolicy":
         bind_host = normalize_bind_host(host)
         if bind_host is None:
@@ -498,6 +756,7 @@ class SecurityPolicy:
             token=token,
             allowed_origins=origins,
             allowed_hosts=frozenset(hosts),
+            renderer_token=renderer_token,
             secure_cookie=tls,
             session_ttl_s=session_ttl_s,
         )
@@ -520,6 +779,22 @@ class SecurityPolicy:
             separator
             and scheme.lower() == "bearer"
             and secrets.compare_digest(candidate, self.token)
+        )
+
+    def renderer_bearer_valid(self, authorization: str | None) -> bool:
+        """Validate only the renderer-scoped credential.
+
+        Route code must call this exclusively on the raw frame WebSocket; it
+        deliberately doesn't participate in general API authentication.
+        """
+
+        if not authorization or self.renderer_token is None:
+            return False
+        scheme, separator, candidate = authorization.partition(" ")
+        return bool(
+            separator
+            and scheme.lower() == "bearer"
+            and secrets.compare_digest(candidate, self.renderer_token)
         )
 
     def authenticated(

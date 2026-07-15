@@ -20,8 +20,21 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/__init__.py',
   'custback/__main__.py',
   'custback/api/__init__.py',
+  'custback/api/avatar_proxy.py',
   'custback/api/security.py',
   'custback/api/server.py',
+  'custback/api/webui.py',
+  'custback/avatar/__init__.py',
+  'custback/avatar/__main__.py',
+  'custback/avatar/api.py',
+  'custback/avatar/audio2face.py',
+  'custback/avatar/config.py',
+  'custback/avatar/drivers.py',
+  'custback/avatar/renderer.py',
+  'custback/avatar/rig.py',
+  'custback/avatar/service.py',
+  'custback/avatar/state.py',
+  'custback/avatar/store.py',
   'custback/backgrounds.py',
   'custback/capture.py',
   'custback/compositor.py',
@@ -38,6 +51,13 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_api.py',
   'tests/test_api_lifecycle.py',
   'tests/test_api_security.py',
+  'tests/test_avatar_api.py',
+  'tests/test_avatar_config.py',
+  'tests/test_avatar_drivers.py',
+  'tests/test_avatar_proxy.py',
+  'tests/test_avatar_rig.py',
+  'tests/test_avatar_service.py',
+  'tests/test_avatar_store.py',
   'tests/test_capture.py',
   'tests/test_config.py',
   'tests/test_diagnostics.py',
@@ -47,9 +67,11 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_preview.py',
   'tests/test_processing.py',
   'tests/test_segmentation_rvm.py',
+  'tests/test_webui.py',
 ];
 const REVIEWED_NPM_PAYLOAD = [
   'README.md',
+  'config/avatar.yaml',
   'config/default.yaml',
   'examples/avatar_client.py',
   'package.json',
@@ -74,11 +96,17 @@ const REVIEWED_CORE_DEPENDENCIES = [
   'pyyaml>=6.0,<7',
   'websockets>=12.0,<17',
   'python-multipart>=0.0.9,<1',
+  'httpx>=0.27,<0.29',
 ];
 const REVIEWED_OPTIONAL_DEPENDENCIES = {
   mediapipe: ['mediapipe>=0.10.14,<0.11'],
   rvm: ['onnxruntime>=1.17,<2'],
   gpu: ['onnxruntime-gpu>=1.17,<1.27'],
+  audio2face: [
+    'grpcio>=1.60,<2',
+    'nvidia-ace>=1.2,<2',
+    'sounddevice>=0.4,<0.6',
+  ],
   dev: [
     'build>=1.2,<2',
     'pytest>=8.0,<10',
@@ -87,7 +115,10 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
     'httpx2>=2,<3',
   ],
 };
-const REVIEWED_CONSOLE_SCRIPTS = { custback: 'custback.__main__:main' };
+const REVIEWED_CONSOLE_SCRIPTS = {
+  custback: 'custback.__main__:main',
+  'custback-avatar': 'custback.avatar.__main__:main',
+};
 const REVIEWED_NPM_METADATA = {
   name: 'custback',
   description: 'Virtual camera with background replacement for meeting apps (Ubuntu / macOS)',
@@ -122,6 +153,69 @@ const REVIEWED_NPM_METADATA = {
 
 function fail(message) {
   throw new Error(message);
+}
+
+function remediationBlockers(root = ROOT) {
+  const registryPath = path.join(root, 'scripts', 'release', 'remediation-blockers.json');
+  if (!fs.existsSync(registryPath)) {
+    fail('release remediation blocker registry is missing');
+  }
+  let registry;
+  try {
+    registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+  } catch (err) {
+    fail(`release remediation blocker registry is invalid JSON: ${err.message}`);
+  }
+  if (!registry || registry.schema_version !== 1 || !Array.isArray(registry.blockers)) {
+    fail('release remediation blocker registry must use schema_version 1 with a blockers array');
+  }
+  const seen = new Set();
+  const blockers = registry.blockers.map((entry) => {
+    if (!entry || typeof entry !== 'object' ||
+        typeof entry.id !== 'string' || !/^[A-Z][A-Z0-9]+-\d{2}$/.test(entry.id) ||
+        !Number.isSafeInteger(entry.phase) || entry.phase < 1 ||
+        !['open', 'resolved'].includes(entry.status) ||
+        typeof entry.title !== 'string' || entry.title.trim() === '' ||
+        typeof entry.regression !== 'string' || entry.regression.trim() === '' ||
+        path.isAbsolute(entry.regression) ||
+        entry.regression.split(/[\\/]/).includes('..')) {
+      fail('release remediation blocker registry contains an invalid entry');
+    }
+    if (seen.has(entry.id)) {
+      fail(`release remediation blocker registry contains duplicate id ${entry.id}`);
+    }
+    seen.add(entry.id);
+    return { ...entry };
+  });
+  const open = blockers.filter((entry) => entry.status === 'open');
+  if (registry.release_blocked !== (open.length > 0)) {
+    fail('release_blocked must be true exactly while remediation blockers remain open');
+  }
+  return blockers;
+}
+
+function verifyBlockerRegressionCoverage(root = ROOT) {
+  for (const blocker of remediationBlockers(root)) {
+    const regressionPath = path.join(root, blocker.regression);
+    if (!fs.existsSync(regressionPath) || !fs.statSync(regressionPath).isFile()) {
+      fail(`${blocker.id} regression file is missing: ${blocker.regression}`);
+    }
+    const source = fs.readFileSync(regressionPath, 'utf8');
+    if (!source.includes(blocker.id)) {
+      fail(`${blocker.id} is not referenced by ${blocker.regression}`);
+    }
+  }
+}
+
+function verifyNoReleaseBlockers(root = ROOT) {
+  verifyBlockerRegressionCoverage(root);
+  const open = remediationBlockers(root).filter((entry) => entry.status === 'open');
+  if (open.length) {
+    fail(
+      `release blocked by ${open.length} open remediation blocker(s): ` +
+      `${open.map((entry) => entry.id).join(', ')}; see REMEDIATION_PLAN.md`,
+    );
+  }
 }
 
 function projectVersion(pyproject) {
@@ -738,6 +832,7 @@ function main(argv = process.argv.slice(2)) {
     const version = verifyVersions();
     verifyDependencies();
     verifyDocs();
+    verifyNoReleaseBlockers();
     const stale = staleArtifacts();
     if (stale.length) {
       fail(`stale release artifacts must be removed before release: ${stale.join(', ')}`);
@@ -758,12 +853,15 @@ module.exports = {
   main,
   parseNpmPackPayload,
   projectVersion,
+  remediationBlockers,
   staleArtifacts,
   verifyDependencies,
   verifyDocs,
   verifyBuiltArtifacts,
+  verifyBlockerRegressionCoverage,
   verifyNpmArtifactInstall,
   verifyNpmMetadata,
+  verifyNoReleaseBlockers,
   verifyPack,
   verifyPythonArtifacts,
   verifyVersions,

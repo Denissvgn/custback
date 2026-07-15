@@ -829,7 +829,7 @@ def create_backdrop(
     video_max_width: int = 3840,
     video_max_height: int = 2160,
 ) -> BackdropProvider | None:
-    """Build the active provider, including remote mode's local fallback."""
+    """Build the active provider, including remote mode's preflight backdrop."""
     mode = cfg.mode
     if mode == "passthrough":
         return None

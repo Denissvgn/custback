@@ -11,10 +11,78 @@ const release = require('../../../scripts/release/verify-release');
 const root = path.resolve(__dirname, '..', '..', '..');
 
 test('release metadata versions and required compatibility bounds agree', () => {
-  assert.equal(release.verifyVersions(root), '0.3.0');
+  assert.equal(release.verifyVersions(root), '0.4.0');
   assert.doesNotThrow(() => release.verifyNpmMetadata(root));
   assert.doesNotThrow(() => release.verifyDependencies(root));
   assert.doesNotThrow(() => release.verifyDocs(root));
+});
+
+test('remediation registry tracks resolved work and keeps the release frozen', () => {
+  const blockers = release.remediationBlockers(root);
+  assert.equal(blockers.length, 26);
+  assert.deepEqual(
+    blockers.filter((entry) => entry.status === 'resolved').map((entry) => entry.id),
+    ['SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01', 'SEG-03'],
+  );
+  assert.equal(blockers.filter((entry) => entry.status === 'open').length, 21);
+  assert.doesNotThrow(() => release.verifyBlockerRegressionCoverage(root));
+  assert.throws(
+    () => release.verifyNoReleaseBlockers(root),
+    /release blocked by 21 open remediation blocker.*A2F-01.*HYGIENE-01/,
+  );
+});
+
+test('remediation registry fails closed on missing, malformed, or inconsistent state', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-blocker-test-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const directory = path.join(fixture, 'scripts', 'release');
+  fs.mkdirSync(directory, { recursive: true });
+
+  assert.throws(
+    () => release.remediationBlockers(fixture),
+    /registry is missing/,
+  );
+
+  const registryPath = path.join(directory, 'remediation-blockers.json');
+  fs.writeFileSync(registryPath, '{bad');
+  assert.throws(
+    () => release.remediationBlockers(fixture),
+    /invalid JSON/,
+  );
+
+  fs.writeFileSync(registryPath, JSON.stringify({
+    schema_version: 1,
+    release_blocked: false,
+    blockers: [
+      {
+        id: 'SEC-01', phase: 1, status: 'open', title: 'still open',
+        regression: 'tests/security.test.js',
+      },
+    ],
+  }));
+  assert.throws(
+    () => release.remediationBlockers(fixture),
+    /release_blocked must be true/,
+  );
+
+  fs.writeFileSync(registryPath, JSON.stringify({
+    schema_version: 1,
+    release_blocked: true,
+    blockers: [
+      {
+        id: 'SEC-01', phase: 1, status: 'open', title: 'first',
+        regression: 'tests/security.test.js',
+      },
+      {
+        id: 'SEC-01', phase: 1, status: 'resolved', title: 'duplicate',
+        regression: 'tests/security.test.js',
+      },
+    ],
+  }));
+  assert.throws(
+    () => release.remediationBlockers(fixture),
+    /duplicate id SEC-01/,
+  );
 });
 
 test('release version parity rejects a mismatched lock root', (t) => {
@@ -37,13 +105,20 @@ test('source fallback verification ignores a matching comment decoy', (t) => {
   fs.mkdirSync(path.join(fixture, 'src', 'custback'), { recursive: true });
   fs.copyFileSync(path.join(root, 'package.json'), path.join(fixture, 'package.json'));
   fs.copyFileSync(path.join(root, 'package-lock.json'), path.join(fixture, 'package-lock.json'));
-  fs.writeFileSync(path.join(fixture, 'pyproject.toml'), '[project]\nversion = "0.3.0"\n');
+  // Match the real package version so only the fallback line disagrees.
+  const packageVersion = JSON.parse(
+    fs.readFileSync(path.join(root, 'package.json'), 'utf8'),
+  ).version;
+  fs.writeFileSync(
+    path.join(fixture, 'pyproject.toml'),
+    `[project]\nversion = "${packageVersion}"\n`,
+  );
   fs.writeFileSync(path.join(fixture, 'src', 'custback', '__init__.py'), `
 from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("custback")
 except PackageNotFoundError:
-    # __version__ = "0.3.0"
+    # __version__ = "${packageVersion}"
     __version__ = "9.9.9"
 `);
   assert.throws(
@@ -95,7 +170,7 @@ test('release and install probes remain active with Python optimization', () => 
   const previous = process.env.PYTHONOPTIMIZE;
   process.env.PYTHONOPTIMIZE = '2';
   try {
-    assert.equal(release.verifyVersions(root), '0.3.0');
+    assert.equal(release.verifyVersions(root), '0.4.0');
   } finally {
     if (previous === undefined) delete process.env.PYTHONOPTIMIZE;
     else process.env.PYTHONOPTIMIZE = previous;

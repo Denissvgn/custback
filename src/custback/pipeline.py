@@ -12,11 +12,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import numpy as np
+import cv2
 
 from .backgrounds import BlurBackdrop, create_backdrop
 from .capture import open_capture
 from .compositor import composite
 from .config import (
+    AVATAR_PROXY_RESTART_ONLY_FIELDS,
     AppConfig,
     ConfigState,
     ConfigVersionConflictError,
@@ -45,6 +47,20 @@ _VIDEO_STATS_DEFAULTS: dict[str, object] = {
     "background_video_seek_count": 0,
     "background_video_decode_failures": 0,
 }
+
+# Retain only compact downsampled fingerprints, bounded by both time and the
+# maximum supported capture rate (240 fps). This detects delayed renderer
+# echoes without keeping historical raw camera images.
+_RAW_FINGERPRINT_HISTORY = 1024
+_RAW_FINGERPRINT_WINDOW_S = 3.0
+_RAW_FINGERPRINT_SIZE = (16, 12)
+_RAW_ECHO_PIXEL_TOLERANCE = 3
+_RAW_ECHO_CHANGED_FRACTION = 0.02
+_RAW_ECHO_MEAN_DELTA = 4.0
+_RAW_ECHO_HASH_DISTANCE = 16
+_RAW_ECHO_MEAN_COLOR_DELTA = 24.0
+_RAW_ECHO_LOWRES_MEAN_DELTA = 20.0
+_RAW_ECHO_LOWRES_CORRELATION = 0.93
 
 
 def _ewma(previous: float | None, sample: float, alpha: float = 0.1) -> float:
@@ -88,6 +104,21 @@ class ConfigConflictError(RuntimeError):
             f"configuration changed concurrently: expected version {expected_version}, "
             f"current version is {current_version}"
         )
+
+
+class _PrivacyViolation(ValueError):
+    """A frame or mask violated the remote-output privacy boundary."""
+
+    def __init__(self, reason: str, message: str):
+        self.reason = reason
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class _RawFingerprint:
+    perceptual_hash: int
+    means: tuple[int, int, int]
+    thumbnail: np.ndarray
 
 
 def _safe_close(resource: Any, label: str) -> None:
@@ -212,6 +243,7 @@ def _restart_only_changes(old: AppConfig, new: AppConfig) -> list[str]:
         if path.startswith("camera.")
         or path.startswith("output.")
         or (path.startswith("api.") and path != "api.remote_timeout_ms")
+        or path in AVATAR_PROXY_RESTART_ONLY_FIELDS
     ]
 
 
@@ -238,6 +270,10 @@ class Pipeline:
         self._runtime_writer = runtime._coordinator_writer()
         self._model_preparation = model_preparation
         self._fallback_log_states: dict[str, tuple[bool, str]] = {}
+        self._recent_raw_fingerprints: deque[tuple[float, _RawFingerprint]] = deque(
+            maxlen=_RAW_FINGERPRINT_HISTORY
+        )
+        self._latest_raw_frame: np.ndarray | None = None
 
     def start(self, timeout: float | None = None) -> None:
         """Start and synchronously acknowledge resource activation."""
@@ -254,6 +290,8 @@ class Pipeline:
             self._error = None
             self._active_state = None
             self._fallback_log_states.clear()
+            self._recent_raw_fingerprints.clear()
+            self._latest_raw_frame = None
             self._thread = threading.Thread(
                 target=self._run, name="pipeline", daemon=True
             )
@@ -581,15 +619,13 @@ class Pipeline:
             return
         try:
             if segmentation_changed:
-                mask = activation.refiner.refine(
-                    activation.segmenter.segment(frame), frame
+                mask = self._validate_mask(
+                    activation.refiner.refine(
+                        activation.segmenter.segment(frame), frame
+                    ),
+                    frame,
+                    privacy_safe=activation.candidate.background.mode == "remote",
                 )
-                if (
-                    not isinstance(mask, np.ndarray)
-                    or mask.shape != frame.shape[:2]
-                    or not np.isfinite(mask).all()
-                ):
-                    raise ValueError("candidate segmenter returned an invalid mask")
             else:
                 # A deterministic synthetic edge exercises backdrop/compositor
                 # contracts without touching the working processing state.
@@ -669,6 +705,8 @@ class Pipeline:
                 self.hub.clear_remote_frames()
             except Exception:
                 log.exception("cannot clear remote frames after mode switch")
+            self._recent_raw_fingerprints.clear()
+            self._latest_raw_frame = None
         try:
             self._update_identity_stats(resources)
         except Exception:
@@ -872,9 +910,7 @@ class Pipeline:
             ),
             capture_target_fps=cfg.camera.fps,
             remote_fallback_mode=(
-                cfg.background.remote_fallback_mode
-                if cfg.background.mode == "remote"
-                else ""
+                "privacy-slate" if cfg.background.mode == "remote" else ""
             ),
             config_version=resources.version,
             **video_stats,
@@ -934,32 +970,225 @@ class Pipeline:
             )
 
     @staticmethod
+    def _privacy_slate(shape: tuple[int, ...]) -> np.ndarray:
+        """Return a fixed opaque slate containing no camera-derived pixels."""
+
+        if len(shape) != 3 or shape[2] != 3:
+            raise ValueError(f"privacy slate requires an HxWx3 shape, got {shape}")
+        height, width, _channels = shape
+        if height <= 0 or width <= 0:
+            raise ValueError(f"privacy slate requires a non-empty shape, got {shape}")
+        # A two-tone neutral checker remains visibly a privacy fallback and,
+        # unlike a mean-color or blurred fallback, cannot reveal source color,
+        # silhouettes, text, or other spatial detail. The pattern also avoids
+        # becoming byte-identical to an ordinary uniform camera frame.
+        tile = max(2, min(height, width) // 8)
+        yy, xx = np.indices((height, width), dtype=np.int32)
+        checker = ((yy // tile) + (xx // tile)) & 1
+        slate = np.empty((height, width, 3), dtype=np.uint8)
+        slate[checker == 0] = (24, 27, 32)
+        slate[checker == 1] = (36, 40, 48)
+        return slate
+
+    @staticmethod
     def _emergency_blur(frame: np.ndarray) -> np.ndarray:
-        """Produce a privacy-safe full-frame fallback without segmentation."""
-        try:
-            emergency = BlurBackdrop(101)
-            emergency.set_source_frame(frame)
-            blurred = emergency.frame(frame.shape[1], frame.shape[0])
+        """Compatibility name for the input-independent privacy slate."""
+
+        return Pipeline._privacy_slate(frame.shape)
+
+    @staticmethod
+    def _validate_mask(
+        mask: np.ndarray,
+        frame: np.ndarray,
+        *,
+        privacy_safe: bool,
+    ) -> np.ndarray:
+        """Validate a mask before any compositor or backdrop can consume it."""
+
+        if (
+            not isinstance(mask, np.ndarray)
+            or mask.ndim != 2
+            or mask.shape != frame.shape[:2]
+            or not (
+                np.issubdtype(mask.dtype, np.integer)
+                or np.issubdtype(mask.dtype, np.floating)
+            )
+            or mask.size == 0
+        ):
+            raise _PrivacyViolation(
+                "segmentation-invalid-mask",
+                "segmenter returned a mask with an invalid type or shape",
+            )
+        if not np.isfinite(mask).all():
+            raise _PrivacyViolation(
+                "segmentation-invalid-mask",
+                "segmenter returned a non-finite mask",
+            )
+        minimum = float(np.min(mask))
+        maximum = float(np.max(mask))
+        if minimum < 0.0 or maximum > 1.0:
+            raise _PrivacyViolation(
+                "segmentation-invalid-mask",
+                "segmenter returned a mask outside [0, 1]",
+            )
+        validated = np.ascontiguousarray(mask, dtype=np.float32)
+        if privacy_safe and bool(np.all(validated >= (1.0 - 1e-6))):
+            raise _PrivacyViolation(
+                "segmentation-all-foreground",
+                "remote fallback mask exposes the entire camera frame",
+            )
+        return validated
+
+    @staticmethod
+    def _raw_fingerprint(frame: np.ndarray) -> _RawFingerprint:
+        """Build a compact low-pass fingerprint without retaining raw pixels."""
+
+        thumbnail = cv2.resize(
+            frame,
+            _RAW_FINGERPRINT_SIZE,
+            interpolation=cv2.INTER_AREA,
+        )
+        sample = cv2.resize(
+            thumbnail,
+            (9, 8),
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.uint16)
+        gray = (
+            sample[..., 0] * 29
+            + sample[..., 1] * 150
+            + sample[..., 2] * 77
+        ) >> 8
+        comparisons = gray[:, 1:] >= gray[:, :-1]
+        packed = np.packbits(comparisons.reshape(-1), bitorder="little").tobytes()
+        perceptual_hash = int.from_bytes(packed, "little")
+        means = tuple(
+            int(value)
+            for value in np.rint(thumbnail.mean(axis=(0, 1), dtype=np.float64))
+        )
+        thumbnail.setflags(write=False)
+        return _RawFingerprint(
+            perceptual_hash=perceptual_hash,
+            means=means,  # type: ignore[arg-type]
+            thumbnail=thumbnail,
+        )
+
+    def _remember_raw_frame(self, frame: np.ndarray) -> None:
+        # Keep one current copy for the precise near-raw comparison. Historical
+        # frames are represented only by small, non-reversible fingerprints.
+        self._latest_raw_frame = frame.copy()
+        now = time.monotonic()
+        self._recent_raw_fingerprints.append((now, self._raw_fingerprint(frame)))
+        while (
+            self._recent_raw_fingerprints
+            and now - self._recent_raw_fingerprints[0][0]
+            > _RAW_FINGERPRINT_WINDOW_S
+        ):
+            self._recent_raw_fingerprints.popleft()
+
+    @staticmethod
+    def _lowres_raw_similarity(
+        candidate: np.ndarray,
+        raw_thumbnail: np.ndarray,
+    ) -> bool:
+        candidate_thumbnail = cv2.resize(
+            candidate,
+            _RAW_FINGERPRINT_SIZE,
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.float32)
+        reference = raw_thumbnail.astype(np.float32)
+        mean_delta = float(np.abs(candidate_thumbnail - reference).mean())
+        if mean_delta > _RAW_ECHO_LOWRES_MEAN_DELTA:
+            return False
+        candidate_centered = candidate_thumbnail - float(candidate_thumbnail.mean())
+        reference_centered = reference - float(reference.mean())
+        denominator = float(
+            np.sqrt(
+                np.sum(candidate_centered * candidate_centered, dtype=np.float64)
+                * np.sum(reference_centered * reference_centered, dtype=np.float64)
+            )
+        )
+        if denominator <= 1e-9:
+            # Uniform/near-uniform frames have no stable correlation; a small
+            # low-resolution delta is sufficient to treat them as an echo.
+            return mean_delta <= _RAW_ECHO_MEAN_DELTA
+        correlation = float(
+            np.sum(
+                candidate_centered * reference_centered,
+                dtype=np.float64,
+            )
+            / denominator
+        )
+        return correlation >= _RAW_ECHO_LOWRES_CORRELATION
+
+    @staticmethod
+    def _is_near_raw(candidate: np.ndarray, raw: np.ndarray) -> bool:
+        if candidate.shape != raw.shape:
+            return False
+        delta = np.abs(candidate.astype(np.int16) - raw.astype(np.int16))
+        if not np.any(delta):
+            return True
+        changed = np.any(delta > _RAW_ECHO_PIXEL_TOLERANCE, axis=2)
+        changed_fraction = float(np.count_nonzero(changed)) / changed.size
+        pixel_near = (
+            changed_fraction <= _RAW_ECHO_CHANGED_FRACTION
+            or float(delta.mean()) <= _RAW_ECHO_MEAN_DELTA
+        )
+        if pixel_near:
+            return True
+        return Pipeline._lowres_raw_similarity(
+            candidate,
+            Pipeline._raw_fingerprint(raw).thumbnail,
+        )
+
+    def _matches_recent_raw(self, candidate: np.ndarray) -> bool:
+        if not self._recent_raw_fingerprints:
+            return False
+        candidate_fingerprint = self._raw_fingerprint(candidate)
+        now = time.monotonic()
+        while (
+            self._recent_raw_fingerprints
+            and now - self._recent_raw_fingerprints[0][0]
+            > _RAW_FINGERPRINT_WINDOW_S
+        ):
+            self._recent_raw_fingerprints.popleft()
+        for _captured_at, raw_fingerprint in self._recent_raw_fingerprints:
             if (
-                blurred.shape == frame.shape
-                and blurred.dtype == np.uint8
-                and not np.array_equal(blurred, frame)
-            ):
-                return blurred
+                candidate_fingerprint.perceptual_hash
+                ^ raw_fingerprint.perceptual_hash
+            ).bit_count() > _RAW_ECHO_HASH_DISTANCE:
+                continue
+            if max(
+                abs(candidate_fingerprint.means[index] - raw_fingerprint.means[index])
+                for index in range(3)
+            ) > _RAW_ECHO_MEAN_COLOR_DELTA:
+                continue
+            if self._lowres_raw_similarity(candidate, raw_fingerprint.thumbnail):
+                return True
+        return False
+
+    def _guard_remote_output(
+        self,
+        candidate: np.ndarray,
+        raw: np.ndarray,
+        *,
+        privacy_safe: bool,
+    ) -> tuple[np.ndarray, str]:
+        """Apply the final fail-closed gate shared by every output sink."""
+
+        if not privacy_safe:
+            return candidate, ""
+        try:
+            self._validate_output_frame(candidate, raw)
         except Exception:
-            log.exception("emergency full-frame blur failed; using solid frame")
-        # Destroy all spatial detail if even the blur backend is unavailable
-        # or if a uniform source made the blur byte-identical to raw capture.
-        mean_bgr = frame.astype(np.float32).mean(axis=(0, 1)).astype(np.uint8)
-        solid = np.full_like(frame, mean_bgr)
-        if np.array_equal(solid, frame):
-            # XOR by the high bit is deterministic and guarantees a different
-            # value for every uint8 channel, including all-black/all-white.
-            solid = np.full_like(frame, np.bitwise_xor(mean_bgr, 0x80))
-        return solid
+            return self._privacy_slate(raw.shape), "privacy-invalid-output"
+        if self._is_near_raw(candidate, raw):
+            return self._privacy_slate(raw.shape), "privacy-raw-echo"
+        if self._matches_recent_raw(candidate):
+            return self._privacy_slate(raw.shape), "privacy-delayed-raw-echo"
+        return candidate, ""
 
     def _render_local_mode(
-        self, resources: _Resources, frame: np.ndarray, *, preflight: bool = False
+        self, resources: _Resources, frame: np.ndarray
     ) -> np.ndarray:
         mode = resources.cfg.background.mode
         if mode == "passthrough":
@@ -969,9 +1198,7 @@ class Pipeline:
         out, _ = self._local_composite(
             resources,
             frame,
-            # Startup and activation must expose a broken candidate rather than
-            # silently accepting it through the runtime emergency path.
-            privacy_safe=mode == "remote" and not preflight,
+            privacy_safe=mode == "remote",
         )
         return out
 
@@ -990,26 +1217,49 @@ class Pipeline:
                 self._stop.wait(0.05)
         if frame is None:
             raise ActivationError("capture returned no frame during startup preflight")
-        if resources.cfg.background.mode == "passthrough":
-            # Passthrough does not need a mask to render, but the segmenter is
-            # already part of the hot-swappable resource generation. Exercise
-            # it now so a later background-only PATCH cannot acknowledge and
-            # then discover that the never-used backend is broken.
-            mask = resources.refiner.refine(
-                resources.segmenter.segment(frame), frame
-            )
-            if (
-                not isinstance(mask, np.ndarray)
-                or mask.shape != frame.shape[:2]
-                or not np.isfinite(mask).all()
-            ):
-                raise ActivationError("segmenter returned an invalid mask")
-        out = self._render_local_mode(resources, frame, preflight=True)
-        self._validate_output_frame(out, frame)
-        # Sending verifies the actual output backend contract. This frame is
-        # deliberately not published, but it is a real consumed/sent frame and
-        # therefore participates in the public counter meanings.
-        resources.output.send(out)
+        remote_mode = resources.cfg.background.mode == "remote"
+        privacy_reason = ""
+        try:
+            if resources.cfg.background.mode == "passthrough":
+                # Passthrough does not need a mask to render, but the segmenter
+                # is already part of the hot-swappable resource generation.
+                # Exercise it so a later background-only PATCH cannot reveal a
+                # backend failure for the first time.
+                self._validate_mask(
+                    resources.refiner.refine(
+                        resources.segmenter.segment(frame), frame
+                    ),
+                    frame,
+                    privacy_safe=False,
+                )
+            if remote_mode:
+                self._remember_raw_frame(frame)
+                # Exercise the configured fallback without publishing it. A
+                # remote startup probes the real output backend only with the
+                # fixed slate, never with a camera-derived composite.
+                _candidate, privacy_reason = self._local_composite(
+                    resources,
+                    frame,
+                    privacy_safe=True,
+                )
+                out = self._privacy_slate(frame.shape)
+                privacy_reason = privacy_reason or "startup-slate"
+            else:
+                self._latest_raw_frame = frame.copy()
+                out = self._render_local_mode(resources, frame)
+            self._validate_output_frame(out, frame)
+        except _PrivacyViolation as exc:
+            raise ActivationError(f"invalid mask: {exc}") from exc
+        # The privacy gate sits at the final publication boundary. Startup uses
+        # the same fail-closed path as the steady-state loop, so a bad mask or
+        # raw-looking preflight result can never reach the real output backend.
+        out, gate_reason = self._guard_remote_output(
+            out,
+            frame,
+            privacy_safe=remote_mode,
+        )
+        privacy_reason = gate_reason or privacy_reason
+        resources.output.send(out.copy() if remote_mode else out)
         health = (
             resources.capture.health_snapshot()
             if hasattr(resources.capture, "health_snapshot")
@@ -1027,7 +1277,12 @@ class Pipeline:
             capture_read_ms=getattr(health, "read_ms", None),
             capture_fps=getattr(health, "capture_fps", 0.0),
             capture_target_met=getattr(health, "target_met", None),
+            remote_fallback_active=bool(privacy_reason),
+            remote_fallback_count=1 if privacy_reason else 0,
+            remote_fallback_reason=privacy_reason,
         )
+        if privacy_reason:
+            log.warning("remote privacy fallback active reason=%s", privacy_reason)
         return out
 
     def _local_composite(
@@ -1048,6 +1303,7 @@ class Pipeline:
             mask = resources.refiner.refine(
                 resources.segmenter.segment(frame), frame
             )
+            mask = self._validate_mask(mask, frame, privacy_safe=privacy_safe)
             if timings is not None:
                 timings["segmentation_ms"] = (
                     time.monotonic_ns() - started
@@ -1074,17 +1330,14 @@ class Pipeline:
                 else None
             )
             started = time.monotonic_ns()
-            rendered = self._privacy_checked(
-                composite(
-                    frame,
-                    bg,
-                    mask,
-                    light_wrap=cfg.compositing.light_wrap,
-                    edge_foreground=edge_fg,
-                ),
+            rendered = composite(
                 frame,
-                privacy_safe,
+                bg,
+                mask,
+                light_wrap=cfg.compositing.light_wrap,
+                edge_foreground=edge_fg,
             )
+            self._validate_output_frame(rendered, frame)
             if timings is not None:
                 timings["composite_ms"] = (
                     time.monotonic_ns() - started
@@ -1093,22 +1346,28 @@ class Pipeline:
                 rendered,
                 "",
             )
+        except _PrivacyViolation as exc:
+            if not privacy_safe:
+                raise
+            log.warning("local remote-mode privacy fallback reason=%s", exc.reason)
+            return self._privacy_slate(frame.shape), exc.reason
         except Exception:
             if not privacy_safe:
                 raise
             log.exception("local remote-mode fallback failed")
-            return self._emergency_blur(frame), "local-failure"
+            return self._privacy_slate(frame.shape), "local-failure"
 
     def _privacy_checked(
         self, candidate: np.ndarray, frame: np.ndarray, privacy_safe: bool
     ) -> np.ndarray:
-        """Ensure a remote fallback can never be the raw capture verbatim."""
-        if not privacy_safe:
-            return candidate
-        self._validate_output_frame(candidate, frame)
-        if np.array_equal(candidate, frame):
-            return self._emergency_blur(frame)
-        return candidate
+        """Compatibility wrapper for direct privacy-gate callers and tests."""
+
+        guarded, _reason = self._guard_remote_output(
+            candidate,
+            frame,
+            privacy_safe=privacy_safe,
+        )
+        return guarded
 
     def _loop(
         self, resources: _Resources, *, initial_output: np.ndarray | None = None
@@ -1117,11 +1376,16 @@ class Pipeline:
         fps_window: deque[float] = deque()
         initial_sends = 1 if initial_output is not None else 0
         frames_in = frames_out = initial_sends
-        remote_used = fallback_count = 0
+        initial_remote_slate = (
+            initial_output is not None
+            and resources.cfg.background.mode == "remote"
+        )
+        remote_used = 0
+        fallback_count = 1 if initial_remote_slate else 0
         repeated_frames = deadline_misses = 0
         last_output = initial_output
-        fallback_active = False
-        fallback_reason = ""
+        fallback_active = initial_remote_slate
+        fallback_reason = "startup-slate" if initial_remote_slate else ""
         previous_remote_fallback: tuple[bool, str] = (False, "")
         stage_ewma: dict[str, float | None] = {
             "segmentation_ms": None,
@@ -1134,6 +1398,7 @@ class Pipeline:
         while not self._stop.is_set():
             loop_start = time.monotonic()
             frame = resources.capture.read()
+            used_remote_candidate = False
             timings = {
                 "segmentation_ms": 0.0,
                 "background_ms": 0.0,
@@ -1162,6 +1427,10 @@ class Pipeline:
                 mode = cfg.background.mode
                 fallback_active = False
                 fallback_reason = ""
+                if mode == "remote":
+                    self._remember_raw_frame(frame)
+                else:
+                    self._latest_raw_frame = frame.copy()
 
                 if mode == "remote":
                     remote, fallback_reason = self.hub.remote_frame_status(
@@ -1180,17 +1449,14 @@ class Pipeline:
                             fallback_reason = "wrong-size"
                     if remote is not None:
                         out_frame = remote
-                        remote_used += 1
+                        used_remote_candidate = True
                         fallback_reason = ""
                     else:
-                        out_frame, local_reason = self._local_composite(
-                            resources,
-                            frame,
-                            privacy_safe=True,
-                            timings=timings,
-                        )
-                        if local_reason:
-                            fallback_reason = local_reason
+                        # A segmented local composite necessarily preserves the
+                        # foreground and is therefore not a privacy boundary.
+                        # Missing, stale, or malformed remote output always
+                        # fails closed to the input-independent slate.
+                        out_frame = self._privacy_slate(frame.shape)
                         fallback_active = True
                         fallback_count += 1
                 elif mode == "passthrough" or resources.backdrop is None:
@@ -1213,7 +1479,6 @@ class Pipeline:
                 )
                 for name, sample in samples:
                     stage_ewma[name] = _ewma(stage_ewma[name], sample)
-                last_output = out_frame
             else:
                 if last_output is None:
                     self._stop.wait(min(0.01, frame_interval))
@@ -1221,8 +1486,33 @@ class Pipeline:
                 out_frame = last_output
                 repeated_frames += 1
 
+            mode = resources.cfg.background.mode
+            guard_source = frame if frame is not None else self._latest_raw_frame
+            if guard_source is None:
+                # Defensive invariant: startup preflight always establishes the
+                # source associated with ``initial_output`` before this loop.
+                raise RuntimeError("output publication has no associated source frame")
+            out_frame, privacy_reason = self._guard_remote_output(
+                out_frame,
+                guard_source,
+                privacy_safe=mode == "remote",
+            )
+            if privacy_reason:
+                if not fallback_active:
+                    fallback_count += 1
+                fallback_active = True
+                fallback_reason = privacy_reason
+                used_remote_candidate = False
+            if used_remote_candidate:
+                remote_used += 1
+            # Repeats retain only the already-guarded output, so loss of camera
+            # input cannot resurrect an unsafe pre-gate candidate.
+            last_output = out_frame
+
             send_started = time.monotonic_ns()
-            resources.output.send(out_frame)
+            resources.output.send(
+                out_frame.copy() if mode == "remote" else out_frame
+            )
             output_send_ms = (
                 time.monotonic_ns() - send_started
             ) / 1_000_000.0
@@ -1261,11 +1551,11 @@ class Pipeline:
                 if fallback_active:
                     log.warning(
                         "remote fallback active mode=%s reason=%s",
-                        resources.cfg.background.remote_fallback_mode,
+                        "privacy-slate",
                         fallback_reason,
                     )
                 elif previous_remote_fallback[0]:
-                    log.info("remote renderer recovered; local fallback inactive")
+                    log.info("remote renderer recovered; privacy fallback inactive")
                 previous_remote_fallback = remote_state
             self.hub.update_stats(
                 frames_in=frames_in,

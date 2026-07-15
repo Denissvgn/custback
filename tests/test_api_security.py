@@ -9,14 +9,21 @@ from custback.api.security import (
     SecurityConfigurationError,
     SecurityPolicy,
     canonical_origin,
+    create_client_ssl_context,
     default_origins,
+    is_numeric_loopback_host,
     normalize_bind_host,
     resolve_api_token,
+    resolve_renderer_token,
+    validate_outbound_endpoint,
     validate_bind_security,
 )
+from custback.__main__ import _security_policy
+from custback.config import AppConfig
 
 
 TOKEN = "a-secure-test-token-with-more-than-32-characters"
+RENDERER_TOKEN = "a-distinct-renderer-token-with-more-than-32-characters"
 
 
 def test_token_environment_takes_precedence(tmp_path):
@@ -76,6 +83,54 @@ def test_token_file_rejects_symlinks_including_dangling_links(tmp_path):
         resolve_api_token(link, environ={})
 
 
+def test_renderer_client_token_is_never_provisioned_implicitly(tmp_path):
+    path = tmp_path / "renderer-token"
+    with pytest.raises(SecurityConfigurationError, match="will not be created"):
+        resolve_renderer_token(path, environ={})
+    assert not path.exists()
+
+    provisioned = resolve_renderer_token(path, environ={}, create=True)
+    assert provisioned.created
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert resolve_renderer_token(path, environ={}).value == provisioned.value
+
+
+def test_renderer_token_uses_its_own_environment_variable(tmp_path):
+    resolved = resolve_renderer_token(
+        tmp_path / "missing",
+        environ={"CUSTBACK_RENDERER_TOKEN": RENDERER_TOKEN, "CUSTBACK_API_TOKEN": TOKEN},
+    )
+    assert resolved.value == RENDERER_TOKEN
+
+
+def test_core_provisions_distinct_management_and_renderer_credentials(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("CUSTBACK_API_TOKEN", raising=False)
+    monkeypatch.delenv("CUSTBACK_RENDERER_TOKEN", raising=False)
+    management_path = tmp_path / "management-token"
+    renderer_path = tmp_path / "renderer-token"
+    cfg = AppConfig.from_dict(
+        {
+            "api": {
+                "token_file": str(management_path),
+                "renderer_token_file": str(renderer_path),
+            }
+        }
+    )
+
+    policy = _security_policy(cfg)
+
+    assert management_path.is_file() and renderer_path.is_file()
+    assert stat.S_IMODE(management_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(renderer_path.stat().st_mode) == 0o600
+    assert policy.bearer_valid(f"Bearer {management_path.read_text().strip()}")
+    assert policy.renderer_bearer_valid(
+        f"Bearer {renderer_path.read_text().strip()}"
+    )
+    assert not policy.bearer_valid(f"Bearer {renderer_path.read_text().strip()}")
+
+
 def test_token_file_is_bounded_ascii_and_token_has_header_safe_characters(tmp_path):
     path = tmp_path / "token"
     path.write_bytes(b"x" * 4097)
@@ -125,6 +180,57 @@ def test_loopback_does_not_require_tls():
         validate_bind_security(host, allow_non_loopback=False)
 
 
+@pytest.mark.parametrize(
+    "kind,scheme",
+    [("http", "http"), ("websocket", "ws"), ("grpc", "grpc")],
+)
+def test_outbound_plaintext_is_numeric_loopback_only(kind, scheme):
+    endpoint = validate_outbound_endpoint(
+        f"{scheme}://[::1]:8710",
+        kind=kind,
+        require_port=True,
+    )
+    assert endpoint is not None
+    assert endpoint.host == "::1"
+    assert endpoint.authority == "[::1]:8710"
+    for host in ("localhost", "service.example", "192.168.1.4", "0.0.0.0"):
+        with pytest.raises(SecurityConfigurationError):
+            validate_outbound_endpoint(f"{scheme}://{host}:8710", kind=kind)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "wss://example.test:bad",
+        "wss://example.test:65536",
+        "wss://user@example.test:443",
+        "wss://example.test:443/path",
+        "wss://[fe80::1]:443",
+        "wss://240.0.0.1:443",
+    ],
+)
+def test_outbound_endpoints_reject_latent_or_unsafe_authorities(url):
+    with pytest.raises(SecurityConfigurationError):
+        validate_outbound_endpoint(url, kind="websocket")
+
+
+def test_secure_outbound_context_requires_hostname_verification():
+    endpoint = validate_outbound_endpoint(
+        "wss://renderer.example:8710", kind="websocket"
+    )
+    assert endpoint is not None
+    context = create_client_ssl_context(endpoint)
+    assert context is not None
+    assert context.check_hostname
+    assert context.verify_mode.name == "CERT_REQUIRED"
+
+
+def test_numeric_loopback_helper_excludes_dns_names():
+    assert is_numeric_loopback_host("127.0.0.1")
+    assert is_numeric_loopback_host("::1")
+    assert not is_numeric_loopback_host("localhost")
+
+
 def test_policy_uses_exact_origin_and_host_and_constant_bearer_contract():
     policy = SecurityPolicy.for_bind(
         TOKEN,
@@ -139,6 +245,28 @@ def test_policy_uses_exact_origin_and_host_and_constant_bearer_contract():
     assert policy.bearer_valid(f"Bearer {TOKEN}")
     assert not policy.bearer_valid(f"Basic {TOKEN}")
     assert not policy.bearer_valid("Bearer wrong")
+
+
+def test_renderer_credential_is_distinct_and_not_general_authentication():
+    policy = SecurityPolicy.for_bind(
+        TOKEN,
+        "127.0.0.1",
+        8710,
+        renderer_token=RENDERER_TOKEN,
+    )
+    authorization = f"Bearer {RENDERER_TOKEN}"
+    assert policy.renderer_bearer_valid(authorization)
+    assert not policy.bearer_valid(authorization)
+    assert not policy.authenticated(authorization, None)
+    assert not policy.renderer_bearer_valid(f"Bearer {TOKEN}")
+
+    with pytest.raises(SecurityConfigurationError, match="distinct"):
+        SecurityPolicy.for_bind(
+            TOKEN,
+            "127.0.0.1",
+            8710,
+            renderer_token=TOKEN,
+        )
 
 
 def test_browser_session_expires_and_revokes(monkeypatch):

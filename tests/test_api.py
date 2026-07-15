@@ -41,6 +41,8 @@ from custback.pipeline import Pipeline
 
 TOKEN = "test-api-token-which-is-at-least-32-characters"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+RENDERER_TOKEN = "test-renderer-token-which-is-at-least-32-characters"
+RENDERER_AUTH = {"Authorization": f"Bearer {RENDERER_TOKEN}"}
 ORIGIN = "http://testserver"
 
 
@@ -229,6 +231,7 @@ def stack(tmp_path):
         80,
         allowed_origins=[ORIGIN],
         extra_hosts=["testserver"],
+        renderer_token=RENDERER_TOKEN,
     )
     upload_dir = tmp_path / "uploads"
     app = create_app(
@@ -286,7 +289,13 @@ def test_status_and_config_with_bearer(stack):
     assert body["output_fallback_active"] is False
     config = stack.get("/config", headers=AUTH)
     assert config.json()["background"]["mode"] == "color"
-    assert "token" not in config.json()["api"]
+    assert {
+        "token",
+        "token_file",
+        "renderer_token_file",
+        "tls_keyfile",
+    }.isdisjoint(config.json()["api"])
+    assert "token_file" not in config.json()["avatar"]
 
 
 def test_exact_origin_is_enforced_even_with_token(stack):
@@ -729,6 +738,49 @@ def test_websocket_requires_auth_and_origin(stack):
     run_async(scenario())
 
 
+def test_renderer_credential_is_scoped_to_raw_frame_websocket(stack):
+    assert stack.get("/status", headers=RENDERER_AUTH).status_code == 401
+
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
+        ).connect()
+        await websocket.close()
+
+        with pytest.raises(WebSocketClosed) as output_stream:
+            await ASGIWebSocket(
+                stack.app,
+                "/ws/frames?stream=output",
+                headers={**RENDERER_AUTH, "Origin": ORIGIN},
+            ).connect()
+        assert output_stream.value.code == 4401
+
+    run_async(scenario())
+
+
+def test_output_websocket_is_read_only_and_does_not_create_renderer_session(stack):
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=output",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        assert stack.hub.stats_dict()["remote_connected"] is False
+        frame = np.zeros((72, 128, 3), dtype=np.uint8)
+        ok, jpeg = cv2.imencode(".jpg", frame)
+        assert ok
+        await websocket.send_bytes(jpeg.tobytes())
+        closed = await websocket.receive_close()
+        assert closed.code == 1008
+        assert stack.hub.remote_in.latest()[0] is None
+        assert stack.hub.stats_dict()["remote_connected"] is False
+        await websocket.close()
+
+    run_async(scenario())
+
+
 def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
     docs = stack.get("/docs", headers=AUTH)
     assert docs.status_code == 200
@@ -740,9 +792,22 @@ def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
     assert "requestBody" in schema["paths"]["/auth/session"]["post"]
     assert "requestBody" in schema["paths"]["/config"]["patch"]
     get_config = schema["paths"]["/config"]["get"]
-    assert get_config["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ]["$ref"].endswith("/AppConfig")
+    public_config_ref = get_config["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["$ref"]
+    assert public_config_ref.endswith("/PublicAppConfig")
+    schemas = schema["components"]["schemas"]
+    assert {
+        "token_file",
+        "renderer_token_file",
+        "tls_keyfile",
+    }.isdisjoint(schemas["PublicApiConfig"]["properties"])
+    assert {
+        "token_file",
+        "tls_ca_file",
+        "tls_certfile",
+        "tls_keyfile",
+    }.isdisjoint(schemas["PublicAvatarRemoteConfig"]["properties"])
     patch_schema = schema["paths"]["/config"]["patch"]["responses"]["200"][
         "content"
     ]["application/json"]["schema"]

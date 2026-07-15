@@ -20,7 +20,8 @@ background:
   video_path: ""       # looping live backdrop (mode: video)
   camera_device: ""    # second camera or stream URL (mode: camera)
   color: [18, 100, 32] # BGR (mode: color)
-  # Privacy-safe local output while a remote renderer is absent or stale.
+  # Local mode restored when remote/avatar mode is disabled. Renderer outages
+  # always emit the fixed privacy slate, regardless of this preference.
   # blur | image | video | color | camera (never passthrough or remote)
   remote_fallback_mode: blur
 
@@ -58,6 +59,9 @@ api:
   # binds require explicit exact origins such as https://studio.example:8710.
   allowed_origins: []
   token_file: ~/.config/custback/api-token
+  # Dedicated credential accepted only by the raw-frame renderer WebSocket.
+  # custback provisions it; renderer clients only load an existing file.
+  renderer_token_file: ~/.config/custback/renderer-token
   session_ttl_s: 28800     # browser session lifetime: eight hours
   tls_certfile: ""         # both TLS paths are mandatory for non-loopback
   tls_keyfile: ""
@@ -70,3 +74,17 @@ api:
     video_max_height: 2160
     storage_max_bytes: 2147483648
     max_files: 100
+
+avatar:
+  # The custback-avatar control API behind the web UI's /avatar/* proxy.
+  # Empty url disables the proxy. Destination, credential, and TLS trust are
+  # immutable startup settings; changes require restarting custback. Plaintext
+  # is accepted only on numeric loopback. CUSTBACK_AVATAR_API_TOKEN overrides
+  # the avatar service's existing control-token file.
+  url: ""                        # http://127.0.0.1:8711 or https://gb10:8711
+  token_file: ~/.config/custback/avatar-api-token
+  tls_ca_file: ""                # optional private CA bundle for HTTPS
+  tls_certfile: ""               # optional mTLS client certificate (pair required)
+  tls_keyfile: ""                # optional mTLS client private key (never exposed)
+  connect_timeout_s: 3.0
+  read_timeout_s: 30.0

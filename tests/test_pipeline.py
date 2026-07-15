@@ -249,10 +249,12 @@ def test_remote_mode_uses_pushed_frames_and_falls_back():
     pipeline, hub = run_pipeline(runtime)
     remote_session = None
     try:
-        # No remote client yet -> privacy-safe configured local fallback.
+        slate = Pipeline._privacy_slate((72, 128, 3))
+        # No remote client yet -> fixed input-independent privacy slate.
         frame, seq = wait_for_frame(hub)
-        assert tuple(frame[0, 0]) == (1, 2, 3)
+        assert np.array_equal(frame, slate)
         assert hub.stats_dict()["remote_fallback_reason"] == "no-client"
+        assert hub.stats_dict()["remote_fallback_mode"] == "privacy-slate"
 
         # push an "avatar" frame; it must become the output while fresh
         remote_session = hub.remote_client_connected()
@@ -271,7 +273,7 @@ def test_remote_mode_uses_pushed_frames_and_falls_back():
         # stop pushing -> output must fall back after remote_timeout_ms
         time.sleep(0.5)
         frame, _ = wait_for_frame(hub, seq)
-        assert tuple(frame[0, 0]) == (1, 2, 3)
+        assert np.array_equal(frame, slate)
         stats = hub.stats_dict()
         assert stats["remote_fallback_reason"] == "stale"
         assert stats["remote_fallback_count"] >= 1
@@ -288,6 +290,173 @@ def test_emergency_privacy_fallback_never_equals_uniform_raw(value):
     assert fallback.shape == raw.shape
     assert fallback.dtype == np.uint8
     assert not np.array_equal(fallback, raw)
+
+
+def test_privacy_slate_is_independent_of_camera_pixels():
+    first = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
+    first = (first % 251).astype(np.uint8)
+    second = ((first.astype(np.uint16) + 97) % 251).astype(np.uint8)
+
+    assert np.array_equal(
+        Pipeline._emergency_blur(first),
+        Pipeline._emergency_blur(second),
+    )
+
+
+def test_privacy_gate_rejects_current_and_delayed_near_raw_echoes():
+    pipeline = Pipeline(make_runtime(mode="remote"), FrameHub())
+    prior = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
+    prior = (prior % 251).astype(np.uint8)
+    current = ((prior.astype(np.uint16) + 97) % 251).astype(np.uint8)
+
+    near_current = current.copy()
+    near_current[0, 0, 0] ^= np.uint8(1)
+    guarded, reason = pipeline._guard_remote_output(
+        near_current,
+        current,
+        privacy_safe=True,
+    )
+    assert reason == "privacy-raw-echo"
+    assert np.array_equal(guarded, Pipeline._privacy_slate(current.shape))
+
+    pipeline._remember_raw_frame(prior)
+    delayed = prior.copy()
+    delayed[-1, -1, -1] ^= np.uint8(1)
+    guarded, reason = pipeline._guard_remote_output(
+        delayed,
+        current,
+        privacy_safe=True,
+    )
+    assert reason == "privacy-delayed-raw-echo"
+    assert np.array_equal(guarded, Pipeline._privacy_slate(current.shape))
+
+
+@pytest.mark.parametrize("quality", [50, 60])
+def test_privacy_gate_rejects_current_and_delayed_jpeg_raw_echoes(quality):
+    pipeline = Pipeline(make_runtime(mode="remote"), FrameHub())
+    raw = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
+    raw = (raw % 251).astype(np.uint8)
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        raw,
+        [cv2.IMWRITE_JPEG_QUALITY, quality],
+    )
+    assert ok
+    jpeg_echo = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    assert jpeg_echo is not None
+
+    pipeline._recent_raw_fingerprints.clear()
+    guarded, reason = pipeline._guard_remote_output(
+        jpeg_echo,
+        raw,
+        privacy_safe=True,
+    )
+    assert reason == "privacy-raw-echo"
+    assert np.array_equal(guarded, Pipeline._privacy_slate(raw.shape))
+
+    current = ((raw.astype(np.uint16) + 97) % 251).astype(np.uint8)
+    pipeline._recent_raw_fingerprints.clear()
+    pipeline._remember_raw_frame(raw)
+    guarded, reason = pipeline._guard_remote_output(
+        jpeg_echo,
+        current,
+        privacy_safe=True,
+    )
+    assert reason == "privacy-delayed-raw-echo"
+    assert np.array_equal(guarded, Pipeline._privacy_slate(raw.shape))
+
+
+def test_privacy_gate_allows_a_materially_transformed_renderer_frame():
+    pipeline = Pipeline(make_runtime(mode="remote"), FrameHub())
+    raw = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
+    raw = (raw % 251).astype(np.uint8)
+    rendered = (raw // np.uint8(64)) * np.uint8(64)
+
+    guarded, reason = pipeline._guard_remote_output(
+        rendered,
+        raw,
+        privacy_safe=True,
+    )
+
+    assert reason == ""
+    assert np.array_equal(guarded, rendered)
+
+
+@pytest.mark.parametrize(
+    "bad_mask",
+    [
+        pytest.param(np.full((24, 32), np.nan, np.float32), id="nan"),
+        pytest.param(np.full((24, 32), np.inf, np.float32), id="infinite"),
+        pytest.param(np.full((24, 32), 1.1, np.float32), id="out-of-range"),
+        pytest.param(np.ones((24, 32), np.float32), id="all-foreground"),
+        pytest.param(np.ones((23, 32), np.float32), id="wrong-shape"),
+    ],
+)
+def test_remote_mask_validation_rejects_unsafe_masks(bad_mask):
+    raw = np.zeros((24, 32, 3), np.uint8)
+    with pytest.raises(ValueError):
+        Pipeline._validate_mask(bad_mask, raw, privacy_safe=True)
+
+
+def test_runtime_privacy_gate_protects_vcam_and_preview(monkeypatch):
+    raw = np.arange(72 * 128 * 3, dtype=np.uint32).reshape(72, 128, 3)
+    raw = (raw % 251).astype(np.uint8)
+
+    class FixedCapture:
+        def read(self):
+            return raw.copy()
+
+        def close(self):
+            pass
+
+    class RecordingOutput:
+        paces = False
+        fallback_active = False
+        fallback_reason = ""
+
+        def __init__(self):
+            self.frames = []
+
+        def send(self, frame):
+            self.frames.append(frame.copy())
+
+        def close(self):
+            pass
+
+    output = RecordingOutput()
+    monkeypatch.setattr(pipeline_mod, "open_capture", lambda _cfg: FixedCapture())
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_output",
+        lambda *_args, **_kwargs: output,
+    )
+    pipeline, hub = run_pipeline(
+        make_runtime(mode="remote", remote_fallback_mode="color")
+    )
+    session = hub.remote_client_connected()
+    try:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            assert hub.push_remote_frame(raw.copy(), session)
+            if hub.stats_dict()["remote_fallback_reason"] in {
+                "privacy-raw-echo",
+                "privacy-delayed-raw-echo",
+            }:
+                break
+            time.sleep(0.005)
+        else:
+            raise AssertionError("raw echo did not reach the privacy gate")
+
+        slate = Pipeline._privacy_slate(raw.shape)
+        preview, _timestamp = hub.output.latest()
+        assert preview is not None
+        assert np.array_equal(preview, slate)
+        assert output.frames
+        assert np.array_equal(output.frames[-1], slate)
+        assert all(np.array_equal(frame, slate) for frame in output.frames)
+    finally:
+        hub.remote_client_disconnected(session)
+        pipeline.stop()
 
 
 def test_remote_sessions_clear_frames_and_reject_prior_session_replay():
@@ -307,29 +476,30 @@ def test_remote_sessions_clear_frames_and_reject_prior_session_replay():
     hub.remote_client_disconnected(next_session)
 
 
-def test_malformed_and_wrong_sized_remote_frames_use_local_fallback():
+def test_malformed_and_wrong_sized_remote_frames_use_privacy_slate():
     runtime = make_runtime(
         mode="remote", remote_fallback_mode="color", color=[11, 22, 33]
     )
     pipeline, hub = run_pipeline(runtime)
     session = hub.remote_client_connected()
     try:
+        slate = Pipeline._privacy_slate((72, 128, 3))
         _, seq = wait_for_frame(hub)
         assert hub.push_remote_frame(np.zeros((72, 128, 3), np.float32), session)
         frame, seq = wait_for_frame(hub, seq)
-        assert tuple(frame[0, 0]) == (11, 22, 33)
+        assert np.array_equal(frame, slate)
         assert hub.stats_dict()["remote_fallback_reason"] == "invalid"
 
         assert hub.push_remote_frame(np.zeros((10, 10, 3), np.uint8), session)
         frame, _ = wait_for_frame(hub, seq)
-        assert tuple(frame[0, 0]) == (11, 22, 33)
+        assert np.array_equal(frame, slate)
         assert hub.stats_dict()["remote_fallback_reason"] == "wrong-size"
     finally:
         hub.remote_client_disconnected(session)
         pipeline.stop()
 
 
-def test_segmentation_none_remote_fallback_is_not_raw_capture():
+def test_segmentation_none_remote_fallback_is_input_independent_slate():
     cfg = AppConfig.from_dict(
         {
             "camera": {"synthetic": True, "width": 128, "height": 72, "fps": 60},
@@ -344,8 +514,8 @@ def test_segmentation_none_remote_fallback_is_not_raw_capture():
         output, _ = wait_for_frame(hub)
         raw, _timestamp = hub.raw.latest()
         assert raw is not None
-        assert not np.array_equal(output, raw)
-        assert hub.stats_dict()["remote_fallback_reason"] == "segmentation-none"
+        assert np.array_equal(output, Pipeline._privacy_slate(raw.shape))
+        assert hub.stats_dict()["remote_fallback_reason"] == "no-client"
     finally:
         pipeline.stop()
 
@@ -482,6 +652,14 @@ def test_restart_only_patch_rejected_and_noop_does_not_bump_version():
             ["api.uploads.storage_max_bytes"],
         ),
         ({"api": {"uploads": {"max_files": 50}}}, ["api.uploads.max_files"]),
+        (
+            {"avatar": {"url": "https://avatar.example:8711"}},
+            ["avatar.url"],
+        ),
+        (
+            {"avatar": {"token_file": "/tmp/avatar-client-token"}},
+            ["avatar.token_file"],
+        ),
     ],
 )
 def test_every_restart_only_field_is_classified(patch, expected):

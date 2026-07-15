@@ -9,7 +9,10 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from types import FrameType
+from typing import Any
 
 from .backgrounds import IMAGE_EXTS, VIDEO_EXTS
 from .config import MODES, AppConfig, RuntimeConfig
@@ -22,6 +25,7 @@ EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
 EXIT_API = 3
 API_START_TIMEOUT_S = 5.0
+SignalHandler = Callable[[int, FrameType | None], Any] | int | signal.Handlers | None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,14 +72,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-port", type=int, help="API port (default 8710)")
     parser.add_argument("--api-token-file", help="path to the mode-0600 API token file")
     parser.add_argument(
+        "--renderer-token-file",
+        help="path to the mode-0600 renderer-scoped frame token file",
+    )
+    parser.add_argument(
         "--allow-non-loopback-api", action="store_true",
         help="allow a TLS-protected API bind outside loopback",
     )
     parser.add_argument("--api-tls-cert", help="TLS certificate for the API")
     parser.add_argument("--api-tls-key", help="TLS private key for the API")
-    parser.add_argument(
+    show_token = parser.add_mutually_exclusive_group()
+    show_token.add_argument(
         "--show-api-token", action="store_true",
         help="print the resolved API token and exit",
+    )
+    show_token.add_argument(
+        "--show-renderer-token", action="store_true",
+        help="provision and print the renderer-scoped frame token, then exit",
     )
     parser.add_argument(
         "--no-vcam", action="store_true",
@@ -159,6 +172,8 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
         api.port = args.api_port
     if args.api_token_file:
         api.token_file = args.api_token_file
+    if args.renderer_token_file:
+        api.renderer_token_file = args.renderer_token_file
     if args.allow_non_loopback_api:
         api.allow_non_loopback = True
     if args.api_tls_cert or args.api_tls_key:
@@ -225,7 +240,8 @@ class _ApiRunner:
 
     def start(self, timeout: float = API_START_TIMEOUT_S) -> None:
         try:
-            self._socket = self.server.config.bind_socket()
+            bound_socket = self.server.config.bind_socket()
+            self._socket = bound_socket
         except SystemExit as exc:
             raise ApiStartupError("API socket bind failed") from exc
         except OSError as exc:
@@ -233,7 +249,7 @@ class _ApiRunner:
 
         def serve() -> None:
             try:
-                self.server.run(sockets=[self._socket])
+                self.server.run(sockets=[bound_socket])
             except BaseException as exc:
                 self._error = exc
 
@@ -347,6 +363,7 @@ def _security_policy(cfg: AppConfig):
         SecurityPolicy,
         is_loopback_host,
         resolve_api_token,
+        resolve_renderer_token,
         validate_bind_security,
     )
 
@@ -364,6 +381,9 @@ def _security_policy(cfg: AppConfig):
     token = resolve_api_token(api.token_file)
     if token.created:
         log.info("created API token file %s", token.path)
+    renderer_token = resolve_renderer_token(api.renderer_token_file, create=True)
+    if renderer_token.created:
+        log.info("created renderer token file %s", renderer_token.path)
     return SecurityPolicy.for_bind(
         token.value,
         api.host,
@@ -371,6 +391,7 @@ def _security_policy(cfg: AppConfig):
         allowed_origins=api.allowed_origins,
         tls=bool(api.tls_certfile),
         session_ttl_s=api.session_ttl_s,
+        renderer_token=renderer_token.value,
     )
 
 
@@ -378,7 +399,7 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
     hub = FrameHub(run_id=run_id)
     stop = threading.Event()
     shutdown_reason = "normal"
-    previous_signal_handlers: dict[signal.Signals, object] = {}
+    previous_signal_handlers: dict[signal.Signals, SignalHandler] = {}
     if threading.current_thread() is threading.main_thread():
         def request_shutdown(signum, _frame) -> None:
             nonlocal shutdown_reason
@@ -583,6 +604,20 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             except (OSError, ValueError) as exc:
                 log.error("cannot resolve API token: %s", exc)
+                return EXIT_CONFIG
+        if args.show_renderer_token:
+            try:
+                from .api.security import resolve_renderer_token
+
+                print(
+                    resolve_renderer_token(
+                        cfg.api.renderer_token_file,
+                        create=True,
+                    ).value
+                )
+                return 0
+            except (OSError, ValueError) as exc:
+                log.error("cannot resolve renderer token: %s", exc)
                 return EXIT_CONFIG
         try:
             return run(cfg, run_id=logging_session.run_id)

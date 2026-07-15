@@ -19,9 +19,14 @@ real camera ──► segmentation ──► compositor ──► virtual camera
 * **NVIDIA GPU acceleration** (optional): matting runs on CUDA 12 when
   `onnxruntime-gpu` completes verified CUDA inference; use the `rvm` extra for an
   explicitly CPU-only npm installation.
+* **Avatar stage**: the bundled `custback-avatar` service replaces you with
+  an animated avatar — expression tracking (MediaPipe) or NVIDIA
+  Audio2Face-3D lip sync, selectable visible parts, scale/position, and its
+  own backdrop — locally or from another GPU host. See
+  [Avatar stage (stage 2)](#avatar-stage-stage-2).
 * **API**: control everything at runtime, preview in a browser, and forward
-  frames to an external service — the integration point for the upcoming
-  avatar-replacement stage.
+  frames to an external service — the integration point the avatar stage
+  builds on.
 * **Local-first**: everything runs on your machine; the API binds to
   `127.0.0.1` by default.
 
@@ -47,6 +52,7 @@ subcommands:
 | `custback setup` | OS-level virtual camera setup (runs the right script for your platform) |
 | `custback doctor` | validate the managed venv, versions, dependencies, and selected extras; setup gaps are warnings |
 | `custback rebuild` | build and validate a new venv generation, then switch to it atomically |
+| `custback avatar …` | run the bundled stage-2 avatar service (`custback-avatar` in the managed venv) |
 | anything else | passed through to the app (`custback --help`) |
 
 Environment overrides: `CUSTBACK_VENV=/dedicated/path` relocates the private
@@ -230,6 +236,14 @@ explicit command below when you need to enter it in the browser login shell:
 custback --show-api-token
 ```
 
+Raw-frame renderers use a separate least-privilege credential. Custback
+provisions `api.renderer_token_file` (default
+`~/.config/custback/renderer-token`); renderer clients load it or
+`CUSTBACK_RENDERER_TOKEN` without creating a missing file. This credential is
+accepted only on `WS /ws/frames?stream=raw` and cannot authenticate REST,
+browser sessions, or the output stream. Inspect/provision it explicitly with
+`custback --show-renderer-token`.
+
 The browser exchanges that token at `POST /auth/session` for a bounded
 server-side `HttpOnly`, `SameSite=Strict` cookie; `DELETE /auth/session` signs
 out. Tokens are never returned by `/config`, logged normally, or accepted in
@@ -255,10 +269,13 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 | `GET /config` / `PATCH /config` | read / partially update config live |
 | `POST /background/image` | upload static backdrop and switch to it |
 | `POST /background/video` | upload live (video) backdrop and switch to it |
-| `GET /backgrounds` | list uploaded backdrops |
+| `GET /backgrounds` | list uploaded backdrops (with the store directory) |
+| `GET /backgrounds/{id}/thumbnail.jpg` | downscaled preview of an uploaded backdrop |
 | `DELETE /backgrounds/{id}` | delete an inactive uploaded backdrop |
 | `GET /video/mjpeg` | processed output as MJPEG stream |
 | `GET /video/snapshot.jpg` | single processed frame |
+| `GET /` | the web control UI (see below) |
+| `/avatar/{path}` | authenticated reverse proxy to the avatar control API (see below) |
 | `WS /ws/frames?stream=raw\|output` | binary JPEG frame forwarding (see below) |
 
 Examples:
@@ -277,9 +294,13 @@ auth_header | curl --config - -X POST http://127.0.0.1:8710/background/video \
 `X-Config-Version`. PATCHes are serialized and transactional. Background,
 segmentation, compositing, remote timeout, and remote fallback fields can
 activate live; camera, output, API bind/security, and upload-limit changes
-return `409 restart_required`. A mixed hot/restart PATCH applies nothing.
+return `409 restart_required`. Avatar proxy URL, token file, CA bundle, and
+mTLS identity are likewise startup-only. A mixed hot/restart PATCH applies nothing.
 Invalid content returns `422`, activation unavailability returns `503`, and a
 no-op preserves the version.
+
+Public config responses and their OpenAPI models omit management/renderer
+token paths, proxy credential/trust paths, and private-key paths.
 
 Uploads are streamed in 1 MiB chunks to mode-`0600` UUID files, inspected
 before activation, and committed only after backdrop preflight. Defaults are
@@ -287,22 +308,150 @@ before activation, and committed only after backdrop preflight. Defaults are
 Oversize, unsupported, invalid, quota, and active-delete failures use
 `413`, `415`, `422`, `507`, and `409` respectively.
 
-## Avatar stage (stage 2) integration
+### The web control UI
 
-Full avatar replacement (user tracking + facial-expression matching) plugs in
-through the WebSocket frame API — no pipeline changes needed:
+`GET /` (after the browser login shell) serves a single-page control UI for
+the whole system: a live preview of the vcam output (or the raw avatar
+render), background selection with thumbnail galleries, uploads for both
+stores, Meet-style avatar tiles, the animation-mode picker (follow my
+movements / follow my voice only / idle presence), and sliders for framing,
+size, position, and smoothing. Everything hot-patchable applies live to the
+preview; controls that would need a restart surface the `409` reason instead
+of failing silently.
 
-1. The avatar service connects to `WS /ws/frames?stream=raw` and receives
+The page talks to this origin only. Avatar controls go through the
+`/avatar/{path}` reverse proxy. Configure the operator-owned `avatar:` URL,
+existing control-token file, and optional CA/mTLS files before starting
+custback; the browser cannot edit outbound destinations or credential paths.
+Custback resolves one immutable target and injects the avatar Bearer token
+server-side. The proxy disables redirects and environment proxies, forwards
+only exact documented method/path pairs, and maps missing/unreachable/bad-auth
+services to `503 avatar_unconfigured`, `502 avatar_unreachable`, or
+`502 avatar_auth_failed` without expiring the browser session.
+
+The header's **Avatar** toggle is plain config: enabling patches
+`background.mode: remote` (remembering the previous local mode in
+`background.remote_fallback_mode`); disabling restores that fallback mode.
+While remote mode is active, renderer stalls always show the fixed privacy
+slate; the remembered local mode is used only when Avatar is disabled.
+
+## Avatar stage (stage 2)
+
+Avatar replacement plugs in through the WebSocket frame API — no pipeline
+changes needed:
+
+1. An avatar service connects to `WS /ws/frames?stream=raw` and receives
    every raw camera frame as binary JPEG.
 2. It renders the avatar and sends frames back on the same socket.
 3. With `background.mode = "remote"`, returned frames become the virtual
    camera output. If the service stalls longer than `api.remote_timeout_ms`,
-   custback uses `background.remote_fallback_mode` (blur by default). Missing,
-   stale, malformed, wrong-sized, prior-session, and disconnected output can
-   never reveal the raw capture. If local segmentation/compositing also fails,
-   custback fails closed to a full-frame blur.
+   custback emits one fixed, opaque, camera-independent privacy slate. Missing,
+   stale, malformed, wrong-sized, invalid-mask, raw/near-raw, delayed-raw,
+   prior-session, and disconnected output all fail closed to that same slate.
+   The final gate protects startup probes, repeats, preview publication, and
+   the virtual-camera sink.
 
-A runnable reference client is in
+### The built-in avatar service: `custback-avatar`
+
+The package ships that stage-2 service. It tracks you in the forwarded
+camera frames, animates an avatar (52 ARKit blendshape channels + head
+pose), composites it over its own selected background at exactly the camera
+frame size, and returns the frames — a person-like presence in the meeting
+without your pixels ever leaving the machine that runs custback-avatar.
+
+```bash
+custback --mode remote &                # custback shows what the avatar service returns
+custback-avatar                         # connects to ws://127.0.0.1:8710, renders the avatar
+custback-avatar -c config/avatar.yaml   # everything from YAML (see the annotated example)
+custback-avatar --avatar robin --style realistic --framing bust
+                                        # a different presenter, soft-shaded,
+                                        # head-and-chest framed for meeting tiles
+custback-avatar --parts head,eyes,brows,nose,mouth,hair --scale 0.6 \
+    --bg-image ~/walls/office.jpg       # floating head over an office backdrop
+```
+
+**Animation drivers** (`driver.backend`):
+
+| Driver | Input | Notes |
+| --- | --- | --- |
+| `vision` | raw camera frames | MediaPipe Face Landmarker: blendshapes + head pose follow your real expressions. Needs the `mediapipe` extra; the pinned `face_landmarker.task` model is verified and cached like the segmentation models. |
+| `audio2face` | microphone / WAV audio | Streams audio to an [NVIDIA Audio2Face-3D](https://huggingface.co/nvidia/Audio2Face-3D-v3.0) endpoint and applies the returned ARKit blendshapes — lip sync from speech, no camera tracking. Use `grpc://127.0.0.1:port` only on numeric loopback or verified `grpcs://host:port` remotely, with optional private CA/mTLS files. Needs the `audio2face` extra and a running Audio2Face-3D service. |
+| `idle` | none | Deterministic synthetic presence: gentle head sway, periodic blinks. |
+| `auto` (default) | — | `vision` when mediapipe is installed, otherwise `idle` with a warning. |
+
+**Appearance** is controlled live: `appearance.avatar` picks the builtin
+presenter (`casey`, `robin`, `alex`, `nova` — different skin/hair/wardrobe),
+`appearance.style` the treatment (`cartoon`, `realistic` for natural
+proportions with soft shading, `sketch` for a pencil drawing), and
+`appearance.framing` how much stays in shot: `bust` (default) keeps the
+head **and chest** in frame like a webcam — the right look for Meet/Zoom
+tiles — while `full` shows the waist-up shot and `closeup` fills the frame
+with the face. `appearance.parts` selects the visible layers
+(`torso, head, mouth, nose, eyes, brows, hair`), `appearance.scale` sets
+the framed avatar height relative to the frame (0.1–3),
+`offset_x`/`offset_y` move it, and `background.mode` picks the scene behind
+it (`color`, `image`, `video`, or `blur` of the real room). Point
+`appearance.rig` at a directory of PNG layers (`head.png`, `torso.png`, …,
+optional `eyes_closed.png`/`mouth_open.png` variants and a `rig.yaml` for
+pivot/sway/framing tuning) for a custom look; PNG rigs render as authored
+(`sketch` still applies, `avatar`/`realistic` are builtin-only).
+
+**Control API**: the service has its own Bearer-authenticated control plane
+on `127.0.0.1:8711` with its own token (`custback-avatar --show-api-token`,
+env `CUSTBACK_AVATAR_API_TOKEN`): `GET /status`; `GET /avatars` for the
+selectable avatars/styles/framings/parts plus installed rigs and the
+animation `modes` (each mapped to a `driver.backend` with availability for
+this host); `GET`/`PATCH /config`; `GET /video/snapshot.jpg`;
+`GET /video/mjpeg`; and tile thumbnails at
+`GET /avatars/{name}/thumbnail.jpg` / `GET /rigs/{name}/thumbnail.jpg` /
+`GET /backgrounds/{name}/thumbnail.jpg`. Appearance, background, driver, and
+render fields patch live; `source`, `storage`, and `api` changes return
+`409 restart_required`. The same non-loopback rules as custback's API apply
+(explicit opt-in + TLS + exact origins).
+
+**Uploads live on the avatar host** (they are its inputs): `POST
+/rigs?name=<slug>` installs a zipped PNG-layer rig — members are
+allow-listed by name, capped in count and size, and validated by actually
+loading the rig before the name becomes visible; `GET /rigs` lists installs
+and `DELETE /rigs/{name}` refuses the active one. `POST
+/backgrounds/image|video?name=<file>` (raw body) stores scene media for
+`background.image_path`/`video_path`, listed and deleted via
+`GET`/`DELETE /backgrounds…`. The `storage:` config section sets both
+directories and all quotas. Through custback's `/avatar/*` proxy the web UI
+reaches all of this with the browser session alone — uploads land on
+whichever machine renders the avatar.
+
+### Running the avatar service on another host
+
+Rendering and tracking can move off the meeting machine — e.g. custback on
+a laptop and the avatar service next to a bigger GPU:
+
+```bash
+# meeting machine: TLS-protected non-loopback custback API
+custback --mode remote --api-host 0.0.0.0 --allow-non-loopback-api \
+    --api-tls-cert cert.pem --api-tls-key key.pem     # + api.allowed_origins in YAML
+
+# GPU host: connect back over verified WSS with the renderer-only token.
+# Configure source.tls_ca_file in config/avatar.yaml for a private CA.
+CUSTBACK_RENDERER_TOKEN="$(cat renderer-token)" \
+custback-avatar -c config/avatar.yaml \
+  --source wss://laptop.example:8710 --driver vision
+```
+
+GPU guidance:
+
+* **Local NVIDIA GeForce RTX 3060** — use the `vision` driver (MediaPipe,
+  CPU-friendly) for the avatar and the existing `gpu` extra for RVM matting.
+  Audio2Face-3D officially supports GeForce RTX 3080 and up (plus
+  data-center GPUs), so the RTX 3060 is *not* a supported A2F host.
+* **Remote NVIDIA GB10 (DGX Spark)** — run `custback-avatar` on the GB10
+  host (aarch64 Linux; the core service needs only OpenCV/NumPy wheels) and
+  point `driver.audio2face.url` at an Audio2Face-3D NIM on the same box.
+  Check NVIDIA's NIM support matrix for the GB10/Blackwell container before
+  planning on it; the `vision` driver is the portable alternative.
+
+The wire protocol is unchanged, so a custom stage-2 renderer still works: a
+minimal reference client lives in
 [`examples/avatar_client.py`](examples/avatar_client.py):
 
 ```bash
@@ -333,8 +482,10 @@ This release intentionally breaks the old unauthenticated control plane:
 * Upload callers must handle `201` metadata plus the committed config version,
   the immutable size/quota limits, and UUID asset IDs. Active assets must be
   switched away before deletion.
-* Remote mode no longer falls through to raw camera frames. Configure a local
-  `background.remote_fallback_mode`; the default is privacy-safe blur.
+* Remote mode no longer uses camera-derived local compositing as a fallback.
+  Every renderer failure or raw echo produces a fixed input-independent slate;
+  `background.remote_fallback_mode` is retained only as the local mode restored
+  when remote/avatar mode is disabled.
 * Configuration is strict: unknown fields, coercible strings, out-of-range
   values, and unsafe network settings are startup/API errors. Even positive
   blur/feather kernels are still normalized upward to the next odd value.
@@ -354,6 +505,7 @@ This release intentionally breaks the old unauthenticated control plane:
 | `preview.py` | interactive on-screen verification window (main thread; mode/file/blur controls, q/ESC quits) |
 | `pipeline.py` | main loop; transactional frame-boundary reconfiguration |
 | `api/server.py` | authenticated FastAPI control, uploads, MJPEG, and WebSockets |
+| `avatar/` | stage-2 avatar service (`custback-avatar`): drivers (`drivers.py`, `audio2face.py`), rigs (`rig.py`), composition (`renderer.py`), WS client loop (`service.py`), control API (`api.py`) |
 
 ## Tests
 

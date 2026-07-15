@@ -33,6 +33,19 @@ CameraModeMismatch = Literal["warn", "error"]
 ColorChannel = Annotated[int, Field(ge=0, le=255)]
 SAFE_IMAGE_MAX_PIXELS = 89_478_485
 
+# These fields select the avatar proxy's outbound security boundary.  They are
+# consumed when the API application is constructed and cannot safely diverge
+# from the immutable destination/credential snapshot held by the proxy.
+AVATAR_PROXY_RESTART_ONLY_FIELDS = frozenset(
+    {
+        "avatar.url",
+        "avatar.token_file",
+        "avatar.tls_ca_file",
+        "avatar.tls_certfile",
+        "avatar.tls_keyfile",
+    }
+)
+
 
 def _clean_config_string(value: str, *, allow_empty: bool = True) -> str:
     """Reject invisible/path-breaking input without silently trimming it."""
@@ -123,8 +136,8 @@ class BackgroundConfig(_StrictModel):
     camera_device: int | str = ""
     color: tuple[ColorChannel, ColorChannel, ColorChannel] = (18, 100, 32)
     blur_strength: int = Field(default=31, ge=3, le=151)
-    # Remote output must never reveal the unprocessed camera when the renderer
-    # is absent or stale. This selects the local, privacy-safe fallback.
+    # Local mode restored when remote/avatar mode is disabled. While remote is
+    # active, every renderer failure emits the fixed input-independent slate.
     remote_fallback_mode: LocalBackgroundMode = "blur"
 
     @field_validator("image_path", "video_path")
@@ -263,6 +276,7 @@ class ApiConfig(_StrictModel):
     allow_non_loopback: bool = False
     allowed_origins: tuple[str, ...] = ()
     token_file: str = "~/.config/custback/api-token"
+    renderer_token_file: str = "~/.config/custback/renderer-token"
     session_ttl_s: int = Field(default=28_800, ge=60, le=31_536_000)
     tls_certfile: str = ""
     tls_keyfile: str = ""
@@ -279,7 +293,7 @@ class ApiConfig(_StrictModel):
             raise ValueError("host must be a DNS name or IP literal without a port")
         return normalized
 
-    @field_validator("token_file")
+    @field_validator("token_file", "renderer_token_file")
     @classmethod
     def _valid_token_file(cls, value: str) -> str:
         return _clean_config_string(value, allow_empty=False)
@@ -315,6 +329,77 @@ class ApiConfig(_StrictModel):
         return self
 
 
+class AvatarRemoteConfig(_StrictModel):
+    """Where the custback-avatar control API lives, for the ``/avatar/*`` proxy.
+
+    An empty ``url`` disables the proxy. ``token_file`` is the avatar
+    service's own control token (``custback-avatar --show-api-token``); the
+    ``CUSTBACK_AVATAR_API_TOKEN`` environment variable overrides the file.
+    The destination and credential path are restart-only because the proxy
+    resolves both into an immutable startup snapshot.  Timeout changes remain
+    hot-configurable.
+    """
+
+    url: str = ""
+    token_file: str = "~/.config/custback/avatar-api-token"
+    tls_ca_file: str = ""
+    tls_certfile: str = ""
+    tls_keyfile: str = ""
+    connect_timeout_s: float = Field(default=3.0, ge=0.5, le=60.0)
+    read_timeout_s: float = Field(default=30.0, ge=1.0, le=600.0)
+
+    @field_validator("url")
+    @classmethod
+    def _valid_url(cls, value: str) -> str:
+        from .api.security import validate_outbound_endpoint
+
+        value = _clean_config_string(value)
+        endpoint = validate_outbound_endpoint(
+            value,
+            kind="http",
+            label="avatar.url",
+            allow_empty=True,
+        )
+        return "" if endpoint is None else endpoint.url
+
+    @field_validator("token_file")
+    @classmethod
+    def _valid_token_file(cls, value: str) -> str:
+        return _clean_config_string(value, allow_empty=False)
+
+    @field_validator("tls_ca_file", "tls_certfile", "tls_keyfile")
+    @classmethod
+    def _valid_optional_tls_path(cls, value: str) -> str:
+        return _clean_config_string(value)
+
+    @model_validator(mode="after")
+    def _valid_client_tls(self) -> "AvatarRemoteConfig":
+        from .api.security import validate_outbound_endpoint
+
+        endpoint = validate_outbound_endpoint(
+            self.url,
+            kind="http",
+            label="avatar.url",
+            allow_empty=True,
+        )
+        if bool(self.tls_certfile) != bool(self.tls_keyfile):
+            raise ValueError(
+                "avatar TLS certificate and private key must be configured together"
+            )
+        tls_configured = bool(
+            self.tls_ca_file or self.tls_certfile or self.tls_keyfile
+        )
+        if tls_configured and endpoint is None:
+            raise ValueError(
+                "avatar TLS files require a configured secure endpoint"
+            )
+        if tls_configured and endpoint is not None and not endpoint.secure:
+            raise ValueError(
+                "avatar TLS files cannot be used with a plaintext endpoint"
+            )
+        return self
+
+
 class AppConfig(_StrictModel):
     camera: CameraConfig = Field(default_factory=CameraConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
@@ -322,6 +407,7 @@ class AppConfig(_StrictModel):
     compositing: CompositingConfig = Field(default_factory=CompositingConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    avatar: AvatarRemoteConfig = Field(default_factory=AvatarRemoteConfig)
 
     def to_dict(self) -> dict[str, Any]:
         """Return plain Python values, preserving tuple compatibility."""

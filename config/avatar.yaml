@@ -1,0 +1,100 @@
+# custback-avatar default configuration
+# Start custback with --mode remote, then: custback-avatar -c config/avatar.yaml
+
+source:
+  # custback's API, ws:// for the local machine or wss:// for a remote
+  # custback behind TLS (api.tls_certfile/tls_keyfile on the custback side).
+  url: ws://127.0.0.1:8710
+  # Renderer-only frame token; CUSTBACK_RENDERER_TOKEN overrides the file.
+  token_file: ~/.config/custback/renderer-token
+  # Optional private CA and mTLS identity for wss://. System roots are used
+  # when tls_ca_file is empty; certificate and key must be set together.
+  tls_ca_file: ""
+  tls_certfile: ""
+  tls_keyfile: ""
+  connect_timeout_s: 5.0
+  reconnect_min_s: 0.5
+  reconnect_max_s: 10.0
+  frame_max_bytes: 16777216
+
+driver:
+  # auto   — vision when mediapipe is installed, else the idle animator
+  # vision — MediaPipe Face Landmarker on the forwarded camera frames
+  #          (CPU-friendly; fits any local GPU, RTX 3060 included)
+  # audio2face — NVIDIA Audio2Face-3D gRPC endpoint (see audio2face below)
+  # idle   — synthetic presence (blinks and gentle head sway), no tracking
+  backend: auto
+  smoothing: 0.4        # 0..0.95 damping of tracking jitter; blinks stay sharp
+  vision:
+    model_path: ""      # optional face_landmarker .task override
+  audio2face:
+    url: ""             # grpc://127.0.0.1:52000 locally, or a verified
+                        # grpcs://host:52000 remote endpoint
+    tls_ca_file: ""     # optional private CA; otherwise system roots
+    tls_certfile: ""    # optional mTLS client certificate (pair with key)
+    tls_keyfile: ""
+    audio_source: microphone   # or a path to a 16 kHz mono 16-bit .wav
+    sample_rate: 16000
+    chunk_ms: 40
+
+appearance:
+  rig: builtin          # builtin presenter, or a directory of PNG layers
+  avatar: casey         # builtin character: casey | robin | alex | nova
+                        # (ignored when rig is a PNG-layer directory)
+  style: cartoon        # cartoon | realistic (soft-shaded, natural
+                        # proportions) | sketch (pencil drawing; the only
+                        # style that also applies to PNG rigs)
+  # How much of the avatar stays in shot:
+  #   bust    — head and chest, webcam-style (right for Meet/Zoom tiles)
+  #   full    — everything the rig has (waist-up for the builtin)
+  #   closeup — the face fills the frame
+  framing: bust
+  # Visible layers; drop entries to hide them (e.g. [head, eyes, brows,
+  # nose, mouth, hair] for a floating head).
+  parts: [torso, head, mouth, nose, eyes, brows, hair]
+  scale: 1.0            # framed avatar height relative to the frame height (0.1-3)
+  offset_x: 0.0         # -1..1, shifts the avatar left/right
+  offset_y: 0.0         # -1..1, negative lifts the avatar up
+  follow_pose: true     # head layers follow the tracked head pose
+
+background:
+  mode: color           # color | image | video | blur (blurred real room)
+  color: [60, 46, 32]   # BGR
+  image_path: ""
+  video_path: ""
+  blur_strength: 31
+
+render:
+  max_fps: 30
+  jpeg_quality: 85
+
+storage:
+  # Where uploaded rigs (POST /rigs) and avatar scene media
+  # (POST /backgrounds/image|video) land on this host. Installed rigs are
+  # selected by name via appearance.rig; scene files via background paths.
+  rigs_dir: ~/.local/share/custback/rigs
+  backgrounds_dir: ~/.local/share/custback/avatar-backgrounds
+  image_max_bytes: 20971520      # 20 MiB per image
+  video_max_bytes: 268435456     # 256 MiB per video
+  image_max_pixels: 16777216
+  video_max_width: 3840
+  video_max_height: 2160
+  rig_zip_max_bytes: 67108864    # compressed rig upload cap (64 MiB)
+  rig_max_bytes: 134217728       # extracted rig cap (128 MiB)
+  rig_max_entries: 16            # files per rig archive
+  storage_max_bytes: 1073741824  # scene media store cap (1 GiB)
+  max_files: 100
+
+api:
+  enabled: true
+  host: 127.0.0.1
+  port: 8711
+  # The avatar service's own control token (not custback's);
+  # CUSTBACK_AVATAR_API_TOKEN overrides the file.
+  token_file: ~/.config/custback/avatar-api-token
+  allow_non_loopback: false
+  allowed_origins: []
+  session_ttl_s: 28800
+  tls_certfile: ""
+  tls_keyfile: ""
+  ws_max_bytes: 16777216

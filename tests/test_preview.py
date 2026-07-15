@@ -110,6 +110,15 @@ def test_cli_flag_sets_preview():
     assert config_from_args(build_parser().parse_args([])).output.preview is False
 
 
+def test_cli_sets_renderer_token_file():
+    cfg = config_from_args(
+        build_parser().parse_args(
+            ["--renderer-token-file", "/tmp/custback-renderer-token"]
+        )
+    )
+    assert cfg.api.renderer_token_file == "/tmp/custback-renderer-token"
+
+
 def test_cli_populates_required_background_source_before_switching_mode():
     image = config_from_args(build_parser().parse_args(["--image", "missing.jpg"]))
     assert image.background.mode == "image"

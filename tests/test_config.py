@@ -4,10 +4,21 @@ import time
 import pytest
 
 from custback.config import (
+    AVATAR_PROXY_RESTART_ONLY_FIELDS,
     AppConfig,
     ConfigVersionConflictError,
     RuntimeConfig,
 )
+
+
+def test_avatar_proxy_security_boundary_fields_are_restart_only():
+    assert AVATAR_PROXY_RESTART_ONLY_FIELDS == {
+        "avatar.url",
+        "avatar.token_file",
+        "avatar.tls_ca_file",
+        "avatar.tls_certfile",
+        "avatar.tls_keyfile",
+    }
 
 
 def test_defaults_valid():
@@ -17,6 +28,7 @@ def test_defaults_valid():
     assert cfg.camera.pixel_format == "auto"
     assert cfg.camera.mode_mismatch == "warn"
     assert cfg.camera.recovery_timeout_s == 10.0
+    assert cfg.api.renderer_token_file == "~/.config/custback/renderer-token"
 
 
 def test_round_trip_yaml(tmp_path):
@@ -129,7 +141,9 @@ def test_invalid_delegate_rejected():
         {"background": {"video_path": "clip.mp4\x00ignored"}},
         {"output": {"device": "/dev/video10\n"}},
         {"api": {"token_file": "  "}},
+        {"api": {"renderer_token_file": ""}},
         {"api": {"tls_certfile": "cert.pem\t", "tls_keyfile": "key.pem"}},
+        {"avatar": {"tls_ca_file": "ca.pem\n"}},
         {"segmentation": {"backend": "rvm", "model_path": "model.tflite"}},
         {"segmentation": {"backend": "mediapipe", "model_path": "model.onnx"}},
         {"segmentation": {"backend": "none", "model_path": "model.onnx"}},
