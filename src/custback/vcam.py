@@ -22,6 +22,8 @@ class VideoOutput(ABC):
     #: True when send() itself blocks until the next frame slot (the pipeline
     #: must not add its own sleep on top).
     paces = False
+    fallback_active = False
+    fallback_reason = ""
 
     @abstractmethod
     def send(self, frame_bgr: np.ndarray) -> None: ...
@@ -33,8 +35,12 @@ class VideoOutput(ABC):
 class NullOutput(VideoOutput):
     """Discards frames; useful when only the HTTP/WebSocket API is consumed."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, fallback_active: bool = False, fallback_reason: str = ""
+    ) -> None:
         self.frames_sent = 0
+        self.fallback_active = fallback_active
+        self.fallback_reason = fallback_reason
 
     def send(self, frame_bgr: np.ndarray) -> None:
         self.frames_sent += 1
@@ -75,10 +81,13 @@ def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
     except Exception as exc:
         if cfg.backend == "pyvirtualcam":
             raise
-        log.warning(
+        log.debug(
             "virtual camera unavailable (%s); frames will only be served via "
             "the API. On Linux run scripts/install_linux.sh, on macOS run "
             "scripts/install_macos.sh.",
             exc,
         )
-        return NullOutput()
+        return NullOutput(
+            fallback_active=True,
+            fallback_reason="virtual-camera-unavailable",
+        )

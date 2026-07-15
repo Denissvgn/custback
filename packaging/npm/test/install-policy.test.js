@@ -37,13 +37,14 @@ test('installer reaches interrupted-promotion recovery under the install lock', 
 
 function completeStamp(expected, selectedExtras = expected.requestedExtras) {
   return {
-    schema: 2,
+    schema: 3,
     ...expected,
     selectedExtras,
     capabilities: {
       mediapipe: selectedExtras.includes('mediapipe'),
       rvm: selectedExtras.includes('rvm') || selectedExtras.includes('gpu'),
       cuda_provider: selectedExtras.includes('gpu'),
+      cuda_inference: selectedExtras.includes('gpu'),
     },
     createdAt: '2026-07-14T00:00:00.000Z',
   };
@@ -99,6 +100,43 @@ test('install stamp extras are canonical, supported, and include every request',
     ...stamp,
     capabilities: { ...stamp.capabilities, cuda_provider: false },
   }), false);
+  assert.equal(installer.validInstallStamp({
+    ...stamp,
+    capabilities: { ...stamp.capabilities, cuda_inference: false },
+  }), false);
+  assert.equal(installer.validInstallStamp({ ...stamp, schema: 2 }), false);
+});
+
+test('CUDA capability parser fails closed on malformed or CPU-fallback evidence', () => {
+  const verified = {
+    schema: 1,
+    onnxruntime: true,
+    cuda_provider: true,
+    cuda_inference: true,
+    active_providers: ['CUDAExecutionProvider'],
+    output_verified: true,
+    profile_verified: true,
+    error: '',
+  };
+  assert.deepEqual(installer.parseCudaProbeOutput(JSON.stringify(verified)), verified);
+  assert.equal(installer.parseCudaProbeOutput('{bad').cuda_inference, false);
+  assert.equal(installer.parseCudaProbeOutput(JSON.stringify({
+    ...verified,
+    active_providers: [123],
+  })).cuda_inference, false);
+  assert.equal(installer.parseCudaProbeOutput(JSON.stringify({
+    ...verified,
+    active_providers: ['CPUExecutionProvider'],
+  })).cuda_inference, false);
+  const cpuFallback = installer.parseCudaProbeOutput(JSON.stringify({
+    ...verified,
+    cuda_inference: false,
+    active_providers: ['CPUExecutionProvider'],
+    profile_verified: false,
+    error: 'probe did not execute on CUDAExecutionProvider',
+  }));
+  assert.equal(cpuFallback.cuda_provider, true);
+  assert.equal(cpuFallback.cuda_inference, false);
 });
 
 test('stamp reuse requires a healthy environment and force always rebuilds', () => {
@@ -148,9 +186,15 @@ test('doctor keeps optional capabilities and machine setup non-fatal', () => {
   assert.doesNotMatch(source, /report\('MediaPipe segmentation not installed'/);
   assert.match(source, /requested\.includes\('mediapipe'\)/);
   assert.match(source, /requested\.includes\('gpu'\)/);
+  assert.match(source, /installer\.cudaProbe\(python\)/);
+  assert.match(source, /verified CUDA inference/);
   assert.match(source, /installer\.validInstallStamp\(stamp\)/);
   assert.match(source, /stamp\.sourceDigest === installer\.sourceDigest\(\)/);
   assert.match(source, /timeout: PROBE_TIMEOUT_MS/);
+  const installerSource = fs.readFileSync(path.resolve(__dirname, '..', 'install.js'), 'utf8');
+  assert.match(installerSource, /custback\.gpu_probe/);
+  assert.match(installerSource, /cuda_inference/);
+  assert.match(installerSource, /timeout: CUDA_PROBE_TIMEOUT_MS/);
 });
 
 test('release smoke reuses one managed target, rebuilds, and bounds subprocesses', () => {

@@ -28,6 +28,8 @@ LocalBackgroundMode = Literal["blur", "image", "video", "color", "camera"]
 SegmentationBackend = Literal["auto", "rvm", "mediapipe", "heuristic", "none"]
 SegmentationDelegate = Literal["cpu", "gpu"]
 OutputBackend = Literal["auto", "pyvirtualcam", "null"]
+CameraPixelFormat = Literal["auto", "mjpeg", "backend"]
+CameraModeMismatch = Literal["warn", "error"]
 ColorChannel = Annotated[int, Field(ge=0, le=255)]
 SAFE_IMAGE_MAX_PIXELS = 89_478_485
 
@@ -92,6 +94,9 @@ class CameraConfig(_StrictModel):
     width: int = Field(default=1280, ge=16, le=7680)
     height: int = Field(default=720, ge=16, le=7680)
     fps: int = Field(default=30, ge=1, le=240)
+    pixel_format: CameraPixelFormat = "auto"
+    mode_mismatch: CameraModeMismatch = "warn"
+    recovery_timeout_s: float = Field(default=10.0, ge=2.0, le=300.0)
     synthetic: bool = False
     mirror: bool = False
 
@@ -99,6 +104,16 @@ class CameraConfig(_StrictModel):
     @classmethod
     def _valid_device(cls, value: int | str) -> int | str:
         return _clean_device(value, allow_empty=False)
+
+    @model_validator(mode="after")
+    def _recovery_outlasts_stall_detection(self) -> "CameraConfig":
+        stall_after_s = max(2.0, 5.0 / self.fps)
+        if self.recovery_timeout_s <= stall_after_s:
+            raise ValueError(
+                "recovery_timeout_s must be greater than the camera stall threshold "
+                f"({stall_after_s:g}s at {self.fps} fps)"
+            )
+        return self
 
 
 class BackgroundConfig(_StrictModel):

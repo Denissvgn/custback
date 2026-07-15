@@ -17,6 +17,7 @@ from typing import Callable
 import numpy as np
 
 from .config import BackgroundConfig
+from .diagnostics import sanitized_source
 
 try:
     import cv2
@@ -66,6 +67,28 @@ class BackdropProvider(ABC):
     def close(self) -> None:
         pass
 
+    def reset_stats(self) -> None:
+        """Start a new public provider-scoped telemetry generation."""
+
+        pass
+
+    def stats_dict(self) -> dict[str, object]:
+        """Return current-provider playback telemetry.
+
+        Non-video providers deliberately expose the same zero/null shape so
+        callers can reset public status atomically when modes change.
+        """
+        return {
+            "background_video_source_fps": None,
+            "background_video_timing_mode": None,
+            "background_video_frames_displayed": 0,
+            "background_video_frames_skipped": 0,
+            "background_video_frames_reused": 0,
+            "background_video_skip_ratio": 0.0,
+            "background_video_seek_count": 0,
+            "background_video_decode_failures": 0,
+        }
+
 
 class ColorBackdrop(BackdropProvider):
     def __init__(self, color_bgr: tuple[int, int, int]):
@@ -86,7 +109,9 @@ class ImageBackdrop(BackdropProvider):
             raise RuntimeError("opencv-python is required for image backdrops")
         image = cv2.imread(path, cv2.IMREAD_COLOR)
         if image is None:
-            raise FileNotFoundError(f"cannot read background image: {path}")
+            raise FileNotFoundError(
+                f"cannot read background image: {sanitized_source(path)}"
+            )
         self._image = image
         self._cache: np.ndarray | None = None
 
@@ -126,7 +151,9 @@ class VideoBackdrop(BackdropProvider):
         self.cap = cv2.VideoCapture(path)
         if not self.cap.isOpened():
             self.cap.release()
-            raise FileNotFoundError(f"cannot open background video: {path}")
+            raise FileNotFoundError(
+                f"cannot open background video: {sanitized_source(path)}"
+            )
         try:
             metadata_width = float(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             metadata_height = float(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -151,7 +178,7 @@ class VideoBackdrop(BackdropProvider):
         ):
             log.warning(
                 "video %s has implausible FPS metadata (%r); assuming 30 FPS",
-                path,
+                sanitized_source(path),
                 source_fps,
             )
             source_fps = self._DEFAULT_FPS
@@ -186,6 +213,13 @@ class VideoBackdrop(BackdropProvider):
         self._last_fit: np.ndarray | None = None
         self._last_size: tuple[int, int] | None = None
         self._fatal_decode_error = False
+        self._frames_displayed = 0
+        self._frames_skipped = 0
+        self._frames_reused = 0
+        self._seek_count = 0
+        self._decode_failures = 0
+        self._last_returned_logical_index: int | None = None
+        self._skip_warning_emitted = False
 
     def _valid_decoded_frame(self, frame: np.ndarray | None) -> bool:
         valid = bool(
@@ -210,7 +244,7 @@ class VideoBackdrop(BackdropProvider):
                 self._fatal_decode_error = True
             log.warning(
                 "ignoring invalid or oversized frame from background video %s",
-                self.path,
+                sanitized_source(self.path),
             )
         return valid
 
@@ -527,6 +561,7 @@ class VideoBackdrop(BackdropProvider):
             self._last_reliable_pts_s = pts_s
             self._last_reliable_source_index = source_index
         self._prefetch_next()
+        self._seek_count += 1
         return True
 
     def _decode_first(self, now: float) -> None:
@@ -552,6 +587,8 @@ class VideoBackdrop(BackdropProvider):
                 raise ValueError(
                     "background video contains a frame that exceeds configured dimensions"
                 )
+        else:
+            self._decode_failures += 1
 
     def _advance_to_time(self, now: float) -> None:
         if self._fatal_decode_error:
@@ -565,7 +602,11 @@ class VideoBackdrop(BackdropProvider):
 
         if self._pending is None and not self._prefetch_next():
             self._retry_not_before_s = elapsed_s + 1.0 / self._fps
-            log.warning("cannot decode timed frame from background video %s", self.path)
+            self._decode_failures += 1
+            log.warning(
+                "cannot decode timed frame from background video %s",
+                sanitized_source(self.path),
+            )
             return
 
         assert self._pending is not None
@@ -588,12 +629,20 @@ class VideoBackdrop(BackdropProvider):
         if estimated_stale > self._MAX_SEQUENTIAL_SKIP and self._frame_count:
             if not self._seek_to_elapsed(elapsed_s):
                 self._retry_not_before_s = elapsed_s + 1.0 / self._fps
-                log.warning("cannot decode timed frame from background video %s", self.path)
+                self._decode_failures += 1
+                log.warning(
+                    "cannot decode timed frame from background video %s",
+                    sanitized_source(self.path),
+                )
             return
         if not self._container_timing and estimated_stale > 1 and self._frame_count:
             if not self._skip_stale_nominal(estimated_stale):
                 self._retry_not_before_s = elapsed_s + 1.0 / self._fps
-                log.warning("cannot decode timed frame from background video %s", self.path)
+                self._decode_failures += 1
+                log.warning(
+                    "cannot decode timed frame from background video %s",
+                    sanitized_source(self.path),
+                )
             return
 
         advanced = 0
@@ -620,19 +669,75 @@ class VideoBackdrop(BackdropProvider):
                     return
                 if not self._seek_to_elapsed(elapsed_s):
                     self._retry_not_before_s = elapsed_s + 1.0 / self._fps
+                    self._decode_failures += 1
                     log.warning(
-                        "cannot decode timed frame from background video %s", self.path
+                        "cannot decode timed frame from background video %s",
+                        sanitized_source(self.path),
                     )
 
     def frame(self, width: int, height: int) -> np.ndarray:
         self._advance_to_time(self._clock())
         if self._last_raw is None:
-            raise RuntimeError(f"background video has no decodable frame: {self.path}")
+            raise RuntimeError(
+                "background video has no decodable frame: "
+                f"{sanitized_source(self.path)}"
+            )
+        previous = self._last_returned_logical_index
+        current = self._logical_index
+        if previous is None or current != previous:
+            self._frames_displayed += 1
+            if previous is not None:
+                self._frames_skipped += max(0, current - previous - 1)
+            self._last_returned_logical_index = current
+        else:
+            self._frames_reused += 1
+        opportunities = self._frames_displayed + self._frames_skipped
+        skip_ratio = (
+            self._frames_skipped / opportunities if opportunities else 0.0
+        )
+        if (
+            not self._skip_warning_emitted
+            and opportunities >= 30
+            and skip_ratio >= 0.10
+        ):
+            self._skip_warning_emitted = True
+            log.warning(
+                "background video is skipping %.1f%% of source frames to retain phase",
+                skip_ratio * 100.0,
+            )
         size = (width, height)
         if self._last_fit is None or self._last_size != size:
             self._last_fit = _fit(self._last_raw, width, height)
             self._last_size = size
         return self._last_fit
+
+    def stats_dict(self) -> dict[str, object]:
+        opportunities = self._frames_displayed + self._frames_skipped
+        return {
+            "background_video_source_fps": self._fps,
+            "background_video_timing_mode": (
+                "container" if self._container_timing else "nominal"
+            ),
+            "background_video_frames_displayed": self._frames_displayed,
+            "background_video_frames_skipped": self._frames_skipped,
+            "background_video_frames_reused": self._frames_reused,
+            "background_video_skip_ratio": (
+                self._frames_skipped / opportunities if opportunities else 0.0
+            ),
+            "background_video_seek_count": self._seek_count,
+            "background_video_decode_failures": self._decode_failures,
+        }
+
+    def reset_stats(self) -> None:
+        """Exclude activation trials from counters of the installed provider."""
+
+        self._frames_displayed = 0
+        self._frames_skipped = 0
+        self._frames_reused = 0
+        self._seek_count = 0
+        self._decode_failures = 0
+        self._last_returned_logical_index = None
+        self._skip_warning_emitted = False
 
     def close(self) -> None:
         self.cap.release()
@@ -648,7 +753,9 @@ class CameraBackdrop(BackdropProvider):
             device = int(device)
         self.cap = cv2.VideoCapture(device)
         if not self.cap.isOpened():
-            raise RuntimeError(f"cannot open backdrop source: {device!r}")
+            raise RuntimeError(
+                f"cannot open backdrop source: {sanitized_source(device)!r}"
+            )
         self._last: np.ndarray | None = None
 
     def frame(self, width: int, height: int) -> np.ndarray:

@@ -6,6 +6,9 @@ camera:
   width: 1280
   height: 720
   fps: 30
+  pixel_format: auto    # auto | mjpeg | backend; auto requests MJPG on V4L2
+  mode_mismatch: warn   # warn | error when the negotiated mode misses the target
+  recovery_timeout_s: 10.0  # terminal outage limit after the last valid frame
   mirror: false
   synthetic: false     # true = built-in test pattern (no hardware needed)
 

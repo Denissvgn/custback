@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import logging
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,6 +34,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, help="capture width")
     parser.add_argument("--height", type=int, help="capture height")
     parser.add_argument("--fps", type=int, help="target fps")
+    parser.add_argument(
+        "--camera-pixel-format",
+        choices=("auto", "mjpeg", "backend"),
+        help="capture pixel-format policy",
+    )
+    parser.add_argument(
+        "--camera-mode-mismatch",
+        choices=("warn", "error"),
+        help="whether a negotiated camera-mode mismatch is fatal",
+    )
+    parser.add_argument(
+        "--camera-recovery-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="maximum runtime camera outage before exiting",
+    )
     parser.add_argument("--mirror", action="store_true", help="mirror the camera")
     parser.add_argument(
         "--synthetic", action="store_true",
@@ -69,6 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the processed output in an on-screen window (q/ESC quits)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
+    log_group = parser.add_mutually_exclusive_group()
+    log_group.add_argument(
+        "--log-file",
+        metavar="PATH",
+        help="override the default rotating diagnostics log",
+    )
+    log_group.add_argument(
+        "--no-file-log",
+        action="store_true",
+        help="disable the default rotating diagnostics log",
+    )
     parser.add_argument(
         "--dump-config", metavar="PATH",
         help="write the effective config to PATH and exit",
@@ -88,6 +116,12 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
     if args.fps is not None:
         cam.fps = args.fps
         cfg.output.fps = args.fps
+    if args.camera_pixel_format is not None:
+        cam.pixel_format = args.camera_pixel_format
+    if args.camera_mode_mismatch is not None:
+        cam.mode_mismatch = args.camera_mode_mismatch
+    if args.camera_recovery_timeout is not None:
+        cam.recovery_timeout_s = args.camera_recovery_timeout
     if args.mirror:
         cam.mirror = True
     if args.synthetic:
@@ -144,6 +178,10 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
 
 class ApiStartupError(RuntimeError):
     """The configured API could not become or remain available."""
+
+
+class _ShutdownSignal(BaseException):
+    """Unwind startup/runtime work so signal-driven shutdown can clean up."""
 
 
 class _ApiRunner:
@@ -252,15 +290,55 @@ def _wait_headless(
     pipeline: Pipeline,
     stop: threading.Event,
     api_runner: _ApiRunner | None,
-) -> int:
-    """Monitor required services until shutdown; return the selected status."""
+) -> None:
+    """Monitor required services until shutdown; classification is centralized."""
     while not stop.is_set() and pipeline.running:
         if api_runner is not None and api_runner.failed:
-            log.error("API server stopped unexpectedly: %s", api_runner.error)
             stop.set()
-            return EXIT_API
+            return
         stop.wait(0.5)
-    return 0
+
+
+def _classify_service_failure(
+    pipeline: Pipeline, api_runner: _ApiRunner | None
+) -> tuple[int, str]:
+    """Return one authoritative required-service failure, if present."""
+    if api_runner is not None and api_runner.failed:
+        detail = api_runner.error or "server thread exited without an exception"
+        log.error("API server stopped unexpectedly: %s", detail)
+        return EXIT_API, "api-failure"
+    if not pipeline.running:
+        log.error("pipeline stopped unexpectedly")
+        return EXIT_RUNTIME, "pipeline-failure"
+    return 0, ""
+
+
+def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
+    stats = hub.stats_dict()
+    log.info(
+        "shutdown reason=%s exit=%d uptime=%.1fs frames_in=%d frames_out=%d "
+        "capture_fps=%.1f output_fps=%.1f read_failures=%d restarts=%d "
+        "repeats=%d video_skips=%d capture_read_ms=%s segmentation_ms=%s "
+        "background_ms=%s composite_ms=%s output_send_ms=%s "
+        "frame_processing_ms=%s",
+        reason,
+        exit_code,
+        stats["uptime_s"],
+        stats["frames_in"],
+        stats["frames_out"],
+        stats["capture_fps"],
+        stats["fps"],
+        stats["capture_read_failures"],
+        stats["capture_restarts"],
+        stats["output_repeated_frames"],
+        stats["background_video_frames_skipped"],
+        stats["capture_read_ms"],
+        stats["segmentation_ms"],
+        stats["background_ms"],
+        stats["composite_ms"],
+        stats["output_send_ms"],
+        stats["frame_processing_ms"],
+    )
 
 
 def _security_policy(cfg: AppConfig):
@@ -296,122 +374,223 @@ def _security_policy(cfg: AppConfig):
     )
 
 
-def run(cfg: AppConfig) -> int:
-    if cfg.output.preview:
-        from .preview import preview_available
-
-        available, reason = preview_available()
-        if not available:
-            log.warning("preview disabled: %s", reason)
-            cfg.output.preview = False
-
-    runtime = RuntimeConfig(cfg)
-    hub = FrameHub()
-    pipeline = Pipeline(runtime, hub)
-
-    api_runner: _ApiRunner | None = None
-    if cfg.api.enabled:
-        from .api.server import create_app
-
-        # Security validation is unconditional: accepting an injected policy
-        # here could otherwise bypass non-loopback/TLS/origin checks while the
-        # server still binds to cfg.api.host.
-        security = _security_policy(cfg)
-        app = create_app(runtime, hub, pipeline, security=security)
-        api_runner = _ApiRunner(app, cfg.api)
-        try:
-            api_runner.start()
-        except ApiStartupError:
-            log.exception("API startup failed")
-            return EXIT_API
-        scheme = "https" if cfg.api.tls_certfile else "http"
-        log.info("API listening on %s://%s:%d", scheme, cfg.api.host, cfg.api.port)
-
-    try:
-        pipeline.start()
-    except BaseException:
-        api_stop_failed = api_runner is not None and not api_runner.stop()
-        log.exception("pipeline startup failed")
-        if api_stop_failed:
-            log.error("API server survived failed pipeline startup")
-            return EXIT_API
-        return EXIT_RUNTIME
-
+def run(cfg: AppConfig, *, run_id: str = "") -> int:
+    hub = FrameHub(run_id=run_id)
     stop = threading.Event()
+    shutdown_reason = "normal"
+    previous_signal_handlers: dict[signal.Signals, object] = {}
     if threading.current_thread() is threading.main_thread():
+        def request_shutdown(signum, _frame) -> None:
+            nonlocal shutdown_reason
+            if stop.is_set():
+                return
+            shutdown_reason = signal.Signals(signum).name.lower()
+            stop.set()
+            raise _ShutdownSignal()
+
         for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, lambda *_: stop.set())
+            previous_signal_handlers[sig] = signal.signal(sig, request_shutdown)
 
     exit_code = 0
+    security = None
+    pipeline: Pipeline | None = None
+    api_runner: _ApiRunner | None = None
     try:
-        if cfg.output.preview:
-            # Runs on the main thread (required by OpenCV GUI on macOS);
-            # returns when the user quits the window or `stop` is set.
-            from .preview import run_preview
+        if cfg.api.enabled:
+            # Resolve token and validate the bind policy before activating hardware,
+            # but do not advertise a listening API until the pipeline is ready.
+            security = _security_policy(cfg)
 
-            watchdog = threading.Thread(
-                target=_watch_pipeline, args=(pipeline, stop, api_runner),
-                name="watchdog", daemon=True,
-            )
-            watchdog.start()
-            user_quit = run_preview(runtime, hub, stop, coordinator=pipeline)
-            if not user_quit and not stop.is_set():
-                log.warning("continuing without the preview window")
-                exit_code = _wait_headless(pipeline, stop, api_runner)
-        else:
-            exit_code = _wait_headless(pipeline, stop, api_runner)
-    finally:
-        # No `return` in this block: a return inside `finally` silences any
-        # exception still propagating from the `try` above, which would mask
-        # a real crash behind an unrelated pipeline.stop() failure.
-        pipeline_stop_failed = False
+        from .segmentation import preacquire_segmenter_model
+
         try:
-            pipeline.stop()
+            model_preparation = preacquire_segmenter_model(cfg.segmentation)
         except Exception:
-            log.exception("pipeline error")
-            pipeline_stop_failed = True
-        if api_runner is not None:
-            if api_runner.failed:
+            log.exception("segmentation model acquisition failed")
+            exit_code = EXIT_RUNTIME
+            shutdown_reason = "model-acquisition-failure"
+
+        # Probe preview only after security and managed models are resolved.
+        # This keeps the hardware/API readiness sequence deterministic while
+        # still normalizing Qt before the real native window is opened.
+        if exit_code == 0 and not stop.is_set() and cfg.output.preview:
+            from .preview import preview_available
+
+            available, reason = preview_available()
+            if not available:
+                log.warning("preview disabled: %s", reason)
+                cfg.output.preview = False
+
+        runtime = RuntimeConfig(cfg)
+        if exit_code == 0 and not stop.is_set():
+            pipeline = Pipeline(
+                runtime,
+                hub,
+                model_preparation=model_preparation,
+            )
+            try:
+                pipeline.start()
+            except _ShutdownSignal:
+                raise
+            except BaseException:
+                log.exception("pipeline startup failed")
+                exit_code = EXIT_RUNTIME
+                shutdown_reason = "pipeline-startup-failure"
+
+        api_address = "disabled"
+        if (
+            exit_code == 0
+            and not stop.is_set()
+            and cfg.api.enabled
+            and pipeline is not None
+        ):
+            from .api.server import create_app
+
+            assert security is not None
+            app = create_app(runtime, hub, pipeline, security=security)
+            api_runner = _ApiRunner(app, cfg.api)
+            try:
+                api_runner.start()
+            except ApiStartupError:
+                log.exception("API startup failed")
                 exit_code = EXIT_API
-            if not api_runner.stop():
+                shutdown_reason = "api-startup-failure"
+            else:
+                scheme = "https" if cfg.api.tls_certfile else "http"
+                api_address = f"{scheme}://{cfg.api.host}:{cfg.api.port}"
+
+        if exit_code == 0 and not stop.is_set() and pipeline is not None:
+            ready = hub.stats_dict()
+            log.info(
+                "ready api=%s camera_requested=%s/%sx%s@%s "
+                "camera_negotiated=%s/%s %sx%s@%s segmenter=%s/%s output=%s "
+                "preview=%s",
+                api_address,
+                cfg.camera.pixel_format,
+                cfg.camera.width,
+                cfg.camera.height,
+                cfg.camera.fps,
+                ready["capture_backend"],
+                ready["capture_fourcc"] or "backend",
+                ready["capture_width"],
+                ready["capture_height"],
+                ready["capture_fps_reported"],
+                ready["segmentation_backend"],
+                ready["segmentation_device"],
+                ready["output_backend"],
+                "native" if cfg.output.preview else "disabled",
+            )
+
+            if cfg.output.preview:
+                # Runs on the main thread (required by OpenCV GUI on macOS);
+                # returns when the user quits the window or `stop` is set.
+                from .preview import run_preview
+
+                watchdog = threading.Thread(
+                    target=_watch_pipeline, args=(pipeline, stop, api_runner),
+                    name="watchdog", daemon=True,
+                )
+                watchdog.start()
+                user_quit = run_preview(runtime, hub, stop, coordinator=pipeline)
+                failure_code, failure_reason = _classify_service_failure(
+                    pipeline, api_runner
+                )
+                if failure_code:
+                    exit_code = failure_code
+                    shutdown_reason = failure_reason
+                    stop.set()
+                elif user_quit:
+                    shutdown_reason = "preview-quit"
+                    stop.set()
+                elif not stop.is_set():
+                    log.warning("continuing without the preview window")
+                    _wait_headless(pipeline, stop, api_runner)
+            else:
+                _wait_headless(pipeline, stop, api_runner)
+
+            if exit_code == 0:
+                failure_code, failure_reason = _classify_service_failure(
+                    pipeline, api_runner
+                )
+                if failure_code:
+                    exit_code = failure_code
+                    shutdown_reason = failure_reason
+    except (_ShutdownSignal, KeyboardInterrupt):
+        stop.set()
+    except (OSError, ValueError):
+        exit_code = EXIT_CONFIG
+        shutdown_reason = "configuration-failure"
+        raise
+    except Exception:
+        log.exception("runtime coordination failed")
+        if exit_code == 0:
+            exit_code = EXIT_RUNTIME
+            shutdown_reason = "runtime-failure"
+    finally:
+        if api_runner is not None:
+            stop_api = getattr(api_runner, "stop", None)
+            if callable(stop_api) and not stop_api():
                 log.error("API server did not stop cleanly")
                 exit_code = EXIT_API
-    if pipeline_stop_failed:
-        return EXIT_RUNTIME
-    if api_runner is not None and api_runner.failed:
-        return EXIT_API
+                shutdown_reason = "api-shutdown-failure"
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except Exception:
+                log.exception("pipeline error")
+                if exit_code == 0:
+                    exit_code = EXIT_RUNTIME
+                    shutdown_reason = "pipeline-failure"
+        if api_runner is not None and getattr(api_runner, "failed", False):
+            exit_code = EXIT_API
+            shutdown_reason = "api-failure"
+        _log_shutdown_summary(hub, shutdown_reason, exit_code)
+        if threading.current_thread() is threading.main_thread():
+            for sig, previous in previous_signal_handlers.items():
+                if previous is not None:
+                    signal.signal(sig, previous)
     return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    try:
-        cfg = config_from_args(args)
-    except (OSError, ValueError) as exc:
-        log.error("invalid configuration: %s", exc)
-        return EXIT_CONFIG
-    if args.dump_config:
-        cfg.save(args.dump_config)
-        print(f"config written to {args.dump_config}")
-        return 0
-    if args.show_api_token:
-        try:
-            from .api.security import resolve_api_token
+    from .diagnostics import LoggingConfigurationError, configure_logging
 
-            print(resolve_api_token(cfg.api.token_file).value)
-            return 0
-        except (OSError, ValueError) as exc:
-            log.error("cannot resolve API token: %s", exc)
-            return EXIT_CONFIG
     try:
-        return run(cfg)
-    except (OSError, ValueError) as exc:
-        log.error("startup configuration error: %s", exc)
+        logging_session = configure_logging(
+            verbose=args.verbose,
+            log_file=args.log_file,
+            no_file_log=args.no_file_log,
+        )
+    except (LoggingConfigurationError, ValueError) as exc:
+        print(f"custback: logging configuration error: {exc}", file=sys.stderr)
         return EXIT_CONFIG
+    try:
+        try:
+            cfg = config_from_args(args)
+        except (OSError, ValueError) as exc:
+            log.error("invalid configuration: %s", exc)
+            return EXIT_CONFIG
+        if args.dump_config:
+            cfg.save(args.dump_config)
+            print(f"config written to {args.dump_config}")
+            return 0
+        if args.show_api_token:
+            try:
+                from .api.security import resolve_api_token
+
+                print(resolve_api_token(cfg.api.token_file).value)
+                return 0
+            except (OSError, ValueError) as exc:
+                log.error("cannot resolve API token: %s", exc)
+                return EXIT_CONFIG
+        try:
+            return run(cfg, run_id=logging_session.run_id)
+        except (OSError, ValueError) as exc:
+            log.error("startup configuration error: %s", exc)
+            return EXIT_CONFIG
+    finally:
+        logging_session.close()
 
 
 if __name__ == "__main__":

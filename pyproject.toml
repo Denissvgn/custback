@@ -29,8 +29,10 @@ mediapipe = ["mediapipe>=0.10.14,<0.11"]
 # Robust Video Matting backend: best edge quality (true alpha matting),
 # CPU inference via onnxruntime.
 rvm = ["onnxruntime>=1.17,<2"]
-# Same, accelerated on NVIDIA GPUs (CUDA execution provider).
-gpu = ["onnxruntime-gpu>=1.17,<2"]
+# Same, accelerated on NVIDIA GPUs (CUDA 12 execution provider).
+# ONNX Runtime 1.27 switched the Python 3.14 Linux wheel to CUDA 13, while
+# custback's supported GPU runtime line remains CUDA 12.
+gpu = ["onnxruntime-gpu>=1.17,<1.27"]
 dev = [
     "build>=1.2,<2",
     "pytest>=8.0,<10",

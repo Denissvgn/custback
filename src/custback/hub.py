@@ -19,6 +19,7 @@ import numpy as np
 
 @dataclass
 class Stats:
+    run_id: str = ""
     frames_in: int = 0
     frames_out: int = 0
     fps: float = 0.0
@@ -33,6 +34,42 @@ class Stats:
     remote_fallback_count: int = 0
     remote_fallback_reason: str = ""
     config_version: int = 0
+    capture_backend: str = ""
+    capture_fourcc: str | None = None
+    capture_width: int | None = None
+    capture_height: int | None = None
+    capture_fps_reported: float | None = None
+    capture_target_fps: int = 0
+    capture_fps: float = 0.0
+    capture_target_met: bool | None = None
+    capture_frames_read: int = 0
+    capture_dropped_frames: int = 0
+    capture_read_failures: int = 0
+    capture_restarts: int = 0
+    capture_stalled: bool = False
+    capture_frame_age_ms: float | None = None
+    output_target_fps: int = 0
+    fps_attainment_pct: float | None = None
+    output_repeated_frames: int = 0
+    processing_deadline_misses: int = 0
+    capture_read_ms: float | None = None
+    segmentation_ms: float | None = None
+    background_ms: float | None = None
+    composite_ms: float | None = None
+    output_send_ms: float | None = None
+    frame_processing_ms: float | None = None
+    output_fallback_active: bool = False
+    output_fallback_reason: str = ""
+    segmentation_fallback_active: bool = False
+    segmentation_fallback_reason: str = ""
+    background_video_source_fps: float | None = None
+    background_video_timing_mode: str | None = None
+    background_video_frames_displayed: int = 0
+    background_video_frames_skipped: int = 0
+    background_video_frames_reused: int = 0
+    background_video_skip_ratio: float = 0.0
+    background_video_seek_count: int = 0
+    background_video_decode_failures: int = 0
     started_at: float = field(default_factory=time.time)
 
 
@@ -77,11 +114,11 @@ class _Slot:
 
 
 class FrameHub:
-    def __init__(self) -> None:
+    def __init__(self, *, run_id: str = "") -> None:
         self.output = _Slot()      # processed frames (what the vcam shows)
         self.raw = _Slot()         # raw camera frames (for remote avatar svc)
         self.remote_in = _Slot()   # frames rendered by the remote avatar svc
-        self.stats = Stats()
+        self.stats = Stats(run_id=run_id)
         self._stats_lock = threading.Lock()
         self._remote_clients = 0
         self._remote_session = 0
@@ -159,6 +196,7 @@ class FrameHub:
     def stats_dict(self) -> dict:
         with self._stats_lock:
             return {
+                "run_id": self.stats.run_id,
                 "frames_in": self.stats.frames_in,
                 "frames_out": self.stats.frames_out,
                 "fps": round(self.stats.fps, 1),
@@ -173,5 +211,75 @@ class FrameHub:
                 "remote_fallback_count": self.stats.remote_fallback_count,
                 "remote_fallback_reason": self.stats.remote_fallback_reason,
                 "config_version": self.stats.config_version,
+                "capture_backend": self.stats.capture_backend,
+                "capture_fourcc": self.stats.capture_fourcc,
+                "capture_width": self.stats.capture_width,
+                "capture_height": self.stats.capture_height,
+                "capture_fps_reported": self._rounded_optional(
+                    self.stats.capture_fps_reported, 2
+                ),
+                "capture_target_fps": self.stats.capture_target_fps,
+                "capture_fps": round(self.stats.capture_fps, 1),
+                "capture_target_met": self.stats.capture_target_met,
+                "capture_frames_read": self.stats.capture_frames_read,
+                "capture_dropped_frames": self.stats.capture_dropped_frames,
+                "capture_read_failures": self.stats.capture_read_failures,
+                "capture_restarts": self.stats.capture_restarts,
+                "capture_stalled": self.stats.capture_stalled,
+                "capture_frame_age_ms": self._rounded_optional(
+                    self.stats.capture_frame_age_ms, 1
+                ),
+                "output_target_fps": self.stats.output_target_fps,
+                "fps_attainment_pct": self._rounded_optional(
+                    self.stats.fps_attainment_pct, 1
+                ),
+                "output_repeated_frames": self.stats.output_repeated_frames,
+                "processing_deadline_misses": self.stats.processing_deadline_misses,
+                "capture_read_ms": self._rounded_optional(
+                    self.stats.capture_read_ms, 1
+                ),
+                "segmentation_ms": self._rounded_optional(
+                    self.stats.segmentation_ms, 1
+                ),
+                "background_ms": self._rounded_optional(
+                    self.stats.background_ms, 1
+                ),
+                "composite_ms": self._rounded_optional(
+                    self.stats.composite_ms, 1
+                ),
+                "output_send_ms": self._rounded_optional(
+                    self.stats.output_send_ms, 1
+                ),
+                "frame_processing_ms": self._rounded_optional(
+                    self.stats.frame_processing_ms, 1
+                ),
+                "output_fallback_active": self.stats.output_fallback_active,
+                "output_fallback_reason": self.stats.output_fallback_reason,
+                "segmentation_fallback_active": self.stats.segmentation_fallback_active,
+                "segmentation_fallback_reason": self.stats.segmentation_fallback_reason,
+                "background_video_source_fps": self._rounded_optional(
+                    self.stats.background_video_source_fps, 2
+                ),
+                "background_video_timing_mode": self.stats.background_video_timing_mode,
+                "background_video_frames_displayed": (
+                    self.stats.background_video_frames_displayed
+                ),
+                "background_video_frames_skipped": (
+                    self.stats.background_video_frames_skipped
+                ),
+                "background_video_frames_reused": (
+                    self.stats.background_video_frames_reused
+                ),
+                "background_video_skip_ratio": round(
+                    self.stats.background_video_skip_ratio, 4
+                ),
+                "background_video_seek_count": self.stats.background_video_seek_count,
+                "background_video_decode_failures": (
+                    self.stats.background_video_decode_failures
+                ),
                 "uptime_s": round(time.time() - self.stats.started_at, 1),
             }
+
+    @staticmethod
+    def _rounded_optional(value: float | None, digits: int) -> float | None:
+        return None if value is None else round(value, digits)

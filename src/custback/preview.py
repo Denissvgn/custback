@@ -23,9 +23,19 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
+
+# OpenCV's Qt bootstrap mutates these variables during import.  Remember what
+# the user supplied so we can remove only OpenCV's broken defaults while
+# preserving intentional overrides.
+_QT_ENV_BEFORE_CV2 = {
+    key: os.environ.get(key)
+    for key in ("QT_QPA_FONTDIR", "QT_QPA_PLATFORM")
+}
 
 from .backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, list_background_files
 from .config import RuntimeConfig
@@ -62,6 +72,19 @@ BLUR_STEP = 10
 BLUR_MIN, BLUR_MAX = 3, 151
 MESSAGE_SECONDS = 2.5
 PREVIEW_PROBE_TIMEOUT_S = 3.0
+PROBE_STDERR_LIMIT = 2048
+_AMBER = (0, 191, 255)
+
+# Some Linux OpenCV wheels bundle Qt/XCB but no fonts.  Even after removing
+# OpenCV's invalid QT_QPA_FONTDIR and explicitly selecting its xcb plugin, Qt
+# writes these harmless bootstrap diagnostics directly to file descriptor 2.
+# Capture only the first real window creation and discard these known lines;
+# replay every other byte so genuine HighGUI diagnostics are not hidden.
+_QT_BOOTSTRAP_NOISE_PREFIXES = (
+    "Warning: Ignoring XDG_SESSION_TYPE=wayland on Gnome.",
+    "QFontDatabase: Cannot find font directory ",
+    "Note that Qt no longer ships fonts.",
+)
 
 _HIGHGUI_PROBE = (
     "import cv2; "
@@ -82,6 +105,235 @@ HELP_LINES = [
 ]
 
 
+def _qt_platform_plugins(
+    cv2_module=None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Return Qt platform plugin names visible to OpenCV, when discoverable."""
+
+    module = cv2 if cv2_module is None else cv2_module
+    roots: list[Path] = []
+    module_file = getattr(module, "__file__", None)
+    if module_file:
+        package_dir = Path(module_file).resolve().parent
+        roots.extend(
+            [
+                package_dir / "qt" / "plugins" / "platforms",
+                package_dir / "plugins" / "platforms",
+            ]
+        )
+    env = os.environ if environ is None else environ
+    for entry in env.get("QT_QPA_PLATFORM_PLUGIN_PATH", "").split(os.pathsep):
+        if entry:
+            roots.append(Path(entry))
+
+    plugins: set[str] = set()
+    for root in roots:
+        try:
+            entries = tuple(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name.lower()
+            if "xcb" in name:
+                plugins.add("xcb")
+            if "wayland" in name:
+                plugins.add("wayland")
+    return plugins
+
+
+def _normalize_highgui_environment(
+    environ: Mapping[str, str],
+    *,
+    inherited_environ: Mapping[str, str],
+    platform: str,
+    cv2_module=None,
+) -> tuple[dict[str, str], str, tuple[str, ...]]:
+    env = dict(environ)
+    notes: list[str] = []
+    if not platform.startswith("linux"):
+        return env, "", ()
+
+    font_dir = env.get("QT_QPA_FONTDIR")
+    module = cv2 if cv2_module is None else cv2_module
+    module_file = getattr(module, "__file__", None)
+    expected_cv2_font_dir = (
+        Path(module_file).resolve().parent / "qt" / "fonts"
+        if module_file
+        else None
+    )
+    looks_opencv_injected = bool(
+        font_dir
+        and expected_cv2_font_dir is not None
+        and Path(font_dir).resolve() == expected_cv2_font_dir
+    )
+    # Other custback modules can import cv2 before preview.py.  In that case
+    # our import-time snapshot already contains OpenCV's unconditional wheel
+    # default, so recognize its exact package-relative path as injected too.
+    font_was_user_supplied = (
+        inherited_environ.get("QT_QPA_FONTDIR") is not None
+        and not looks_opencv_injected
+    )
+    if font_dir and not font_was_user_supplied and not Path(font_dir).is_dir():
+        env.pop("QT_QPA_FONTDIR", None)
+        notes.append("removed OpenCV's missing Qt font directory; using fontconfig")
+
+    wayland = bool(env.get("WAYLAND_DISPLAY")) or (
+        env.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    )
+    if not wayland:
+        return env, "", tuple(notes)
+
+    plugins = _qt_platform_plugins(cv2_module, environ=env)
+    explicit_platform = inherited_environ.get("QT_QPA_PLATFORM") is not None
+    has_xwayland = bool(env.get("DISPLAY"))
+    if (
+        has_xwayland
+        and not explicit_platform
+        and "xcb" in plugins
+        and "wayland" not in plugins
+    ):
+        env["QT_QPA_PLATFORM"] = "xcb"
+        notes.append("selected OpenCV's xcb plugin for the Wayland/XWayland session")
+        return env, "", tuple(notes)
+
+    if not has_xwayland and "wayland" not in plugins:
+        return (
+            env,
+            "Wayland is available but OpenCV has no Qt Wayland platform plugin; "
+            "use the browser preview or run with XWayland (DISPLAY set)",
+            tuple(notes),
+        )
+    return env, "", tuple(notes)
+
+
+def normalize_highgui_environment(
+    *,
+    environ: Mapping[str, str] | None = None,
+    inherited_environ: Mapping[str, str] | None = None,
+    platform: str | None = None,
+    cv2_module=None,
+) -> tuple[dict[str, str], str]:
+    """Normalize OpenCV Qt variables without overriding user choices.
+
+    The returned mapping is suitable for the HighGUI child probe.  The caller
+    can supply ``inherited_environ`` to distinguish values present before
+    OpenCV import from defaults injected by OpenCV itself.
+    """
+
+    env = os.environ if environ is None else environ
+    inherited = env if inherited_environ is None else inherited_environ
+    normalized, reason, _notes = _normalize_highgui_environment(
+        env,
+        inherited_environ=inherited,
+        platform=sys.platform if platform is None else platform,
+        cv2_module=cv2_module,
+    )
+    return normalized, reason
+
+
+def _bounded_probe_stderr(value: object, limit: int = PROBE_STDERR_LIMIT) -> str:
+    if not value:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        if line and line not in seen:
+            seen.add(line)
+            unique.append(line)
+    summary = " | ".join(unique)
+    if len(summary) > limit:
+        summary = summary[: max(0, limit - 1)] + "…"
+    return summary
+
+
+def _probe_failure(reason: str, stderr: object = None) -> tuple[bool, str]:
+    detail = _bounded_probe_stderr(stderr)
+    return False, f"{reason}: {detail}" if detail else reason
+
+
+def _read_probe_stderr(stream) -> bytes:
+    try:
+        stream.flush()
+        stream.seek(0)
+        return stream.read(PROBE_STDERR_LIMIT)
+    except OSError:
+        return b""
+
+
+def _filter_qt_bootstrap_stderr(value: bytes) -> tuple[bytes, int]:
+    """Remove only known OpenCV/Qt bootstrap noise from captured stderr."""
+
+    kept: list[bytes] = []
+    suppressed = 0
+    for line in value.splitlines(keepends=True):
+        text = line.decode("utf-8", errors="replace").lstrip()
+        if text.startswith(_QT_BOOTSTRAP_NOISE_PREFIXES):
+            suppressed += 1
+        else:
+            kept.append(line)
+    return b"".join(kept), suppressed
+
+
+def _named_window_with_filtered_qt_stderr() -> None:
+    """Create the first native window while filtering known Qt wheel noise.
+
+    Qt writes these messages below Python's ``sys.stderr`` layer, so a normal
+    redirect cannot intercept them.  A temporary file avoids pipe-buffer
+    deadlocks, and unknown diagnostics are replayed to the original fd before
+    any captured exception is re-raised.
+    """
+
+    try:
+        saved_stderr = os.dup(2)
+    except OSError:
+        cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+        return
+
+    captured = b""
+    error: tuple[BaseException, object] | None = None
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as stderr_stream:
+            try:
+                os.dup2(stderr_stream.fileno(), 2)
+                try:
+                    cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+                except BaseException as exc:
+                    error = (exc, exc.__traceback__)
+            finally:
+                os.dup2(saved_stderr, 2)
+            try:
+                stderr_stream.flush()
+                stderr_stream.seek(0)
+                captured = stderr_stream.read()
+            except OSError:
+                captured = b""
+
+        remaining, suppressed = _filter_qt_bootstrap_stderr(captured)
+        if remaining:
+            try:
+                os.write(saved_stderr, remaining)
+            except OSError:
+                pass
+        if suppressed:
+            log.debug(
+                "suppressed %d known OpenCV/Qt bootstrap diagnostic lines",
+                suppressed,
+            )
+    finally:
+        os.close(saved_stderr)
+
+    if error is not None:
+        exc, traceback = error
+        raise exc.with_traceback(traceback)
+
+
 def preview_available(
     *,
     environ: dict[str, str] | None = None,
@@ -97,27 +349,62 @@ def preview_available(
 
     if cv2 is None:
         return False, "opencv-python is not installed"
-    env = dict(os.environ if environ is None else environ)
+    source_env = os.environ if environ is None else environ
     current_platform = sys.platform if platform is None else platform
+    inherited = _QT_ENV_BEFORE_CV2 if environ is None else source_env
+    env, normalization_error, notes = _normalize_highgui_environment(
+        source_env,
+        inherited_environ=inherited,
+        platform=current_platform,
+        cv2_module=cv2,
+    )
+    if normalization_error:
+        return False, normalization_error
+    for note in notes:
+        log.debug("HighGUI environment: %s", note)
+    if environ is None:
+        # Apply the same carefully scoped changes to the parent process; the
+        # successful probe and the real preview must use identical Qt settings.
+        for key in ("QT_QPA_FONTDIR", "QT_QPA_PLATFORM"):
+            if key in env:
+                os.environ[key] = env[key]
+            else:
+                os.environ.pop(key, None)
     if current_platform.startswith("linux") and not (
         env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")
     ):
         return False, "no DISPLAY or WAYLAND_DISPLAY is available"
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", _HIGHGUI_PROBE],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with tempfile.TemporaryFile(mode="w+b") as stderr_stream:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", _HIGHGUI_PROBE],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_stream,
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return _probe_failure(
+                    f"HighGUI probe timed out after {timeout:g} seconds",
+                    _read_probe_stderr(stderr_stream),
+                )
+            captured_stderr = getattr(result, "stderr", None)
+            if captured_stderr is None:
+                captured_stderr = _read_probe_stderr(stderr_stream)
+    except OSError as exc:
         return False, f"HighGUI probe failed: {exc}"
     if result.returncode != 0:
         if result.returncode < 0:
-            return False, f"HighGUI probe terminated by signal {-result.returncode}"
-        return False, f"HighGUI probe exited with status {result.returncode}"
+            return _probe_failure(
+                f"HighGUI probe terminated by signal {-result.returncode}",
+                captured_stderr,
+            )
+        return _probe_failure(
+            f"HighGUI probe exited with status {result.returncode}",
+            captured_stderr,
+        )
     return True, ""
 
 
@@ -163,7 +450,11 @@ class _PreviewController:
             self.coordinator, "apply_config_patch"
         ):
             raise RuntimeError("preview controls require the pipeline coordinator")
-        self.coordinator.apply_config_patch(patch, timeout=5.0)
+        self.coordinator.apply_config_patch(
+            patch,
+            timeout=5.0,
+            origin="preview",
+        )
 
     def _set_mode(self, mode: str) -> None:
         cfg = self.runtime.snapshot().background
@@ -215,29 +506,132 @@ class _PreviewController:
             self.flash("n/p applies in image, video or color mode (press 2/3/4)")
 
 
-def _draw_bar(frame, y0: int, y1: int, lines: list[str], alpha: float = 0.55) -> None:
+def _as_float(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _fps_text(actual: object, target: object) -> str:
+    actual_fps = _as_float(actual)
+    target_fps = _as_float(target)
+    shown_actual = "--" if actual_fps is None else f"{actual_fps:.1f}"
+    if target_fps in (None, 0):
+        return shown_actual
+    return f"{shown_actual}/{target_fps:.0f}"
+
+
+def _status_overlay_lines(
+    stats: Mapping[str, object],
+) -> tuple[list[str], list[str]]:
+    """Build compact status and warning lines without assuming warm metrics."""
+
+    mode = str(stats.get("mode") or "starting")
+    output_target = stats.get("output_target_fps")
+    capture_target = stats.get("capture_target_fps", output_target)
+    status = [
+        f"{mode}  IN {_fps_text(stats.get('capture_fps'), capture_target)} fps  "
+        f"OUT {_fps_text(stats.get('fps'), output_target)} fps"
+    ]
+
+    backend = str(stats.get("segmentation_backend") or "unknown")
+    backend = backend.removesuffix("Segmenter").lower()
+    device = str(stats.get("segmentation_device") or "unknown").lower()
+    output_backend = str(stats.get("output_backend") or "unknown")
+    version = stats.get("config_version", 0)
+    status.append(
+        f"SEG {backend}/{device}  OUTPUT {output_backend}  CONFIG v{version}"
+    )
+
+    capture_parts: list[str] = []
+    width, height = stats.get("capture_width"), stats.get("capture_height")
+    if width and height:
+        capture_parts.append(f"{width}x{height}")
+    fourcc = str(stats.get("capture_fourcc") or "").strip()
+    if fourcc:
+        capture_parts.append(fourcc)
+    reported = _as_float(stats.get("capture_fps_reported"))
+    if reported:
+        capture_parts.append(f"reported {reported:.1f} fps")
+    if capture_parts:
+        capture_backend = str(stats.get("capture_backend") or "camera")
+        status.append(f"CAPTURE {capture_backend}: " + "  ".join(capture_parts))
+
+    timing_mode = str(stats.get("background_video_timing_mode") or "")
+    source_fps = _as_float(stats.get("background_video_source_fps"))
+    video_frames = int(stats.get("background_video_frames_displayed") or 0)
+    if timing_mode or source_fps or video_frames:
+        skip_ratio = _as_float(stats.get("background_video_skip_ratio")) or 0.0
+        status.append(
+            "VIDEO "
+            + (f"{source_fps:.1f} fps  " if source_fps else "")
+            + (f"{timing_mode}  " if timing_mode else "")
+            + f"skip {skip_ratio * 100:.0f}%"
+        )
+
+    warnings: list[str] = []
+    if stats.get("capture_stalled"):
+        age = _as_float(stats.get("capture_frame_age_ms"))
+        warnings.append(
+            "CAPTURE STALLED" + (f" ({age:.0f} ms since last frame)" if age else "")
+        )
+    elif stats.get("capture_target_met") is False:
+        warnings.append("CAPTURE BELOW TARGET")
+
+    fallback_fields = (
+        ("output_fallback_active", "output_fallback_reason", "OUTPUT FALLBACK"),
+        (
+            "segmentation_fallback_active",
+            "segmentation_fallback_reason",
+            "SEGMENTATION FALLBACK",
+        ),
+        ("remote_fallback_active", "remote_fallback_reason", "REMOTE FALLBACK"),
+    )
+    for active_key, reason_key, label in fallback_fields:
+        if stats.get(active_key):
+            reason = str(stats.get(reason_key) or "unspecified")
+            warnings.append(f"{label}: {reason[:120]}")
+    return status, warnings
+
+
+def _draw_bar(
+    frame,
+    y0: int,
+    y1: int,
+    lines: list[str],
+    alpha: float = 0.55,
+    colors: list[tuple[int, int, int]] | None = None,
+) -> None:
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, y0), (frame.shape[1], y1), (0, 0, 0), -1)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
     for i, line in enumerate(lines):
+        color = colors[i] if colors and i < len(colors) else (255, 255, 255)
         cv2.putText(frame, line, (10, y0 + 20 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    0.5, color, 1, cv2.LINE_AA)
 
 
 def _draw_overlay(frame, stats: dict, controller: _PreviewController):
     labeled = frame.copy()
-    h, w = labeled.shape[:2]
+    h, _w = labeled.shape[:2]
 
-    label = f"{stats['mode']}  {stats['fps']:.0f} fps"
-    backend = stats.get("segmentation_backend", "").removesuffix("Segmenter").lower()
-    if backend:
-        device = stats.get("segmentation_device", "")
-        label += f"  {backend}" + (f"/{device}" if device and device != "cpu" else "")
-    cv2.putText(labeled, label, (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+    status_lines, warning_lines = _status_overlay_lines(stats)
+    top_lines = status_lines + warning_lines
+    top_h = 22 * len(top_lines) + 12
+    colors = [(0, 255, 0)] + [(255, 255, 255)] * (len(status_lines) - 1)
+    colors.extend([_AMBER] * len(warning_lines))
+    _draw_bar(labeled, 0, top_h, top_lines, alpha=0.6, colors=colors)
 
     if controller.show_help:
-        _draw_bar(labeled, 40, 40 + 22 * len(HELP_LINES) + 14, HELP_LINES)
+        help_y = top_h + 8
+        _draw_bar(
+            labeled,
+            help_y,
+            help_y + 22 * len(HELP_LINES) + 14,
+            HELP_LINES,
+        )
 
     message = controller.current_message()
     bottom_lines = [message] if message else []
@@ -268,7 +662,7 @@ def run_preview(
         return False
 
     try:
-        cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+        _named_window_with_filtered_qt_stderr()
     except cv2.error as exc:
         log.warning("no GUI available, preview disabled (%s)", exc)
         return False

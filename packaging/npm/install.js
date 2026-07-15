@@ -23,6 +23,9 @@ const configuredTimeout = Number(process.env.CUSTBACK_INSTALL_TIMEOUT_MS);
 const INSTALL_TIMEOUT_MS = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0
   ? configuredTimeout
   : 15 * 60 * 1000;
+const configuredCudaProbeTimeout = Number(process.env.CUSTBACK_CUDA_PROBE_TIMEOUT_MS);
+const CUDA_PROBE_TIMEOUT_MS = Number.isSafeInteger(configuredCudaProbeTimeout) &&
+  configuredCudaProbeTimeout > 0 ? configuredCudaProbeTimeout : 60 * 1000;
 
 function spawn(command, args, options = {}) {
   return spawnSync(command, args, { timeout: INSTALL_TIMEOUT_MS, ...options });
@@ -150,7 +153,7 @@ function validExtraSelection(requested, selected) {
 }
 
 function validInstallStamp(stamp) {
-  const valid = Boolean(stamp) && stamp.schema === 2 &&
+  const valid = Boolean(stamp) && stamp.schema === 3 &&
     typeof stamp.packageVersion === 'string' && stamp.packageVersion.length > 0 &&
     typeof stamp.sourceDigest === 'string' && /^sha256:[0-9a-f]{64}$/.test(stamp.sourceDigest) &&
     stamp.python && typeof stamp.python.executable === 'string' &&
@@ -161,12 +164,14 @@ function validInstallStamp(stamp) {
     stamp.capabilities && typeof stamp.capabilities.mediapipe === 'boolean' &&
     typeof stamp.capabilities.rvm === 'boolean' &&
     typeof stamp.capabilities.cuda_provider === 'boolean' &&
+    typeof stamp.capabilities.cuda_inference === 'boolean' &&
     typeof stamp.createdAt === 'string' && Number.isFinite(Date.parse(stamp.createdAt));
   return valid &&
     (!stamp.selectedExtras.includes('mediapipe') || stamp.capabilities.mediapipe) &&
     (!(stamp.selectedExtras.includes('rvm') || stamp.selectedExtras.includes('gpu')) ||
       stamp.capabilities.rvm) &&
-    (!stamp.selectedExtras.includes('gpu') || stamp.capabilities.cuda_provider);
+    (!stamp.selectedExtras.includes('gpu') ||
+      (stamp.capabilities.cuda_provider && stamp.capabilities.cuda_inference));
 }
 
 function stampMatches(stamp, expected) {
@@ -186,30 +191,66 @@ function appBinary(directory) {
   return path.join(directory, 'bin', 'custback');
 }
 
-function capabilities(python) {
-  const code = `
-import json
-result = {"mediapipe": False, "rvm": False, "cuda_provider": False}
-try:
-    import mediapipe
-    result["mediapipe"] = True
-except Exception:
-    pass
-try:
-    import onnxruntime as ort
-    result["rvm"] = True
-    result["cuda_provider"] = "CUDAExecutionProvider" in ort.get_available_providers()
-except Exception:
-    pass
-print(json.dumps(result))
-`;
-  const result = spawn(python, ['-c', code], { encoding: 'utf8' });
-  if (result.status !== 0) return { mediapipe: false, rvm: false, cuda_provider: false };
+function emptyCudaProbe(error = '') {
+  return {
+    schema: 1,
+    onnxruntime: false,
+    cuda_provider: false,
+    cuda_inference: false,
+    active_providers: [],
+    output_verified: false,
+    profile_verified: false,
+    error,
+  };
+}
+
+function parseCudaProbeOutput(stdout) {
   try {
-    return JSON.parse(result.stdout.trim());
+    const parsed = JSON.parse((stdout || '').trim());
+    const valid = parsed && parsed.schema === 1 &&
+      typeof parsed.onnxruntime === 'boolean' &&
+      typeof parsed.cuda_provider === 'boolean' &&
+      typeof parsed.cuda_inference === 'boolean' &&
+      Array.isArray(parsed.active_providers) &&
+      parsed.active_providers.every((provider) => typeof provider === 'string') &&
+      typeof parsed.output_verified === 'boolean' &&
+      typeof parsed.profile_verified === 'boolean' &&
+      typeof parsed.error === 'string' &&
+      (!parsed.cuda_inference || (
+        parsed.onnxruntime && parsed.cuda_provider && parsed.output_verified &&
+        parsed.profile_verified && parsed.active_providers.includes('CUDAExecutionProvider')
+      ));
+    return valid ? parsed : emptyCudaProbe('malformed CUDA probe result');
   } catch {
-    return { mediapipe: false, rvm: false, cuda_provider: false };
+    return emptyCudaProbe('malformed CUDA probe JSON');
   }
+}
+
+function cudaProbe(python) {
+  const result = spawn(python, ['-m', 'custback.gpu_probe', '--json'], {
+    encoding: 'utf8',
+    timeout: CUDA_PROBE_TIMEOUT_MS,
+  });
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.error?.message || 'probe process failed')
+      .trim().split('\n').pop();
+    return emptyCudaProbe(detail);
+  }
+  return parseCudaProbeOutput(result.stdout);
+}
+
+function capabilities(python) {
+  const mediaPipe = spawn(python, ['-c', 'import mediapipe'], {
+    encoding: 'utf8',
+    timeout: CUDA_PROBE_TIMEOUT_MS,
+  });
+  const cuda = cudaProbe(python);
+  return {
+    mediapipe: mediaPipe.status === 0,
+    rvm: cuda.onnxruntime,
+    cuda_provider: cuda.cuda_provider,
+    cuda_inference: cuda.cuda_inference,
+  };
 }
 
 function validateEnvironment(directory, packageVersion, selectedExtras, quiet = false) {
@@ -239,8 +280,8 @@ function validateEnvironment(directory, packageVersion, selectedExtras, quiet = 
   if ((selectedExtras.includes('rvm') || selectedExtras.includes('gpu')) && !observed.rvm) {
     throw new Error('selected ONNX Runtime extra cannot be imported');
   }
-  if (selectedExtras.includes('gpu') && !observed.cuda_provider) {
-    throw new Error('selected gpu extra does not expose CUDAExecutionProvider');
+  if (selectedExtras.includes('gpu') && !observed.cuda_inference) {
+    throw new Error('selected gpu extra cannot complete verified CUDA inference');
   }
   return observed;
 }
@@ -312,7 +353,7 @@ function buildGeneration({ generationRoot, python, attempts, packageVersion, tar
         throw err;
       }
       const stamp = {
-        schema: 2,
+        schema: 3,
         packageVersion,
         sourceDigest: stampBase.sourceDigest,
         python: stampBase.python,
@@ -448,9 +489,12 @@ function main() {
 module.exports = {
   buildGeneration,
   capabilities,
+  cudaProbe,
+  CUDA_PROBE_TIMEOUT_MS,
   findPython,
   installAttempts,
   main,
+  parseCudaProbeOutput,
   parseExtras,
   PIP_SPEC,
   pythonIdentity,

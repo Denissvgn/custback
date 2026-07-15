@@ -10,6 +10,7 @@ import pytest
 cv2 = pytest.importorskip("cv2")
 
 import custback.pipeline as pipeline_mod
+from custback.capture import CaptureHealth
 from custback.config import AppConfig, RuntimeConfig
 from custback.hub import FrameHub
 from custback.pipeline import (
@@ -19,6 +20,7 @@ from custback.pipeline import (
     RestartRequiredError,
 )
 from custback.pipeline import ConfigConflictError, _restart_only_changes
+from custback.vcam import NullOutput
 
 
 def make_runtime(mode="color", **bg_overrides) -> RuntimeConfig:
@@ -109,6 +111,25 @@ def test_hot_mode_switch():
         else:
             raise AssertionError("mode switch did not take effect")
         assert hub.stats_dict()["mode"] == "color"
+    finally:
+        pipeline.stop()
+
+
+def test_config_change_audit_has_origin_version_fields_and_safe_summary(caplog):
+    runtime = make_runtime(mode="passthrough")
+    pipeline, hub = run_pipeline(runtime)
+    try:
+        wait_for_frame(hub)
+        with caplog.at_level("INFO", logger="custback.pipeline"):
+            pipeline.apply_config_patch(
+                {"background": {"mode": "color", "color": [0, 0, 255]}},
+                origin="api",
+            )
+        assert "origin=api" in caplog.text
+        assert "version=1" in caplog.text
+        assert "fields=background.color,background.mode" in caplog.text
+        assert "background.mode=color" in caplog.text
+        assert "background.color=[0,0,255]" in caplog.text
     finally:
         pipeline.stop()
 
@@ -778,3 +799,170 @@ def test_stats_populated():
         assert stats["output_backend"] == "NullOutput"
     finally:
         pipeline.stop()
+
+
+def test_slow_capture_repeats_last_safe_output_without_backlog(monkeypatch):
+    frame = np.full((72, 128, 3), 90, np.uint8)
+
+    class SlowLatestCapture:
+        calls = 0
+        frames_read = 0
+
+        def read(self):
+            self.calls += 1
+            if self.calls == 1 or self.calls % 3 == 1:
+                self.frames_read += 1
+                return frame.copy()
+            return None
+
+        def health_snapshot(self):
+            return CaptureHealth(
+                backend="slow-fake",
+                width=128,
+                height=72,
+                fps_reported=60.0,
+                frames_read=self.frames_read,
+            )
+
+        def close(self):
+            pass
+
+    capture = SlowLatestCapture()
+    monkeypatch.setattr(pipeline_mod, "open_capture", lambda _cfg: capture)
+    runtime = make_runtime(mode="color")
+    pipeline, hub = run_pipeline(runtime)
+    try:
+        deadline = time.monotonic() + 2.0
+        while hub.stats_dict()["frames_out"] < 12 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stats = hub.stats_dict()
+        assert stats["frames_out"] >= 12
+        assert stats["output_repeated_frames"] > 0
+        assert stats["frames_out"] == (
+            stats["frames_in"] + stats["output_repeated_frames"]
+        )
+        assert stats["capture_frames_read"] == stats["frames_in"]
+        assert stats["fps_attainment_pct"] is not None
+    finally:
+        pipeline.stop()
+
+
+def test_slow_processing_counts_deadline_misses_without_send_pacing(monkeypatch):
+    class SlowSegmenter:
+        device = "cpu"
+        last_foreground = None
+        produces_matte = False
+
+        def segment(self, frame):
+            time.sleep(0.025)
+            return np.ones(frame.shape[:2], np.float32)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_segmenter",
+        lambda _cfg: SlowSegmenter(),
+    )
+    runtime = make_runtime(mode="color")
+    pipeline, hub = run_pipeline(runtime)
+    try:
+        deadline = time.monotonic() + 2.0
+        while hub.stats_dict()["frames_out"] < 6 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stats = hub.stats_dict()
+        assert stats["processing_deadline_misses"] > 0
+        assert stats["frame_processing_ms"] >= 16.0
+        # NullOutput send/pacing is outside the processing deadline sample.
+        assert stats["output_send_ms"] < stats["frame_processing_ms"]
+    finally:
+        pipeline.stop()
+
+
+def test_video_counters_reset_when_leaving_the_provider(monkeypatch):
+    class VideoStatsBackdrop:
+        def frame(self, width, height):
+            return np.zeros((height, width, 3), np.uint8)
+
+        def stats_dict(self):
+            return {
+                "background_video_source_fps": 24.0,
+                "background_video_timing_mode": "nominal",
+                "background_video_frames_displayed": 20,
+                "background_video_frames_skipped": 5,
+                "background_video_frames_reused": 2,
+                "background_video_skip_ratio": 0.2,
+                "background_video_seek_count": 1,
+                "background_video_decode_failures": 0,
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_backdrop",
+        lambda cfg, **_kwargs: VideoStatsBackdrop()
+        if cfg.mode == "video"
+        else None,
+    )
+    runtime = make_runtime(mode="video", video_path="fake.mp4")
+    pipeline, hub = run_pipeline(runtime)
+    try:
+        wait_for_frame(hub)
+        assert hub.stats_dict()["background_video_frames_skipped"] == 5
+        pipeline.apply_config_patch(
+            {"background": {"mode": "color", "color": [0, 0, 0]}}
+        )
+        deadline = time.monotonic() + 1.0
+        while (
+            hub.stats_dict()["background_video_frames_skipped"] != 0
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        stats = hub.stats_dict()
+        assert stats["background_video_source_fps"] is None
+        assert stats["background_video_timing_mode"] is None
+        assert stats["background_video_frames_displayed"] == 0
+        assert stats["background_video_frames_skipped"] == 0
+        assert stats["background_video_frames_reused"] == 0
+    finally:
+        pipeline.stop()
+
+
+def test_fallback_logs_only_transitions_and_recovery(monkeypatch, caplog):
+    runtime = make_runtime(mode="color")
+    cfg = runtime.snapshot()
+    cfg.segmentation.backend = "auto"
+    runtime = RuntimeConfig(cfg)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_output",
+        lambda *_args, **_kwargs: NullOutput(
+            fallback_active=True,
+            fallback_reason="virtual-camera-unavailable",
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_segmenter",
+        lambda cfg: pipeline_mod.HeuristicSegmenter(cfg),
+    )
+    with caplog.at_level("INFO", logger="custback.pipeline"):
+        pipeline, hub = run_pipeline(runtime)
+        try:
+            wait_for_frame(hub)
+            pipeline.apply_config_patch(
+                {"background": {"color": [10, 20, 30]}},
+                origin="api",
+            )
+            pipeline.apply_config_patch(
+                {"segmentation": {"backend": "heuristic"}},
+                origin="api",
+            )
+        finally:
+            pipeline.stop()
+    assert caplog.text.count("output fallback active") == 1
+    assert caplog.text.count("segmentation fallback active") == 1
+    assert caplog.text.count("segmentation fallback recovered") == 1

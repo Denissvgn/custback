@@ -273,11 +273,36 @@ class TestBackdrops:
             third = bd.frame(64, 48).copy()
             now[0] = 1.5
             looped = bd.frame(64, 48).copy()
+            stats = bd.stats_dict()
         finally:
             bd.close()
         assert second.mean() > first.mean() + 50
         assert third.mean() > second.mean() + 50
         assert np.allclose(looped, first, atol=3)
+        assert stats["background_video_frames_displayed"] == 4
+        assert stats["background_video_frames_reused"] == 1
+        assert stats["background_video_frames_skipped"] == 0
+
+    def test_video_backdrop_stats_can_reset_after_unsent_activation_trial(
+        self, monkeypatch
+    ):
+        pytest.importorskip("cv2")
+        capture = FakeVideoCapture([10, 20], fps=24.0)
+        monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", lambda _path: capture)
+        backdrop = VideoBackdrop("trial.avi", clock=lambda: 0.0)
+        try:
+            backdrop.frame(6, 4)  # candidate activation trial, never sent
+            assert backdrop.stats_dict()["background_video_frames_displayed"] == 1
+            backdrop.reset_stats()
+            reset = backdrop.stats_dict()
+            assert reset["background_video_frames_displayed"] == 0
+            assert reset["background_video_frames_reused"] == 0
+            backdrop.frame(6, 4)  # first frame of the installed provider
+            installed = backdrop.stats_dict()
+            assert installed["background_video_frames_displayed"] == 1
+            assert installed["background_video_frames_reused"] == 0
+        finally:
+            backdrop.close()
 
     @pytest.mark.parametrize("reported_fps", [0.0, 0.25, 241.0, float("nan")])
     def test_video_backdrop_bounds_bad_fps_metadata(
@@ -426,6 +451,11 @@ class TestBackdrops:
             now[0] = 1.5
             assert int(backdrop.frame(6, 4).mean()) == 15
             assert (cv2.CAP_PROP_POS_FRAMES, 15) in capture.set_calls
+            stats = backdrop.stats_dict()
+            assert stats["background_video_frames_displayed"] == 3
+            assert stats["background_video_frames_skipped"] == 13
+            assert stats["background_video_seek_count"] == 1
+            assert stats["background_video_skip_ratio"] == pytest.approx(13 / 16)
         finally:
             backdrop.close()
 

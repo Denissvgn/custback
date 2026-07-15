@@ -263,8 +263,27 @@ def test_unauthenticated_root_exposes_only_login_shell(stack):
 def test_status_and_config_with_bearer(stack):
     status = stack.get("/status", headers=AUTH)
     assert status.status_code == 200
-    assert status.json()["frames_out"] >= 1
-    assert status.json()["mode"] == "color"
+    body = status.json()
+    assert body["frames_out"] >= 1
+    assert body["mode"] == "color"
+    assert {
+        "run_id",
+        "capture_backend",
+        "capture_target_fps",
+        "capture_fps",
+        "capture_frames_read",
+        "capture_dropped_frames",
+        "capture_frame_age_ms",
+        "output_target_fps",
+        "output_repeated_frames",
+        "processing_deadline_misses",
+        "frame_processing_ms",
+        "output_fallback_active",
+        "segmentation_fallback_active",
+        "background_video_frames_skipped",
+    } <= body.keys()
+    assert body["capture_backend"] == "synthetic"
+    assert body["output_fallback_active"] is False
     config = stack.get("/config", headers=AUTH)
     assert config.json()["background"]["mode"] == "color"
     assert "token" not in config.json()["api"]

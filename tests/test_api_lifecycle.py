@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import signal
 
 import pytest
 
@@ -11,9 +12,10 @@ class FakePipeline:
     instances = []
     start_error = None
 
-    def __init__(self, runtime, hub):
+    def __init__(self, runtime, hub, **_kwargs):
         self.running = False
         self.stopped = False
+        self.options = _kwargs
         type(self).instances.append(self)
 
     def start(self):
@@ -46,7 +48,7 @@ def _patch_common(monkeypatch):
     monkeypatch.setattr(main_mod.signal, "signal", lambda *_args: None)
 
 
-def test_api_startup_failure_returns_3_without_starting_capture(monkeypatch):
+def test_api_startup_failure_returns_3_and_stops_preflighted_pipeline(monkeypatch):
     _patch_common(monkeypatch)
 
     class FailedRunner:
@@ -60,9 +62,10 @@ def test_api_startup_failure_returns_3_without_starting_capture(monkeypatch):
     assert main_mod.run(_cfg()) == main_mod.EXIT_API
     assert len(FakePipeline.instances) == 1
     assert not FakePipeline.instances[0].running
+    assert FakePipeline.instances[0].stopped
 
 
-def test_pipeline_start_exception_stops_already_started_api(monkeypatch):
+def test_pipeline_start_exception_does_not_bind_api(monkeypatch):
     _patch_common(monkeypatch)
     stopped = []
 
@@ -80,7 +83,28 @@ def test_pipeline_start_exception_stops_already_started_api(monkeypatch):
     FakePipeline.start_error = RuntimeError("capture failed")
     monkeypatch.setattr(main_mod, "_ApiRunner", Runner)
     assert main_mod.run(_cfg()) == main_mod.EXIT_RUNTIME
-    assert stopped == [True]
+    assert stopped == []
+
+
+def test_signal_during_pipeline_start_unwinds_as_clean_exit(monkeypatch, caplog):
+    _patch_common(monkeypatch)
+    handlers = {}
+
+    def install(sig, handler):
+        previous = handlers.get(sig, signal.SIG_DFL)
+        handlers[sig] = handler
+        return previous
+
+    monkeypatch.setattr(main_mod.signal, "signal", install)
+
+    def interrupted_start(self):
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    monkeypatch.setattr(FakePipeline, "start", interrupted_start)
+    with caplog.at_level("INFO"):
+        assert main_mod.run(_cfg()) == 0
+    assert FakePipeline.instances[0].stopped
+    assert "shutdown reason=sigterm exit=0" in caplog.text
 
 
 def test_unexpected_api_exit_is_latched_as_exit_3(monkeypatch):
@@ -100,6 +124,81 @@ def test_unexpected_api_exit_is_latched_as_exit_3(monkeypatch):
     monkeypatch.setattr(main_mod, "_ApiRunner", Runner)
     assert main_mod.run(_cfg()) == main_mod.EXIT_API
     assert FakePipeline.instances[0].stopped
+
+
+def test_unexpected_api_exit_during_preview_is_classified_and_logged(
+    monkeypatch, caplog
+):
+    _patch_common(monkeypatch)
+    import custback.preview as preview_mod
+
+    cfg = _cfg()
+    cfg.output.preview = True
+    monkeypatch.setattr(preview_mod, "preview_available", lambda: (True, ""))
+    monkeypatch.setattr(
+        preview_mod,
+        "run_preview",
+        lambda *_args, **_kwargs: False,
+    )
+
+    class Runner:
+        def __init__(self, *_args):
+            self.error = RuntimeError("preview API died")
+            self.failed = True
+
+        def start(self):
+            pass
+
+        def stop(self):
+            return True
+
+    monkeypatch.setattr(main_mod, "_ApiRunner", Runner)
+    assert main_mod.run(cfg) == main_mod.EXIT_API
+    assert "preview API died" in caplog.text
+    assert FakePipeline.instances[0].stopped
+
+
+def test_ready_and_shutdown_records_are_ordered_and_complete(monkeypatch, caplog):
+    _patch_common(monkeypatch)
+    import custback.preview as preview_mod
+
+    cfg = _cfg()
+    cfg.output.preview = True
+    monkeypatch.setattr(preview_mod, "preview_available", lambda: (True, ""))
+    monkeypatch.setattr(preview_mod, "run_preview", lambda *_args, **_kwargs: True)
+
+    class Runner:
+        error = None
+        failed = False
+
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            return True
+
+    monkeypatch.setattr(main_mod, "_ApiRunner", Runner)
+    with caplog.at_level("INFO"):
+        assert main_mod.run(cfg, run_id="lifecycle") == 0
+
+    ready = caplog.text.index("ready api=")
+    shutdown = caplog.text.index("shutdown reason=preview-quit")
+    assert ready < shutdown
+    assert "camera_requested=auto/64x36@30" in caplog.text
+    assert "camera_negotiated=" in caplog.text
+    for field in (
+        "capture_read_ms=",
+        "segmentation_ms=",
+        "background_ms=",
+        "composite_ms=",
+        "output_send_ms=",
+        "frame_processing_ms=",
+    ):
+        assert field in caplog.text
+    assert "model_preparation" in FakePipeline.instances[0].options
 
 
 def test_api_runner_failure_latch_survives_shutdown():

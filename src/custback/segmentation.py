@@ -20,10 +20,19 @@ Backends:
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import importlib
 import logging
+import os
+import tempfile
+import time
 import urllib.request
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO, Iterator
 
 import numpy as np
 
@@ -36,26 +45,348 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-MEDIAPIPE_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
-    "selfie_segmenter/float16/latest/selfie_segmenter.tflite"
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """Immutable identity for a model managed by custback."""
+
+    backend: str
+    url: str
+    filename: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SegmenterPreparation:
+    """ML backends whose dependencies and model bytes passed startup checks."""
+
+    ready_backends: frozenset[str] = frozenset()
+
+
+MEDIAPIPE_MODEL = ModelSpec(
+    backend="mediapipe",
+    url=(
+        "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+        "selfie_segmenter/float16/1/selfie_segmenter.tflite"
+    ),
+    filename="selfie_segmenter.tflite",
+    size=249_537,
+    sha256="191ac9529ae506ee0beefa6b2c945a172dab9d07d1e802a290a4e4038226658b",
 )
-RVM_MODEL_URL = (
-    "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/"
-    "rvm_mobilenetv3_fp32.onnx"
+RVM_MODEL = ModelSpec(
+    backend="rvm",
+    url=(
+        "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/"
+        "rvm_mobilenetv3_fp32.onnx"
+    ),
+    filename="rvm_mobilenetv3_fp32.onnx",
+    size=14_975_696,
+    sha256="88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
 )
+BUILTIN_MODELS = {spec.backend: spec for spec in (RVM_MODEL, MEDIAPIPE_MODEL)}
+# Retain the URL names for downstream code that imported the old constants.
+MEDIAPIPE_MODEL_URL = MEDIAPIPE_MODEL.url
+RVM_MODEL_URL = RVM_MODEL.url
 DEFAULT_MODEL_DIR = Path.home() / ".cache" / "custback" / "models"
+MODEL_CONNECT_TIMEOUT_S = 15.0
+MODEL_DOWNLOAD_TIMEOUT_S = 120.0
+MODEL_LOCK_TIMEOUT_S = 30.0
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
 
-def _download_model(url: str, filename: str) -> Path:
-    DEFAULT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = DEFAULT_MODEL_DIR / filename
-    if not model_path.exists():
-        log.info("downloading %s to %s", filename, model_path)
-        tmp = model_path.with_suffix(model_path.suffix + ".part")
-        urllib.request.urlretrieve(url, tmp)
-        tmp.replace(model_path)
-    return model_path
+class ModelAcquisitionError(RuntimeError):
+    """A managed model could not be acquired and integrity-checked."""
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(_DOWNLOAD_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _valid_cached_model(path: Path, spec: ModelSpec) -> bool:
+    try:
+        return (
+            path.is_file()
+            and path.stat().st_size == spec.size
+            and _sha256_file(path) == spec.sha256
+        )
+    except OSError:
+        return False
+
+
+@contextmanager
+def _model_lock(path: Path, timeout_s: float = MODEL_LOCK_TIMEOUT_S) -> Iterator[None]:
+    """Serialize model writers without leaving an owned sentinel behind."""
+
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(descriptor, 0o600)
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise ModelAcquisitionError(
+                        f"timed out waiting for model lock {path}"
+                    ) from exc
+                time.sleep(0.1)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _sync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:  # pragma: no cover - uncommon filesystem limitation
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:  # pragma: no cover - not supported by every filesystem
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _stream_model(
+    spec: ModelSpec,
+    output: BinaryIO,
+    *,
+    opener=urllib.request.urlopen,
+) -> tuple[int, str]:
+    request = urllib.request.Request(
+        spec.url,
+        headers={"User-Agent": "custback-model-fetch/1"},
+    )
+    started = time.monotonic()
+    deadline = started + MODEL_DOWNLOAD_TIMEOUT_S
+    digest = hashlib.sha256()
+    size = 0
+    connect_timeout = min(
+        MODEL_CONNECT_TIMEOUT_S,
+        max(0.001, deadline - time.monotonic()),
+    )
+    with opener(request, timeout=connect_timeout) as response:
+        header = response.headers.get("Content-Length") if response.headers else None
+        if header is not None:
+            try:
+                advertised = int(header)
+            except ValueError as exc:
+                raise ModelAcquisitionError(
+                    f"invalid Content-Length for {spec.filename}: {header!r}"
+                ) from exc
+            if advertised != spec.size:
+                raise ModelAcquisitionError(
+                    f"unexpected size for {spec.filename}: server advertised "
+                    f"{advertised}, expected {spec.size}"
+                )
+        next_progress = max(_DOWNLOAD_CHUNK_SIZE, spec.size // 4)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ModelAcquisitionError(
+                    f"download timed out after {MODEL_DOWNLOAD_TIMEOUT_S:.0f}s: {spec.filename}"
+                )
+            _set_response_timeout(
+                response,
+                min(MODEL_CONNECT_TIMEOUT_S, max(0.001, remaining)),
+            )
+            read = getattr(response, "read1", None)
+            if not callable(read):
+                read = response.read
+            chunk = read(min(_DOWNLOAD_CHUNK_SIZE, spec.size - size + 1))
+            if time.monotonic() >= deadline:
+                raise ModelAcquisitionError(
+                    f"download timed out after {MODEL_DOWNLOAD_TIMEOUT_S:.0f}s: "
+                    f"{spec.filename}"
+                )
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > spec.size:
+                raise ModelAcquisitionError(
+                    f"download exceeded expected size for {spec.filename}"
+                )
+            output.write(chunk)
+            digest.update(chunk)
+            if size >= next_progress and size < spec.size:
+                log.info("downloading %s: %d/%d bytes", spec.filename, size, spec.size)
+                next_progress += max(_DOWNLOAD_CHUNK_SIZE, spec.size // 4)
+    return size, digest.hexdigest()
+
+
+def _set_response_timeout(response: object, timeout_s: float) -> None:
+    """Best-effort per-read socket deadline for urllib HTTP responses."""
+
+    pending = [response]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        setter = getattr(candidate, "settimeout", None)
+        if callable(setter):
+            try:
+                setter(timeout_s)
+                return
+            except OSError:
+                return
+        for attribute in ("fp", "raw", "_sock", "sock", "socket"):
+            child = getattr(candidate, attribute, None)
+            if child is not None:
+                pending.append(child)
+
+
+def acquire_model(
+    spec: ModelSpec,
+    model_dir: Path | None = None,
+    *,
+    opener=urllib.request.urlopen,
+    allow_download: bool = True,
+) -> Path:
+    """Return a verified built-in model, downloading it atomically if needed."""
+
+    if Path(spec.filename).name != spec.filename or spec.filename in {"", ".", ".."}:
+        raise ValueError(f"unsafe model filename: {spec.filename!r}")
+    if not spec.url.startswith("https://"):
+        raise ValueError("managed model URLs must use HTTPS")
+    if spec.size <= 0 or len(spec.sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in spec.sha256
+    ):
+        raise ValueError(f"invalid integrity metadata for {spec.filename}")
+    directory = Path(model_dir) if model_dir is not None else DEFAULT_MODEL_DIR
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+    except OSError:  # pragma: no cover - best effort on unusual filesystems
+        pass
+    model_path = directory / spec.filename
+    if _valid_cached_model(model_path, spec):
+        log.debug("verified cached model %s (sha256 %s)", model_path, spec.sha256[:12])
+        return model_path
+    if not allow_download:
+        raise ModelAcquisitionError(
+            f"pre-acquired model is missing or failed integrity validation: "
+            f"{spec.filename}"
+        )
+
+    lock_path = directory / f".{spec.filename}.lock"
+    with _model_lock(lock_path):
+        # Another process may have completed the download while we waited.
+        if _valid_cached_model(model_path, spec):
+            log.debug("verified cached model %s after lock wait", model_path)
+            return model_path
+        if model_path.exists():
+            log.warning("cached model failed integrity validation: %s", model_path)
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{spec.filename}.", suffix=".part", dir=directory
+        )
+        temporary = Path(temporary_name)
+        started = time.monotonic()
+        try:
+            log.info("downloading %s to %s", spec.filename, model_path)
+            with os.fdopen(descriptor, "wb") as output:
+                size, digest = _stream_model(spec, output, opener=opener)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o600)
+            if size != spec.size:
+                raise ModelAcquisitionError(
+                    f"truncated download for {spec.filename}: got {size}, expected {spec.size}"
+                )
+            if digest != spec.sha256:
+                raise ModelAcquisitionError(
+                    f"checksum mismatch for {spec.filename}: got {digest}, "
+                    f"expected {spec.sha256}"
+                )
+            os.replace(temporary, model_path)
+            _sync_directory(directory)
+            log.info(
+                "downloaded and verified %s (%d bytes, sha256 %s) in %.1fs",
+                spec.filename,
+                size,
+                digest[:12],
+                time.monotonic() - started,
+            )
+            return model_path
+        except ModelAcquisitionError:
+            raise
+        except Exception as exc:
+            raise ModelAcquisitionError(f"could not acquire {spec.filename}: {exc}") from exc
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def acquire_builtin_model(backend: str, model_dir: Path | None = None) -> Path:
+    """Pre-acquire one selected managed model before runtime services start."""
+
+    try:
+        spec = BUILTIN_MODELS[backend]
+    except KeyError as exc:
+        raise ValueError(f"{backend!r} does not have a custback-managed model") from exc
+    return acquire_model(spec, model_dir)
+
+
+def preacquire_segmenter_model(cfg: SegmentationConfig) -> SegmenterPreparation:
+    """Resolve every viable startup fallback before camera resources open.
+
+    Automatic selection prepares both installed ML backends.  This avoids a
+    second network attempt after capture starts when RVM activation fails and
+    MediaPipe becomes the next candidate.  Custom paths remain user-owned and
+    unpinned; they receive only an existence/readability preflight.
+    """
+
+    module_names = {"rvm": "onnxruntime", "mediapipe": "mediapipe"}
+    candidates = (
+        ("rvm", module_names["rvm"]),
+        ("mediapipe", module_names["mediapipe"]),
+    ) if cfg.backend == "auto" else (
+        (cfg.backend, module_names.get(cfg.backend, cfg.backend)),
+    )
+    ready: set[str] = set()
+    custom_path = Path(cfg.model_path) if cfg.model_path else None
+    custom_backend = (
+        "rvm"
+        if custom_path is not None and custom_path.suffix.lower() == ".onnx"
+        else "mediapipe"
+        if custom_path is not None and custom_path.suffix.lower() == ".tflite"
+        else None
+    )
+    for backend, module in candidates:
+        if backend not in BUILTIN_MODELS:
+            continue
+        try:
+            importlib.import_module(module)
+            if backend == custom_backend:
+                assert custom_path is not None
+                if not custom_path.is_file():
+                    raise FileNotFoundError(
+                        f"custom {backend} model does not exist: {custom_path}"
+                    )
+                with custom_path.open("rb") as stream:
+                    stream.read(1)
+            else:
+                acquire_builtin_model(backend)
+            ready.add(backend)
+        except Exception as exc:
+            if cfg.backend != "auto":
+                raise
+            log.info("%s model pre-acquisition unavailable (%s)", backend, exc)
+    return SegmenterPreparation(frozenset(ready))
 
 
 class Segmenter(ABC):
@@ -111,7 +442,9 @@ class HeuristicSegmenter(Segmenter):
 class MediaPipeSegmenter(Segmenter):
     """MediaPipe Tasks ImageSegmenter with the selfie segmentation model."""
 
-    def __init__(self, cfg: SegmentationConfig):
+    def __init__(
+        self, cfg: SegmentationConfig, *, allow_model_download: bool = True
+    ):
         import mediapipe as mp
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision as mp_vision
@@ -119,7 +452,9 @@ class MediaPipeSegmenter(Segmenter):
         if cfg.model_path and cfg.model_path.endswith(".tflite"):
             model_path = Path(cfg.model_path)
         else:
-            model_path = _download_model(MEDIAPIPE_MODEL_URL, "selfie_segmenter.tflite")
+            model_path = acquire_model(
+                MEDIAPIPE_MODEL, allow_download=allow_model_download
+            )
 
         def make(delegate):
             options = mp_vision.ImageSegmenterOptions(
@@ -169,13 +504,17 @@ class RVMSegmenter(Segmenter):
 
     produces_matte = True
 
-    def __init__(self, cfg: SegmentationConfig):
+    def __init__(
+        self, cfg: SegmentationConfig, *, allow_model_download: bool = True
+    ):
         import onnxruntime as ort
 
         if cfg.model_path and cfg.model_path.endswith(".onnx"):
             model_path = Path(cfg.model_path)
         else:
-            model_path = _download_model(RVM_MODEL_URL, "rvm_mobilenetv3_fp32.onnx")
+            model_path = acquire_model(
+                RVM_MODEL, allow_download=allow_model_download
+            )
 
         available = ort.get_available_providers()
         preferred = [
@@ -434,27 +773,46 @@ def refiner_for(cfg: SegmentationConfig, segmenter: Segmenter) -> MaskRefiner:
     return MaskRefiner(cfg)
 
 
-def create_segmenter(cfg: SegmentationConfig) -> Segmenter:
+def create_segmenter(
+    cfg: SegmentationConfig,
+    *,
+    preparation: SegmenterPreparation | None = None,
+) -> Segmenter:
     backend = cfg.backend
+    prepared = preparation.ready_backends if preparation is not None else None
     if backend == "none":
         return NullSegmenter()
-    if backend in ("auto", "rvm"):
+    if (
+        prepared is not None
+        and backend in {"rvm", "mediapipe"}
+        and backend not in prepared
+    ):
+        raise ModelAcquisitionError(
+            f"explicit {backend} backend did not pass model pre-acquisition"
+        )
+    if backend in ("auto", "rvm") and (prepared is None or "rvm" in prepared):
         try:
-            seg = RVMSegmenter(cfg)
+            seg = RVMSegmenter(
+                cfg, allow_model_download=preparation is None
+            )
             log.info("using rvm matting backend on %s", seg.device)
             return seg
         except Exception as exc:
             if backend == "rvm":
                 raise
             log.info("rvm backend unavailable (%s)", exc)
-    if backend in ("auto", "mediapipe"):
+    if backend in ("auto", "mediapipe") and (
+        prepared is None or "mediapipe" in prepared
+    ):
         try:
-            seg = MediaPipeSegmenter(cfg)
+            seg = MediaPipeSegmenter(
+                cfg, allow_model_download=preparation is None
+            )
             log.info("using mediapipe segmentation backend on %s", seg.device)
             return seg
         except Exception as exc:
             if backend == "mediapipe":
                 raise
-            log.warning("mediapipe unavailable (%s); falling back to heuristic", exc)
+            log.info("mediapipe unavailable (%s); falling back to heuristic", exc)
     log.info("using heuristic segmentation backend")
     return HeuristicSegmenter(cfg)

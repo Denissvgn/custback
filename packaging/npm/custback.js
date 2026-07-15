@@ -150,27 +150,23 @@ function doctor() {
   }
 
   if (selected.includes('rvm') || selected.includes('gpu')) {
-    const ort = runProbe(python, [
-      '-c',
-      'import onnxruntime as o; print(",".join(o.get_available_providers()))',
-    ], { encoding: 'utf8' });
-    if (ort.status === 0) {
+    const cuda = installer.cudaProbe(python);
+    if (cuda.onnxruntime) {
       report('RVM ONNX Runtime', true);
     } else if (requested.includes('rvm') || requested.includes('gpu')) {
-      report('RVM ONNX Runtime', false, (ort.stderr || '').trim().split('\n').pop());
+      report('RVM ONNX Runtime', false, cuda.error || 'ONNX Runtime import failed');
     } else {
       warn('implicit RVM ONNX Runtime is unavailable');
     }
-    if (ort.status === 0 && selected.includes('gpu')) {
-      const cuda = (ort.stdout || '').includes('CUDAExecutionProvider');
+    if (cuda.onnxruntime && selected.includes('gpu')) {
       if (requested.includes('gpu')) {
-        report('CUDA inference provider', cuda,
-          'GPU extra was requested but CUDA is unavailable; check NVIDIA driver/runtime');
-      } else if (!cuda) {
-        warn('implicit CUDA inference provider is unavailable');
+        report('verified CUDA inference', cuda.cuda_inference,
+          cuda.error || 'GPU extra was requested but execution fell back from CUDA');
+      } else if (!cuda.cuda_inference) {
+        warn('implicit CUDA inference is unavailable', cuda.error);
       }
-    } else if (ort.status === 0) {
-      note(`ONNX providers: ${(ort.stdout || '').trim() || 'unknown'}`);
+    } else if (cuda.onnxruntime) {
+      note(`CUDA provider ${cuda.cuda_provider ? 'registered' : 'not registered'}; CPU RVM is healthy`);
     }
   } else if (requested.includes('rvm') || requested.includes('gpu')) {
     report('requested RVM backend', false, 'requested extra is absent; run: custback rebuild');

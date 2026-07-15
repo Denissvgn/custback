@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -21,11 +22,33 @@ from .config import (
     ConfigVersionConflictError,
     RuntimeConfig,
 )
+from .diagnostics import sanitized_config_summary
 from .hub import FrameHub
-from .segmentation import NullSegmenter, create_segmenter, refiner_for
+from .segmentation import (
+    HeuristicSegmenter,
+    NullSegmenter,
+    SegmenterPreparation,
+    create_segmenter,
+    refiner_for,
+)
 from .vcam import open_output
 
 log = logging.getLogger(__name__)
+
+_VIDEO_STATS_DEFAULTS: dict[str, object] = {
+    "background_video_source_fps": None,
+    "background_video_timing_mode": None,
+    "background_video_frames_displayed": 0,
+    "background_video_frames_skipped": 0,
+    "background_video_frames_reused": 0,
+    "background_video_skip_ratio": 0.0,
+    "background_video_seek_count": 0,
+    "background_video_decode_failures": 0,
+}
+
+
+def _ewma(previous: float | None, sample: float, alpha: float = 0.1) -> float:
+    return sample if previous is None else previous + alpha * (sample - previous)
 
 
 class RestartRequiredError(RuntimeError):
@@ -114,6 +137,7 @@ class _Activation:
 class _PatchRequest:
     candidate: AppConfig
     expected_version: int
+    origin: str = "internal"
     activation_candidate: AppConfig | None = None
     before_activate: Callable[[], None] | None = None
     rollback_activate: Callable[[], None] | None = None
@@ -192,7 +216,13 @@ def _restart_only_changes(old: AppConfig, new: AppConfig) -> list[str]:
 
 
 class Pipeline:
-    def __init__(self, runtime: RuntimeConfig, hub: FrameHub):
+    def __init__(
+        self,
+        runtime: RuntimeConfig,
+        hub: FrameHub,
+        *,
+        model_preparation: SegmenterPreparation | None = None,
+    ):
         self.runtime = runtime
         self.hub = hub
         self._stop = threading.Event()
@@ -206,9 +236,16 @@ class Pipeline:
         self._teardown_threads: set[threading.Thread] = set()
         self._deferred_closes: list[tuple[Any, str]] = []
         self._runtime_writer = runtime._coordinator_writer()
+        self._model_preparation = model_preparation
+        self._fallback_log_states: dict[str, tuple[bool, str]] = {}
 
-    def start(self, timeout: float = 30.0) -> None:
+    def start(self, timeout: float | None = None) -> None:
         """Start and synchronously acknowledge resource activation."""
+        effective_timeout = (
+            max(30.0, self.runtime.snapshot().camera.recovery_timeout_s + 5.0)
+            if timeout is None
+            else timeout
+        )
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 raise ReconfigurationUnavailable("pipeline is already running")
@@ -216,15 +253,16 @@ class Pipeline:
             self._startup_done.clear()
             self._error = None
             self._active_state = None
+            self._fallback_log_states.clear()
             self._thread = threading.Thread(
                 target=self._run, name="pipeline", daemon=True
             )
             self._thread.start()
-        if not self._startup_done.wait(timeout):
+        if not self._startup_done.wait(effective_timeout):
             self._stop.set()
             thread = self._thread
             if thread is not None:
-                thread.join(timeout=max(0.1, min(5.0, timeout)))
+                thread.join(timeout=max(0.1, min(5.0, effective_timeout)))
             if thread is not None and thread.is_alive():
                 raise ReconfigurationUnavailable(
                     "pipeline startup timed out; worker is still running after "
@@ -279,7 +317,11 @@ class Pipeline:
         )
 
     def apply_config_patch(
-        self, patch: dict[str, Any], timeout: float = 5.0
+        self,
+        patch: dict[str, Any],
+        timeout: float = 5.0,
+        *,
+        origin: str = "internal",
     ) -> ConfigState:
         """Validate, activate, commit, and acknowledge a hot configuration patch."""
         while True:
@@ -292,6 +334,12 @@ class Pipeline:
             # to that generation instead of returning a stale header/body.
             current = self.runtime.read()
             if current.version == base.version:
+                log.info(
+                    "config update accepted origin=%s version=%d fields=none "
+                    "summary=none (no change)",
+                    origin,
+                    current.version,
+                )
                 return current
         restart_fields = _restart_only_changes(base.config, candidate)
         if restart_fields:
@@ -303,7 +351,7 @@ class Pipeline:
                 "cannot synchronously reconfigure from the pipeline worker"
             )
 
-        request = _PatchRequest(candidate, base.version)
+        request = _PatchRequest(candidate, base.version, origin=origin)
         return self._submit_patch(request, timeout)
 
     def apply_staged_config_patch(
@@ -357,6 +405,7 @@ class Pipeline:
         request = _PatchRequest(
             candidate,
             base.version,
+            origin="api-upload",
             activation_candidate=staging_candidate,
             before_activate=before_activate,
             rollback_activate=rollback_activate,
@@ -420,7 +469,13 @@ class Pipeline:
         with ExitStack() as startup:
             capture = open_capture(cfg.camera)
             startup.callback(_safe_close, capture, "capture")
-            segmenter = create_segmenter(cfg.segmentation)
+            if self._model_preparation is not None:
+                segmenter = create_segmenter(
+                    cfg.segmentation,
+                    preparation=self._model_preparation,
+                )
+            else:
+                segmenter = create_segmenter(cfg.segmentation)
             startup.callback(_safe_close, segmenter, "segmenter")
             refiner = refiner_for(cfg.segmentation, segmenter)
             backdrop = create_backdrop(
@@ -448,10 +503,10 @@ class Pipeline:
             self._active_state = state
             if state.config.background.mode == "remote":
                 self.hub.clear_remote_frames()
-            self._preflight(resources)
+            initial_output = self._preflight(resources)
             self._update_identity_stats(resources)
             self._startup_done.set()
-            self._loop(resources)
+            self._loop(resources, initial_output=initial_output)
         except BaseException as exc:
             log.exception("pipeline crashed")
             self._error = exc
@@ -638,6 +693,14 @@ class Pipeline:
                 resources, request.activation_candidate or request.candidate
             )
             self._trial_activation(resources, activation, trial_frame)
+            if activation.replace_backdrop and hasattr(
+                activation.backdrop, "reset_stats"
+            ):
+                # Candidate trials are deliberately unsent.  The provider
+                # object is installed after the trial, so reset only its public
+                # counters (not playback state) before publishing the new
+                # current-provider telemetry generation.
+                activation.backdrop.reset_stats()
             # Resources were exercised through the hidden staging path, but
             # the effective snapshot published below must contain only the
             # promoted final path.
@@ -686,6 +749,14 @@ class Pipeline:
                 if old_cfg is not None:
                     self._post_install_activation(resources, old_cfg)
                 request.result = committed
+                changed = _changed_paths(old_cfg or resources.cfg, request.candidate)
+                log.info(
+                    "config update accepted origin=%s version=%d fields=%s summary=%s",
+                    request.origin,
+                    committed.version,
+                    ",".join(changed) or "none",
+                    sanitized_config_summary(request.candidate, changed),
+                )
             # Publish success/failure before teardown. A blocking or faulty
             # old backend must not delay or invalidate an already-committed ack.
             request.done.set()
@@ -754,18 +825,98 @@ class Pipeline:
 
     def _update_identity_stats(self, resources: _Resources) -> None:
         cfg = resources.cfg
+        capture_health = (
+            resources.capture.health_snapshot()
+            if hasattr(resources.capture, "health_snapshot")
+            else None
+        )
+        output_fallback = bool(
+            getattr(resources.output, "fallback_active", False)
+        )
+        segmentation_fallback = (
+            cfg.segmentation.backend == "auto"
+            and isinstance(resources.segmenter, HeuristicSegmenter)
+        )
+        video_stats = (
+            resources.backdrop.stats_dict()
+            if resources.backdrop is not None
+            and hasattr(resources.backdrop, "stats_dict")
+            else dict(_VIDEO_STATS_DEFAULTS)
+        )
         self.hub.update_stats(
             mode=cfg.background.mode,
             segmentation_backend=type(resources.segmenter).__name__,
             segmentation_device=resources.segmenter.device,
             output_backend=type(resources.output).__name__,
+            output_target_fps=cfg.output.fps,
+            output_fallback_active=output_fallback,
+            output_fallback_reason=(
+                getattr(resources.output, "fallback_reason", "")
+                if output_fallback
+                else ""
+            ),
+            segmentation_fallback_active=segmentation_fallback,
+            segmentation_fallback_reason=(
+                "ml-backend-unavailable" if segmentation_fallback else ""
+            ),
+            capture_backend=(
+                getattr(capture_health, "backend", type(resources.capture).__name__)
+                if capture_health is not None
+                else type(resources.capture).__name__
+            ),
+            capture_fourcc=getattr(capture_health, "fourcc", None),
+            capture_width=getattr(capture_health, "width", cfg.camera.width),
+            capture_height=getattr(capture_health, "height", cfg.camera.height),
+            capture_fps_reported=getattr(
+                capture_health, "fps_reported", float(cfg.camera.fps)
+            ),
+            capture_target_fps=cfg.camera.fps,
             remote_fallback_mode=(
                 cfg.background.remote_fallback_mode
                 if cfg.background.mode == "remote"
                 else ""
             ),
             config_version=resources.version,
+            **video_stats,
         )
+        self._log_fallback_transition(
+            "output",
+            output_fallback,
+            getattr(resources.output, "fallback_reason", "")
+            if output_fallback
+            else "",
+        )
+        self._log_fallback_transition(
+            "segmentation",
+            segmentation_fallback,
+            "ml-backend-unavailable" if segmentation_fallback else "",
+        )
+
+    def _log_fallback_transition(
+        self, kind: str, active: bool, reason: str
+    ) -> None:
+        """Emit one record only when a fallback state or reason changes."""
+
+        state = (active, reason if active else "")
+        previous = self._fallback_log_states.get(kind)
+        if previous == state:
+            return
+        self._fallback_log_states[kind] = state
+        if active:
+            if kind == "output":
+                log.warning(
+                    "output fallback active reason=%s; frames are API-only. "
+                    "Run the platform setup script to restore the virtual camera",
+                    reason or "unknown",
+                )
+            else:
+                log.warning(
+                    "%s fallback active reason=%s",
+                    kind,
+                    reason or "unknown",
+                )
+        elif previous is not None and previous[0]:
+            log.info("%s fallback recovered", kind)
 
     # -- frame processing ---------------------------------------------
     @staticmethod
@@ -824,9 +975,14 @@ class Pipeline:
         )
         return out
 
-    def _preflight(self, resources: _Resources) -> None:
+    def _preflight(self, resources: _Resources) -> np.ndarray:
         """Read and process a real frame before reporting startup readiness."""
-        deadline = time.monotonic() + 2.0
+        camera_wait = (
+            2.0
+            if resources.cfg.camera.synthetic
+            else resources.cfg.camera.recovery_timeout_s + 2.0
+        )
+        deadline = time.monotonic() + camera_wait
         frame: np.ndarray | None = None
         while frame is None and time.monotonic() < deadline and not self._stop.is_set():
             frame = resources.capture.read()
@@ -851,11 +1007,36 @@ class Pipeline:
         out = self._render_local_mode(resources, frame, preflight=True)
         self._validate_output_frame(out, frame)
         # Sending verifies the actual output backend contract. This frame is
-        # deliberately not published and does not affect public frame stats.
+        # deliberately not published, but it is a real consumed/sent frame and
+        # therefore participates in the public counter meanings.
         resources.output.send(out)
+        health = (
+            resources.capture.health_snapshot()
+            if hasattr(resources.capture, "health_snapshot")
+            else None
+        )
+        self.hub.update_stats(
+            frames_in=1,
+            frames_out=1,
+            capture_frames_read=getattr(health, "frames_read", 1),
+            capture_dropped_frames=getattr(health, "dropped_frames", 0),
+            capture_read_failures=getattr(health, "read_failures", 0),
+            capture_restarts=getattr(health, "restarts", 0),
+            capture_stalled=getattr(health, "stalled", False),
+            capture_frame_age_ms=getattr(health, "frame_age_ms", None),
+            capture_read_ms=getattr(health, "read_ms", None),
+            capture_fps=getattr(health, "capture_fps", 0.0),
+            capture_target_met=getattr(health, "target_met", None),
+        )
+        return out
 
     def _local_composite(
-        self, resources: _Resources, frame: np.ndarray, *, privacy_safe: bool
+        self,
+        resources: _Resources,
+        frame: np.ndarray,
+        *,
+        privacy_safe: bool,
+        timings: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, str]:
         cfg = resources.cfg
         backdrop = resources.backdrop
@@ -863,33 +1044,53 @@ class Pipeline:
             return self._emergency_blur(frame), "segmentation-none"
 
         try:
+            started = time.monotonic_ns()
             mask = resources.refiner.refine(
                 resources.segmenter.segment(frame), frame
             )
+            if timings is not None:
+                timings["segmentation_ms"] = (
+                    time.monotonic_ns() - started
+                ) / 1_000_000.0
+            started = time.monotonic_ns()
             if isinstance(backdrop, BlurBackdrop):
                 backdrop.set_source_frame(frame, mask)
             if backdrop is None:
+                if timings is not None:
+                    timings["background_ms"] = (
+                        time.monotonic_ns() - started
+                    ) / 1_000_000.0
                 if privacy_safe:
                     return self._emergency_blur(frame), "local-failure"
                 return frame, ""
             bg = backdrop.frame(frame.shape[1], frame.shape[0])
+            if timings is not None:
+                timings["background_ms"] = (
+                    time.monotonic_ns() - started
+                ) / 1_000_000.0
             edge_fg = (
                 resources.segmenter.last_foreground
                 if cfg.compositing.use_model_foreground
                 else None
             )
-            return (
-                self._privacy_checked(
-                    composite(
-                        frame,
-                        bg,
-                        mask,
-                        light_wrap=cfg.compositing.light_wrap,
-                        edge_foreground=edge_fg,
-                    ),
+            started = time.monotonic_ns()
+            rendered = self._privacy_checked(
+                composite(
                     frame,
-                    privacy_safe,
+                    bg,
+                    mask,
+                    light_wrap=cfg.compositing.light_wrap,
+                    edge_foreground=edge_fg,
                 ),
+                frame,
+                privacy_safe,
+            )
+            if timings is not None:
+                timings["composite_ms"] = (
+                    time.monotonic_ns() - started
+                ) / 1_000_000.0
+            return (
+                rendered,
                 "",
             )
         except Exception:
@@ -909,79 +1110,163 @@ class Pipeline:
             return self._emergency_blur(frame)
         return candidate
 
-    def _loop(self, resources: _Resources) -> None:
+    def _loop(
+        self, resources: _Resources, *, initial_output: np.ndarray | None = None
+    ) -> None:
         frame_interval = 1.0 / resources.cfg.output.fps
-        fps_window: list[float] = []
-        frames_in = frames_out = remote_used = fallback_count = 0
+        fps_window: deque[float] = deque()
+        initial_sends = 1 if initial_output is not None else 0
+        frames_in = frames_out = initial_sends
+        remote_used = fallback_count = 0
+        repeated_frames = deadline_misses = 0
+        last_output = initial_output
+        fallback_active = False
+        fallback_reason = ""
+        previous_remote_fallback: tuple[bool, str] = (False, "")
+        stage_ewma: dict[str, float | None] = {
+            "segmentation_ms": None,
+            "background_ms": None,
+            "composite_ms": None,
+            "output_send_ms": None,
+            "frame_processing_ms": None,
+        }
 
         while not self._stop.is_set():
             loop_start = time.monotonic()
             frame = resources.capture.read()
-            if frame is None:
-                self._stop.wait(0.05)
-                continue
-            frames_in += 1
-            self.hub.publish_raw(frame)
+            timings = {
+                "segmentation_ms": 0.0,
+                "background_ms": 0.0,
+                "composite_ms": 0.0,
+            }
+            processed = frame is not None
+            if processed:
+                assert frame is not None
+                frames_in += 1
+                self.hub.publish_raw(frame)
 
-            # A real current frame is the activation trial input. No candidate
-            # is committed until this preflight succeeds.
-            try:
-                request = self._requests.get_nowait()
-            except queue.Empty:
-                request = None
-            if request is not None:
-                if isinstance(request, _PatchRequest):
-                    self._handle_patch_request(resources, request, frame)
-                else:
-                    self._handle_mutation_request(resources, request)
-            cfg = resources.cfg
-            mode = cfg.background.mode
-            fallback_active = False
-            fallback_reason = ""
+                # A real current frame is the activation trial input. No candidate
+                # is committed until this preflight succeeds.
+                try:
+                    request = self._requests.get_nowait()
+                except queue.Empty:
+                    request = None
+                if request is not None:
+                    if isinstance(request, _PatchRequest):
+                        self._handle_patch_request(resources, request, frame)
+                    else:
+                        self._handle_mutation_request(resources, request)
 
-            if mode == "remote":
-                remote, fallback_reason = self.hub.remote_frame_status(
-                    max_age_s=cfg.api.remote_timeout_ms / 1000.0
-                )
-                if remote is not None:
-                    if remote.dtype != np.uint8 or remote.ndim != 3 or remote.shape[2] != 3:
-                        remote = None
-                        fallback_reason = "invalid"
-                    elif remote.shape != frame.shape:
-                        remote = None
-                        fallback_reason = "wrong-size"
-                if remote is not None:
-                    out_frame = remote
-                    remote_used += 1
-                    fallback_reason = ""
-                else:
-                    out_frame, local_reason = self._local_composite(
-                        resources, frame, privacy_safe=True
+                process_started = time.monotonic_ns()
+                cfg = resources.cfg
+                mode = cfg.background.mode
+                fallback_active = False
+                fallback_reason = ""
+
+                if mode == "remote":
+                    remote, fallback_reason = self.hub.remote_frame_status(
+                        max_age_s=cfg.api.remote_timeout_ms / 1000.0
                     )
-                    if local_reason:
-                        fallback_reason = local_reason
-                    fallback_active = True
-                    fallback_count += 1
-            elif mode == "passthrough" or resources.backdrop is None:
-                out_frame = frame
-            else:
-                out_frame, _ = self._local_composite(
-                    resources, frame, privacy_safe=False
+                    if remote is not None:
+                        if (
+                            remote.dtype != np.uint8
+                            or remote.ndim != 3
+                            or remote.shape[2] != 3
+                        ):
+                            remote = None
+                            fallback_reason = "invalid"
+                        elif remote.shape != frame.shape:
+                            remote = None
+                            fallback_reason = "wrong-size"
+                    if remote is not None:
+                        out_frame = remote
+                        remote_used += 1
+                        fallback_reason = ""
+                    else:
+                        out_frame, local_reason = self._local_composite(
+                            resources,
+                            frame,
+                            privacy_safe=True,
+                            timings=timings,
+                        )
+                        if local_reason:
+                            fallback_reason = local_reason
+                        fallback_active = True
+                        fallback_count += 1
+                elif mode == "passthrough" or resources.backdrop is None:
+                    out_frame = frame
+                else:
+                    out_frame, _ = self._local_composite(
+                        resources,
+                        frame,
+                        privacy_safe=False,
+                        timings=timings,
+                    )
+                frame_processing_ms = (
+                    time.monotonic_ns() - process_started
+                ) / 1_000_000.0
+                if frame_processing_ms / 1000.0 > frame_interval:
+                    deadline_misses += 1
+                samples = (
+                    *timings.items(),
+                    ("frame_processing_ms", frame_processing_ms),
                 )
+                for name, sample in samples:
+                    stage_ewma[name] = _ewma(stage_ewma[name], sample)
+                last_output = out_frame
+            else:
+                if last_output is None:
+                    self._stop.wait(min(0.01, frame_interval))
+                    continue
+                out_frame = last_output
+                repeated_frames += 1
 
+            send_started = time.monotonic_ns()
             resources.output.send(out_frame)
-            self.hub.publish_output(out_frame)
+            output_send_ms = (
+                time.monotonic_ns() - send_started
+            ) / 1_000_000.0
+            stage_ewma["output_send_ms"] = _ewma(
+                stage_ewma["output_send_ms"], output_send_ms
+            )
             frames_out += 1
 
             now = time.monotonic()
             fps_window.append(now)
             while fps_window and now - fps_window[0] > 2.0:
-                fps_window.pop(0)
+                fps_window.popleft()
             if len(fps_window) >= 2:
                 span = fps_window[-1] - fps_window[0]
                 measured_fps = (len(fps_window) - 1) / span if span > 0 else 0.0
             else:
                 measured_fps = 0.0
+            attainment = (
+                min(100.0, measured_fps / resources.cfg.output.fps * 100.0)
+                if len(fps_window) >= 2
+                else None
+            )
+            capture_health = (
+                resources.capture.health_snapshot()
+                if hasattr(resources.capture, "health_snapshot")
+                else None
+            )
+            video_stats = (
+                resources.backdrop.stats_dict()
+                if resources.backdrop is not None
+                and hasattr(resources.backdrop, "stats_dict")
+                else dict(_VIDEO_STATS_DEFAULTS)
+            )
+            remote_state = (fallback_active, fallback_reason)
+            if remote_state != previous_remote_fallback:
+                if fallback_active:
+                    log.warning(
+                        "remote fallback active mode=%s reason=%s",
+                        resources.cfg.background.remote_fallback_mode,
+                        fallback_reason,
+                    )
+                elif previous_remote_fallback[0]:
+                    log.info("remote renderer recovered; local fallback inactive")
+                previous_remote_fallback = remote_state
             self.hub.update_stats(
                 frames_in=frames_in,
                 frames_out=frames_out,
@@ -990,8 +1275,44 @@ class Pipeline:
                 remote_fallback_count=fallback_count,
                 remote_fallback_reason=fallback_reason,
                 fps=measured_fps,
+                fps_attainment_pct=attainment,
+                output_repeated_frames=repeated_frames,
+                processing_deadline_misses=deadline_misses,
+                capture_fps=getattr(capture_health, "capture_fps", 0.0),
+                capture_target_met=getattr(capture_health, "target_met", None),
+                capture_backend=getattr(
+                    capture_health, "backend", type(resources.capture).__name__
+                ),
+                capture_fourcc=getattr(capture_health, "fourcc", None),
+                capture_width=getattr(capture_health, "width", None),
+                capture_height=getattr(capture_health, "height", None),
+                capture_fps_reported=getattr(
+                    capture_health, "fps_reported", None
+                ),
+                capture_frames_read=getattr(capture_health, "frames_read", frames_in),
+                capture_dropped_frames=getattr(
+                    capture_health, "dropped_frames", 0
+                ),
+                capture_read_failures=getattr(
+                    capture_health, "read_failures", 0
+                ),
+                capture_restarts=getattr(capture_health, "restarts", 0),
+                capture_stalled=getattr(capture_health, "stalled", False),
+                capture_frame_age_ms=getattr(
+                    capture_health, "frame_age_ms", None
+                ),
+                capture_read_ms=getattr(capture_health, "read_ms", None),
+                segmentation_ms=stage_ewma["segmentation_ms"],
+                background_ms=stage_ewma["background_ms"],
+                composite_ms=stage_ewma["composite_ms"],
+                output_send_ms=stage_ewma["output_send_ms"],
+                frame_processing_ms=stage_ewma["frame_processing_ms"],
                 config_version=resources.version,
+                **video_stats,
             )
+            # Publish only after the matching counters/fallback state are
+            # visible, so consumers never observe a frame with stale status.
+            self.hub.publish_output(out_frame)
 
             if not resources.output.paces:
                 elapsed = time.monotonic() - loop_start

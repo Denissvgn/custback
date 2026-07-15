@@ -16,8 +16,8 @@ real camera ──► segmentation ──► compositor ──► virtual camera
 * **Rendering quality**: true alpha matting (RVM), edge-aware mask
   refinement, light wrap, color-spill removal, person-free background blur —
   see [Rendering quality & GPU](#rendering-quality--gpu-acceleration).
-* **NVIDIA GPU acceleration** (optional): matting runs on CUDA when
-  `onnxruntime-gpu` exposes the CUDA provider; use the `rvm` extra for an
+* **NVIDIA GPU acceleration** (optional): matting runs on CUDA 12 when
+  `onnxruntime-gpu` completes verified CUDA inference; use the `rvm` extra for an
   explicitly CPU-only npm installation.
 * **API**: control everything at runtime, preview in a browser, and forward
   frames to an external service — the integration point for the upcoming
@@ -108,7 +108,17 @@ custback --mode color                       # green-screen style solid color
 custback -c config/default.yaml             # everything from YAML
 custback --synthetic --no-vcam              # hardware-free demo (test pattern)
 custback --mode blur --preview              # verify on screen (q/ESC quits)
+custback --camera-pixel-format backend       # opt out of V4L2 MJPEG negotiation
+custback --camera-mode-mismatch error        # fail instead of warning on mismatch
 ```
+
+On Linux/V4L2, the default `camera.pixel_format: auto` requests MJPEG before
+the dimensions and rate. This avoids the common silent 720p YUYV fallback to
+10 FPS on cameras that support 720p30 only in MJPEG. Custback reads the
+negotiated mode back after the first frame and reports both input and output
+rates separately. Short capture stalls keep the last safe processed frame on
+the virtual camera while the device is reopened; the default
+`camera.recovery_timeout_s: 10` then fails clearly instead of freezing forever.
 
 `--preview` opens a window showing exactly what the virtual camera sends,
 with the active mode and fps overlaid — the quickest way to verify
@@ -137,6 +147,15 @@ Open <http://127.0.0.1:8710/> and enter the local API token for a live
 preview. The authenticated local API index at
 <http://127.0.0.1:8710/docs> links to the OpenAPI document.
 
+Every run also writes a private rotating diagnostic log to
+`$XDG_STATE_HOME/custback/custback.log` (or
+`~/.local/state/custback/custback.log`): 5 MiB plus three backups, all mode
+`0600`. Use `--log-file PATH` to override it or `--no-file-log` to keep only
+stderr. Logs and `GET /status` share a short run ID; accepted live controls,
+fallback transitions, capture recovery, readiness, and the shutdown summary
+are recorded with credential-free summaries and without paths, URLs, or API
+tokens.
+
 ## Rendering quality & GPU acceleration
 
 The person/background boundary is where composites live or die, so several
@@ -146,7 +165,9 @@ stages work on it (all tunable live via `PATCH /config`, defaults on):
   installed one: **rvm** ([Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting),
   true alpha matting with hair-level edges, temporal consistency and a clean
   foreground prediction) → **mediapipe** (selfie segmentation) → heuristic
-  fallback. Models are downloaded once to `~/.cache/custback/models`.
+  fallback. Built-in models live in `~/.cache/custback/models`; their pinned
+  size and SHA-256 are verified on every use, and downloads are locked,
+  bounded, and published atomically.
 * **Edge-aware refinement** (`segmentation.edge_refine`) — bounded marker
   watershed may move the contour only inside an eight-pixel uncertainty band,
   so it follows nearby hair and shoulder edges without disturbing the mask
@@ -169,8 +190,13 @@ stages work on it (all tunable live via `PATCH /config`, defaults on):
 
 ### Using the NVIDIA GPU
 
-The rvm backend runs on CUDA when `onnxruntime-gpu` is installed (needs an
-NVIDIA driver + CUDA runtime; ~10x faster than CPU matting):
+The rvm backend runs on CUDA 12 when `onnxruntime-gpu` is installed (needs an
+NVIDIA driver plus CUDA 12 runtime and cuDNN 9; ~10x faster than CPU matting).
+The `gpu` extra deliberately stays below ONNX Runtime 1.27 because its Python
+3.14 Linux wheel requires CUDA 13. `nvidia-smi` reporting CUDA 13.x means the
+driver can support that generation; it does not install the CUDA 13 runtime.
+The CUDA compiler/toolkit is not needed when the CUDA 12 runtime libraries are
+already present.
 
 ```bash
 # npm install
@@ -181,8 +207,9 @@ pip install -e '.[gpu,dev]'              # CPU-only matting instead: .[rvm,dev]
 ```
 
 No configuration is needed at runtime: `backend: auto` prefers rvm, and rvm
-prefers CUDA. The npm `gpu` extra validates that CUDA is actually available;
-choose `rvm` for CPU inference. Check what's active with
+prefers CUDA. The npm `gpu` extra runs a real profiled ONNX inference and
+validates that its node executed on CUDA, rather than trusting provider
+registration alone; choose `rvm` for CPU inference. Check what's active with
 `custback doctor`, `GET /status` (`segmentation_backend` /
 `segmentation_device`), or the preview overlay (e.g. `blur 30 fps rvm/cuda`).
 
@@ -224,7 +251,7 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /status` | fps, frame counters, active mode/backends |
+| `GET /status` | run ID; input/output FPS; capture/drop/repeat/skip counters; stage timings; active and fallback backends |
 | `GET /config` / `PATCH /config` | read / partially update config live |
 | `POST /background/image` | upload static backdrop and switch to it |
 | `POST /background/video` | upload live (video) backdrop and switch to it |
@@ -320,6 +347,8 @@ This release intentionally breaks the old unauthenticated control plane:
 | `segmentation.py` | person mask: RVM matting (CUDA/CPU) / MediaPipe / heuristic fallback; bounded marker-watershed refinement + adaptive temporal smoothing |
 | `backgrounds.py` | backdrop providers: image, video loop, second camera/stream, person-free blur, color |
 | `compositor.py` | alpha blending of person over backdrop; light wrap + color-spill removal |
+| `diagnostics.py` | secure rotating logs, run correlation, and safe config audit records |
+| `gpu_probe.py` | real CUDA inference/profile capability probe for installer and doctor |
 | `vcam.py` | virtual camera output (pyvirtualcam → v4l2loopback / OBS extension) |
 | `hub.py` | thread-safe frame exchange between pipeline and API |
 | `preview.py` | interactive on-screen verification window (main thread; mode/file/blur controls, q/ESC quits) |

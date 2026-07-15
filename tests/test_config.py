@@ -14,6 +14,9 @@ def test_defaults_valid():
     cfg = AppConfig()
     cfg.validate()
     assert cfg.background.mode == "blur"
+    assert cfg.camera.pixel_format == "auto"
+    assert cfg.camera.mode_mismatch == "warn"
+    assert cfg.camera.recovery_timeout_s == 10.0
 
 
 def test_round_trip_yaml(tmp_path):
@@ -119,6 +122,9 @@ def test_invalid_delegate_rejected():
     "data",
     [
         {"camera": {"device": -1}},
+        {"camera": {"pixel_format": "h264"}},
+        {"camera": {"mode_mismatch": "ignore"}},
+        {"camera": {"recovery_timeout_s": 2.0}},
         {"background": {"image_path": " office.jpg"}},
         {"background": {"video_path": "clip.mp4\x00ignored"}},
         {"output": {"device": "/dev/video10\n"}},

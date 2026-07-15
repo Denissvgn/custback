@@ -77,8 +77,8 @@ class ImmediateCoordinator:
         self.writer = runtime._coordinator_writer()
         self.patches = []
 
-    def apply_config_patch(self, patch, timeout):
-        self.patches.append((patch, timeout))
+    def apply_config_patch(self, patch, timeout, *, origin="internal"):
+        self.patches.append((patch, timeout, origin))
         state = self.runtime.read()
         candidate = state.config.patched(patch)
         if candidate != state.config:
@@ -211,6 +211,207 @@ def test_preview_probe_success(monkeypatch):
     ) == (True, "")
 
 
+def test_highgui_env_removes_only_opencv_injected_missing_font_dir(tmp_path):
+    missing = tmp_path / "cv2" / "qt" / "fonts"
+    normalized, reason = preview_mod.normalize_highgui_environment(
+        environ={"DISPLAY": ":0", "QT_QPA_FONTDIR": str(missing)},
+        inherited_environ={},
+        platform="linux",
+        cv2_module=object(),
+    )
+    assert reason == ""
+    assert "QT_QPA_FONTDIR" not in normalized
+
+    preserved, reason = preview_mod.normalize_highgui_environment(
+        environ={"DISPLAY": ":0", "QT_QPA_FONTDIR": str(missing)},
+        inherited_environ={"QT_QPA_FONTDIR": str(missing)},
+        platform="linux",
+        cv2_module=object(),
+    )
+    assert reason == ""
+    assert preserved["QT_QPA_FONTDIR"] == str(missing)
+
+
+def test_highgui_env_recognizes_cv2_font_default_imported_earlier(tmp_path):
+    package = tmp_path / "cv2"
+    missing = package / "qt" / "fonts"
+    module = SimpleNamespace(__file__=str(package / "__init__.py"))
+    normalized, reason = preview_mod.normalize_highgui_environment(
+        environ={"DISPLAY": ":0", "QT_QPA_FONTDIR": str(missing)},
+        # Simulate backgrounds.py having imported cv2 before preview.py.
+        inherited_environ={"QT_QPA_FONTDIR": str(missing)},
+        platform="linux",
+        cv2_module=module,
+    )
+    assert reason == ""
+    assert "QT_QPA_FONTDIR" not in normalized
+
+
+def test_highgui_env_selects_xcb_for_xwayland(monkeypatch):
+    monkeypatch.setattr(
+        preview_mod, "_qt_platform_plugins", lambda *_args, **_kwargs: {"xcb"}
+    )
+    normalized, reason = preview_mod.normalize_highgui_environment(
+        environ={
+            "DISPLAY": ":0",
+            "WAYLAND_DISPLAY": "wayland-0",
+            "XDG_SESSION_TYPE": "wayland",
+        },
+        inherited_environ={},
+        platform="linux",
+        cv2_module=object(),
+    )
+    assert reason == ""
+    assert normalized["QT_QPA_PLATFORM"] == "xcb"
+
+
+def test_highgui_env_does_not_force_xcb_when_wayland_plugin_exists(monkeypatch):
+    monkeypatch.setattr(
+        preview_mod,
+        "_qt_platform_plugins",
+        lambda *_args, **_kwargs: {"xcb", "wayland"},
+    )
+    normalized, reason = preview_mod.normalize_highgui_environment(
+        environ={
+            "DISPLAY": ":0",
+            "WAYLAND_DISPLAY": "wayland-0",
+            "XDG_SESSION_TYPE": "wayland",
+        },
+        inherited_environ={},
+        platform="linux",
+        cv2_module=object(),
+    )
+    assert reason == ""
+    assert "QT_QPA_PLATFORM" not in normalized
+
+
+def test_highgui_env_preserves_explicit_platform(monkeypatch):
+    monkeypatch.setattr(
+        preview_mod, "_qt_platform_plugins", lambda *_args, **_kwargs: {"xcb"}
+    )
+    normalized, reason = preview_mod.normalize_highgui_environment(
+        environ={
+            "DISPLAY": ":0",
+            "WAYLAND_DISPLAY": "wayland-0",
+            "QT_QPA_PLATFORM": "minimal",
+        },
+        inherited_environ={"QT_QPA_PLATFORM": "minimal"},
+        platform="linux",
+        cv2_module=object(),
+    )
+    assert reason == ""
+    assert normalized["QT_QPA_PLATFORM"] == "minimal"
+
+
+def test_highgui_env_rejects_wayland_only_without_plugin(monkeypatch):
+    monkeypatch.setattr(
+        preview_mod, "_qt_platform_plugins", lambda *_args, **_kwargs: {"xcb"}
+    )
+    _normalized, reason = preview_mod.normalize_highgui_environment(
+        environ={"WAYLAND_DISPLAY": "wayland-0"},
+        inherited_environ={},
+        platform="linux",
+        cv2_module=object(),
+    )
+    assert "browser preview" in reason
+    assert "XWayland" in reason
+
+
+def test_preview_probe_reports_deduplicated_bounded_stderr(monkeypatch):
+    monkeypatch.setattr(preview_mod, "cv2", object())
+    warning = "QFontDatabase: missing fonts"
+    stderr = ((warning + "\n") * 100 + "x" * 5000).encode()
+    monkeypatch.setattr(
+        preview_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stderr=stderr),
+    )
+    available, reason = preview_mod.preview_available(
+        environ={"DISPLAY": ":0"}, platform="linux", timeout=0.1
+    )
+    assert not available
+    assert reason.count(warning) == 1
+    assert len(reason) <= preview_mod.PROBE_STDERR_LIMIT + 80
+
+
+def test_qt_bootstrap_filter_suppresses_only_known_noise():
+    captured = (
+        b"Warning: Ignoring XDG_SESSION_TYPE=wayland on Gnome. Use xcb.\n"
+        b"QFontDatabase: Cannot find font directory /missing/fonts.\n"
+        b"Note that Qt no longer ships fonts. Deploy some or use fontconfig.\n"
+        b"QFontDatabase: Cannot find font directory /missing/fonts.\n"
+        b"real late HighGUI error\n"
+    )
+    remaining, suppressed = preview_mod._filter_qt_bootstrap_stderr(captured)
+    assert suppressed == 4
+    assert remaining == b"real late HighGUI error\n"
+
+
+def test_named_window_filter_replays_unknown_stderr(monkeypatch, capfd):
+    class NoisyCV2(FakeCV2):
+        def namedWindow(self, *_):
+            import os
+
+            os.write(
+                2,
+                b"QFontDatabase: Cannot find font directory /missing/fonts.\n"
+                b"real late HighGUI error\n",
+            )
+
+    monkeypatch.setattr(preview_mod, "cv2", NoisyCV2())
+    preview_mod._named_window_with_filtered_qt_stderr()
+    assert capfd.readouterr().err == "real late HighGUI error\n"
+
+
+def test_status_overlay_shows_actual_backends_cpu_and_fallbacks():
+    status, warnings = preview_mod._status_overlay_lines(
+        {
+            "mode": "video",
+            "capture_fps": 9.8,
+            "fps": 10.0,
+            "capture_target_fps": 30,
+            "output_target_fps": 30,
+            "capture_width": 1280,
+            "capture_height": 720,
+            "capture_fourcc": "YUYV",
+            "capture_fps_reported": 10.0,
+            "capture_backend": "V4L2",
+            "segmentation_backend": "RVMSegmenter",
+            "segmentation_device": "cpu",
+            "output_backend": "NullOutput",
+            "config_version": 4,
+            "capture_target_met": False,
+            "output_fallback_active": True,
+            "output_fallback_reason": "virtual-camera-unavailable",
+            "remote_fallback_active": True,
+            "remote_fallback_reason": "stale",
+            "background_video_source_fps": 24.0,
+            "background_video_timing_mode": "clocked",
+            "background_video_frames_displayed": 100,
+            "background_video_skip_ratio": 0.58,
+        }
+    )
+    rendered = "\n".join(status)
+    warning_text = "\n".join(warnings)
+    assert "IN 9.8/30" in rendered
+    assert "OUT 10.0/30" in rendered
+    assert "rvm/cpu" in rendered
+    assert "NullOutput" in rendered
+    assert "CONFIG v4" in rendered
+    assert "1280x720" in rendered and "YUYV" in rendered
+    assert "skip 58%" in rendered
+    assert "CAPTURE BELOW TARGET" in warning_text
+    assert "OUTPUT FALLBACK" in warning_text
+    assert "REMOTE FALLBACK" in warning_text
+
+
+def test_status_overlay_marks_stalled_capture_age():
+    _status, warnings = preview_mod._status_overlay_lines(
+        {"capture_stalled": True, "capture_frame_age_ms": 2450.0}
+    )
+    assert warnings == ["CAPTURE STALLED (2450 ms since last frame)"]
+
+
 class TestPreviewController:
     """Keyboard control logic, independent of the GUI event loop."""
 
@@ -321,8 +522,21 @@ class TestPreviewController:
             runtime, backgrounds_dir=None, coordinator=coordinator
         )
         ctl.handle_key(ord("1"))
-        assert coordinator.patches == [({"background": {"mode": "blur"}}, 5.0)]
+        assert coordinator.patches == [
+            ({"background": {"mode": "blur"}}, 5.0, "preview")
+        ]
         assert runtime.snapshot().background.mode == "blur"
+
+    def test_successful_update_identifies_preview_origin(self):
+        runtime = make_runtime(mode="passthrough")
+        coordinator = ImmediateCoordinator(runtime)
+        ctl = preview_mod._PreviewController(
+            runtime, backgrounds_dir=None, coordinator=coordinator
+        )
+        ctl.handle_key(ord("1"))
+        assert coordinator.patches == [
+            ({"background": {"mode": "blur"}}, 5.0, "preview")
+        ]
 
 
 def test_preview_end_to_end_key_sequence(monkeypatch, tmp_path):

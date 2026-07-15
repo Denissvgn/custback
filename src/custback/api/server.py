@@ -269,6 +269,7 @@ class _UploadResponse(BaseModel):
 
 
 class _StatusResponse(BaseModel):
+    run_id: str
     frames_in: int
     frames_out: int
     fps: float
@@ -283,6 +284,42 @@ class _StatusResponse(BaseModel):
     remote_fallback_count: int
     remote_fallback_reason: str
     config_version: int
+    capture_backend: str
+    capture_fourcc: str | None
+    capture_width: int | None
+    capture_height: int | None
+    capture_fps_reported: float | None
+    capture_target_fps: int
+    capture_fps: float
+    capture_target_met: bool | None
+    capture_frames_read: int
+    capture_dropped_frames: int
+    capture_read_failures: int
+    capture_restarts: int
+    capture_stalled: bool
+    capture_frame_age_ms: float | None
+    output_target_fps: int
+    fps_attainment_pct: float | None
+    output_repeated_frames: int
+    processing_deadline_misses: int
+    capture_read_ms: float | None
+    segmentation_ms: float | None
+    background_ms: float | None
+    composite_ms: float | None
+    output_send_ms: float | None
+    frame_processing_ms: float | None
+    output_fallback_active: bool
+    output_fallback_reason: str
+    segmentation_fallback_active: bool
+    segmentation_fallback_reason: str
+    background_video_source_fps: float | None
+    background_video_timing_mode: str | None
+    background_video_frames_displayed: int
+    background_video_frames_skipped: int
+    background_video_frames_reused: int
+    background_video_skip_ratio: float
+    background_video_seek_count: int
+    background_video_decode_failures: int
     uptime_s: float
 
 
@@ -363,7 +400,7 @@ def _map_apply_error(exc: BaseException) -> HTTPException:
 
 def _apply_patch(runtime: RuntimeConfig, coordinator: Any, patch: dict[str, Any]):
     try:
-        return coordinator.apply_config_patch(patch, timeout=5.0)
+        return coordinator.apply_config_patch(patch, timeout=5.0, origin="api")
     except BaseException as exc:
         raise _map_apply_error(exc) from exc
 
