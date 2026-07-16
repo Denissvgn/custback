@@ -11,7 +11,8 @@ const managed = require('./managed-venv');
 const installer = require('./install');
 
 const PKG_ROOT = path.resolve(__dirname, '..', '..');
-const DEFAULT_VENV = path.join(PKG_ROOT, '.venv');
+const DEFAULT_VENV = managed.defaultTargetForPackage(PKG_ROOT);
+const AVATAR_CONFIG = path.join(PKG_ROOT, 'config', 'avatar.yaml');
 const configuredProbeTimeout = Number(process.env.CUSTBACK_DOCTOR_TIMEOUT_MS);
 const PROBE_TIMEOUT_MS = Number.isSafeInteger(configuredProbeTimeout) && configuredProbeTimeout > 0
   ? configuredProbeTimeout
@@ -37,14 +38,62 @@ function pythonPath(target = targetPath()) {
   return path.join(target, 'bin', 'python');
 }
 
-function bootstrap(force = false) {
+function bootstrap(force = false, extrasOverride = undefined) {
   const env = { ...process.env };
   if (force) env.CUSTBACK_FORCE_REBUILD = '1';
+  if (extrasOverride !== undefined) env.CUSTBACK_EXTRAS = extrasOverride;
   const result = spawnSync(process.execPath, [path.join(__dirname, 'install.js')], {
     stdio: 'inherit',
     env,
   });
   return result.status === 0;
+}
+
+function invokedAsAvatar(executable = process.argv[1]) {
+  const name = path.basename(executable || '').replace(/\.cmd$/i, '');
+  return name === 'custback-avatar';
+}
+
+function parseRebuildArgs(args) {
+  let extras;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--extras') {
+      if (extras !== undefined || index + 1 >= args.length) {
+        throw new Error('usage: custback rebuild [--extras <comma-separated extras>]');
+      }
+      extras = args[index += 1];
+    } else if (arg.startsWith('--extras=')) {
+      if (extras !== undefined) {
+        throw new Error('--extras may be specified only once');
+      }
+      extras = arg.slice('--extras='.length);
+    } else {
+      throw new Error(`unknown rebuild option: ${arg}`);
+    }
+  }
+  if (extras === undefined) return { extras: undefined };
+  return { extras: installer.parseExtras(extras).join(',') };
+}
+
+function exportAvatarConfig(args, output = process.stdout) {
+  if (args.length > 1) {
+    throw new Error('usage: custback avatar config export [destination]');
+  }
+  const destination = args[0];
+  const contents = fs.readFileSync(AVATAR_CONFIG);
+  if (!destination || destination === '-') {
+    output.write(contents);
+    return 0;
+  }
+  fs.writeFileSync(path.resolve(destination), contents, { flag: 'wx', mode: 0o600 });
+  return 0;
+}
+
+function avatarConfigExportArgs(args) {
+  if (args[0] === 'config' && args[1] === 'export') return args.slice(2);
+  if (args[0] === '--export-config') return args.slice(1);
+  return null;
 }
 
 function hasCustbackCamera() {
@@ -153,6 +202,22 @@ function doctor() {
       'optional; heuristic fallback is available (CUSTBACK_EXTRAS=mediapipe custback rebuild)');
   }
 
+  if (selected.includes('audio2face')) {
+    const protocol = runProbe(python, ['-c', [
+      'import grpc',
+      'from nvidia_audio2face_3d import audio2face_pb2_grpc, messages_pb2',
+      'from nvidia_ace import animation_pb2, audio_pb2',
+    ].join('\n')], { encoding: 'utf8' });
+    report('Audio2Face protocol bindings', protocol.status === 0,
+      (protocol.stderr || '').trim().split('\n').pop());
+  } else if (requested.includes('audio2face')) {
+    report('requested Audio2Face protocol bindings', false,
+      'requested extra is absent; run: custback rebuild');
+  } else {
+    note('Audio2Face protocol bindings not installed',
+      'optional; use custback rebuild --extras audio2face');
+  }
+
   if (selected.includes('rvm') || selected.includes('gpu')) {
     const cuda = installer.cudaProbe(python);
     if (cuda.onnxruntime) {
@@ -200,13 +265,52 @@ function managedAppExists(target) {
   return inspection.kind !== 'absent' && fs.existsSync(appPath(target));
 }
 
-function main(argv = process.argv.slice(2)) {
-  const command = argv[0];
-  if (command === 'setup') return setup();
-  if (command === 'doctor') return doctor();
-  if (command === 'rebuild') return bootstrap(true) ? 0 : 1;
+function extras(args = [], output = process.stdout) {
+  if (args.length > 1 || (args.length === 1 && args[0] !== '--json')) {
+    throw new Error('usage: custback extras [--json]');
+  }
+  const target = targetPath();
+  const inspection = managed.inspectTarget(target);
+  const stamp = inspection.kind === 'absent' ? null : installer.readActiveStamp(target);
+  if (stamp && !installer.validInstallStamp(stamp)) {
+    throw new Error('managed venv install metadata is stale or invalid; run: custback rebuild');
+  }
+  const intent = installer.readInstallIntent(target);
+  const requested = installer.resolveRequestedExtras({}, intent, stamp);
+  const selected = stamp ? stamp.selectedExtras : [];
+  const status = {
+    target,
+    requested,
+    installed: selected,
+    available: installer.allowedExtras(),
+  };
+  if (args[0] === '--json') {
+    output.write(`${JSON.stringify(status)}\n`);
+  } else {
+    const display = (values) => values.join(', ') || 'core only';
+    output.write(`requested extras: ${display(requested)}\n`);
+    output.write(`installed extras: ${display(selected)}\n`);
+    output.write(`available extras: ${status.available.join(', ')}\n`);
+  }
+  return 0;
+}
 
+function main(argv = process.argv.slice(2), options = {}) {
+  const command = argv[0];
   try {
+    const avatarAlias = invokedAsAvatar(options.executable);
+    if (!avatarAlias && command === 'setup') return setup();
+    if (!avatarAlias && command === 'doctor') return doctor();
+    if (!avatarAlias && command === 'extras') return extras(argv.slice(1));
+    if (!avatarAlias && command === 'rebuild') {
+      const parsed = parseRebuildArgs(argv.slice(1));
+      return bootstrap(true, parsed.extras) ? 0 : 1;
+    }
+
+    const avatarArgs = avatarAlias ? argv : (command === 'avatar' ? argv.slice(1) : null);
+    const exportArgs = avatarArgs && avatarConfigExportArgs(avatarArgs);
+    if (exportArgs) return exportAvatarConfig(exportArgs);
+
     const target = targetPath();
     if (!managedAppExists(target) && !bootstrap(false)) {
       console.error('custback: managed Python environment is missing and bootstrap failed');
@@ -220,9 +324,9 @@ function main(argv = process.argv.slice(2)) {
     // managed venv; every other command passes through to the main app.
     let launcher = appPath(target);
     let launchArgs = argv;
-    if (command === 'avatar') {
+    if (avatarArgs) {
       launcher = avatarPath(target);
-      launchArgs = argv.slice(1);
+      launchArgs = avatarArgs;
       if (!fs.existsSync(launcher)) {
         console.error('custback: this managed venv predates the avatar service; run: custback rebuild');
         return 1;
@@ -241,13 +345,19 @@ function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+  AVATAR_CONFIG,
   appPath,
+  avatarConfigExportArgs,
   avatarPath,
   bootstrap,
   doctor,
+  exportAvatarConfig,
+  extras,
   hasCustbackCamera,
+  invokedAsAvatar,
   main,
   managedAppExists,
+  parseRebuildArgs,
   pythonPath,
   targetPath,
 };

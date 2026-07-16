@@ -37,6 +37,7 @@ from ..api.streaming import (
     JpegBroadcaster,
     LeasedStreamingResponse,
 )
+from .audio2face import microphone_available, protocol_available
 from .config import (
     AVATAR_PARTS,
     BUILTIN_AVATARS,
@@ -95,15 +96,12 @@ def driver_modes(cfg: AvatarConfig) -> list[dict]:
     synthetic idle animator, ``auto`` picks motion when available.
     """
     vision_ok = _module_available("mediapipe")
-    a2f_missing = [
-        name for name in ("grpc", "nvidia_ace") if not _module_available(name)
-    ]
     a2f_reason = ""
-    if a2f_missing:
+    if not protocol_available():
         a2f_reason = "install the [audio2face] extra for voice-driven animation"
     elif (
         cfg.driver.audio2face.audio_source == "microphone"
-        and not _module_available("sounddevice")
+        and not microphone_available()
     ):
         a2f_reason = "the microphone audio source needs the sounddevice package"
     active = cfg.driver.backend

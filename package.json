@@ -1,10 +1,11 @@
 {
   "name": "custback",
   "version": "0.4.0",
-  "description": "Virtual camera with background replacement for meeting apps (Ubuntu / macOS)",
+  "description": "Virtual camera with background replacement for meeting apps (Ubuntu / Debian / macOS)",
   "license": "MIT",
   "bin": {
-    "custback": "packaging/npm/custback.js"
+    "custback": "packaging/npm/custback.js",
+    "custback-avatar": "packaging/npm/custback.js"
   },
   "scripts": {
     "postinstall": "node packaging/npm/install.js",
@@ -14,9 +15,11 @@
     "prepack": "node scripts/release/verify-release.js --prepack"
   },
   "files": [
+    "LICENSE",
     "packaging/npm/*.js",
     "src/**/*.py",
     "config/*.yaml",
+    "docs/*.md",
     "scripts/*.sh",
     "scripts/release/*.js",
     "examples/*.py",

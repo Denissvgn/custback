@@ -1,8 +1,49 @@
 #!/usr/bin/env bash
-# custback setup for Ubuntu (tested target: 26.04 LTS).
+# custback automatic setup for Ubuntu and Debian.
 # Installs the v4l2loopback kernel module and creates a persistent
 # "custback Camera" virtual video device that meeting apps can select.
 set -euo pipefail
+
+OS_RELEASE_FILE="${CUSTBACK_OS_RELEASE_FILE:-/etc/os-release}"
+
+os_release_value() {
+  local wanted="$1"
+  local key value
+  while IFS='=' read -r key value; do
+    if [[ "$key" == "$wanted" ]]; then
+      value="${value#\"}"
+      value="${value%\"}"
+      value="${value#\'}"
+      value="${value%\'}"
+      printf '%s' "$value"
+      return 0
+    fi
+  done < "$OS_RELEASE_FILE"
+  return 1
+}
+
+if [[ ! -r "$OS_RELEASE_FILE" ]]; then
+  echo "custback setup: unsupported Linux distribution (cannot read $OS_RELEASE_FILE)" >&2
+  exit 1
+fi
+
+DISTRO_ID="$(os_release_value ID || true)"
+DISTRO_ID_LIKE="$(os_release_value ID_LIKE || true)"
+DISTRO_ID="${DISTRO_ID,,}"
+DISTRO_ID_LIKE="${DISTRO_ID_LIKE,,}"
+
+# The commands below are reviewed and tested only for Ubuntu and Debian. Do
+# not optimistically run apt on derivatives: add and test a distro-specific
+# installer before expanding this allowlist.
+case "$DISTRO_ID" in
+  ubuntu|debian) ;;
+  *)
+    echo "custback setup: unsupported Linux distribution "\
+         "(ID=${DISTRO_ID:-unknown}, ID_LIKE=${DISTRO_ID_LIKE:-unknown}); "\
+         "automatic setup supports Ubuntu and Debian only" >&2
+    exit 1
+    ;;
+esac
 
 echo "==> Installing v4l2loopback and Python build deps"
 sudo apt-get update

@@ -8,10 +8,11 @@ feeds them into the shared :class:`~custback.avatar.state.FaceState`
 contract that the rigs render. Head sway comes from the idle animator, as
 Audio2Face animates skin, jaw, tongue, and eyes but not head translation.
 
-Requirements (the ``audio2face`` extra): the ``nvidia-ace`` gRPC client
-bindings published with NVIDIA's Audio2Face-3D NIM (protocol v1), ``grpcio``,
-and ``sounddevice`` for microphone capture. The service endpoint is
-configured with ``driver.audio2face.url``; see the Audio2Face-3D
+Requirements (the ``audio2face`` extra): NVIDIA's
+``nvidia-audio2face-3d`` service bindings and their ``nvidia-ace`` shared
+messages, ``grpcio``, and ``sounddevice`` for microphone capture only. WAV
+streaming does not import or require the PortAudio binding. The service
+endpoint is configured with ``driver.audio2face.url``; see the Audio2Face-3D
 documentation for supported GPUs (data-center parts and GeForce RTX 3080
 and up — the RTX 3060 is below the supported list, which is why the vision
 driver is the local default).
@@ -78,9 +79,13 @@ def map_blendshape_frame(names: list[str], values: list[float]) -> dict[str, flo
 
 
 class AudioSource:
-    """Produces 16-bit mono PCM chunks at the configured sample rate."""
+    """Produces 16-bit mono PCM chunks at the configured sample rate.
 
-    def read(self, frames: int) -> bytes:
+    Returning ``None`` marks a finite clip complete; an empty byte string
+    means that a live source has no audio available yet.
+    """
+
+    def read(self, frames: int) -> bytes | None:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -149,9 +154,19 @@ def create_audio_source(cfg: Audio2FaceConfig) -> AudioSource:
     return WavAudioSource(cfg.audio_source, cfg.sample_rate)
 
 
+def microphone_available() -> bool:
+    """Return whether the optional microphone binding can load PortAudio."""
+
+    try:
+        import sounddevice  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class _Protocol:
-    """The nvidia-ace gRPC surface this driver targets (A2F-3D NIM v1)."""
+    """Published Audio2Face-3D/ACE gRPC surface targeted by this driver."""
 
     grpc: Any
     stub_class: Any
@@ -159,6 +174,7 @@ class _Protocol:
     audio_stream_header: Any
     audio_header: Any
     audio_with_emotion: Any
+    end_of_audio: Any
 
 
 @dataclass
@@ -176,26 +192,41 @@ class _PendingInterruption:
 def _load_protocol() -> _Protocol:
     try:
         import grpc
-        from nvidia_ace.a2f.v1_pb2 import AudioWithEmotion
-        from nvidia_ace.audio.v1_pb2 import AudioHeader
-        from nvidia_ace.controller.v1_pb2 import AudioStream, AudioStreamHeader
-        from nvidia_ace.services.a2f_controller.v1_pb2_grpc import (
+        from nvidia_ace.audio_pb2 import AudioHeader
+        from nvidia_audio2face_3d.audio2face_pb2_grpc import (
             A2FControllerServiceStub,
         )
-    except ImportError as exc:
+        from nvidia_audio2face_3d.messages_pb2 import (
+            AudioWithEmotion,
+            AudioWithEmotionStream,
+            AudioWithEmotionStreamHeader,
+        )
+    except Exception as exc:
         raise DriverUnavailableError(
-            "the audio2face driver needs the nvidia-ace gRPC bindings and "
-            "grpcio; install the [audio2face] extra and see NVIDIA's "
-            "Audio2Face-3D NIM documentation"
+            "the audio2face driver needs compatible nvidia-audio2face-3d, "
+            "nvidia-ace, protobuf, and grpcio bindings; install the "
+            "[audio2face] extra and see NVIDIA's Audio2Face-3D NIM "
+            "documentation"
         ) from exc
     return _Protocol(
         grpc=grpc,
         stub_class=A2FControllerServiceStub,
-        audio_stream=AudioStream,
-        audio_stream_header=AudioStreamHeader,
+        audio_stream=AudioWithEmotionStream,
+        audio_stream_header=AudioWithEmotionStreamHeader,
         audio_header=AudioHeader,
         audio_with_emotion=AudioWithEmotion,
+        end_of_audio=AudioWithEmotionStream.EndOfAudio,
     )
+
+
+def protocol_available() -> bool:
+    """Probe every generated module and message required by the driver."""
+
+    try:
+        _load_protocol()
+    except DriverUnavailableError:
+        return False
+    return True
 
 
 class Audio2FaceDriver(FaceDriver):
@@ -633,6 +664,9 @@ class Audio2FaceDriver(FaceDriver):
             started = time.monotonic()
             data = source.read(chunk_frames)
             if self._stop.is_set():
+                return
+            if data is None:
+                yield protocol.audio_stream(end_of_audio=protocol.end_of_audio())
                 return
             if not data:
                 self._stop.wait(chunk_seconds)

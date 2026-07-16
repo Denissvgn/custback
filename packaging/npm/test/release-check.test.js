@@ -5,36 +5,216 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const zlib = require('node:zlib');
 
 const release = require('../../../scripts/release/verify-release');
 
 const root = path.resolve(__dirname, '..', '..', '..');
 
+function tarballWithFile(name, contents) {
+  const data = Buffer.from(contents);
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 100, 'utf8');
+  header.write('0000644\0', 100, 8, 'ascii');
+  header.write('0000000\0', 108, 8, 'ascii');
+  header.write('0000000\0', 116, 8, 'ascii');
+  header.write(`${data.length.toString(8).padStart(11, '0')}\0`, 124, 12, 'ascii');
+  header[156] = '0'.charCodeAt(0);
+  const padding = Buffer.alloc(Math.ceil(data.length / 512) * 512 - data.length);
+  return zlib.gzipSync(Buffer.concat([header, data, padding, Buffer.alloc(1024)]));
+}
+
 test('release metadata versions and required compatibility bounds agree', () => {
   assert.equal(release.verifyVersions(root), '0.4.0');
   assert.doesNotThrow(() => release.verifyNpmMetadata(root));
   assert.doesNotThrow(() => release.verifyDependencies(root));
+  assert.doesNotThrow(() => release.verifyLicenseMetadata(root));
   assert.doesNotThrow(() => release.verifyDocs(root));
+  assert.doesNotThrow(() => release.verifyCiWorkflow(root));
+  assert.doesNotThrow(() => release.verifyPlatformScope(root));
 });
 
-test('remediation registry tracks resolved work and keeps the release frozen', () => {
+test('prepack verifies the non-recursive packlist and reserves artifact installs', () => {
+  assert.deepEqual(release.releasePlan(['--prepack']), {
+    builtArtifacts: false,
+    success: 'metadata and non-recursive npm packlist verified',
+  });
+  assert.equal(release.releasePlan([]).builtArtifacts, true);
+  assert.equal(release.releasePlan(['--quick']).builtArtifacts, false);
+  assert.throws(() => release.releasePlan(['--prepack', '--quick']), /invalid release/);
+  assert.throws(() => release.releasePlan(['--unknown']), /invalid release/);
+
+  const source = fs.readFileSync(
+    path.join(root, 'scripts', 'release', 'verify-release.js'), 'utf8',
+  );
+  assert.match(
+    source,
+    /\['pack', '--dry-run', '--json', '--ignore-scripts'/,
+    'packlist verification must suppress lifecycle recursion',
+  );
+});
+
+test('full release temporary roots reject Linux memory-backed filesystems', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-release-base-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const baseEnv = { CUSTBACK_RELEASE_TMPDIR: fixture };
+  const tmpfs = () => ({ type: 0x01021994 });
+  const ramfs = () => ({ type: 0x858458f6 });
+  const disk = () => ({ type: 0xef53 });
+
+  assert.equal(release.filesystemIsMemoryBacked(fixture, tmpfs, 'linux'), true);
+  assert.equal(release.filesystemIsMemoryBacked(fixture, ramfs, 'linux'), true);
+  assert.equal(release.filesystemIsMemoryBacked(fixture, tmpfs, 'darwin'), false);
+  assert.throws(
+    () => release.filesystemIsMemoryBacked(fixture, null, 'linux'),
+    /cannot determine whether release temporary storage is memory-backed/,
+  );
+  assert.throws(
+    () => release.createReleaseTemporaryRoot({ env: baseEnv, statfs: tmpfs, platform: 'linux' }),
+    /memory-backed filesystem/,
+  );
+  assert.throws(
+    () => release.createReleaseTemporaryRoot({ env: baseEnv, statfs: ramfs, platform: 'linux' }),
+    /memory-backed filesystem/,
+  );
+
+  const allowed = release.createReleaseTemporaryRoot({
+    env: { ...baseEnv, CUSTBACK_RELEASE_ALLOW_TMPFS: '1' },
+    statfs: tmpfs,
+    platform: 'linux',
+  });
+  assert.equal(path.dirname(allowed), fs.realpathSync(fixture));
+  assert.equal(fs.statSync(allowed).isDirectory(), true);
+  fs.rmSync(allowed, { recursive: true, force: true });
+
+  const diskRoot = release.createReleaseTemporaryRoot({
+    env: baseEnv,
+    statfs: disk,
+    platform: 'linux',
+  });
+  assert.equal(fs.statSync(diskRoot).isDirectory(), true);
+  fs.rmSync(diskRoot, { recursive: true, force: true });
+
+  const checkout = fs.mkdtempSync(path.join(fixture, 'checkout-'));
+  const nestedBase = path.join(checkout, 'release-scratch');
+  fs.mkdirSync(nestedBase);
+  assert.throws(
+    () => release.createReleaseTemporaryRoot({
+      env: { CUSTBACK_RELEASE_TMPDIR: nestedBase },
+      root: checkout,
+      statfs: disk,
+      platform: 'linux',
+    }),
+    /outside the source checkout/,
+  );
+});
+
+test('release profile directories are disposed after success and failure', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-disposable-test-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+
+  const successful = path.join(fixture, 'successful');
+  assert.equal(release.withDisposableDirectory(successful, (directory) => {
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, 'payload'), 'large environment');
+    return 42;
+  }), 42);
+  assert.equal(fs.existsSync(successful), false);
+
+  const failed = path.join(fixture, 'failed');
+  assert.throws(() => release.withDisposableDirectory(failed, (directory) => {
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, 'payload'), 'partial environment');
+    throw new Error('profile failed');
+  }), /profile failed/);
+  assert.equal(fs.existsSync(failed), false);
+
+  const existing = path.join(fixture, 'existing');
+  fs.mkdirSync(existing);
+  assert.throws(
+    () => release.withDisposableDirectory(existing, () => undefined),
+    /refusing to reuse/,
+  );
+  assert.equal(fs.existsSync(existing), true);
+});
+
+test('release scratch environment is relocated and restored after failures', () => {
+  const env = { TMPDIR: '/old/tmpdir', TEMP: '/old/temp', KEEP: 'unchanged' };
+  const before = { ...env };
+  assert.throws(() => release.withTemporaryEnvironment({
+    TMPDIR: '/disk/release',
+    TMP: '/disk/release',
+    TEMP: '/disk/release',
+  }, () => {
+    assert.equal(env.TMPDIR, '/disk/release');
+    assert.equal(env.TMP, '/disk/release');
+    assert.equal(env.TEMP, '/disk/release');
+    throw new Error('artifact failure');
+  }, env), /artifact failure/);
+  assert.deepEqual(env, before);
+});
+
+test('release native build parallelism is memory-bounded by default', () => {
+  assert.equal(release.releaseBuildJobs({}), '2');
+  assert.equal(release.releaseBuildJobs({ CUSTBACK_RELEASE_BUILD_JOBS: '1' }), '1');
+  assert.equal(release.releaseBuildJobs({ CUSTBACK_RELEASE_BUILD_JOBS: '32' }), '32');
+  for (const invalid of ['', '0', '-1', '2.5', '33', 'many']) {
+    assert.throws(
+      () => release.releaseBuildJobs({ CUSTBACK_RELEASE_BUILD_JOBS: invalid }),
+      /integer from 1 through 32/,
+    );
+  }
+});
+
+test('advertised built-wheel extra profiles cover every platform-feasible group', () => {
+  assert.deepEqual(
+    release.extraArtifactProfiles('linux', 'x64').map((profile) => profile.name),
+    ['mediapipe', 'rvm', 'gpu', 'audio2face', 'dev'],
+  );
+  assert.deepEqual(
+    release.extraArtifactProfiles('darwin', 'x64').map((profile) => profile.name),
+    ['mediapipe', 'rvm', 'audio2face', 'dev'],
+  );
+  const audio2face = release.extraArtifactProfiles('linux', 'x64')
+    .find((profile) => profile.name === 'audio2face');
+  assert.deepEqual(audio2face.extras, ['audio2face', 'dev']);
+  assert.equal(audio2face.test, 'tests/test_audio2face_protocol.py');
+});
+
+test('npm artifact LICENSE must be byte-identical to the canonical source', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-license-test-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const canonical = release.canonicalLicense(root);
+  const matching = path.join(fixture, 'matching.tgz');
+  const changed = path.join(fixture, 'changed.tgz');
+  fs.writeFileSync(matching, tarballWithFile('package/LICENSE', canonical));
+  fs.writeFileSync(changed, tarballWithFile('package/LICENSE', `${canonical}changed\n`));
+  assert.doesNotThrow(() => release.verifyNpmArtifactLicense(matching, root));
+  assert.throws(
+    () => release.verifyNpmArtifactLicense(changed, root),
+    /not byte-identical/,
+  );
+});
+
+test('remediation registry records all 26 blockers as resolved', () => {
   const blockers = release.remediationBlockers(root);
   assert.equal(blockers.length, 26);
   assert.deepEqual(
     blockers.filter((entry) => entry.status === 'resolved').map((entry) => entry.id),
     [
       'SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01',
+      'A2F-01',
       'CFG-01', 'CFG-02', 'LIFE-01', 'LIFE-02',
       'STOR-01', 'STOR-02', 'SEG-01', 'SEG-02', 'SEG-03',
-      'RENDER-01', 'RENDER-02', 'API-01', 'MISC-01', 'MISC-02',
+      'RENDER-01', 'RENDER-02', 'API-01',
+      'NPM-01', 'PKG-01', 'PKG-02', 'DEPLOY-01',
+      'MISC-01', 'MISC-02',
+      'LICENSE-01', 'PLATFORM-01', 'HYGIENE-01',
     ],
   );
-  assert.equal(blockers.filter((entry) => entry.status === 'open').length, 8);
+  assert.deepEqual(blockers.filter((entry) => entry.status === 'open'), []);
   assert.doesNotThrow(() => release.verifyBlockerRegressionCoverage(root));
-  assert.throws(
-    () => release.verifyNoReleaseBlockers(root),
-    /release blocked by 8 open remediation blocker.*A2F-01.*HYGIENE-01/,
-  );
+  assert.doesNotThrow(() => release.verifyNoReleaseBlockers(root));
 });
 
 test('remediation registry fails closed on missing, malformed, or inconsistent state', (t) => {
@@ -273,7 +453,13 @@ test('dependency verification rejects unreviewed extras and console scripts', (t
 test('stale artifact reporting is deterministic and non-mutating', (t) => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-release-test-'));
   t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
-  for (const name of ['custback-0.1.0.tgz', 'debug.txt', 'uninstall.log', 'keep.txt']) {
+  for (const name of [
+    'custback-0.1.0.tgz',
+    'debug.txt',
+    'onnxruntime_profile__2026-07-16_12-34-56.json',
+    'uninstall.log',
+    'keep.txt',
+  ]) {
     fs.writeFileSync(path.join(fixture, name), name);
   }
   fs.mkdirSync(path.join(fixture, 'build'));
@@ -281,7 +467,14 @@ test('stale artifact reporting is deterministic and non-mutating', (t) => {
   fs.mkdirSync(path.join(fixture, 'src', 'custback.egg-info'));
   assert.deepEqual(
     release.staleArtifacts(fixture).sort(),
-    ['build', 'custback-0.1.0.tgz', 'debug.txt', 'src/custback.egg-info', 'uninstall.log'],
+    [
+      'build',
+      'custback-0.1.0.tgz',
+      'debug.txt',
+      'onnxruntime_profile__2026-07-16_12-34-56.json',
+      'src/custback.egg-info',
+      'uninstall.log',
+    ],
   );
   assert.equal(fs.readFileSync(path.join(fixture, 'keep.txt'), 'utf8'), 'keep.txt');
 });

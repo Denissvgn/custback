@@ -415,6 +415,45 @@ def test_avatars_reports_rigs_and_driver_modes(stack):
         }
 
 
+def test_audio2face_wav_availability_does_not_require_microphone(monkeypatch):
+    monkeypatch.setattr(avatar_api_mod, "protocol_available", lambda: True)
+    monkeypatch.setattr(avatar_api_mod, "microphone_available", lambda: False)
+    wav_config = AvatarConfig.from_dict(
+        {
+            "driver": {
+                "audio2face": {
+                    "url": "grpc://127.0.0.1:52000",
+                    "audio_source": "voice.wav",
+                }
+            }
+        }
+    )
+
+    wav_mode = next(
+        mode for mode in avatar_api_mod.driver_modes(wav_config)
+        if mode["backend"] == "audio2face"
+    )
+    assert wav_mode["available"] is True
+    assert wav_mode["reason"] == ""
+
+    microphone_config = AvatarConfig.from_dict(
+        {
+            "driver": {
+                "audio2face": {
+                    "url": "grpc://127.0.0.1:52000",
+                    "audio_source": "microphone",
+                }
+            }
+        }
+    )
+    microphone_mode = next(
+        mode for mode in avatar_api_mod.driver_modes(microphone_config)
+        if mode["backend"] == "audio2face"
+    )
+    assert microphone_mode["available"] is False
+    assert "sounddevice" in microphone_mode["reason"]
+
+
 def test_builtin_thumbnails_served_and_validated(stack):
     response = stack.get("/avatars/casey/thumbnail.jpg", headers=AUTH)
     assert response.status_code == 200

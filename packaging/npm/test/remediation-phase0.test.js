@@ -16,6 +16,8 @@ const path = require('node:path');
 const test = require('node:test');
 
 const installer = require('../install');
+const launcher = require('../custback');
+const managed = require('../managed-venv');
 const release = require('../../../scripts/release/verify-release');
 
 const root = path.resolve(__dirname, '..', '..', '..');
@@ -30,8 +32,7 @@ function json(relative) {
 
 test(
   'NPM-01: the default managed venv and rollback generations survive npm package replacement',
-  { todo: 'move the default managed runtime outside the replaceable npm package root' },
-  () => {
+  (t) => {
     const sources = [read('packaging/npm/install.js'), read('packaging/npm/custback.js')];
     for (const source of sources) {
       assert.equal(
@@ -40,12 +41,48 @@ test(
         'the default venv must not be stored below the replaceable package root',
       );
     }
+    const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-phase0-prefix-'));
+    t.after(() => fs.rmSync(prefix, { recursive: true, force: true }));
+    const packageRoot = path.join(prefix, 'lib', 'node_modules', 'custback');
+    fs.mkdirSync(packageRoot, { recursive: true });
+    const target = managed.defaultTargetForPackage(packageRoot);
+    const generationRoot = managed.ensureGenerationsRoot(target);
+    const makeGeneration = () => {
+      const generation = managed.createGeneration(generationRoot);
+      fs.mkdirSync(path.join(generation, 'bin'));
+      fs.writeFileSync(path.join(generation, 'pyvenv.cfg'), 'home = /python\n');
+      fs.writeFileSync(path.join(generation, 'bin', 'python'), '#!/bin/sh\n');
+      fs.writeFileSync(path.join(generation, 'bin', 'custback'), '#!/bin/sh\n');
+      managed.markGeneration(generation, target);
+      return generation;
+    };
+    const rollback = makeGeneration();
+    managed.promoteGeneration({
+      target,
+      generation: rollback,
+      inspection: managed.inspectTarget(target),
+      validateActive() {},
+    });
+    const active = makeGeneration();
+    managed.promoteGeneration({
+      target,
+      generation: active,
+      inspection: managed.inspectTarget(target),
+      validateActive() {},
+    });
+    installer.writeInstallIntent(target, ['gpu']);
+
+    fs.rmSync(packageRoot, { recursive: true });
+    fs.mkdirSync(packageRoot, { recursive: true });
+    assert.equal(managed.defaultTargetForPackage(packageRoot), target);
+    assert.equal(fs.realpathSync(target), fs.realpathSync(active));
+    managed.validateGeneration(rollback, target, generationRoot);
+    assert.deepEqual(installer.readInstallIntent(target).requestedExtras, ['gpu']);
   },
 );
 
 test(
   'NPM-01: an absent CUSTBACK_EXTRAS preserves persisted intent while an explicit empty value clears it',
-  { todo: 'persist install intent and distinguish an absent environment variable from an empty one' },
   () => {
     const source = read('packaging/npm/install.js');
     const collapsesAbsentAndEmpty =
@@ -59,12 +96,14 @@ test(
       { collapsesAbsentAndEmpty, distinguishesPresence, persistsIntent },
       { collapsesAbsentAndEmpty: false, distinguishesPresence: true, persistsIntent: true },
     );
+    const intent = { requestedExtras: ['gpu'] };
+    assert.deepEqual(installer.resolveRequestedExtras({}, intent), ['gpu']);
+    assert.deepEqual(installer.resolveRequestedExtras({ CUSTBACK_EXTRAS: '' }, intent), []);
   },
 );
 
 test(
   'NPM-01: config/avatar.yaml participates in the managed-environment source digest',
-  { todo: 'include every shipped configuration template in sourceDigest()' },
   (t) => {
     const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-avatar-digest-'));
     t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
@@ -85,7 +124,6 @@ test(
 
 test(
   'PKG-01: npm exposes both documented custback and custback-avatar launch surfaces',
-  { todo: 'publish the compatibility avatar bin and keep package-lock/docs in sync' },
   () => {
     const pkg = json('package.json');
     const lock = json('package-lock.json');
@@ -97,14 +135,27 @@ test(
 
     assert.deepEqual(pkg.bin, expectedBins);
     assert.deepEqual(lock.packages[''].bin, expectedBins);
+    if (process.platform !== 'win32') {
+      assert.notEqual(
+        fs.statSync(path.join(root, 'packaging', 'npm', 'custback.js')).mode & 0o111,
+        0,
+        'npm bin target must be executable',
+      );
+    }
     assert.match(readme, /\bcustback avatar\b/);
     assert.match(readme, /\bcustback-avatar\b/);
+    assert.match(readme, /custback avatar config export/);
+    assert.equal(launcher.invokedAsAvatar('/npm-prefix/bin/custback-avatar'), true);
+    let exported = Buffer.alloc(0);
+    launcher.exportAvatarConfig([], {
+      write(chunk) { exported = Buffer.concat([exported, chunk]); },
+    });
+    assert.deepEqual(exported, fs.readFileSync(path.join(root, 'config', 'avatar.yaml')));
   },
 );
 
 test(
   'PKG-02: the documented npm pack command is safe for shell command substitution',
-  { todo: 'silence lifecycle chatter in the documented tarball capture command' },
   () => {
     const tarballCommands = read('README.md').split('\n')
       .filter((line) => line.includes('TARBALL='));
@@ -119,7 +170,6 @@ test(
 
 test(
   'PKG-02: prepack never claims that an npm payload was verified when payload verification was skipped',
-  { todo: 'either verify the ignore-scripts packlist during prepack or emit a narrower status message' },
   () => {
     const source = read('scripts/release/verify-release.js');
     const skipsPayloadVerification =
@@ -138,7 +188,6 @@ test(
 
 test(
   'PLATFORM-01: Linux setup rejects unsupported distributions before invoking apt-get',
-  { todo: 'validate ID/ID_LIKE from os-release before running Debian-specific setup' },
   () => {
     const source = read('scripts/install_linux.sh');
     const distroProbe = source.search(/(?:\/etc\/os-release|lsb_release)/);
@@ -154,7 +203,6 @@ test(
 
 test(
   'LICENSE-01: canonical MIT license text is present in npm and Python release contracts',
-  { todo: 'add LICENSE and include it in every built artifact and release allowlist' },
   () => {
     const licensePath = path.join(root, 'LICENSE');
     const licenseText = fs.existsSync(licensePath) ? fs.readFileSync(licensePath, 'utf8') : '';
@@ -168,7 +216,8 @@ test(
         /THE SOFTWARE IS PROVIDED [“"]AS IS[”"]/.test(licenseText),
       npmArtifactContract: pkg.files.includes('LICENSE'),
       pythonArtifactContract:
-        /license(?:-files|_files)?\s*=\s*(?:\{[^\n]*file\s*=\s*)?["']?LICENSE/i.test(pyproject),
+        /^license\s*=\s*["']MIT["']\s*$/m.test(pyproject) &&
+        /^license-files\s*=\s*\[\s*["']LICENSE["']\s*\]\s*$/m.test(pyproject),
       reviewedReleasePayload: /['"]LICENSE['"]/.test(releaseSource),
     };
 
@@ -184,7 +233,6 @@ test(
 
 test(
   'A2F-01: the Audio2Face extra names the published service protocol package used by the driver',
-  { todo: 'replace the impossible nvidia-ace constraint and update protocol imports/release allowlists' },
   () => {
     const pyproject = read('pyproject.toml');
     const driver = read('src/custback/avatar/audio2face.py');
@@ -201,14 +249,15 @@ test(
 
 test(
   'DEPLOY-01: the remote deployment guide separates renderer and control credentials over WSS/HTTPS',
-  { todo: 'document both remote trust planes, their distinct tokens, and TLS transports' },
   () => {
     const readme = read('README.md');
     const start = readme.indexOf('### Running the avatar service on another host');
     const next = readme.indexOf('\n### ', start + 4);
-    const guide = start >= 0 ? readme.slice(start, next >= 0 ? next : undefined) : '';
+    const summary = start >= 0 ? readme.slice(start, next >= 0 ? next : undefined) : '';
+    const guide = read('docs/remote-deployment.md');
     const requirements = {
-      sectionPresent: start >= 0,
+      sectionPresent:
+        start >= 0 && /\(docs\/remote-deployment\.md\)/.test(summary),
       rendererToken:
         /renderer(?:-scoped)?[- ]+(?:credential|token)|renderer[_ -]token/i.test(guide),
       controlToken:
@@ -216,6 +265,12 @@ test(
       explicitlySeparate: /\b(?:separate|distinct)\b/i.test(guide),
       rendererWss: /\bwss:\/\//i.test(guide),
       controlHttps: /\bhttps:\/\//i.test(guide),
+      trustAndRotation:
+        /source\.tls_ca_file/.test(guide) && /avatar\.tls_ca_file/.test(guide) &&
+        /\brotation\b/i.test(guide),
+      outageBehavior:
+        /privacy slate/i.test(guide) && /avatar_auth_failed/.test(guide) &&
+        /avatar_unreachable/.test(guide),
     };
 
     assert.deepEqual(requirements, {
@@ -225,13 +280,14 @@ test(
       explicitlySeparate: true,
       rendererWss: true,
       controlHttps: true,
+      trustAndRotation: true,
+      outageBehavior: true,
     });
   },
 );
 
 test(
   'HYGIENE-01: generated ONNX Runtime profiles are ignored and rejected as stale release artifacts',
-  { todo: 'ignore onnxruntime_profile__*.json and make staleArtifacts reject them' },
   (t) => {
     const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-onnx-profile-'));
     t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));

@@ -7,6 +7,8 @@ const path = require('node:path');
 const test = require('node:test');
 
 const installer = require('../install');
+const launcher = require('../custback');
+const managed = require('../managed-venv');
 
 test('interpreter identity probe executes valid Python and reports support', () => {
   const identity = installer.pythonIdentity(
@@ -37,11 +39,12 @@ test('installer reaches interrupted-promotion recovery under the install lock', 
 
 function completeStamp(expected, selectedExtras = expected.requestedExtras) {
   return {
-    schema: 3,
+    schema: installer.INSTALL_STAMP_SCHEMA,
     ...expected,
     selectedExtras,
     capabilities: {
       mediapipe: selectedExtras.includes('mediapipe'),
+      audio2face: selectedExtras.includes('audio2face'),
       rvm: selectedExtras.includes('rvm') || selectedExtras.includes('gpu'),
       cuda_provider: selectedExtras.includes('gpu'),
       cuda_inference: selectedExtras.includes('gpu'),
@@ -51,9 +54,13 @@ function completeStamp(expected, selectedExtras = expected.requestedExtras) {
 }
 
 test('extras are normalized and invalid/conflicting requests fail', () => {
-  assert.deepEqual(installer.parseExtras(' gpu,mediapipe,gpu '), ['gpu', 'mediapipe']);
+  assert.deepEqual(installer.parseExtras(' audio2face,gpu,audio2face '), ['audio2face', 'gpu']);
   assert.throws(() => installer.parseExtras('dev'), /unsupported CUSTBACK_EXTRAS/);
   assert.throws(() => installer.parseExtras('gpu,rvm'), /cannot combine rvm and gpu/);
+  assert.throws(
+    () => installer.parseExtras('audio2face,mediapipe'),
+    /conflicting protobuf requirements/,
+  );
 });
 
 test('only implicit MediaPipe can be removed from fallback attempts', () => {
@@ -61,6 +68,11 @@ test('only implicit MediaPipe can be removed from fallback attempts', () => {
   assert.deepEqual(installer.installAttempts(['gpu']), [['gpu', 'mediapipe'], ['gpu']]);
   assert.deepEqual(installer.installAttempts(['rvm']), [['mediapipe', 'rvm'], ['rvm']]);
   assert.deepEqual(installer.installAttempts(['mediapipe']), [['mediapipe']]);
+  assert.deepEqual(installer.installAttempts(['audio2face']), [['audio2face']]);
+  assert.deepEqual(
+    installer.installAttempts(['audio2face', 'gpu']),
+    [['audio2face', 'gpu']],
+  );
   assert.deepEqual(
     installer.installAttempts(['gpu', 'mediapipe']),
     [['gpu', 'mediapipe']],
@@ -88,6 +100,8 @@ test('install stamp extras are canonical, supported, and include every request',
   assert.equal(installer.validExtraSelection([], ['unknown']), false);
   assert.equal(installer.validExtraSelection([], ['gpu', 'rvm']), false);
   assert.equal(installer.validExtraSelection([], ['mediapipe', 'gpu']), false);
+  assert.equal(installer.validExtraSelection(['audio2face'], ['audio2face']), true);
+  assert.equal(installer.validExtraSelection([], ['audio2face', 'mediapipe']), false);
   const expected = {
     packageVersion: '0.3.0',
     sourceDigest: `sha256:${'c'.repeat(64)}`,
@@ -104,7 +118,7 @@ test('install stamp extras are canonical, supported, and include every request',
     ...stamp,
     capabilities: { ...stamp.capabilities, cuda_inference: false },
   }), false);
-  assert.equal(installer.validInstallStamp({ ...stamp, schema: 2 }), false);
+  assert.equal(installer.validInstallStamp({ ...stamp, schema: 3 }), false);
 });
 
 test('CUDA capability parser fails closed on malformed or CPU-fallback evidence', () => {
@@ -172,9 +186,164 @@ test('corrupt active install metadata can be treated as stale without hiding str
   assert.throws(() => installer.readActiveStamp(target), /invalid custback metadata/);
 });
 
+test('default target, generations, and extras intent survive package-directory replacement', (t) => {
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-prefix-test-'));
+  t.after(() => fs.rmSync(prefix, { recursive: true, force: true }));
+  const packageRoot = path.join(prefix, 'lib', 'node_modules', 'custback');
+  fs.mkdirSync(packageRoot, { recursive: true });
+  const target = managed.defaultTargetForPackage(packageRoot);
+  assert.equal(target, path.join(prefix, managed.DEFAULT_TARGET_NAME));
+  assert.equal(managed.isWithin(packageRoot, target), false);
+
+  const generations = managed.ensureGenerationsRoot(target);
+  const fakeGeneration = () => {
+    const generation = managed.createGeneration(generations);
+    fs.mkdirSync(path.join(generation, 'bin'));
+    fs.writeFileSync(path.join(generation, 'pyvenv.cfg'), 'home = /python\n');
+    fs.writeFileSync(path.join(generation, 'bin', 'python'), '#!/bin/sh\n');
+    fs.writeFileSync(path.join(generation, 'bin', 'custback'), '#!/bin/sh\n');
+    managed.markGeneration(generation, target);
+    return generation;
+  };
+  const rollback = fakeGeneration();
+  managed.promoteGeneration({
+    target,
+    generation: rollback,
+    inspection: managed.inspectTarget(target),
+    validateActive() {},
+  });
+  const active = fakeGeneration();
+  const promotion = managed.promoteGeneration({
+    target,
+    generation: active,
+    inspection: managed.inspectTarget(target),
+    validateActive() {},
+  });
+  assert.equal(path.resolve(promotion.previousGeneration), path.resolve(rollback));
+  const activeIdentity = fs.statSync(active);
+  const rollbackIdentity = fs.statSync(rollback);
+  installer.writeInstallIntent(target, ['audio2face', 'gpu']);
+  fs.rmSync(packageRoot, { recursive: true });
+  fs.mkdirSync(packageRoot, { recursive: true });
+
+  assert.equal(managed.defaultTargetForPackage(packageRoot), target);
+  assert.equal(fs.existsSync(generations), true);
+  assert.equal(fs.realpathSync(target), fs.realpathSync(active));
+  assert.equal(fs.statSync(active).ino, activeIdentity.ino);
+  assert.equal(fs.statSync(active).dev, activeIdentity.dev);
+  assert.equal(fs.statSync(rollback).ino, rollbackIdentity.ino);
+  assert.equal(fs.statSync(rollback).dev, rollbackIdentity.dev);
+  managed.validateGeneration(rollback, target, generations);
+  assert.deepEqual(
+    installer.readInstallIntent(target).requestedExtras,
+    ['audio2face', 'gpu'],
+  );
+});
+
+test('npm prefix inference handles local, global, scoped, and checkout layouts', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-prefix-layout-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.equal(
+    managed.npmPrefixForPackage(path.join(root, 'node_modules', 'custback')),
+    root,
+  );
+  assert.equal(
+    managed.npmPrefixForPackage(path.join(root, 'lib', 'node_modules', 'custback')),
+    root,
+  );
+  assert.equal(
+    managed.npmPrefixForPackage(path.join(root, 'node_modules', '@scope', 'custback')),
+    root,
+  );
+  assert.equal(
+    managed.npmPrefixForPackage(path.join(root, 'checkout')),
+    root,
+  );
+});
+
+test('extras intent distinguishes absent and empty input and is private metadata', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-intent-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'venv');
+  installer.writeInstallIntent(target, ['gpu']);
+  const intent = installer.readInstallIntent(target);
+  assert.deepEqual(installer.resolveRequestedExtras({}, intent), ['gpu']);
+  assert.deepEqual(installer.resolveRequestedExtras({ CUSTBACK_EXTRAS: '' }, intent), []);
+  assert.deepEqual(
+    installer.resolveRequestedExtras({ CUSTBACK_EXTRAS: ' audio2face,gpu ' }, intent),
+    ['audio2face', 'gpu'],
+  );
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(installer.installIntentPath(target)).mode & 0o777, 0o600);
+  }
+});
+
+test('a newer promoted stamp wins over stale intent after intent publication failure', () => {
+  const expected = {
+    packageVersion: '0.4.0',
+    sourceDigest: `sha256:${'d'.repeat(64)}`,
+    python: { executable: '/python', version: '3.12.1', cacheTag: 'cpython-312' },
+    requestedExtras: [],
+  };
+  const active = {
+    ...completeStamp(expected, []),
+    createdAt: '2026-07-16T12:00:01.000Z',
+  };
+  const staleIntent = {
+    owner: managed.OWNER,
+    schema: installer.INSTALL_INTENT_SCHEMA,
+    logicalTarget: '/managed/venv',
+    requestedExtras: ['gpu'],
+    updatedAt: '2026-07-16T12:00:00.000Z',
+  };
+  assert.deepEqual(installer.resolveRequestedExtras({}, staleIntent, active), []);
+  assert.deepEqual(
+    installer.resolveRequestedExtras({}, { ...staleIntent, updatedAt: '2026-07-16T12:00:02.000Z' }, active),
+    ['gpu'],
+  );
+});
+
+test('legacy package-local environments are read for intent but never relocated', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-legacy-read-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const legacy = path.join(root, '.venv');
+  fs.mkdirSync(path.join(legacy, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(legacy, 'pyvenv.cfg'), 'home = /python\n');
+  fs.writeFileSync(path.join(legacy, 'bin', 'python'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(legacy, 'bin', 'custback'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(legacy, managed.LEGACY_STAMP), '0.2.0 python3.12 3.12 [gpu]');
+  assert.deepEqual(installer.readLegacyRequestedExtras(legacy), ['gpu']);
+  assert.equal(fs.lstatSync(legacy).isDirectory(), true);
+  assert.equal(fs.existsSync(path.join(legacy, 'bin', 'custback')), true);
+});
+
+test('launcher exposes durable extras flags, avatar alias dispatch, and config export', (t) => {
+  assert.deepEqual(launcher.parseRebuildArgs([]), { extras: undefined });
+  assert.deepEqual(launcher.parseRebuildArgs(['--extras', 'gpu,audio2face']), {
+    extras: 'audio2face,gpu',
+  });
+  assert.deepEqual(launcher.parseRebuildArgs(['--extras=']), { extras: '' });
+  assert.throws(() => launcher.parseRebuildArgs(['--extras']), /usage/);
+  assert.equal(launcher.invokedAsAvatar('/prefix/bin/custback-avatar'), true);
+  assert.equal(launcher.invokedAsAvatar('/prefix/bin/custback'), false);
+  assert.deepEqual(launcher.avatarConfigExportArgs(['config', 'export', 'out.yaml']), ['out.yaml']);
+
+  let stdout = Buffer.alloc(0);
+  launcher.exportAvatarConfig([], { write(chunk) { stdout = Buffer.concat([stdout, chunk]); } });
+  assert.deepEqual(stdout, fs.readFileSync(launcher.AVATAR_CONFIG));
+  const destination = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'custback-config-export-')),
+    'avatar.yaml',
+  );
+  t.after(() => fs.rmSync(path.dirname(destination), { recursive: true, force: true }));
+  assert.equal(launcher.exportAvatarConfig([destination]), 0);
+  assert.deepEqual(fs.readFileSync(destination), fs.readFileSync(launcher.AVATAR_CONFIG));
+  assert.throws(() => launcher.exportAvatarConfig([destination]), /EEXIST/);
+});
+
 test('launcher rebuild delegates to installer and never recursively deletes VENV_DIR', () => {
   const source = fs.readFileSync(path.resolve(__dirname, '..', 'custback.js'), 'utf8');
-  assert.match(source, /bootstrap\(true\)/);
+  assert.match(source, /bootstrap\(true,\s*parsed\.extras\)/);
   assert.doesNotMatch(source, /rmSync\s*\(\s*VENV_DIR/);
   assert.doesNotMatch(source, /rmSync\s*\(\s*targetPath/);
 });

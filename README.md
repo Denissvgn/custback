@@ -1,7 +1,7 @@
 # custback
 
 Local virtual camera with background replacement for meeting apps and
-browsers, on **Ubuntu (26.04 LTS)** and **macOS**.
+browsers, on **Ubuntu / Debian** and **macOS**.
 
 ```
 real camera ──► segmentation ──► compositor ──► virtual camera ──► Zoom/Meet/Teams/browser
@@ -19,7 +19,7 @@ real camera ──► segmentation ──► compositor ──► virtual camera
 * **NVIDIA GPU acceleration** (optional): matting runs on CUDA 12 when
   `onnxruntime-gpu` completes verified CUDA inference; use the `rvm` extra for an
   explicitly CPU-only npm installation.
-* **Avatar stage**: the bundled `custback-avatar` service replaces you with
+* **Avatar stage**: the bundled `custback avatar` service replaces you with
   an animated avatar — expression tracking (MediaPipe) or NVIDIA
   Audio2Face-3D lip sync, selectable visible parts, scale/position, and its
   own backdrop — locally or from another GPU host. See
@@ -36,46 +36,54 @@ real camera ──► segmentation ──► compositor ──► virtual camera
 
 ```bash
 npm install -g custback
-# Local release artifact: TARBALL=$(npm pack) && npm install -g "./$TARBALL"
+# Local release artifact: TARBALL=$(npm pack --silent) && npm install -g "./$TARBALL"
 custback setup              # one-time OS virtual-camera setup (v4l2loopback / OBS)
 custback doctor             # verify the installation
 custback --mode blur --preview
 ```
 
 The npm package is a self-contained launcher: on install it finds a suitable
-Python (>= 3.10 and < 3.15, preferring versions with MediaPipe wheels), creates a private
-venv inside the package, and installs the bundled Python app into it. Wrapper
-subcommands:
+Python (>= 3.10 and < 3.15, preferring versions with MediaPipe wheels), creates
+a private venv at a deterministic path scoped to the npm prefix (outside the
+replaceable package directory), and installs the bundled Python app into it.
+Wrapper subcommands:
 
 | Command | Purpose |
 | --- | --- |
 | `custback setup` | OS-level virtual camera setup (runs the right script for your platform) |
 | `custback doctor` | validate the managed venv, versions, dependencies, and selected extras; setup gaps are warnings |
-| `custback rebuild` | build and validate a new venv generation, then switch to it atomically |
-| `custback avatar …` | run the bundled stage-2 avatar service (`custback-avatar` in the managed venv) |
+| `custback extras` | show persisted requested extras, installed extras, and available choices (`--json` is supported) |
+| `custback rebuild [--extras LIST]` | build and validate a new venv generation, then switch to it atomically; an explicit empty list clears extras |
+| `custback avatar …` | run the bundled stage-2 avatar service; the npm `custback-avatar` binary is a compatibility alias |
+| `custback avatar config export [PATH]` | print the bundled annotated avatar YAML, or create `PATH` without overwriting it |
 | anything else | passed through to the app (`custback --help`) |
 
 Environment overrides: `CUSTBACK_VENV=/dedicated/path` relocates the private
 venv. The target must be absent or already owned by custback; rebuild refuses
 unsafe, unrelated, and unmarked directories and never recursively deletes the
 configured path. `CUSTBACK_SKIP_INSTALL=1` skips the Python bootstrap at install
-time. `CUSTBACK_EXTRAS=gpu` (or `rvm`) requires that matting backend; explicitly
-requested extras are never silently discarded. MediaPipe is attempted by
+time. `custback rebuild --extras gpu` (or `rvm`) requires that matting backend;
+`audio2face` installs the remote Audio2Face protocol. `CUSTBACK_EXTRAS` provides
+the same comma-separated selection. When the variable and flag are absent the
+last successful intent is preserved; an explicitly empty value clears it.
+Requested extras are never silently discarded. MediaPipe is attempted by
 default and may fall back to the core heuristic backend when it was not
-explicitly requested. See
+explicitly requested; `audio2face` and `mediapipe` cannot be combined because
+their published protobuf constraints conflict. See
 [Rendering quality & GPU](#rendering-quality--gpu-acceleration).
 Each installer subprocess is bounded to 15 minutes by default
 (`CUSTBACK_INSTALL_TIMEOUT_MS` accepts a positive millisecond override); doctor
 probes use a 60-second bound (`CUSTBACK_DOCTOR_TIMEOUT_MS`).
 
-On the first 0.3.x rebuild, a legacy npm-managed venv is adopted only when its
-old custback stamp and launcher layout validate. It is retained as the rollback
-generation until the newly built environment passes imports, dependency, and
-CLI probes; unrelated custom venvs must be moved aside explicitly.
+When upgrading from a package-local legacy npm venv, custback reads valid old
+extras metadata but builds a fresh generation at the durable prefix-scoped
+target. It never relocates the old venv because Python launcher shebangs contain
+absolute paths. Existing generations at the durable target remain available
+for rollback across npm package replacement.
 
 ### Manual (pip)
 
-#### Ubuntu
+#### Ubuntu / Debian
 
 ```bash
 ./scripts/install_linux.sh      # installs v4l2loopback, creates "custback Camera" (/dev/video10)
@@ -351,22 +359,25 @@ changes needed:
    The final gate protects startup probes, repeats, preview publication, and
    the virtual-camera sink.
 
-### The built-in avatar service: `custback-avatar`
+### The built-in avatar service: `custback avatar`
 
 The package ships that stage-2 service. It tracks you in the forwarded
 camera frames, animates an avatar (52 ARKit blendshape channels + head
 pose), composites it over its own selected background at exactly the camera
 frame size, and returns the frames — a person-like presence in the meeting
-without your pixels ever leaving the machine that runs custback-avatar.
+without your pixels ever leaving the machine that runs `custback avatar`.
+The npm `custback-avatar` binary remains available as a compatibility alias;
+new scripts and examples should use the canonical subcommand.
 
 ```bash
-custback --mode remote &                # custback shows what the avatar service returns
-custback-avatar                         # connects to ws://127.0.0.1:8710, renders the avatar
-custback-avatar -c config/avatar.yaml   # everything from YAML (see the annotated example)
-custback-avatar --avatar robin --style realistic --framing bust
+custback --mode remote &                       # custback shows what the avatar service returns
+custback avatar                                # connects to ws://127.0.0.1:8710, renders the avatar
+custback avatar config export ./avatar.yaml    # export the bundled annotated template
+custback avatar -c ./avatar.yaml               # run everything from YAML
+custback avatar --avatar robin --style realistic --framing bust
                                         # a different presenter, soft-shaded,
                                         # head-and-chest framed for meeting tiles
-custback-avatar --parts head,eyes,brows,nose,mouth,hair --scale 0.6 \
+custback avatar --parts head,eyes,brows,nose,mouth,hair --scale 0.6 \
     --bg-image ~/walls/office.jpg       # floating head over an office backdrop
 ```
 
@@ -397,7 +408,7 @@ pivot/sway/framing tuning) for a custom look; PNG rigs render as authored
 (`sketch` still applies, `avatar`/`realistic` are builtin-only).
 
 **Control API**: the service has its own Bearer-authenticated control plane
-on `127.0.0.1:8711` with its own token (`custback-avatar --show-api-token`,
+on `127.0.0.1:8711` with its own token (`custback avatar --show-api-token`,
 env `CUSTBACK_AVATAR_API_TOKEN`): `GET /status`; `GET /avatars` for the
 selectable avatars/styles/framings/parts plus installed rigs and the
 animation `modes` (each mapped to a `driver.backend` with availability for
@@ -423,8 +434,8 @@ directories/files are kept at exact `0700`/`0600` modes. Audit or repair a
 pre-existing store before startup with:
 
 ```bash
-custback-avatar -c config/avatar.yaml --check-storage-permissions
-custback-avatar -c config/avatar.yaml --fix-storage-permissions
+custback avatar -c ./avatar.yaml --check-storage-permissions
+custback avatar -c ./avatar.yaml --fix-storage-permissions
 ```
 
 Through custback's `/avatar/*` proxy the web UI reaches all of this with the
@@ -432,20 +443,11 @@ browser session alone — uploads land on whichever machine renders the avatar.
 
 ### Running the avatar service on another host
 
-Rendering and tracking can move off the meeting machine — e.g. custback on
-a laptop and the avatar service next to a bigger GPU:
-
-```bash
-# meeting machine: TLS-protected non-loopback custback API
-custback --mode remote --api-host 0.0.0.0 --allow-non-loopback-api \
-    --api-tls-cert cert.pem --api-tls-key key.pem     # + api.allowed_origins in YAML
-
-# GPU host: connect back over verified WSS with the renderer-only token.
-# Configure source.tls_ca_file in config/avatar.yaml for a private CA.
-CUSTBACK_RENDERER_TOKEN="$(cat renderer-token)" \
-custback-avatar -c config/avatar.yaml \
-  --source wss://laptop.example:8710 --driver vision
-```
+Rendering and tracking can move off the meeting machine. The production
+runbook is [Two-host avatar deployment](docs/remote-deployment.md). It defines
+the distinct renderer-scoped token over WSS and avatar-control token over
+HTTPS, both CA and certificate paths, firewall direction, safe rotation, and
+fail-closed outage behavior. Remote plaintext is not a recovery option.
 
 GPU guidance:
 
@@ -453,7 +455,7 @@ GPU guidance:
   CPU-friendly) for the avatar and the existing `gpu` extra for RVM matting.
   Audio2Face-3D officially supports GeForce RTX 3080 and up (plus
   data-center GPUs), so the RTX 3060 is *not* a supported A2F host.
-* **Remote NVIDIA GB10 (DGX Spark)** — run `custback-avatar` on the GB10
+* **Remote NVIDIA GB10 (DGX Spark)** — run `custback avatar` on the GB10
   host (aarch64 Linux; the core service needs only OpenCV/NumPy wheels) and
   point `driver.audio2face.url` at an Audio2Face-3D NIM on the same box.
   Check NVIDIA's NIM support matrix for the GB10/Blackwell container before
@@ -514,7 +516,7 @@ This release intentionally breaks the old unauthenticated control plane:
 | `preview.py` | interactive on-screen verification window (main thread; mode/file/blur controls, q/ESC quits) |
 | `pipeline.py` | main loop; transactional frame-boundary reconfiguration |
 | `api/server.py` | authenticated FastAPI control, uploads, MJPEG, and WebSockets |
-| `avatar/` | stage-2 avatar service (`custback-avatar`): drivers (`drivers.py`, `audio2face.py`), rigs (`rig.py`), composition (`renderer.py`), WS client loop (`service.py`), control API (`api.py`) |
+| `avatar/` | stage-2 avatar service (`custback avatar`): drivers (`drivers.py`, `audio2face.py`), rigs (`rig.py`), composition (`renderer.py`), WS client loop (`service.py`), control API (`api.py`) |
 
 ## Tests
 
@@ -523,9 +525,25 @@ The whole pipeline is testable without a camera, virtual camera, or mediapipe:
 ```bash
 pytest
 npm test
-npm run release:check   # build, inspect, install, and smoke-test Python/npm artifacts
+npm run release:check -- --quick  # metadata and npm packlist; suitable during development
 ```
 
-Release-gate subprocesses have a 15-minute default bound; set
-`CUSTBACK_RELEASE_TIMEOUT_MS` to a positive millisecond value for slower build
-hosts.
+The full artifact gate creates and installs several isolated Python environments.
+Point it at a pre-existing disk-backed directory so those environments do not
+consume tmpfs/RAM; each environment is removed as soon as its profile finishes:
+
+```bash
+mkdir -p "$HOME/.cache/custback-release"
+CUSTBACK_RELEASE_TMPDIR="$HOME/.cache/custback-release" npm run release:check
+```
+
+The full gate rejects Linux tmpfs/ramfs storage by default. Override that guard
+only when the host has measured headroom with
+`CUSTBACK_RELEASE_ALLOW_TMPFS=1`. Native dependency builds default to two
+parallel jobs; set `CUSTBACK_RELEASE_BUILD_JOBS` from 1 through 32 only when the
+host has measured headroom. Release-gate subprocesses have a 15-minute default
+bound; set `CUSTBACK_RELEASE_TIMEOUT_MS` to a positive millisecond value for
+slower build hosts. A force-killed gate cannot run its cleanup handler and may
+leave a `custback-release-*` directory in the configured base; after confirming
+that no gate is running, inspect and remove that exact abandoned directory
+before retrying.

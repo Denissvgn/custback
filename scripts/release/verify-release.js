@@ -8,6 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { isDeepStrictEqual } = require('util');
+const zlib = require('zlib');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const managed = require(path.join(ROOT, 'packaging', 'npm', 'managed-venv'));
@@ -16,6 +17,10 @@ const configuredTimeout = Number(process.env.CUSTBACK_RELEASE_TIMEOUT_MS);
 const COMMAND_TIMEOUT_MS = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0
   ? configuredTimeout
   : 15 * 60 * 1000;
+const LINUX_MEMORY_BACKED_FILESYSTEM_MAGICS = new Set([
+  0x01021994, // TMPFS_MAGIC
+  0x858458f6, // RAMFS_MAGIC
+]);
 const REVIEWED_PYTHON_MODULES = [
   'custback/__init__.py',
   'custback/__main__.py',
@@ -53,6 +58,7 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_api.py',
   'tests/test_api_lifecycle.py',
   'tests/test_api_security.py',
+  'tests/test_audio2face_protocol.py',
   'tests/test_avatar_api.py',
   'tests/test_avatar_config.py',
   'tests/test_avatar_drivers.py',
@@ -69,14 +75,18 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_pipeline.py',
   'tests/test_preview.py',
   'tests/test_processing.py',
+  'tests/test_remediation_runtime.py',
+  'tests/test_remediation_security.py',
   'tests/test_segmentation_rvm.py',
   'tests/test_streaming.py',
   'tests/test_webui.py',
 ];
 const REVIEWED_NPM_PAYLOAD = [
+  'LICENSE',
   'README.md',
   'config/avatar.yaml',
   'config/default.yaml',
+  'docs/remote-deployment.md',
   'examples/avatar_client.py',
   'package.json',
   'packaging/npm/custback.js',
@@ -88,7 +98,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'scripts/release/verify-release.js',
   ...REVIEWED_PYTHON_MODULES.map((name) => `src/${name}`),
 ];
-const REVIEWED_BUILD_REQUIREMENTS = ['setuptools>=68,<84'];
+const REVIEWED_BUILD_REQUIREMENTS = ['setuptools>=77,<84'];
 const REVIEWED_CORE_DEPENDENCIES = [
   'numpy>=1.24,<3',
   'opencv-contrib-python>=4.8,<6',
@@ -107,8 +117,10 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
   rvm: ['onnxruntime>=1.17,<2'],
   gpu: ['onnxruntime-gpu>=1.17,<1.27'],
   audio2face: [
-    'grpcio>=1.60,<2',
-    'nvidia-ace>=1.2,<2',
+    'grpcio>=1.67,<1.67.2',
+    'nvidia-ace==1.0.0',
+    'nvidia-audio2face-3d==1.3.0',
+    'protobuf>=5.29.3,<6',
     'sounddevice>=0.4,<0.6',
   ],
   dev: [
@@ -123,11 +135,20 @@ const REVIEWED_CONSOLE_SCRIPTS = {
   custback: 'custback.__main__:main',
   'custback-avatar': 'custback.avatar.__main__:main',
 };
+const REVIEWED_ACTIONS = new Set([
+  'actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955',
+  'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
+  'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
+]);
+const REVIEWED_LICENSE_COPYRIGHT = 'Copyright (c) 2026 Bramen';
 const REVIEWED_NPM_METADATA = {
   name: 'custback',
-  description: 'Virtual camera with background replacement for meeting apps (Ubuntu / macOS)',
+  description: 'Virtual camera with background replacement for meeting apps (Ubuntu / Debian / macOS)',
   license: 'MIT',
-  bin: { custback: 'packaging/npm/custback.js' },
+  bin: {
+    custback: 'packaging/npm/custback.js',
+    'custback-avatar': 'packaging/npm/custback.js',
+  },
   scripts: {
     postinstall: 'node packaging/npm/install.js',
     test: 'node --test packaging/npm/test/*.test.js',
@@ -136,9 +157,11 @@ const REVIEWED_NPM_METADATA = {
     prepack: 'node scripts/release/verify-release.js --prepack',
   },
   files: [
+    'LICENSE',
     'packaging/npm/*.js',
     'src/**/*.py',
     'config/*.yaml',
+    'docs/*.md',
     'scripts/*.sh',
     'scripts/release/*.js',
     'examples/*.py',
@@ -157,6 +180,125 @@ const REVIEWED_NPM_METADATA = {
 
 function fail(message) {
   throw new Error(message);
+}
+
+function filesystemIsMemoryBacked(
+  directory,
+  statfs = fs.statfsSync,
+  platform = process.platform,
+) {
+  if (platform !== 'linux') return false;
+  if (typeof statfs !== 'function') {
+    fail('cannot determine whether release temporary storage is memory-backed');
+  }
+  return LINUX_MEMORY_BACKED_FILESYSTEM_MAGICS.has(Number(statfs(directory).type));
+}
+
+function releaseBuildJobs(env = process.env) {
+  const configured = env.CUSTBACK_RELEASE_BUILD_JOBS;
+  if (configured === undefined) return '2';
+  const value = String(configured);
+  if (!/^[1-9][0-9]*$/.test(value) || Number(value) > 32) {
+    fail('CUSTBACK_RELEASE_BUILD_JOBS must be an integer from 1 through 32');
+  }
+  return value;
+}
+
+function createReleaseTemporaryRoot(options = {}) {
+  const env = options.env || process.env;
+  const configured = env.CUSTBACK_RELEASE_TMPDIR;
+  const candidate = configured || options.defaultBase || os.tmpdir();
+  let base;
+  try {
+    base = fs.realpathSync(path.resolve(candidate));
+    if (!fs.statSync(base).isDirectory()) {
+      fail('release temporary base must be an existing directory');
+    }
+  } catch (err) {
+    if (err.message === 'release temporary base must be an existing directory') throw err;
+    fail(`release temporary base is unavailable: ${err.message}`);
+  }
+  const sourceRoot = fs.realpathSync(options.root || ROOT);
+  const sourceRelative = path.relative(sourceRoot, base);
+  if (!sourceRelative ||
+      (!sourceRelative.startsWith(`..${path.sep}`) && sourceRelative !== '..' &&
+       !path.isAbsolute(sourceRelative))) {
+    fail('release temporary base must be outside the source checkout');
+  }
+  const allowTmpfs = env.CUSTBACK_RELEASE_ALLOW_TMPFS === '1';
+  if (filesystemIsMemoryBacked(base, options.statfs, options.platform) && !allowTmpfs) {
+    fail(
+      `${base} is a memory-backed filesystem; set CUSTBACK_RELEASE_TMPDIR to an ` +
+      'existing disk-backed directory (or explicitly set CUSTBACK_RELEASE_ALLOW_TMPFS=1)'
+    );
+  }
+  return fs.mkdtempSync(path.join(base, 'custback-release-'));
+}
+
+function withDisposableDirectory(directory, callback) {
+  if (fs.existsSync(directory)) {
+    fail(`refusing to reuse disposable release directory: ${directory}`);
+  }
+  try {
+    return callback(directory);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function withTemporaryEnvironment(updates, callback, env = process.env) {
+  const previous = new Map();
+  for (const [name, value] of Object.entries(updates)) {
+    previous.set(name, Object.prototype.hasOwnProperty.call(env, name) ? env[name] : undefined);
+    env[name] = value;
+  }
+  try {
+    return callback();
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete env[name];
+      else env[name] = value;
+    }
+  }
+}
+
+function canonicalLicense(root = ROOT) {
+  const licensePath = path.join(root, 'LICENSE');
+  let text;
+  try {
+    const stat = fs.lstatSync(licensePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      fail('LICENSE must be a regular, non-symlink file');
+    }
+    text = fs.readFileSync(licensePath, 'utf8');
+  } catch (err) {
+    if (err.message.startsWith('LICENSE must')) throw err;
+    fail(`LICENSE is missing or unreadable: ${err.message}`);
+  }
+  const required = [
+    'MIT License',
+    REVIEWED_LICENSE_COPYRIGHT,
+    'Permission is hereby granted, free of charge, to any person obtaining a copy',
+    'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND',
+  ];
+  if (!text.endsWith('\n') || required.some((line) => !text.includes(line))) {
+    fail(`LICENSE must contain the reviewed MIT grant and ${REVIEWED_LICENSE_COPYRIGHT}`);
+  }
+  return Buffer.from(text, 'utf8');
+}
+
+function verifyLicenseMetadata(root = ROOT) {
+  canonicalLicense(root);
+  const pyproject = fs.readFileSync(path.join(root, 'pyproject.toml'), 'utf8');
+  const project = tableBody(pyproject, 'project');
+  if (stringValue(project, 'license') !== 'MIT' ||
+      !isDeepStrictEqual(arrayValue(project, 'license-files'), ['LICENSE'])) {
+    fail('pyproject.toml must declare MIT and ship only the canonical LICENSE file');
+  }
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  if (pkg.license !== 'MIT' || !Array.isArray(pkg.files) || !pkg.files.includes('LICENSE')) {
+    fail('package.json must declare MIT and explicitly ship LICENSE');
+  }
 }
 
 function remediationBlockers(root = ROOT) {
@@ -360,7 +502,7 @@ function verifyDependencies(root = ROOT) {
   const pyproject = fs.readFileSync(path.join(root, 'pyproject.toml'), 'utf8');
   const buildSystem = arrayValue(tableBody(pyproject, 'build-system'), 'requires');
   if (JSON.stringify(buildSystem) !== JSON.stringify(REVIEWED_BUILD_REQUIREMENTS)) {
-    fail('build-system requirements must be exactly setuptools>=68,<84');
+    fail('build-system requirements must be exactly setuptools>=77,<84');
   }
   const core = arrayValue(tableBody(pyproject, 'project'), 'dependencies');
   for (const spec of REVIEWED_CORE_DEPENDENCIES) {
@@ -436,6 +578,7 @@ function verifyNpmPayload(names, root) {
     /(^|\/)\.venv(?:\/|$)/.test(name) || name.includes('custback-generations') ||
     name.startsWith('packaging/npm/test/') || name.endsWith('.tgz') || name.endsWith('.whl') ||
     name.endsWith('.tar.gz') || name.includes('__pycache__') || name.endsWith('.pyc') ||
+    /(^|\/)onnxruntime_profile__.*\.json$/.test(name) ||
     name === 'debug.txt' || name === 'uninstall.log');
   if (forbidden.length) fail(`npm artifact contains forbidden files: ${forbidden.join(', ')}`);
   const expected = expectedNpmPayload(root);
@@ -486,12 +629,65 @@ function parseNpmPackPayload(stdout, version) {
   return { artifact, names };
 }
 
+function tarString(block, start, length) {
+  const end = block.indexOf(0, start);
+  const limit = end >= start && end < start + length ? end : start + length;
+  return block.subarray(start, limit).toString('utf8');
+}
+
+function npmTarballFile(tarball, wanted) {
+  let archive;
+  try {
+    archive = zlib.gunzipSync(fs.readFileSync(tarball));
+  } catch (err) {
+    fail(`npm artifact is not a readable gzip stream: ${err.message}`);
+  }
+  const seen = new Set();
+  for (let offset = 0; offset + 512 <= archive.length;) {
+    const header = archive.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const name = tarString(header, 0, 100);
+    const prefix = tarString(header, 345, 155);
+    const pathname = prefix ? `${prefix}/${name}` : name;
+    const rawSize = tarString(header, 124, 12).trim();
+    if (!/^[0-7]+$/.test(rawSize)) {
+      fail(`npm artifact has an invalid tar size for ${pathname || '<unnamed>'}`);
+    }
+    const size = Number.parseInt(rawSize, 8);
+    if (!Number.isSafeInteger(size)) fail(`npm artifact tar entry is too large: ${pathname}`);
+    const dataStart = offset + 512;
+    const dataEnd = dataStart + size;
+    if (dataEnd > archive.length) fail(`npm artifact tar entry is truncated: ${pathname}`);
+    const type = String.fromCharCode(header[156] || 48);
+    if (type === '0') {
+      if (!pathname || path.posix.isAbsolute(pathname) ||
+          path.posix.normalize(pathname) !== pathname ||
+          pathname.split('/').includes('..') || seen.has(pathname)) {
+        fail(`npm artifact has an unsafe or duplicate tar entry: ${pathname}`);
+      }
+      seen.add(pathname);
+      if (pathname === wanted) return Buffer.from(archive.subarray(dataStart, dataEnd));
+    }
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  fail(`npm artifact is missing ${wanted}`);
+}
+
+function verifyNpmArtifactLicense(tarball, root = ROOT) {
+  const expected = canonicalLicense(root);
+  const actual = npmTarballFile(tarball, 'package/LICENSE');
+  if (!actual.equals(expected)) {
+    fail('npm artifact LICENSE is not byte-identical to the canonical LICENSE');
+  }
+}
+
 function staleArtifacts(root = ROOT) {
   const staleNames = new Set(['debug.txt', 'uninstall.log']);
   const stale = [];
   for (const name of fs.readdirSync(root)) {
     const full = path.join(root, name);
-    if (staleNames.has(name) || name.endsWith('.tgz') || name.endsWith('.whl') ||
+    if (staleNames.has(name) || /^onnxruntime_profile__.*\.json$/.test(name) ||
+        name.endsWith('.tgz') || name.endsWith('.whl') ||
         name.endsWith('.tar.gz') || (['build', 'dist'].includes(name) && fs.statSync(full).isDirectory())) {
       stale.push(name);
     }
@@ -510,6 +706,88 @@ function verifyDocs(root = ROOT) {
   if (/custback-\d+\.\d+\.\d+\.tgz/.test(readme)) {
     fail('README hard-codes a versioned npm tarball');
   }
+  if (!readme.includes('TARBALL=$(npm pack --silent)')) {
+    fail('README local npm tarball capture must use npm pack --silent');
+  }
+  if (!readme.includes('(docs/remote-deployment.md)')) {
+    fail('README must link the two-host remote deployment guide');
+  }
+  const deployment = fs.readFileSync(
+    path.join(root, 'docs', 'remote-deployment.md'), 'utf8',
+  );
+  const requirements = [
+    [/renderer-scoped token/i, 'renderer-scoped token'],
+    [/avatar-control token/i, 'avatar-control token'],
+    [/\bwss:\/\//i, 'WSS renderer endpoint'],
+    [/\bhttps:\/\//i, 'HTTPS avatar-control endpoint'],
+    [/source\.tls_ca_file/, 'renderer CA configuration'],
+    [/avatar\.tls_ca_file/, 'avatar-control CA configuration'],
+    [/firewall rule/i, 'firewall direction'],
+    [/\brotation\b/i, 'credential rotation'],
+    [/privacy slate/i, 'renderer-outage privacy behavior'],
+    [/avatar_auth_failed/, 'control-token failure behavior'],
+    [/avatar_unreachable/, 'control-plane outage behavior'],
+  ];
+  for (const [pattern, description] of requirements) {
+    if (!pattern.test(deployment)) {
+      fail(`remote deployment guide is missing ${description}`);
+    }
+  }
+}
+
+function verifyCiWorkflow(root = ROOT) {
+  const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const uses = [...workflow.matchAll(/^\s*-\s+uses:\s+([^\s#]+)/gm)]
+    .map((match) => match[1]);
+  if (!uses.length || uses.some((action) => !REVIEWED_ACTIONS.has(action))) {
+    fail(`CI actions must use the reviewed commit SHA pins: ${uses.join(', ') || 'none'}`);
+  }
+  if (/\bnpm\s+install\b/.test(workflow) || !/\bnpm\s+ci\b/.test(workflow)) {
+    fail('CI must use npm ci and must not use npm install');
+  }
+}
+
+function verifyPlatformScope(root = ROOT) {
+  const scriptPath = path.join(root, 'scripts', 'install_linux.sh');
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const guard = source.search(/unsupported Linux distribution/i);
+  const identity = source.search(/DISTRO_ID=/);
+  const identityLike = source.search(/DISTRO_ID_LIKE=/);
+  const apt = source.search(/\bapt-get\b/);
+  if (guard < 0 || identity < 0 || identityLike < 0 || apt < 0 ||
+      guard > apt || identity > apt || identityLike > apt ||
+      !/ubuntu\|debian/.test(source)) {
+    fail('Linux installer must allow only Ubuntu/Debian before apt-get');
+  }
+
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-platform-check-'));
+  try {
+    const releasePath = path.join(fixture, 'os-release');
+    const markerPath = path.join(fixture, 'mutation-attempted');
+    const fakeBin = path.join(fixture, 'bin');
+    fs.mkdirSync(fakeBin);
+    fs.writeFileSync(releasePath, 'ID=fedora\nID_LIKE="rhel centos"\n');
+    const fakeSudo = path.join(fakeBin, 'sudo');
+    fs.writeFileSync(fakeSudo, '#!/bin/sh\n: > "$CUSTBACK_MUTATION_MARKER"\nexit 99\n');
+    fs.chmodSync(fakeSudo, 0o700);
+    const result = spawnSync('/bin/bash', [scriptPath], {
+      encoding: 'utf8',
+      timeout: Math.min(COMMAND_TIMEOUT_MS, 30 * 1000),
+      env: {
+        ...process.env,
+        CUSTBACK_OS_RELEASE_FILE: releasePath,
+        CUSTBACK_MUTATION_MARKER: markerPath,
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+      },
+    });
+    if ((result.error && result.status === null) || result.status === 0 ||
+        !/unsupported Linux distribution/i.test(result.stderr || '') ||
+        fs.existsSync(markerPath)) {
+      fail('Linux installer did not reject an unsupported distro before mutation');
+    }
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
 }
 
 function verifyPack(version, root = ROOT) {
@@ -524,7 +802,9 @@ function verifyPack(version, root = ROOT) {
     if (result.status !== 0) fail(`npm pack dry-run failed: ${(result.stderr || '').trim()}`);
     const { names } = parseNpmPackPayload(result.stdout, version);
     for (const required of [
+      'LICENSE',
       'README.md',
+      'docs/remote-deployment.md',
       'package.json',
       'packaging/npm/custback.js',
       'packaging/npm/install.js',
@@ -561,6 +841,60 @@ function runChecked(command, args, options = {}) {
   return result;
 }
 
+function extraArtifactProfiles(platform = process.platform, arch = process.arch) {
+  const profiles = [
+    {
+      name: 'mediapipe',
+      extras: ['mediapipe'],
+      probe: 'import importlib.metadata as m; import mediapipe; m.version("mediapipe")',
+    },
+    {
+      name: 'rvm',
+      extras: ['rvm'],
+      probe: 'import importlib.metadata as m; import onnxruntime; m.version("onnxruntime")',
+    },
+    {
+      name: 'audio2face',
+      extras: ['audio2face', 'dev'],
+      test: 'tests/test_audio2face_protocol.py',
+    },
+    {
+      name: 'dev',
+      extras: ['dev'],
+      probe: 'import importlib.metadata as m; import build, pytest; m.version("httpx2")',
+    },
+  ];
+  // onnxruntime-gpu publishes Linux x86-64 wheels. Generic CI runners can
+  // validate resolution and metadata without claiming CUDA execution.
+  if (platform === 'linux' && arch === 'x64') {
+    profiles.splice(2, 0, {
+      name: 'gpu',
+      extras: ['gpu'],
+      probe: 'import importlib.metadata as m; m.version("onnxruntime-gpu")',
+    });
+  }
+  return profiles;
+}
+
+function installAndProbeExtra(python, temporaryRoot, artifact, profile, source) {
+  const venv = path.join(temporaryRoot, `${profile.name}-artifact-venv`);
+  return withDisposableDirectory(venv, () => {
+    runChecked(python, ['-m', 'venv', venv]);
+    const venvPython = path.join(venv, 'bin', 'python');
+    const spec = `${artifact}[${profile.extras.join(',')}]`;
+    runChecked(venvPython, [
+      '-m', 'pip', 'install', '--disable-pip-version-check', spec,
+    ]);
+    runChecked(venvPython, ['-m', 'pip', 'check']);
+    if (profile.probe) runChecked(venvPython, ['-c', profile.probe]);
+    if (profile.test) {
+      runChecked(venvPython, [
+        '-m', 'pytest', '-q', path.join(source, profile.test),
+      ], { cwd: source });
+    }
+  });
+}
+
 function stageCleanSource(root, destination) {
   const excludedNames = new Set([
     '.agents', '.codex', '.git', '.venv', '.pytest_cache', 'build', 'dist', '__pycache__',
@@ -575,7 +909,8 @@ function stageCleanSource(root, destination) {
       if (parts.some((part) => excludedNames.has(part) || part.endsWith('.egg-info') ||
           part.endsWith('.custback-generations'))) return false;
       if (relative.endsWith('.tgz') || relative.endsWith('.whl') ||
-          relative.endsWith('.tar.gz') || relative.endsWith('.pyc')) return false;
+          relative.endsWith('.tar.gz') || relative.endsWith('.pyc') ||
+          /(^|[\\/])onnxruntime_profile__.*\.json$/.test(relative)) return false;
       return true;
     },
   });
@@ -587,6 +922,7 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
   const output = path.join(temporaryRoot, 'python-dist');
   const buildTools = path.join(temporaryRoot, 'build-tools-venv');
   verifyReviewedSourceFiles(root, [
+    'LICENSE',
     'README.md',
     'pyproject.toml',
     ...REVIEWED_PYTHON_MODULES.map((name) => `src/${name}`),
@@ -594,13 +930,17 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
   ]);
   stageCleanSource(root, source);
   fs.mkdirSync(output);
-  runChecked(python, ['-m', 'venv', buildTools]);
-  const buildPython = path.join(buildTools, 'bin', 'python');
-  runChecked(buildPython, [
-    '-m', 'pip', 'install', '--disable-pip-version-check',
-    'pip>=23,<27', 'build>=1.2,<2',
-  ]);
-  runChecked(buildPython, ['-m', 'build', '--sdist', '--wheel', '--outdir', output, source]);
+  withDisposableDirectory(buildTools, () => {
+    runChecked(python, ['-m', 'venv', buildTools]);
+    const buildPython = path.join(buildTools, 'bin', 'python');
+    runChecked(buildPython, [
+      '-m', 'pip', 'install', '--disable-pip-version-check',
+      'pip>=23,<27', 'build>=1.2,<2',
+    ]);
+    runChecked(buildPython, [
+      '-m', 'build', '--sdist', '--wheel', '--outdir', output, source,
+    ]);
+  });
   const files = fs.readdirSync(output);
   const wheels = files.filter((name) => name.endsWith('.whl'));
   const sdists = files.filter((name) => name.endsWith('.tar.gz'));
@@ -620,7 +960,7 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
 import configparser, email.parser, io, json, pathlib, re, sys, tarfile, zipfile
 (
     version, wheel_path, sdist_path, module_json, test_json,
-    core_json, optional_json, scripts_json,
+    core_json, optional_json, scripts_json, license_path,
 ) = sys.argv[1:]
 bad = ("/.venv/", "__pycache__", ".pyc", ".tgz", "/debug.txt", "/uninstall.log", "/build/")
 source_modules = set(json.loads(module_json))
@@ -628,6 +968,7 @@ source_tests = set(json.loads(test_json))
 core_dependencies = json.loads(core_json)
 optional_dependencies = json.loads(optional_json)
 console_scripts = json.loads(scripts_json)
+license_bytes = pathlib.Path(license_path).read_bytes()
 
 def require(condition, detail):
     if not condition:
@@ -662,6 +1003,7 @@ def verify_metadata(text):
     metadata = email.parser.Parser().parsestr(text)
     require(metadata["Name"].lower() == "custback", metadata["Name"])
     require(metadata["Version"] == version, metadata["Version"])
+    require(metadata.get_all("License-File", []) == ["LICENSE"], metadata.items())
     requires_python = {
         item.strip() for item in metadata["Requires-Python"].split(",")
     }
@@ -693,6 +1035,7 @@ with zipfile.ZipFile(wheel_path) as archive:
     require(not [n for n in names if n.endswith("/")], names)
     dist_info = f"custback-{version}.dist-info"
     expected = source_modules | {
+        f"{dist_info}/licenses/LICENSE",
         f"{dist_info}/METADATA",
         f"{dist_info}/WHEEL",
         f"{dist_info}/entry_points.txt",
@@ -704,6 +1047,7 @@ with zipfile.ZipFile(wheel_path) as archive:
         "unexpected": sorted(set(names) - expected),
     })
     metadata = f"{dist_info}/METADATA"
+    require(archive.read(f"{dist_info}/licenses/LICENSE") == license_bytes, "wheel LICENSE")
     text = archive.read(metadata).decode()
     require(f"Version: {version}\\n" in text, text[:500])
     verify_metadata(text)
@@ -717,6 +1061,7 @@ with tarfile.open(sdist_path, "r:gz") as archive:
     require(not [n for n in names if any(x in "/" + n for x in bad)], sorted(names))
     prefix = f"custback-{version}"
     expected = {
+        f"{prefix}/LICENSE",
         f"{prefix}/PKG-INFO",
         f"{prefix}/README.md",
         f"{prefix}/pyproject.toml",
@@ -745,6 +1090,7 @@ with tarfile.open(sdist_path, "r:gz") as archive:
         actual_directories - allowed_directories
     ))
     pkg_info = f"{prefix}/PKG-INFO"
+    require(archive.extractfile(f"{prefix}/LICENSE").read() == license_bytes, "sdist LICENSE")
     text = archive.extractfile(pkg_info).read().decode()
     require(f"Version: {version}\\n" in text, text[:500])
     verify_metadata(text)
@@ -758,6 +1104,7 @@ with tarfile.open(sdist_path, "r:gz") as archive:
     JSON.stringify(REVIEWED_CORE_DEPENDENCIES),
     JSON.stringify(REVIEWED_OPTIONAL_DEPENDENCIES),
     JSON.stringify(REVIEWED_CONSOLE_SCRIPTS),
+    path.join(root, 'LICENSE'),
   ]);
 
   const importProbe = [
@@ -773,14 +1120,27 @@ with tarfile.open(sdist_path, "r:gz") as archive:
     ['sdist', path.join(output, sdist)],
   ]) {
     const venv = path.join(temporaryRoot, `${kind}-smoke-venv`);
-    runChecked(python, ['-m', 'venv', venv]);
-    const venvPython = path.join(venv, 'bin', 'python');
-    runChecked(venvPython, [
-      '-m', 'pip', 'install', '--disable-pip-version-check', artifact,
-    ]);
-    runChecked(venvPython, ['-m', 'pip', 'check']);
-    runChecked(venvPython, ['-c', importProbe]);
-    runChecked(venvPython, ['-m', 'custback', '--help']);
+    withDisposableDirectory(venv, () => {
+      runChecked(python, ['-m', 'venv', venv]);
+      const venvPython = path.join(venv, 'bin', 'python');
+      runChecked(venvPython, [
+        '-m', 'pip', 'install', '--disable-pip-version-check', artifact,
+      ]);
+      runChecked(venvPython, ['-m', 'pip', 'check']);
+      runChecked(venvPython, ['-c', importProbe]);
+      runChecked(venvPython, ['-m', 'custback', '--help']);
+    });
+  }
+
+  const audio2faceProfile = extraArtifactProfiles()
+    .find((profile) => profile.name === 'audio2face');
+  if (!audio2faceProfile) fail('audio2face artifact profile is missing');
+  const sourceProfile = { ...audio2faceProfile, name: 'audio2face-source' };
+  installAndProbeExtra(python, temporaryRoot, source, sourceProfile, source);
+  for (const profile of extraArtifactProfiles()) {
+    installAndProbeExtra(
+      python, temporaryRoot, path.join(output, wheel), profile, source,
+    );
   }
   return { wheel: path.join(output, wheel), sdist: path.join(output, sdist) };
 }
@@ -797,6 +1157,7 @@ function verifyNpmArtifactInstall(version, temporaryRoot, root = ROOT) {
   const { artifact, names } = parseNpmPackPayload(packed.stdout, version);
   verifyNpmPayload(names, root);
   const tarball = path.join(packDirectory, artifact.filename);
+  verifyNpmArtifactLicense(tarball, root);
   const smokeEnv = {
     ...process.env,
     CUSTBACK_VENV: managedVenv,
@@ -822,30 +1183,65 @@ function verifyNpmArtifactInstall(version, temporaryRoot, root = ROOT) {
 }
 
 function verifyBuiltArtifacts(version, root = ROOT) {
-  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-release-'));
+  const buildJobs = releaseBuildJobs();
+  const temporaryRoot = createReleaseTemporaryRoot({ root });
   try {
-    verifyPythonArtifacts(version, temporaryRoot, root);
-    verifyNpmArtifactInstall(version, temporaryRoot, root);
+    return withTemporaryEnvironment({
+      TMPDIR: temporaryRoot,
+      TMP: temporaryRoot,
+      TEMP: temporaryRoot,
+      CMAKE_BUILD_PARALLEL_LEVEL: buildJobs,
+      GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS: buildJobs,
+      MAKEFLAGS: `-j${buildJobs}`,
+      MAX_JOBS: buildJobs,
+    }, () => {
+      verifyPythonArtifacts(version, temporaryRoot, root);
+      verifyNpmArtifactInstall(version, temporaryRoot, root);
+    });
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }
 }
 
+function releasePlan(argv) {
+  const allowed = new Set(['--prepack', '--quick']);
+  const unknown = argv.filter((arg) => !allowed.has(arg));
+  if (unknown.length || new Set(argv).size !== argv.length ||
+      (argv.includes('--prepack') && argv.includes('--quick'))) {
+    fail(`invalid release verification arguments: ${argv.join(' ') || '<none>'}`);
+  }
+  const prepack = argv.includes('--prepack');
+  const quick = argv.includes('--quick');
+  return {
+    builtArtifacts: !prepack && !quick,
+    success: prepack
+      ? 'metadata and non-recursive npm packlist verified'
+      : quick
+        ? 'metadata and npm packlist verified (quick mode)'
+        : 'metadata, npm packlist, and built artifacts verified',
+  };
+}
+
 function main(argv = process.argv.slice(2)) {
   try {
+    const plan = releasePlan(argv);
     const version = verifyVersions();
     verifyDependencies();
+    verifyLicenseMetadata();
     verifyDocs();
+    verifyCiWorkflow();
+    verifyPlatformScope();
     verifyNoReleaseBlockers();
     const stale = staleArtifacts();
     if (stale.length) {
       fail(`stale release artifacts must be removed before release: ${stale.join(', ')}`);
     }
-    if (!argv.includes('--prepack')) {
-      verifyPack(version);
-      if (!argv.includes('--quick')) verifyBuiltArtifacts(version);
-    }
-    console.log(`[custback release] metadata and npm payload verified for ${version}`);
+    // --ignore-scripts makes this safe to call from prepack without invoking
+    // the prepack lifecycle recursively. Artifact builds/installs are reserved
+    // for the explicit, full release:check path.
+    verifyPack(version);
+    if (plan.builtArtifacts) verifyBuiltArtifacts(version);
+    console.log(`[custback release] ${plan.success} for ${version}`);
     return 0;
   } catch (err) {
     console.error(`[custback release] ${err.message}`);
@@ -854,21 +1250,33 @@ function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+  canonicalLicense,
+  createReleaseTemporaryRoot,
+  extraArtifactProfiles,
+  filesystemIsMemoryBacked,
   main,
   parseNpmPackPayload,
   projectVersion,
+  releaseBuildJobs,
+  releasePlan,
   remediationBlockers,
   staleArtifacts,
   verifyDependencies,
   verifyDocs,
   verifyBuiltArtifacts,
   verifyBlockerRegressionCoverage,
+  verifyCiWorkflow,
+  verifyLicenseMetadata,
+  verifyNpmArtifactLicense,
   verifyNpmArtifactInstall,
   verifyNpmMetadata,
   verifyNoReleaseBlockers,
   verifyPack,
+  verifyPlatformScope,
   verifyPythonArtifacts,
   verifyVersions,
+  withDisposableDirectory,
+  withTemporaryEnvironment,
 };
 
 if (require.main === module) process.exit(main());

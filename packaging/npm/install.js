@@ -12,12 +12,15 @@ const path = require('path');
 const managed = require('./managed-venv');
 
 const PKG_ROOT = path.resolve(__dirname, '..', '..');
-const DEFAULT_VENV = path.join(PKG_ROOT, '.venv');
+const DEFAULT_VENV = managed.defaultTargetForPackage(PKG_ROOT);
+const LEGACY_DEFAULT_VENV = path.resolve(PKG_ROOT, '.venv');
 const PYTHON_CANDIDATES = [
   'python3.12', 'python3.11', 'python3.10',
   'python3.13', 'python3.14', 'python3', 'python',
 ];
-const ALLOWED_EXTRAS = new Set(['mediapipe', 'rvm', 'gpu']);
+const ALLOWED_EXTRAS = new Set(['audio2face', 'mediapipe', 'rvm', 'gpu']);
+const INSTALL_STAMP_SCHEMA = 4;
+const INSTALL_INTENT_SCHEMA = 1;
 const PIP_SPEC = 'pip>=23,<27';
 const configuredTimeout = Number(process.env.CUSTBACK_INSTALL_TIMEOUT_MS);
 const INSTALL_TIMEOUT_MS = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0
@@ -88,17 +91,24 @@ function parseExtras(raw = '') {
   const unknown = extras.filter((extra) => !ALLOWED_EXTRAS.has(extra));
   if (unknown.length) {
     throw new Error(
-      `unsupported CUSTBACK_EXTRAS: ${unknown.join(', ')}; choose mediapipe, rvm, or gpu`
+      `unsupported CUSTBACK_EXTRAS: ${unknown.join(', ')}; ` +
+      'choose audio2face, mediapipe, rvm, or gpu'
     );
   }
   if (extras.includes('rvm') && extras.includes('gpu')) {
     throw new Error('CUSTBACK_EXTRAS cannot combine rvm and gpu (conflicting ONNX runtimes)');
   }
+  if (extras.includes('audio2face') && extras.includes('mediapipe')) {
+    throw new Error(
+      'CUSTBACK_EXTRAS cannot combine audio2face and mediapipe ' +
+      '(conflicting protobuf requirements)'
+    );
+  }
   return extras;
 }
 
 function installAttempts(requested) {
-  if (requested.includes('mediapipe')) return [requested];
+  if (requested.includes('mediapipe') || requested.includes('audio2face')) return [requested];
   const preferred = [...requested, 'mediapipe'].sort();
   return requested.length ? [preferred, requested] : [preferred, []];
 }
@@ -122,7 +132,7 @@ function sourceDigest(pkgRoot = PKG_ROOT) {
   const roots = [
     path.join(pkgRoot, 'package.json'),
     path.join(pkgRoot, 'pyproject.toml'),
-    path.join(pkgRoot, 'config', 'default.yaml'),
+    ...walkFiles(path.join(pkgRoot, 'config'), (file) => /\.ya?ml$/i.test(file)),
     ...walkFiles(path.join(pkgRoot, 'src', 'custback'), (file) => file.endsWith('.py')),
     ...walkFiles(path.join(pkgRoot, 'scripts'), (file) => file.endsWith('.sh')),
     ...walkFiles(path.join(pkgRoot, 'packaging', 'npm'), (file) =>
@@ -143,17 +153,21 @@ function sameArray(left, right) {
     left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function validExtraSelection(requested, selected) {
-  const validArray = (extras) => Array.isArray(extras) &&
+function validRequestedExtras(extras) {
+  return Array.isArray(extras) &&
     extras.every((extra) => typeof extra === 'string' && ALLOWED_EXTRAS.has(extra)) &&
     sameArray(extras, [...new Set(extras)].sort()) &&
-    !(extras.includes('rvm') && extras.includes('gpu'));
-  return validArray(requested) && validArray(selected) &&
+    !(extras.includes('rvm') && extras.includes('gpu')) &&
+    !(extras.includes('audio2face') && extras.includes('mediapipe'));
+}
+
+function validExtraSelection(requested, selected) {
+  return validRequestedExtras(requested) && validRequestedExtras(selected) &&
     requested.every((extra) => selected.includes(extra));
 }
 
 function validInstallStamp(stamp) {
-  const valid = Boolean(stamp) && stamp.schema === 3 &&
+  const valid = Boolean(stamp) && stamp.schema === INSTALL_STAMP_SCHEMA &&
     typeof stamp.packageVersion === 'string' && stamp.packageVersion.length > 0 &&
     typeof stamp.sourceDigest === 'string' && /^sha256:[0-9a-f]{64}$/.test(stamp.sourceDigest) &&
     stamp.python && typeof stamp.python.executable === 'string' &&
@@ -162,16 +176,94 @@ function validInstallStamp(stamp) {
     typeof stamp.python.cacheTag === 'string' && stamp.python.cacheTag.length > 0 &&
     validExtraSelection(stamp.requestedExtras, stamp.selectedExtras) &&
     stamp.capabilities && typeof stamp.capabilities.mediapipe === 'boolean' &&
+    typeof stamp.capabilities.audio2face === 'boolean' &&
     typeof stamp.capabilities.rvm === 'boolean' &&
     typeof stamp.capabilities.cuda_provider === 'boolean' &&
     typeof stamp.capabilities.cuda_inference === 'boolean' &&
     typeof stamp.createdAt === 'string' && Number.isFinite(Date.parse(stamp.createdAt));
   return valid &&
     (!stamp.selectedExtras.includes('mediapipe') || stamp.capabilities.mediapipe) &&
+    (!stamp.selectedExtras.includes('audio2face') || stamp.capabilities.audio2face) &&
     (!(stamp.selectedExtras.includes('rvm') || stamp.selectedExtras.includes('gpu')) ||
       stamp.capabilities.rvm) &&
     (!stamp.selectedExtras.includes('gpu') ||
       (stamp.capabilities.cuda_provider && stamp.capabilities.cuda_inference));
+}
+
+function installIntentPath(target) {
+  return `${path.resolve(target)}.custback-install-intent.json`;
+}
+
+function validInstallIntent(intent, target) {
+  return Boolean(intent) && intent.owner === managed.OWNER &&
+    intent.schema === INSTALL_INTENT_SCHEMA &&
+    typeof intent.logicalTarget === 'string' && path.isAbsolute(intent.logicalTarget) &&
+    path.resolve(intent.logicalTarget) === path.resolve(target) &&
+    validRequestedExtras(intent.requestedExtras) &&
+    typeof intent.updatedAt === 'string' && Number.isFinite(Date.parse(intent.updatedAt));
+}
+
+function readInstallIntent(target) {
+  const file = installIntentPath(target);
+  let stat;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`custback install intent is not a regular owned file: ${file}`);
+  }
+  const intent = managed.readJson(file);
+  if (!validInstallIntent(intent, target)) {
+    throw new Error(`custback install intent does not match ${path.resolve(target)}`);
+  }
+  return intent;
+}
+
+function writeInstallIntent(target, requestedExtras) {
+  if (!validRequestedExtras(requestedExtras)) {
+    throw new Error('refusing to persist invalid custback extras intent');
+  }
+  const file = installIntentPath(target);
+  const existing = fs.existsSync(file) ? fs.lstatSync(file) : null;
+  if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
+    throw new Error(`custback install intent is not a regular owned file: ${file}`);
+  }
+  if (existing) readInstallIntent(target);
+  managed.writeJson(file, {
+    owner: managed.OWNER,
+    schema: INSTALL_INTENT_SCHEMA,
+    logicalTarget: path.resolve(target),
+    requestedExtras: [...requestedExtras],
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+function resolveRequestedExtras(env, persistedIntent, activeStamp = null) {
+  if (Object.prototype.hasOwnProperty.call(env, 'CUSTBACK_EXTRAS')) {
+    return parseExtras(env.CUSTBACK_EXTRAS);
+  }
+  if (persistedIntent) {
+    // Promotion is authoritative before intent publication. If publication
+    // failed after an otherwise successful promotion, the newer valid active
+    // stamp prevents the stale intent from undoing that environment on the
+    // next absent-env run; reuse will repair the intent file.
+    if (validInstallStamp(activeStamp) &&
+        !sameArray(persistedIntent.requestedExtras, activeStamp.requestedExtras) &&
+        Date.parse(activeStamp.createdAt) > Date.parse(persistedIntent.updatedAt)) {
+      return [...activeStamp.requestedExtras];
+    }
+    return [...persistedIntent.requestedExtras];
+  }
+  if (activeStamp && Object.prototype.hasOwnProperty.call(activeStamp, 'requestedExtras')) {
+    if (!validRequestedExtras(activeStamp.requestedExtras)) {
+      throw new Error('active managed venv contains invalid persisted extras metadata');
+    }
+    return [...activeStamp.requestedExtras];
+  }
+  return [];
 }
 
 function stampMatches(stamp, expected) {
@@ -244,9 +336,18 @@ function capabilities(python) {
     encoding: 'utf8',
     timeout: CUDA_PROBE_TIMEOUT_MS,
   });
+  const audio2face = spawn(python, ['-c', [
+    'import grpc',
+    'from nvidia_audio2face_3d import audio2face_pb2_grpc, messages_pb2',
+    'from nvidia_ace import animation_pb2, audio_pb2',
+  ].join('\n')], {
+    encoding: 'utf8',
+    timeout: CUDA_PROBE_TIMEOUT_MS,
+  });
   const cuda = cudaProbe(python);
   return {
     mediapipe: mediaPipe.status === 0,
+    audio2face: audio2face.status === 0,
     rvm: cuda.onnxruntime,
     cuda_provider: cuda.cuda_provider,
     cuda_inference: cuda.cuda_inference,
@@ -276,6 +377,9 @@ function validateEnvironment(directory, packageVersion, selectedExtras, quiet = 
   const observed = capabilities(python);
   if (selectedExtras.includes('mediapipe') && !observed.mediapipe) {
     throw new Error('selected mediapipe extra cannot be imported');
+  }
+  if (selectedExtras.includes('audio2face') && !observed.audio2face) {
+    throw new Error('selected Audio2Face protocol modules cannot be imported');
   }
   if ((selectedExtras.includes('rvm') || selectedExtras.includes('gpu')) && !observed.rvm) {
     throw new Error('selected ONNX Runtime extra cannot be imported');
@@ -353,7 +457,7 @@ function buildGeneration({ generationRoot, python, attempts, packageVersion, tar
         throw err;
       }
       const stamp = {
-        schema: 3,
+        schema: INSTALL_STAMP_SCHEMA,
         packageVersion,
         sourceDigest: stampBase.sourceDigest,
         python: stampBase.python,
@@ -372,6 +476,25 @@ function buildGeneration({ generationRoot, python, attempts, packageVersion, tar
   throw new Error('no permitted custback dependency set could be installed');
 }
 
+function readLegacyRequestedExtras(target = LEGACY_DEFAULT_VENV) {
+  if (!fs.existsSync(target)) return null;
+  const inspection = managed.inspectTarget(target);
+  if (inspection.kind === 'absent') return null;
+  const stamp = readActiveStamp(target);
+  if (stamp && Object.prototype.hasOwnProperty.call(stamp, 'requestedExtras')) {
+    if (!validRequestedExtras(stamp.requestedExtras)) {
+      throw new Error('legacy managed venv contains invalid extras metadata');
+    }
+    return [...stamp.requestedExtras];
+  }
+  if (inspection.legacy) {
+    const legacy = fs.readFileSync(path.join(target, managed.LEGACY_STAMP), 'utf8').trim();
+    const match = legacy.match(/\[([^\]]*)\]$/);
+    if (match) return parseExtras(match[1].replace(/\s+/g, ','));
+  }
+  return null;
+}
+
 function main() {
   if (process.env.CUSTBACK_SKIP_INSTALL === '1') {
     log('CUSTBACK_SKIP_INSTALL=1, skipping Python bootstrap');
@@ -388,7 +511,10 @@ function main() {
     const target = managed.assertSafeTarget(process.env.CUSTBACK_VENV || DEFAULT_VENV, {
       pkgRoot: PKG_ROOT,
     });
-    const requestedExtras = parseExtras(process.env.CUSTBACK_EXTRAS || '');
+    const explicitExtras = Object.prototype.hasOwnProperty.call(process.env, 'CUSTBACK_EXTRAS');
+    // Validate explicit intent before doing interpreter probes or filesystem
+    // mutation. An empty value deliberately means core-only.
+    if (explicitExtras) parseExtras(process.env.CUSTBACK_EXTRAS);
     const packageVersion = require(path.join(PKG_ROOT, 'package.json')).version;
     const python = findPython();
     if (!python.binary) {
@@ -405,22 +531,43 @@ function main() {
     // Reject unsafe/unowned targets before creating sibling metadata, while
     // allowing a journal-proven dangling promotion to reach locked recovery.
     const generationRoot = managed.prepareInstallTarget(target);
-    const expected = {
-      packageVersion,
-      sourceDigest: sourceDigest(),
-      python: {
-        executable: python.identity.executable,
-        version: python.identity.version,
-        cacheTag: python.identity.cache_tag,
-      },
-      requestedExtras,
-    };
     return managed.withInstallLock(generationRoot, () => {
       managed.recoverInterruptedPromotion(target, generationRoot);
       const inspection = managed.inspectTarget(target);
       const activeStamp = inspection.kind === 'absent' ? null : readActiveStamp(target, (err) => {
         log(`managed venv install metadata is corrupt (${err.message}); rebuilding`);
       });
+      // Malformed or unowned intent fails closed instead of silently dropping
+      // extras or replacing a colliding file.
+      const persistedIntent = readInstallIntent(target);
+      let legacyStamp = null;
+      if (!explicitExtras && !persistedIntent && !activeStamp &&
+          !Object.prototype.hasOwnProperty.call(process.env, 'CUSTBACK_VENV')) {
+        try {
+          const requestedExtras = readLegacyRequestedExtras();
+          if (requestedExtras) {
+            legacyStamp = { requestedExtras };
+            log('rebuilding the legacy package-local venv at the durable npm-prefix target');
+          }
+        } catch (err) {
+          log(`warning: legacy package-local venv was not adopted (${err.message})`);
+        }
+      }
+      const requestedExtras = resolveRequestedExtras(
+        process.env,
+        persistedIntent,
+        activeStamp || legacyStamp,
+      );
+      const expected = {
+        packageVersion,
+        sourceDigest: sourceDigest(),
+        python: {
+          executable: python.identity.executable,
+          version: python.identity.version,
+          cacheTag: python.identity.cache_tag,
+        },
+        requestedExtras,
+      };
       const reuse = reusableEnvironment({
         force: process.env.CUSTBACK_FORCE_REBUILD === '1',
         inspectionKind: inspection.kind,
@@ -431,6 +578,10 @@ function main() {
           validateEnvironment(target, packageVersion, selectedExtras, true),
       });
       if (reuse) {
+        if (!persistedIntent ||
+            !sameArray(persistedIntent.requestedExtras, requestedExtras)) {
+          writeInstallIntent(target, requestedExtras);
+        }
         log('managed venv is already up to date and healthy');
         return 0;
       }
@@ -460,6 +611,10 @@ function main() {
           },
         });
         promoted = true;
+        // Persist only after the new environment has been promoted and its
+        // active-path validation succeeded. Failed candidates retain the last
+        // successful extras choice.
+        writeInstallIntent(target, requestedExtras);
         const keep = new Set([path.resolve(built.generation)]);
         if (promotion.previousGeneration) keep.add(path.resolve(promotion.previousGeneration));
         try {
@@ -487,24 +642,36 @@ function main() {
 }
 
 module.exports = {
+  allowedExtras: () => [...ALLOWED_EXTRAS].sort(),
   buildGeneration,
   capabilities,
   cudaProbe,
   CUDA_PROBE_TIMEOUT_MS,
+  DEFAULT_VENV,
   findPython,
+  INSTALL_INTENT_SCHEMA,
+  INSTALL_STAMP_SCHEMA,
+  installIntentPath,
   installAttempts,
+  LEGACY_DEFAULT_VENV,
   main,
   parseCudaProbeOutput,
   parseExtras,
   PIP_SPEC,
   pythonIdentity,
   readActiveStamp,
+  readInstallIntent,
+  readLegacyRequestedExtras,
+  resolveRequestedExtras,
   reusableEnvironment,
   sourceDigest,
   stampMatches,
   validExtraSelection,
+  validInstallIntent,
   validInstallStamp,
+  validRequestedExtras,
   validateEnvironment,
+  writeInstallIntent,
 };
 
 if (require.main === module) process.exit(main());

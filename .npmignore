@@ -11,3 +11,4 @@ packaging/npm/test/
 *.tar.gz
 debug.txt
 uninstall.log
+onnxruntime_profile__*.json

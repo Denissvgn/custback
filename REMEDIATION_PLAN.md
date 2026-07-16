@@ -1,11 +1,19 @@
 # Custback remediation plan
 
-Status: **Phase 3 complete — release blocked; Phase 4 is next**
+Status: **RELEASE BLOCKED — Phase 5 corrective remediation is next**
 
 This plan converts the findings from the July 2026 repository review into an
-implementation sequence. The Phase 1–3 gates are satisfied, but the tree
-remains stop-ship while 8 Phase 4 blockers remain open,
-including the Audio2Face dependency/protocol gate.
+implementation sequence. A completeness re-audit on 2026-07-16 found that six
+previously resolved blockers do not yet satisfy their full acceptance contracts
+and identified two additional stop-ship findings. Phase 1–4 completion records
+below are retained as historical implementation records, but they no longer
+authorize a release. Phase 5 closes the corrective backlog; Phase 6 performs
+migration, artifact, stress, and two-host TLS validation.
+
+The machine-readable registry still reports `release_blocked=false`. The first
+Phase 5 change must reopen/add the blockers listed below and set that field to
+`true`. No package may be published from the current state, even if the existing
+`prepack` or `release:check` command reports success.
 
 ## Target invariants
 
@@ -21,8 +29,12 @@ The remediated system must guarantee that:
   replaced or closed.
 - Staging and committed data share private permissions and aggregate quotas.
 - Every advertised optional feature installs and runs from built artifacts.
+- Wheel, sdist, and npm installs expose the same canonical commands and bundled
+  configuration without access to the source checkout.
 - npm reinstall and upgrade preserve the managed environment, rollback state,
   and explicitly selected extras.
+- Release authorization is bound to one clean commit and the exact artifact
+  digests that passed every required dynamic gate.
 
 ## Delivery roadmap
 
@@ -33,13 +45,14 @@ The remediated system must guarantee that:
 | 2 | Transactional avatar engine and worker lifecycle | Config/resources activate atomically; no worker survives teardown |
 | 3 | Storage, merge semantics, segmentation, rendering, streaming | Concurrency, quota, media, and correctness gates pass |
 | 4 | Audio2Face, npm, release, docs, and compliance | All extras install from artifacts; npm upgrades preserve state |
-| 5 | Migration and end-to-end validation | Clean artifacts and a two-host TLS smoke test pass |
+| 5 | Corrective security, lifecycle, storage, and packaging | Seven Phase 5 blockers pass; only `REL-01` remains open |
+| 6 | Migration and end-to-end validation | Clean artifacts, stress, upgrade, and two-host TLS gates pass |
 
-Phases 1, 2, and 4 may run in parallel after Phase 0. Production fixes should
-be split into reviewable PRs; do not combine the transactional render-engine
-change with the storage-reservation migration.
+The original Phase 0–4 sequence is retained below for traceability. Current
+implementation order and parallelization rules are defined by the corrective PR
+sequence after Phase 6.
 
-### Phase 0 completion record
+### Historical Phase 0 completion record
 
 - At the Phase 0 freeze, the machine-readable registry contained 26 open
   blocker IDs.
@@ -57,11 +70,14 @@ change with the storage-reservation migration.
 
 The machine-readable source of truth is
 `scripts/release/remediation-blockers.json`. `release:check` and `prepack`
-must fail while any entry remains open. A blocker is closed only in the same
-change that removes its strict expected-failure marker and makes its acceptance
-test pass.
+must fail while any entry remains open. The registry is presently stale with
+respect to this re-audit and must be corrected before production work resumes.
+A blocker is closed only in the same change that removes its strict
+expected-failure marker and makes its acceptance test pass. Merely checking that
+a regression file contains the blocker ID is not evidence that the acceptance
+scenario executed.
 
-| ID | Finding | Target phase |
+| ID | Finding | Historical target phase |
 | --- | --- | --- |
 | SEC-01 | Avatar proxy authenticated SSRF and credential-file exfiltration | 1 |
 | TOKEN-01 | Proxy client token auto-creation and upstream-auth misclassification | 1 |
@@ -89,6 +105,31 @@ test pass.
 | LICENSE-01 | Declared MIT artifacts contain no license text | 4 |
 | PLATFORM-01 | Automatic Linux setup is Ubuntu-specific but scope is broader | 4 |
 | HYGIENE-01 | Generated ONNX Runtime profiles are not rejected as stale | 4 |
+
+### Corrective registry delta (2026-07-16)
+
+| ID | Registry action | Finding | Target phase |
+| --- | --- | --- | --- |
+| SEC-02 | Add open | Hot camera-backdrop configuration permits authenticated SSRF | 5 |
+| PRIV-01 | Reopen | Raw replay is accepted after fingerprint history expires | 5 |
+| LIFE-01 | Reopen | A cancelled avatar session can publish a queued render | 5 |
+| LIFE-02 | Reopen | Audio2Face loses RPC/channel ownership while its worker survives | 5 |
+| STOR-02 | Reopen | Post-rename cleanup failure leaves an unowned inode/reservation gap | 5 |
+| PKG-01 | Reopen | Canonical avatar/config-export commands are npm-wrapper-only | 5 |
+| PKG-02 | Reopen | `npm pack --silent` emits non-filename text on stdout | 5 |
+| REL-01 | Add open | Release automation can pass without Phase 6, Ruff, or stress evidence | 6 |
+
+The corrective freeze therefore begins with eight open entries: six reopened
+and two new. Existing passing behavior for the other 20 original blockers must
+remain permanent regression coverage.
+
+### Re-audit authority
+
+The Phase 1–4 completion records describe what the earlier suites proved at the
+time. Where a completion record conflicts with the corrective registry delta or
+the Phase 5 acceptance tests below, the corrective requirement wins. Do not edit
+the historical test counts to make them appear to cover scenarios that were not
+executed.
 
 ## Phase 1 — security and privacy
 
@@ -146,7 +187,7 @@ Acceptance: a recording sink observes every emitted frame; raw, near-raw,
 all-foreground, invalid-mask, and delayed-echo cases all receive the same slate
 for different camera inputs.
 
-### Phase 1 completion record (2026-07-16)
+### Historical Phase 1 completion record (2026-07-16)
 
 - `SEC-01`, `TOKEN-01`, `TRANS-01`, and `PRIV-01` are resolved and their
   strict expected-failure markers are now permanent passing regressions.
@@ -203,7 +244,7 @@ status reports version N while version N-1 resources render.
 Acceptance: blocked fake render/gRPC calls cannot overlap reconnect, observe
 closed resources, or survive the shutdown deadline.
 
-### Phase 2 completion record (2026-07-16)
+### Historical Phase 2 completion record (2026-07-16)
 
 - `CFG-01`, `LIFE-01`, and `LIFE-02` are resolved and their strict
   expected-failure markers are now permanent passing regressions. The registry
@@ -265,7 +306,7 @@ Acceptance includes analytical alpha cases, pose behavior, NaN/Inf masks,
 custom-model routing, non-blocking model acquisition, executor saturation, and
 concise CLI errors.
 
-### Phase 3 completion record (2026-07-16)
+### Historical Phase 3 completion record (2026-07-16)
 
 - `CFG-02`, `STOR-01`, `STOR-02`, `SEG-01`, `SEG-02`, `RENDER-01`,
   `RENDER-02`, `API-01`, `MISC-01`, and `MISC-02` are resolved and their
@@ -339,35 +380,380 @@ rollback generations, and failed-rebuild recovery.
 - Delete/ignore ONNX Runtime profile debris and make release checks reject it.
 - Pin CI actions to commit SHAs and use `npm ci`.
 
-## Recommended PR sequence
+### Historical Phase 4 completion record (2026-07-16)
 
-1. Phase 0 blocker registry and regression harness.
-2. Immutable proxy target, token split, redaction, and upstream-auth mapping.
-3. Secure endpoint policy and central privacy firewall.
-4. Shared merge-patch and validation fixes.
-5. Transactional avatar engine and render lifecycle.
-6. Audio2Face protocol, TLS, cancellation, and CI.
-7. Private storage, reservations, quotas, and decoded-image limits.
-8. Segmentation, alpha, pose, and async streaming.
-9. Stable npm runtime and persistent extras.
-10. Binaries, prepack, license, platform guards, and deployment documentation.
-11. End-to-end TLS deployment and final artifact release gate.
+- `A2F-01`, `NPM-01`, `PKG-01`, `PKG-02`, `DEPLOY-01`, `LICENSE-01`,
+  `PLATFORM-01`, and `HYGIENE-01` are resolved. All 26 registry entries are now
+  permanent passing regressions, with no open blocker and
+  `release_blocked=false`.
+- Audio2Face uses the verified official `nvidia-audio2face-3d==1.3.0`,
+  `nvidia-ace==1.0.0`, `grpcio>=1.67,<1.67.2`, and compatible protobuf stack.
+  Source and built-wheel installs serialize real messages, parse responses,
+  exercise an in-process generated gRPC service, and keep WAV availability
+  independent of microphone/PortAudio availability.
+- npm environments and rollback generations now live under a stable
+  prefix-scoped root. Extra intent survives package replacement, can be
+  inspected or rebuilt explicitly, updates only after promotion, and covers
+  the shipped avatar configuration in its source digest. `custback avatar` is
+  canonical and the compatibility launcher/config export are packaged.
+- The root MIT license is asserted byte-for-byte in npm, wheel, and sdist;
+  deployment documentation separates the renderer and avatar-control trust
+  planes; automatic Linux setup rejects unsupported distributions before
+  mutation; CI uses reviewed action SHA pins and `npm ci`; generated ONNX
+  Runtime profiles are ignored and rejected as stale release input.
+- Full artifact verification is memory-bounded: it rejects Linux tmpfs/ramfs
+  scratch by default, relocates all subprocess scratch to a configured
+  disk-backed root, limits native builds to two jobs by default, and removes
+  each optional-profile environment immediately on success or failure. This
+  prevents the release matrix from accumulating multiple large venvs in the
+  editor's cgroup.
+- Final local verification passed 690 Python tests with one expected core-env
+  skip for the optional Audio2Face bindings, all four npm test files, the quick
+  metadata/packlist gate, and the full source/wheel/npm artifact gate. The full
+  Python 3.14 artifact run completed in an isolated service in 17m40s with a
+  3 GB peak and no swap; its scratch tree was removed on success.
+
+## Phase 5 — corrective remediation
+
+### Entry gate and regression freeze
+
+- Change the registry to phase 5, set `release_blocked=true`, reopen the six
+  existing IDs, and add `SEC-02` plus `REL-01`. The registry must contain 28
+  unique entries, with eight open at the corrective freeze.
+- Add one deterministic regression for each reproduced failure before changing
+  production code. Use strict expected failures/TODOs only while the owning
+  blocker is open; an unexpected pass is a failure until the marker is removed
+  in the implementation change. Node TODO coverage must add an explicit
+  unexpected-pass failure because the default Node TODO result is not strict.
+- Record exact pytest node IDs or Node test names in the registry instead of
+  treating a source-file substring match as executable coverage. Release CI must
+  prove that every recorded test was collected and produced the registry-required
+  open/resolved outcome; every resolved blocker must pass normally.
+- Preserve all passing Phase 1–4 tests. The corrective work is not permission to
+  weaken TLS policy, privacy fallbacks, quota accounting, or lifecycle deadlines.
+
+Acceptance: the registry reports 20 resolved and eight open entries,
+`release_blocked=true`, and both `prepack` and every release-check mode fail
+before artifact publication. All eight new regressions execute and fail for the
+documented reason on the pre-fix tree.
+
+### Immutable live-backdrop authority (`SEC-02`)
+
+- Remove free-form `background.camera_device` network destinations from the hot
+  API contract. Numeric local camera indices may remain selectable; strings that
+  can cause filesystem or network access are startup authority.
+- Prefer operator-defined immutable backdrop targets with public, non-secret IDs.
+  A hot request may select an ID, but it cannot supply or mutate a path, URL,
+  credential, TLS setting, or OpenCV backend option.
+- Normalize and validate a startup target before constructing any capture. Apply
+  explicit scheme, port, address-class, DNS, redirect, proxy, and TLS policy. If
+  OpenCV cannot guarantee verified remote transport, reject that remote scheme
+  rather than silently delegating security to `cv2.VideoCapture`.
+- Snapshot the approved target in the candidate resource. Unrelated PATCHes must
+  not reread startup-only files or environment state.
+- Keep redacted public configuration limited to target IDs and safe status.
+
+Acceptance: PATCHes containing HTTP, RTSP, link-local metadata, loopback admin,
+device-path, or credential-path strings return `409 restart_required` or a
+validation error without changing the version and with zero calls to
+`VideoCapture`, DNS, file open, or network connect. A configured target ID still
+activates transactionally, and a failed target leaves the old backdrop identity
+and version unchanged.
+
+### Session-wide privacy firewall (`PRIV-01`)
+
+- Replace the three-second permissive history eviction with session-wide replay
+  protection. No expired or capacity-evicted raw fingerprint may turn into an
+  allow decision.
+- Use a bounded design that fails closed: for example, a session-keyed compact
+  replay structure or robust per-frame tag. If its safe capacity is exhausted,
+  emit the privacy slate and reset/re-authenticate the renderer session rather
+  than evicting evidence into a permissive state.
+- Detect exact, near-raw, JPEG-altered, delayed, capacity-pressure, and
+  prior-session echoes. Clear/rekey evidence only at a linearized authenticated
+  session boundary, after stale remote output has been invalidated.
+- Continue sending every startup, repeated, preview, virtual-camera, fallback,
+  and remote frame through the same last-mile gate.
+
+Acceptance: with fake monotonic time advanced beyond the old window and with
+history driven past its configured capacity, replaying any earlier exact or JPEG
+raw frame produces the same input-independent slate for different camera inputs.
+A recording sink proves that no publication path observes the replay.
+
+### Linearizable render-session cancellation (`LIFE-01`)
+
+- Give each renderer connection a session epoch/lease and include it in deferred
+  render publications.
+- Linearize cancellation by invalidating the lease under the same ownership
+  mechanism used to authorize preview publication and render statistics. A
+  generation-version check alone is insufficient.
+- Make send completion, local publication, and accounting order explicit. Once
+  cancellation wins a side effect's linearization point, later callbacks must be
+  discard-only. A send that committed before cancellation may be counted exactly
+  once, but it cannot authorize a later preview publication or `frames_rendered`
+  update.
+- Drain the authoritative lane future before reconnect, resource replacement, or
+  executor teardown without converting a cancelled result back into a publishable
+  one.
+
+Acceptance: barriers at decode, render completion, WebSocket send, queued
+publication, and publication callback make each side effect's winner
+deterministic. In the reproduced ordering, WebSocket send returns, lane
+publication blocks, stop invalidates the lease, and the callback is released;
+the preview and `frames_rendered` remain unchanged. Completed-send accounting is
+defined separately and occurs at most once. The stale result cannot affect a new
+session even when the component version is unchanged.
+
+### Terminal Audio2Face ownership (`LIFE-02`)
+
+- Retain the source, RPC, channel, interruption operations, and worker as one
+  owned session until the worker is terminal. A successful return from
+  `cancel()` or `close()` is only an interruption attempt, not proof of terminal
+  ownership.
+- If the worker remains alive, preserve every handle for ordered retry and
+  prohibit reconnect, component replacement, or a successful close result.
+- Ensure every source read, pacing wait, RPC iteration, and reconnect wait has a
+  bounded interruption path. If a native gRPC thread cannot be made killable
+  within the shutdown deadline, isolate the streaming session in a subprocess
+  that can be terminated and reaped rather than weakening the deadline.
+- Keep close idempotent across partial interruption, retry, normal completion,
+  and concurrent start/close races.
+
+Acceptance: a fake RPC whose `cancel()` returns success without waking its
+iterator, combined with a channel whose `close()` also returns, causes the first
+close either to terminate/reap an isolated worker or to time out while retaining
+the complete source/call/channel/worker generation and refusing restart. After
+the iterator is released, repeated close joins and clears the same generation.
+Repeated close is safe, and no Audio2Face worker remains after a successful
+teardown. If subprocess isolation is used, forced termination and reaping have a
+separate deterministic regression.
+
+### Rename-aware storage cleanup (`STOR-02`)
+
+- Represent upload/install ownership with a transaction that tracks the
+  authoritative inode path through temporary, staged, and final names.
+- Transfer cleanup ownership before each rename. A failed post-rename chmod,
+  inode check, rollback rename, unlink, or recursive removal must retain the
+  actual remaining path and its byte/file reservation in a retry queue.
+- Remove `suppress`/`ignore_errors` cleanup branches that can discard ownership.
+  Surface the primary error while keeping retryable cleanup metadata.
+- Count committed, active, and cleanup-pending data exactly once. Add bounded
+  startup recovery for crash-left owned staging records without deleting
+  unmarked user data.
+- Apply the same state machine to core uploads, avatar media, and rig directories.
+
+Acceptance: fault injection at every rename/hardening/rollback/removal boundary,
+including two simultaneous failures, leaves either no inode or a fully charged,
+discoverable cleanup record. A later retry or restart removes it and releases the
+reservation; no failed publication is visible or non-private.
+
+### Installed avatar command surface (`PKG-01`)
+
+- Make `custback avatar ...` dispatch in the Python entry point as well as the
+  npm wrapper. Keep `custback-avatar` as a compatibility alias on both surfaces.
+- Package the annotated avatar template as Python package data and export it via
+  `importlib.resources` (or an equivalent installed-resource API), not a checkout
+  or npm-tree-relative path.
+- Support `custback avatar config export [PATH]` from wheel, sdist, editable, and
+  npm installs with exclusive, mode-`0600` destination creation.
+- Update the shipped template, examples, and documentation to call the canonical
+  command while describing the alias only as compatibility behavior.
+
+Acceptance: isolated installs of wheel, sdist, and npm tarball successfully run
+`custback avatar --help`, start a hardware-free avatar smoke, export
+byte-identical config, refuse overwrite, and run the alias. Tests must execute
+installed launchers, not only call JavaScript helper functions.
+
+### Shell-safe npm pack contract (`PKG-02`)
+
+- Keep prepack diagnostics off stdout when npm is expected to print the tarball
+  name. Send human diagnostics to stderr or suppress the success line in
+  lifecycle mode.
+- Make the documented command substitution capture exactly one non-empty
+  filename with no whitespace or extra lines.
+- Retain non-recursive `npm pack --dry-run --json --ignore-scripts` verification
+  internally and full artifact installation only in the explicit release path.
+- Replace the string-matching regression with a real subprocess test in an
+  isolated pack destination, followed by installation of the captured path.
+
+Acceptance: `TARBALL=$(npm pack --silent)` yields exactly
+`custback-<version>.tgz`; the file exists, installs successfully, and prepack
+emits no other stdout. Failure diagnostics remain actionable on stderr.
+
+### Phase 5 exit gate
+
+Phase 5 is complete only when `SEC-02`, `PRIV-01`, `LIFE-01`, `LIFE-02`,
+`STOR-02`, `PKG-01`, and `PKG-02` are resolved by their executable acceptance
+tests. Then advance the registry's top-level phase to 6; `REL-01` remains the
+only open entry, retains blocker phase 6, and keeps `release_blocked=true` until
+release enforcement is installed. Passing the ordinary unit suites is necessary
+but not sufficient.
+
+## Phase 6 — migration and end-to-end release validation
+
+### Upgrade and migration matrix
+
+- Build fixtures from the last released artifacts and every supported legacy
+  on-disk format. Test clean install, in-place upgrade, interrupted upgrade,
+  rollback, reinstall, and uninstall/reinstall without relying on the source
+  checkout.
+- Verify npm package-directory replacement preserves the prefix-scoped venv,
+  explicit extras intent, active and rollback generations, and recovery journal.
+- Exercise config migration for the new immutable backdrop-target model. Unsafe
+  free-form remote targets must require explicit operator migration; they must
+  never be silently re-enabled as hot API authority.
+- Audit and repair existing core/avatar stores without data loss, following
+  symlinks, widening permissions, or dropping quota ownership.
+- Run migrations from wheel, sdist, and npm artifacts on every advertised OS and
+  supported runtime where the artifact is published. The initial reviewed matrix
+  is Python 3.10–3.14 on Ubuntu, Python 3.12 on macOS, Node 18/20/22 on Ubuntu,
+  and Node 20 on macOS. Keep this finite matrix machine-readable; bound or update
+  `engines.node` when changing supported Node lines.
+- In that manifest, enumerate artifact and legacy-fixture IDs plus MediaPipe and
+  RVM on Python 3.11/3.12, Audio2Face source/wheel contracts on Python 3.12,
+  Linux x86-64 GPU dependency resolution, and a separate CUDA-hardware execution
+  gate that does not infer execution from provider registration.
+
+Acceptance: golden pre-upgrade fixtures produce the expected post-upgrade config,
+assets, permissions, extras, and rollback state. Killing each migration at every
+durable boundary converges to the old or new valid state on retry.
+
+### Two-host WSS/HTTPS system test
+
+- Run meeting-host and renderer-host processes in separate containers, network
+  namespaces, or equivalent isolated hosts with distinct addresses and no shared
+  secret directory.
+- Run the isolated-network scenario for every release candidate and repeat it on
+  two clean machines or VMs before production publication; a loopback-only
+  substitution is not release evidence.
+- Generate ephemeral independent CAs, server identities, and renderer/control
+  tokens. Exercise the WSS frame plane and HTTPS control plane with real sockets,
+  hostname verification, and the documented firewall direction.
+- Test nominal rendering, renderer outage, stale output, wrong renderer token,
+  wrong control token, untrusted/expired/wrong-host certificates, removed
+  firewall paths, reconnect, and rotation. Never downgrade to plaintext.
+- Attach a recording virtual-camera/preview sink and assert the fixed privacy
+  slate throughout startup and every frame-plane failure. Assert control failures
+  map to `avatar_unreachable`/`avatar_auth_failed` without invalidating the core
+  browser session.
+- Prove failed TLS handshakes transmit no bearer token, PCM, or camera frame to
+  the untrusted peer.
+
+Acceptance: the complete two-host matrix passes from packaged artifacts, and the
+test tears down every process, socket, certificate, token, and temporary file on
+success, assertion failure, timeout, and cancellation.
+
+### Quality, stress, artifact, and clean-tree gates
+
+- Build the wheel, sdist, and npm tarball once from a clean release commit,
+  record their SHA-256 digests, and pass those exact files to every downstream
+  job. The publish job must upload the qualified files without rebuilding them.
+- Add Ruff to the development/release toolchain with a reviewed configuration
+  and require both `ruff check src tests examples` and
+  `ruff format --check src tests examples`, plus any Python release runners.
+- Add deterministic bounded stress jobs for concurrent PATCH/activation,
+  session cancellation/reconnect, stream connection caps, upload reservations,
+  cleanup retries, and repeated Audio2Face shutdown. Run at least 100 iterations
+  per race/fault family with recorded seeds and retain the failing seed.
+- Run the full Python and npm suites plus `pip check` from clean source and built
+  artifacts. Every advertised optional extra must install and execute its real
+  smoke from a built wheel.
+- Reject generated profiles, build outputs, caches, untracked release payloads,
+  and missing delivery-critical files. `LICENSE`, deployment docs, protocol
+  tests, and every reviewed payload must be committed before release.
+- Bind every result to the exact commit and artifact digests. Stale evidence from
+  another tree, a checked-in result, or a locally edited attestation must fail
+  closed.
+
+Acceptance: required CI jobs cover Python, Node, Ruff, stress, migrations,
+artifacts, clean-tree checks, and two-host TLS. Re-running the gate on a changed
+source or artifact digest invalidates the prior evidence. Each stress group ends
+at quiescence with zero failures, timeouts, unexpected skips, surviving workers
+or handles, leaked reservations, lost cleanup owners, or privacy violations.
+
+### Release workflow integrity (`REL-01`)
+
+- Make the production publish workflow depend on all required Phase 6 jobs. A
+  green metadata/packlist prepack is not a production-readiness attestation.
+- Add one aggregate release-gate job that evaluates every required dependency
+  even when an earlier job fails and refuses publication unless all conclusions
+  are successful for the same workflow run.
+- Maintain one versioned machine-readable allow-list of required gate, CI-job,
+  matrix, and scenario IDs. The workflow, aggregate job, evidence producer, and
+  verifier must match that exact set; they cannot silently agree to omit a gate.
+- Keep `prepack` non-recursive and fast, but make it fail whenever the blocker
+  registry is open or required release metadata is inconsistent.
+- Provide a non-authorizing qualification/test entry point so Phase 6 jobs can
+  exercise their runners while `REL-01` is open. Its evidence is diagnostic only
+  and cannot satisfy the publish workflow or bypass registry checks. It may build
+  an npm candidate with lifecycle scripts disabled, but final qualification must
+  use the normal prepack path after `REL-01` closes.
+- Make full `release:check` run the locally executable gates and verify
+  commit-bound CI evidence for any true two-host/platform matrix that cannot run
+  locally.
+- Close `REL-01` and set `release_blocked=false` only in the final release-candidate
+  change after every other blocker is closed and the enforcement machinery plus
+  its fail-closed regressions are mandatory. That commit becomes eligible to run
+  dynamic qualification; it is not pre-qualified by results from its parent.
+  Any later source, dependency, workflow, or artifact change requires a fresh
+  qualification run and new artifacts.
+
+`release_blocked=false` means that a revision is eligible to attempt final
+qualification; it is not itself evidence that any artifact passed. Dynamic
+evidence must be produced by the release workflow and must name the exact commit,
+workflow run, platform matrix, scenario IDs, and publishable artifact digests.
+Publication evidence must be authenticated by the CI provider or a reviewed
+signed-attestation mechanism and tied to artifacts from that same workflow run;
+a locally fabricated JSON file is invalid. Local `release:check` is diagnostic
+unless it can verify that trusted provenance.
+
+Acceptance: deleting or failing any required job/evidence, reopening a blocker,
+changing a reviewed file, or substituting an artifact makes the publish job and
+full release check fail. Only the exact fully validated commit can publish.
+
+## Corrective PR sequence
+
+1. Registry freeze: reopen/add eight entries and land strict failing regressions.
+2. `SEC-02`: immutable operator-owned live-backdrop targets.
+3. `PRIV-01`: session-wide, capacity-safe raw replay rejection.
+4. `LIFE-01`: linearizable renderer-session publication lease.
+5. `LIFE-02`: terminal/killable Audio2Face ownership.
+6. `STOR-02`: rename-aware cleanup transactions and restart recovery.
+7. `PKG-01`: installed Python/npm avatar command and packaged config export.
+8. `PKG-02`: stdout-clean prepack and real command-substitution regression.
+9. Migration fixtures, Ruff, stress, clean-tree, and artifact gates.
+10. Packaged two-host WSS/HTTPS system test and required CI integration.
+11. `REL-01`: exact-commit release candidate, registry close, and publish gate.
+
+Security/privacy, lifecycle, storage, and packaging PRs may proceed in parallel
+after the registry freeze. Do not combine `LIFE-01`/`LIFE-02` ownership changes
+with `STOR-02`, and do not close `REL-01` in an implementation PR.
 
 ## Final release gate
 
 A release is permitted only when:
 
-- the blocker registry contains no open entries;
-- the SSRF reproduction performs no I/O;
+- the blocker registry contains no open entries, reports
+  `release_blocked=false`, and the required-gate allow-list is exact;
+- hot backdrop and proxy SSRF reproductions perform no file, DNS, capture, or
+  network I/O;
 - remote plaintext fails before connection;
-- a recording sink proves every remote frame passes the privacy firewall;
+- a recording sink proves every remote frame passes the privacy firewall,
+  including raw replays beyond the old time window and under capacity pressure;
 - invalid avatar patches leave version/resources unchanged;
-- no render or Audio2Face worker survives shutdown;
-- concurrent staging plus committed data stays within quota;
+- cancelled sessions cannot publish or incorrectly account queued renders, and
+  no render or Audio2Face worker/handle survives a successful shutdown;
+- concurrent staging, committed data, and cleanup-pending data stay private and
+  within aggregate quota;
 - decompression bombs fail before OpenCV;
 - every optional extra installs and smokes from a built wheel;
 - npm reinstall preserves venv, extras, and rollback state;
-- npm, wheel, and sdist contain the license and expected launchers;
-- Python, npm, Ruff, stress, and clean-artifact checks pass; and
+- installed npm, wheel, and sdist surfaces contain the license, canonical avatar
+  command, compatibility alias, and exportable avatar config;
+- `npm pack --silent` emits exactly one installable filename on stdout;
+- migration, Python, npm, Ruff, stress, clean-tree, and artifact checks pass for
+  the exact release commit;
+- the publish job selects the already qualified wheel, sdist, and npm tarball by
+  their recorded digests without rebuilding them; and
 - the documented two-host WSS/HTTPS deployment passes, including renderer
-  outage and token-failure behavior.
+  outage, certificate, rotation, privacy-slate, and token-failure behavior.

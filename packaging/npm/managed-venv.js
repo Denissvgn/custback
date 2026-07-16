@@ -19,6 +19,7 @@ const LOCK_OWNER_PREFIX = '.install-lock-owner-';
 const LOCK_BREAK_PREFIX = '.install-lock-break-';
 const LOCK_QUARANTINE_PREFIX = '.install-lock-quarantine-';
 const MIGRATION_JOURNAL = '.migration-pending.json';
+const DEFAULT_TARGET_NAME = '.custback-venv';
 
 function isWithin(parent, candidate) {
   const rel = path.relative(parent, candidate);
@@ -64,6 +65,32 @@ function resolveProtectedPath(input) {
 function generationsRootFor(target) {
   const base = path.basename(target).replace(/^\.+/, '') || 'venv';
   return path.join(path.dirname(target), `.${base}.custback-generations`);
+}
+
+function npmPrefixForPackage(pkgRoot) {
+  const resolvedRoot = path.resolve(pkgRoot);
+  let cursor = resolvedRoot;
+  while (true) {
+    const parent = path.dirname(cursor);
+    if (path.basename(parent) === 'node_modules') {
+      const container = path.dirname(parent);
+      // npm's global Unix layout is <prefix>/lib/node_modules/<package>;
+      // local installs use <prefix>/node_modules/<package>. Scoped package
+      // names are handled naturally because the walk reaches their scope
+      // directory before node_modules.
+      return path.basename(container) === 'lib' ? path.dirname(container) : container;
+    }
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  // Direct checkout execution has no node_modules anchor. Keep its managed
+  // runtime in a sibling of the checkout so replacing the checkout itself
+  // still cannot remove the environment.
+  return path.dirname(resolvedRoot);
+}
+
+function defaultTargetForPackage(pkgRoot) {
+  return path.join(npmPrefixForPackage(pkgRoot), DEFAULT_TARGET_NAME);
 }
 
 function assertSafeTarget(input, options = {}) {
@@ -834,6 +861,7 @@ function withInstallLock(generationRoot, callback, options = {}) {
 }
 
 module.exports = {
+  DEFAULT_TARGET_NAME,
   GENERATIONS_MARKER,
   INSTALL_STAMP,
   LEGACY_STAMP,
@@ -844,12 +872,14 @@ module.exports = {
   assertSafeTarget,
   cleanupGenerations,
   createGeneration,
+  defaultTargetForPackage,
   ensureGenerationsRoot,
   generationIsReferenced,
   generationsRootFor,
   inspectTarget,
   isWithin,
   markGeneration,
+  npmPrefixForPackage,
   prepareInstallTarget,
   promoteGeneration,
   readJson,

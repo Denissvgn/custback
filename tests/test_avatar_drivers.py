@@ -1,5 +1,6 @@
 """Animation drivers: idle determinism, smoothing, Audio2Face mapping."""
 
+import builtins
 import math
 import ssl
 import threading
@@ -324,18 +325,21 @@ def test_wav_audio_source_rejects_wrong_formats(tmp_path):
         WavAudioSource(slow, 16000)
 
 
-def test_audio2face_driver_requires_bindings(tmp_path):
-    try:
-        import nvidia_ace  # noqa: F401
-        pytest.skip("nvidia-ace installed; unavailability path not testable")
-    except ImportError:
-        pass
+def test_audio2face_driver_requires_bindings(tmp_path, monkeypatch):
+    real_import = builtins.__import__
+
+    def without_service_bindings(name, *args, **kwargs):
+        if name.startswith("nvidia_audio2face_3d"):
+            raise ImportError("simulated missing Audio2Face service bindings")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_service_bindings)
     wav = tmp_path / "voice.wav"
     _write_wav(wav)
     driver = Audio2FaceDriver(
         Audio2FaceConfig(url="grpc://127.0.0.1:52000", audio_source=str(wav))
     )
-    with pytest.raises(DriverUnavailableError, match="nvidia-ace"):
+    with pytest.raises(DriverUnavailableError, match="nvidia-audio2face-3d"):
         driver.start()
 
 
