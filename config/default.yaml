@@ -18,12 +18,18 @@ background:
   blur_strength: 31
   image_path: ""       # static backdrop (mode: image)
   video_path: ""       # looping live backdrop (mode: video)
-  camera_device: ""    # second camera or stream URL (mode: camera)
+  camera_device: ""    # legacy startup-only local device (mode: camera)
+  camera_target: ""    # hot-selectable ID from operator-owned backdrop_targets
   color: [18, 100, 32] # BGR (mode: color)
   # Local mode restored when remote/avatar mode is disabled. Renderer outages
   # always emit the fixed privacy slate, regardless of this preference.
   # blur | image | video | color | camera (never passthrough or remote)
   remote_fallback_mode: blur
+
+# Immutable live-backdrop authority. Sources are startup-only local OpenCV
+# devices/paths; remote URL schemes are rejected because OpenCV cannot enforce
+# verified TLS, redirect, proxy, and address-class policy.
+backdrop_targets: {}
 
 segmentation:
   # auto picks the best available: rvm (matting, needs the [rvm] or [gpu]

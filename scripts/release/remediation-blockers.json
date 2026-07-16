@@ -1,33 +1,180 @@
 {
-  "schema_version": 1,
-  "phase": 4,
-  "release_blocked": false,
+  "schema_version": 2,
+  "phase": 6,
+  "release_blocked": true,
   "blockers": [
-    {"id": "SEC-01", "phase": 1, "status": "resolved", "title": "Avatar proxy SSRF and credential-file exfiltration", "regression": "tests/test_remediation_security.py"},
-    {"id": "TOKEN-01", "phase": 1, "status": "resolved", "title": "Proxy client token creation and upstream-auth mapping", "regression": "tests/test_remediation_security.py"},
-    {"id": "TRANS-01", "phase": 1, "status": "resolved", "title": "Non-loopback plaintext transports", "regression": "tests/test_remediation_security.py"},
-    {"id": "PRIV-01", "phase": 1, "status": "resolved", "title": "Remote startup and fallback privacy bypasses", "regression": "tests/test_remediation_security.py"},
-    {"id": "A2F-01", "phase": 4, "status": "resolved", "title": "Audio2Face dependency and protocol contract", "regression": "packaging/npm/test/remediation-phase0.test.js"},
-    {"id": "CFG-01", "phase": 2, "status": "resolved", "title": "Non-transactional avatar activation", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "CFG-02", "phase": 3, "status": "resolved", "title": "Non-recursive configuration merge patch", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "LIFE-01", "phase": 2, "status": "resolved", "title": "Render cancellation outlives resource ownership", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "LIFE-02", "phase": 2, "status": "resolved", "title": "Audio2Face blocked RPC survives close", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "STOR-01", "phase": 3, "status": "resolved", "title": "Avatar asset permissions are not private", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "STOR-02", "phase": 3, "status": "resolved", "title": "Incomplete staging, rig, and decoded-image limits", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "SEG-01", "phase": 3, "status": "resolved", "title": "Model acquisition blocks frame processing", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "SEG-02", "phase": 3, "status": "resolved", "title": "Auto backend ignores custom TFLite model", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "SEG-03", "phase": 3, "status": "resolved", "title": "Non-finite masks can reach output", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "RENDER-01", "phase": 3, "status": "resolved", "title": "Avatar alpha is multiplied twice", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "RENDER-02", "phase": 3, "status": "resolved", "title": "follow_pose is nonfunctional", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "API-01", "phase": 3, "status": "resolved", "title": "Streams exhaust the shared asyncio executor", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "NPM-01", "phase": 4, "status": "resolved", "title": "npm upgrade loses venv, generations, and extras", "regression": "packaging/npm/test/remediation-phase0.test.js"},
-    {"id": "PKG-01", "phase": 4, "status": "resolved", "title": "npm avatar command and documentation mismatch", "regression": "packaging/npm/test/remediation-phase0.test.js"},
-    {"id": "PKG-02", "phase": 4, "status": "resolved", "title": "Prepack and local tarball behavior are inconsistent", "regression": "packaging/npm/test/remediation-phase0.test.js"},
-    {"id": "DEPLOY-01", "phase": 4, "status": "resolved", "title": "Remote token and TLS deployment is incomplete", "regression": "packaging/npm/test/remediation-phase0.test.js"},
-    {"id": "MISC-01", "phase": 3, "status": "resolved", "title": "Failed camera backdrop leaks capture", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "MISC-02", "phase": 3, "status": "resolved", "title": "YAML, URL port, and CLI override validation gaps", "regression": "tests/test_remediation_runtime.py"},
-    {"id": "LICENSE-01", "phase": 4, "status": "resolved", "title": "Declared MIT artifacts omit license text", "regression": "packaging/npm/test/remediation-phase0.test.js"},
-    {"id": "PLATFORM-01", "phase": 4, "status": "resolved", "title": "Automatic Linux setup scope is overstated", "regression": "packaging/npm/test/remediation-phase0.test.js"},
-    {"id": "HYGIENE-01", "phase": 4, "status": "resolved", "title": "Generated ONNX Runtime profiles are not release-stale", "regression": "packaging/npm/test/remediation-phase0.test.js"}
+    {
+      "id": "SEC-01", "phase": 1, "status": "resolved",
+      "title": "Avatar proxy SSRF and credential-file exfiltration",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_security.py::test_proxy_destination_and_credential_path_are_restart_only"}
+    },
+    {
+      "id": "TOKEN-01", "phase": 1, "status": "resolved",
+      "title": "Proxy client token creation and upstream-auth mapping",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_security.py::test_missing_proxy_client_token_is_not_created"}
+    },
+    {
+      "id": "TRANS-01", "phase": 1, "status": "resolved",
+      "title": "Non-loopback plaintext transports",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_security.py::test_non_loopback_plaintext_endpoints_are_rejected"}
+    },
+    {
+      "id": "PRIV-01", "phase": 5, "status": "resolved",
+      "title": "Raw replay is accepted after fingerprint history expires",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_security.py::test_PRIV_01_replay_is_rejected_after_window_and_capacity"}
+    },
+    {
+      "id": "A2F-01", "phase": 4, "status": "resolved",
+      "title": "Audio2Face dependency and protocol contract",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/remediation-phase0.test.js",
+        "test": "A2F-01: the Audio2Face extra names the published service protocol package used by the driver"
+      }
+    },
+    {
+      "id": "CFG-01", "phase": 2, "status": "resolved",
+      "title": "Non-transactional avatar activation",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_CFG_01_failed_candidate_preserves_complete_live_generation"}
+    },
+    {
+      "id": "CFG-02", "phase": 3, "status": "resolved",
+      "title": "Non-recursive configuration merge patch",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_CFG_02_core_nested_patch_preserves_upload_siblings"}
+    },
+    {
+      "id": "LIFE-01", "phase": 5, "status": "resolved",
+      "title": "A cancelled avatar session can publish a queued render",
+      "regression": {"runner": "pytest", "test": "tests/test_phase5_lifecycle.py::test_LIFE_01_stop_after_completed_send_discards_queued_publication_same_version"}
+    },
+    {
+      "id": "LIFE-02", "phase": 5, "status": "resolved",
+      "title": "Audio2Face loses RPC/channel ownership while its worker survives",
+      "regression": {"runner": "pytest", "test": "tests/test_phase5_lifecycle.py::test_LIFE_02_successful_cancel_without_wakeup_retains_complete_generation"}
+    },
+    {
+      "id": "STOR-01", "phase": 3, "status": "resolved",
+      "title": "Avatar asset permissions are not private",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_STOR_01_media_and_rig_assets_have_exact_private_permissions"}
+    },
+    {
+      "id": "STOR-02", "phase": 5, "status": "resolved",
+      "title": "Post-rename cleanup failure leaves an unowned inode/reservation gap",
+      "regression": {"runner": "pytest", "test": "tests/test_phase5_storage.py::test_STOR_02_post_rename_failures_retain_cleanup_ownership"}
+    },
+    {
+      "id": "SEG-01", "phase": 3, "status": "resolved",
+      "title": "Model acquisition blocks frame processing",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_SEG_01_segmenter_preparation_does_not_run_on_frame_worker"}
+    },
+    {
+      "id": "SEG-02", "phase": 3, "status": "resolved",
+      "title": "Auto backend ignores custom TFLite model",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_SEG_02_auto_tflite_selects_mediapipe"}
+    },
+    {
+      "id": "SEG-03", "phase": 3, "status": "resolved",
+      "title": "Non-finite masks can reach output",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_SEG_03_remote_nan_mask_uses_input_independent_fallback"}
+    },
+    {
+      "id": "RENDER-01", "phase": 3, "status": "resolved",
+      "title": "Avatar alpha is multiplied twice",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_RENDER_01_half_alpha_layer_is_not_double_multiplied"}
+    },
+    {
+      "id": "RENDER-02", "phase": 3, "status": "resolved",
+      "title": "follow_pose is nonfunctional",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_RENDER_02_follow_pose_false_changes_rendered_output"}
+    },
+    {
+      "id": "API-01", "phase": 3, "status": "resolved",
+      "title": "Streams exhaust the shared asyncio executor",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_API_01_stream_routes_use_async_subscriptions_not_blocking_to_thread"}
+    },
+    {
+      "id": "NPM-01", "phase": 4, "status": "resolved",
+      "title": "npm upgrade loses venv, generations, and extras",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/remediation-phase0.test.js",
+        "test": "NPM-01: the default managed venv and rollback generations survive npm package replacement"
+      }
+    },
+    {
+      "id": "PKG-01", "phase": 5, "status": "resolved",
+      "title": "Canonical avatar/config-export commands are npm-wrapper-only",
+      "regression": {"runner": "pytest", "test": "tests/test_avatar_config.py::test_PKG_01_installed_avatar_template_exports_privately_without_overwrite"}
+    },
+    {
+      "id": "PKG-02", "phase": 5, "status": "resolved",
+      "title": "npm pack --silent emits non-filename text on stdout",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/remediation-phase0.test.js",
+        "test": "PKG-02: npm pack --silent stdout is one installable filename"
+      }
+    },
+    {
+      "id": "DEPLOY-01", "phase": 4, "status": "resolved",
+      "title": "Remote token and TLS deployment is incomplete",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/remediation-phase0.test.js",
+        "test": "DEPLOY-01: the remote deployment guide separates renderer and control credentials over WSS/HTTPS"
+      }
+    },
+    {
+      "id": "MISC-01", "phase": 3, "status": "resolved",
+      "title": "Failed camera backdrop leaks capture",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_MISC_01_camera_backdrop_releases_failed_capture"}
+    },
+    {
+      "id": "MISC-02", "phase": 3, "status": "resolved",
+      "title": "YAML, URL-port, and CLI override validation gaps",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_runtime.py::test_MISC_02_combined_cli_overrides_are_validated_as_one_candidate"}
+    },
+    {
+      "id": "LICENSE-01", "phase": 4, "status": "resolved",
+      "title": "Declared MIT artifacts omit license text",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/remediation-phase0.test.js",
+        "test": "LICENSE-01: canonical MIT license text is present in npm and Python release contracts"
+      }
+    },
+    {
+      "id": "PLATFORM-01", "phase": 4, "status": "resolved",
+      "title": "Automatic Linux setup scope is overstated",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/remediation-phase0.test.js",
+        "test": "PLATFORM-01: Linux setup rejects unsupported distributions before invoking apt-get"
+      }
+    },
+    {
+      "id": "HYGIENE-01", "phase": 4, "status": "resolved",
+      "title": "Generated ONNX Runtime profiles are not release-stale",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/remediation-phase0.test.js",
+        "test": "HYGIENE-01: generated ONNX Runtime profiles are ignored and rejected as stale release artifacts"
+      }
+    },
+    {
+      "id": "SEC-02", "phase": 5, "status": "resolved",
+      "title": "Hot camera-backdrop configuration permits authenticated SSRF",
+      "regression": {"runner": "pytest", "test": "tests/test_remediation_security.py::test_SEC_02_hot_backdrop_authority_is_io_free"}
+    },
+    {
+      "id": "REL-01", "phase": 6, "status": "open",
+      "title": "Release automation can pass without Phase 6, Ruff, or stress evidence",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/release-check.test.js",
+        "test": "REL-01: production publish requires exact Phase 6 gate evidence",
+        "guard": "REL-01: open registry still blocks the installed Phase 6 publish machinery"
+      }
+    }
   ]
 }

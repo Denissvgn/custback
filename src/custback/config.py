@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,9 @@ CameraPixelFormat = Literal["auto", "mjpeg", "backend"]
 CameraModeMismatch = Literal["warn", "error"]
 ColorChannel = Annotated[int, Field(ge=0, le=255)]
 SAFE_IMAGE_MAX_PIXELS = 89_478_485
+_BACKDROP_TARGET_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\\\/]")
 
 # These fields select the avatar proxy's outbound security boundary.  They are
 # consumed when the API application is constructed and cannot safely diverge
@@ -92,6 +96,39 @@ def _clean_device(value: int | str, *, allow_empty: bool) -> int | str:
         return value
     if isinstance(value, str):
         return _clean_config_string(value, allow_empty=allow_empty)
+    return value
+
+
+def _clean_backdrop_source(value: int | str, *, allow_empty: bool) -> int | str:
+    """Normalize an operator-owned OpenCV source without accepting URLs.
+
+    OpenCV does not expose enough redirect, proxy, certificate, or address-class
+    controls to make a remote ``VideoCapture`` URL a verified transport.  Local
+    device names and paths remain available as startup authority, but URI-like
+    strings are rejected before OpenCV, DNS, or the filesystem is consulted.
+    """
+
+    value = _clean_device(value, allow_empty=allow_empty)
+    if isinstance(value, str):
+        is_windows_drive = bool(_WINDOWS_DRIVE_RE.match(value))
+        if value and (
+            value.startswith(("//", "\\\\"))
+            or "://" in value
+            or (_URI_SCHEME_RE.match(value) and not is_windows_drive)
+        ):
+            raise ValueError(
+                "remote or URI camera backdrop sources are unsupported; "
+                "configure a local device target"
+            )
+        if (
+            value
+            and not value.isdecimal()
+            and not value.startswith("/")
+            and not is_windows_drive
+        ):
+            raise ValueError(
+                "camera backdrop source must be a numeric index or absolute local path"
+            )
     return value
 
 
@@ -153,11 +190,31 @@ class CameraConfig(_StrictModel):
         return self
 
 
+class BackdropTargetConfig(_StrictModel):
+    """One immutable, operator-owned live-backdrop source."""
+
+    source: int | str
+
+    @field_validator("source")
+    @classmethod
+    def _valid_source(cls, value: int | str) -> int | str:
+        return _clean_backdrop_source(value, allow_empty=False)
+
+
+@dataclass(frozen=True)
+class ResolvedBackdropTarget:
+    """Validated source snapshot handed to a candidate resource."""
+
+    identifier: str
+    source: int | str
+
+
 class BackgroundConfig(_StrictModel):
     mode: BackgroundMode = "blur"
     image_path: str = ""
     video_path: str = ""
     camera_device: int | str = ""
+    camera_target: str = ""
     color: tuple[ColorChannel, ColorChannel, ColorChannel] = (18, 100, 32)
     blur_strength: int = Field(default=31, ge=3, le=151)
     # Local mode restored when remote/avatar mode is disabled. While remote is
@@ -172,7 +229,15 @@ class BackgroundConfig(_StrictModel):
     @field_validator("camera_device")
     @classmethod
     def _valid_camera_device(cls, value: int | str) -> int | str:
-        return _clean_device(value, allow_empty=True)
+        return _clean_backdrop_source(value, allow_empty=True)
+
+    @field_validator("camera_target")
+    @classmethod
+    def _valid_camera_target(cls, value: str) -> str:
+        value = _clean_config_string(value)
+        if value and not _BACKDROP_TARGET_ID_RE.fullmatch(value):
+            raise ValueError("camera_target must match [a-z][a-z0-9_-]{0,63}")
+        return value
 
     @field_validator("color", mode="before")
     @classmethod
@@ -197,8 +262,17 @@ class BackgroundConfig(_StrictModel):
             raise ValueError("image_path is required for the active image background")
         if "video" in active_modes and not self.video_path:
             raise ValueError("video_path is required for the active video background")
-        if "camera" in active_modes and self.camera_device == "":
-            raise ValueError("camera_device is required for the active camera background")
+        if self.camera_device != "" and self.camera_target:
+            raise ValueError("camera_device and camera_target are mutually exclusive")
+        if (
+            "camera" in active_modes
+            and self.camera_device == ""
+            and not self.camera_target
+        ):
+            raise ValueError(
+                "camera_target or camera_device is required for the active "
+                "camera background"
+            )
         return self
 
 
@@ -276,9 +350,7 @@ class UploadLimits(_StrictModel):
     video_max_bytes: int = Field(default=256 * 1024 * 1024, ge=1, le=2**31)
     # Stay at or below Pillow's decompression-bomb warning threshold across
     # the supported Pillow 10-12 range so the configured limit is authoritative.
-    image_max_pixels: int = Field(
-        default=16_777_216, ge=256, le=SAFE_IMAGE_MAX_PIXELS
-    )
+    image_max_pixels: int = Field(default=16_777_216, ge=256, le=SAFE_IMAGE_MAX_PIXELS)
     video_max_width: int = Field(default=3840, ge=16, le=7680)
     video_max_height: int = Field(default=2160, ge=16, le=7680)
     storage_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1, le=2**40)
@@ -288,7 +360,9 @@ class UploadLimits(_StrictModel):
     def _storage_can_hold_one_file(self) -> "UploadLimits":
         largest = max(self.image_max_bytes, self.video_max_bytes)
         if self.storage_max_bytes < largest:
-            raise ValueError("storage_max_bytes must be at least the largest per-file limit")
+            raise ValueError(
+                "storage_max_bytes must be at least the largest per-file limit"
+            )
         return self
 
 
@@ -344,7 +418,9 @@ class ApiConfig(_StrictModel):
                 raise ValueError(f"invalid exact HTTP(S) origin: {origin!r}")
             normalized.append(canonical)
         if len(normalized) != len(set(normalized)):
-            raise ValueError("allowed_origins entries must be unique after normalization")
+            raise ValueError(
+                "allowed_origins entries must be unique after normalization"
+            )
         return tuple(normalized)
 
     @model_validator(mode="after")
@@ -411,13 +487,9 @@ class AvatarRemoteConfig(_StrictModel):
             raise ValueError(
                 "avatar TLS certificate and private key must be configured together"
             )
-        tls_configured = bool(
-            self.tls_ca_file or self.tls_certfile or self.tls_keyfile
-        )
+        tls_configured = bool(self.tls_ca_file or self.tls_certfile or self.tls_keyfile)
         if tls_configured and endpoint is None:
-            raise ValueError(
-                "avatar TLS files require a configured secure endpoint"
-            )
+            raise ValueError("avatar TLS files require a configured secure endpoint")
         if tls_configured and endpoint is not None and not endpoint.secure:
             raise ValueError(
                 "avatar TLS files cannot be used with a plaintext endpoint"
@@ -428,11 +500,49 @@ class AvatarRemoteConfig(_StrictModel):
 class AppConfig(_StrictModel):
     camera: CameraConfig = Field(default_factory=CameraConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
+    backdrop_targets: dict[str, BackdropTargetConfig] = Field(default_factory=dict)
     segmentation: SegmentationConfig = Field(default_factory=SegmentationConfig)
     compositing: CompositingConfig = Field(default_factory=CompositingConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     avatar: AvatarRemoteConfig = Field(default_factory=AvatarRemoteConfig)
+
+    @field_validator("backdrop_targets")
+    @classmethod
+    def _valid_backdrop_target_ids(
+        cls, value: dict[str, BackdropTargetConfig]
+    ) -> dict[str, BackdropTargetConfig]:
+        for identifier in value:
+            if not _BACKDROP_TARGET_ID_RE.fullmatch(identifier):
+                raise ValueError("backdrop target IDs must match [a-z][a-z0-9_-]{0,63}")
+        return value
+
+    @model_validator(mode="after")
+    def _selected_backdrop_target_exists(self) -> "AppConfig":
+        selected = self.background.camera_target
+        if selected and selected not in self.backdrop_targets:
+            raise ValueError(f"unknown camera backdrop target ID: {selected!r}")
+        return self
+
+    def resolved_backdrop_target(self) -> ResolvedBackdropTarget | None:
+        """Return a detached, validated snapshot of the selected source."""
+
+        def normalized(source: int | str) -> int | str:
+            if isinstance(source, str) and source.isdecimal():
+                return int(source)
+            return source
+
+        selected = self.background.camera_target
+        if selected:
+            configured = self.backdrop_targets[selected]
+            return ResolvedBackdropTarget(selected, normalized(configured.source))
+        source = self.background.camera_device
+        if source != "":
+            # Safe legacy startup-only configuration remains readable long
+            # enough for the explicit ``custback migrate`` workflow. It is
+            # never accepted as hot API authority.
+            return ResolvedBackdropTarget("", normalized(source))
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         """Return plain Python values, preserving tuple compatibility."""
@@ -507,9 +617,7 @@ class _RuntimeConfigCoordinator:
     def __init__(self, runtime: "RuntimeConfig"):
         self.__runtime = runtime
 
-    def commit(
-        self, candidate: AppConfig, expected_version: int
-    ) -> ConfigState:
+    def commit(self, candidate: AppConfig, expected_version: int) -> ConfigState:
         return self.__runtime._commit_with_activation(
             candidate, expected_version, lambda _: None
         )

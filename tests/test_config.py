@@ -95,10 +95,54 @@ def test_active_background_paths_are_structural_not_existence_checks():
     assert remote.background.camera_device == 2
 
 
+def test_operator_backdrop_targets_resolve_to_immutable_local_snapshots():
+    cfg = AppConfig.from_dict(
+        {
+            "background": {"mode": "camera", "camera_target": "side-camera"},
+            "backdrop_targets": {"side-camera": {"source": "2"}},
+        }
+    )
+
+    resolved = cfg.resolved_backdrop_target()
+    assert resolved is not None
+    assert resolved.identifier == "side-camera"
+    assert resolved.source == 2
+    assert cfg.backdrop_targets["side-camera"].source == "2"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http://camera.example/live",
+        "https://camera.example/live",
+        "rtsp://camera.example/live",
+        "file:///run/secrets/token",
+        "//camera.example/share",
+        "rtspsrc location=rtsp://camera.example/live ! decodebin",
+    ],
+)
+def test_remote_opencv_backdrop_schemes_are_rejected(source):
+    with pytest.raises(ValueError, match="unsupported"):
+        AppConfig.from_dict(
+            {
+                "background": {
+                    "mode": "camera",
+                    "camera_target": "remote-camera",
+                },
+                "backdrop_targets": {"remote-camera": {"source": source}},
+            }
+        )
+
+
 def test_even_blur_made_odd():
     cfg = AppConfig.from_dict({"background": {"blur_strength": 20}})
     assert cfg.background.blur_strength % 2 == 1
-    assert AppConfig.from_dict({"background": {"blur_strength": 2}}).background.blur_strength == 3
+    assert (
+        AppConfig.from_dict(
+            {"background": {"blur_strength": 2}}
+        ).background.blur_strength
+        == 3
+    )
     with pytest.raises(ValueError):
         AppConfig.from_dict({"background": {"blur_strength": 0}})
 
@@ -216,9 +260,7 @@ def test_new_security_upload_and_remote_fallback_defaults():
     assert cfg.api.ws_max_bytes == 16 * 1024 * 1024
     assert cfg.api.uploads.video_max_bytes == 256 * 1024 * 1024
     with pytest.raises(ValueError):
-        AppConfig.from_dict(
-            {"background": {"remote_fallback_mode": "passthrough"}}
-        )
+        AppConfig.from_dict({"background": {"remote_fallback_mode": "passthrough"}})
 
 
 def test_atomic_read_and_compare_and_swap_commit():
@@ -248,9 +290,7 @@ def test_commit_with_activation_hides_candidate_until_resource_swap():
         effective["mode"] = "color"
 
     committer = threading.Thread(
-        target=lambda: writer.commit_with_activation(
-            candidate, base.version, activate
-        )
+        target=lambda: writer.commit_with_activation(candidate, base.version, activate)
     )
     committer.start()
     assert entered.wait(1.0)

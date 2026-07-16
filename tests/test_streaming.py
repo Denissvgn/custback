@@ -100,11 +100,7 @@ def test_jpeg_broadcaster_coalesces_newer_frames_while_encoder_is_busy():
             frame = np.full((1, 1, 3), value, np.uint8)
             if value < 32:
                 superseded.append(weakref.ref(frame))
-            newer.append(
-                asyncio.create_task(
-                    broadcaster._encode(frame, value)
-                )
-            )
+            newer.append(asyncio.create_task(broadcaster._encode(frame, value)))
             del frame
             # Ensure each distinct sequence reaches the scheduler before the
             # next one replaces it.

@@ -32,9 +32,10 @@ def test_default_log_path_prefers_absolute_xdg_state_home(tmp_path):
 
 
 def test_default_log_path_ignores_relative_xdg_state_home(tmp_path):
-    assert default_log_path(
-        environ={"XDG_STATE_HOME": "relative"}, home=tmp_path
-    ) == tmp_path / ".local" / "state" / "custback" / "custback.log"
+    assert (
+        default_log_path(environ={"XDG_STATE_HOME": "relative"}, home=tmp_path)
+        == tmp_path / ".local" / "state" / "custback" / "custback.log"
+    )
 
 
 def test_configure_logging_creates_secure_default_log_and_run_id(tmp_path):
@@ -124,9 +125,7 @@ def test_existing_backup_symlink_is_never_followed(tmp_path):
 
 def test_no_file_log_keeps_only_console_handler():
     logger = logging.Logger("custback-console-test")
-    session = configure_logging(
-        no_file_log=True, logger=logger, run_id="console"
-    )
+    session = configure_logging(no_file_log=True, logger=logger, run_id="console")
     try:
         assert session.file_logging is False
         assert session.log_path is None

@@ -101,9 +101,7 @@ def _load_vision_bindings() -> _VisionBindings:
     return _VisionBindings(mp, mp_tasks, mp_vision)
 
 
-def _prepare_vision_model(
-    cfg: VisionConfig, *, allow_model_download: bool
-) -> Path:
+def _prepare_vision_model(cfg: VisionConfig, *, allow_model_download: bool) -> Path:
     if cfg.model_path:
         model_path = Path(cfg.model_path).expanduser()
         if not model_path.is_file():
@@ -111,9 +109,7 @@ def _prepare_vision_model(
                 f"vision model_path does not exist: {model_path}"
             )
         return model_path
-    return acquire_model(
-        FACE_LANDMARKER_MODEL, allow_download=allow_model_download
-    )
+    return acquire_model(FACE_LANDMARKER_MODEL, allow_download=allow_model_download)
 
 
 def prepare_driver(
@@ -238,7 +234,9 @@ class VisionDriver(FaceDriver):
         preparation: DriverPreparation | None = None,
     ):
         if cv2 is None:
-            raise DriverUnavailableError("opencv-python is required for vision tracking")
+            raise DriverUnavailableError(
+                "opencv-python is required for vision tracking"
+            )
         if preparation is not None:
             if preparation.vision_model_setting != cfg.model_path:
                 raise ValueError(
@@ -268,7 +266,9 @@ class VisionDriver(FaceDriver):
                 options
             )
         except Exception as exc:  # mediapipe raises framework-specific types
-            raise DriverUnavailableError(f"face landmarker failed to start: {exc}") from exc
+            raise DriverUnavailableError(
+                f"face landmarker failed to start: {exc}"
+            ) from exc
         self._last_timestamp_ms = -1
 
     def update(self, frame_bgr: np.ndarray | None, timestamp: float) -> FaceState:

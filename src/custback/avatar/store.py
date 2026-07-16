@@ -38,6 +38,11 @@ import yaml
 from yaml.events import AliasEvent
 
 from ..backgrounds import IMAGE_EXTS, VIDEO_EXTS
+from ..storage_tx import (
+    OwnedPath,
+    OwnershipLedger,
+    rename_noreplace,
+)
 from .config import (
     AVATAR_PARTS,
     AppearanceConfig,
@@ -88,6 +93,7 @@ class _RigManifestLoader(yaml.SafeLoader):
         if self.check_event(AliasEvent):
             raise yaml.YAMLError("rig.yaml aliases are not allowed")
         return super().compose_node(parent, index)
+
 
 # The only files a rig archive may carry (optionally under one shared
 # top-level directory, which is flattened away).
@@ -153,9 +159,7 @@ def _secure_existing(path: Path, mode: int, *, directory: bool) -> None:
     # but cannot bind it with os.open first. Repair by name only after a
     # no-follow lstat/ownership check, then verify the inode identity before
     # opening and fchmod'ing the authoritative descriptor.
-    required_owner_bits = (
-        stat.S_IRUSR | stat.S_IXUSR if directory else stat.S_IRUSR
-    )
+    required_owner_bits = stat.S_IRUSR | stat.S_IXUSR if directory else stat.S_IRUSR
     if stat.S_IMODE(before.st_mode) & required_owner_bits != required_owner_bits:
         os.chmod(path, mode, follow_symlinks=False)
         after = path.lstat()
@@ -208,19 +212,16 @@ def _make_private_directory(path: Path) -> None:
     """Exclusively create one private managed child directory."""
 
     path.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
-    try:
-        _secure_existing(path, _PRIVATE_DIRECTORY_MODE, directory=True)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            path.rmdir()
-        raise
+    # The caller creates a durable ownership marker before reaching here, so
+    # any hardening failure is cleaned by that transaction rather than by a
+    # best-effort rmdir which could forget the remaining inode.
+    _secure_existing(path, _PRIVATE_DIRECTORY_MODE, directory=True)
 
 
 def _open_private_file(path: Path) -> BinaryIO:
     """Exclusively bind a no-follow mode-0600 file and return it writable."""
 
     descriptor: int | None = None
-    created = False
     try:
         flags = (
             os.O_WRONLY
@@ -230,7 +231,6 @@ def _open_private_file(path: Path) -> BinaryIO:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         descriptor = os.open(path, flags, _PRIVATE_FILE_MODE)
-        created = True
         # Both permissive and restrictive umasks converge on the exact mode.
         os.fchmod(descriptor, _PRIVATE_FILE_MODE)
         destination = os.fdopen(descriptor, "wb")
@@ -241,9 +241,8 @@ def _open_private_file(path: Path) -> BinaryIO:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
             descriptor = None
-        if created:
-            with contextlib.suppress(OSError):
-                path.unlink()
+        # The containing upload/install transaction already owns ``path`` (or
+        # its parent tree) and will retain retry metadata if removal fails.
         raise
     finally:
         if descriptor is not None:
@@ -279,6 +278,15 @@ def _tree_size(path: Path) -> int:
     for child in path.iterdir():
         total += _tree_size(child)
     return total
+
+
+def _remove_owned_path(path: Path, kind: str) -> None:
+    """Remove one ledger-owned artifact without discarding failures."""
+
+    if kind == "tree":
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
 @dataclass(frozen=True)
@@ -321,9 +329,7 @@ def audit_storage_permissions(
     ):
         for path, metadata in _permission_nodes(root):
             is_directory = stat.S_ISDIR(metadata.st_mode)
-            expected = (
-                _PRIVATE_DIRECTORY_MODE if is_directory else _PRIVATE_FILE_MODE
-            )
+            expected = _PRIVATE_DIRECTORY_MODE if is_directory else _PRIVATE_FILE_MODE
             actual = stat.S_IMODE(metadata.st_mode)
             if stat.S_ISLNK(metadata.st_mode):
                 reason = "symlink"
@@ -335,9 +341,7 @@ def audit_storage_permissions(
                 reason = "mode"
             else:
                 continue
-            issues.append(
-                StoragePermissionIssue(path, expected, actual, reason)
-            )
+            issues.append(StoragePermissionIssue(path, expected, actual, reason))
     return tuple(issues)
 
 
@@ -388,9 +392,11 @@ class UploadReservation(os.PathLike[str]):
         destination: BinaryIO,
         *,
         max_bytes: int,
+        ownership: OwnedPath,
     ) -> None:
         self._store = store
         self.path = path
+        self._ownership = ownership
         self._destination: BinaryIO | None = destination
         self.max_bytes = max_bytes
         self.reserved_bytes = 0
@@ -427,15 +433,29 @@ class UploadReservation(os.PathLike[str]):
                     raise OSError("short staging-file write")
                 return written
             except OSError as exc:
-                self.abort()
+                self._abort_after_primary_failure()
                 raise StoreError(
                     507,
                     "insufficient_storage",
                     "cannot write upload staging",
                 ) from exc
             except BaseException:
-                self.abort()
+                self._abort_after_primary_failure()
                 raise
+
+    def _abort_after_primary_failure(self) -> None:
+        """Retain cleanup ownership without replacing the operation error."""
+
+        try:
+            self.abort()
+        except OSError:
+            try:
+                with self._store._lock:
+                    self._store._detach_failed_upload_locked(self)
+            except OSError:
+                # The ledger already retained its last durable candidates and
+                # charge; the original write/quota error remains authoritative.
+                pass
 
     def write_bytes(self, payload: bytes) -> int:
         """Path-compatible one-shot helper that retains reservation ownership."""
@@ -581,9 +601,7 @@ def render_avatar_thumbnail(
     )
     try:
         sprite = rig.render(_neutral_face_state(), frozenset(AVATAR_PARTS))
-        backdrop = np.full(
-            (height, width, 3), _THUMBNAIL_BACKDROP_BGR, dtype=np.uint8
-        )
+        backdrop = np.full((height, width, 3), _THUMBNAIL_BACKDROP_BGR, dtype=np.uint8)
         frame = compose_avatar(
             sprite,
             backdrop,
@@ -664,10 +682,29 @@ class RigStore:
         self.directory = Path(cfg.rigs_dir).expanduser()
         self._cfg = cfg
         self._lock = threading.RLock()
-        self._reserved_bytes = 0
-        self._reserved_rigs = 0
+        self._ledger = OwnershipLedger(self.directory)
+        self._external_reserved_bytes = 0
+        self._reserved_bytes = self._ledger.reserved_bytes
+        self._reserved_rigs = self._ledger.reserved_slots
         self._active_uploads: dict[Path, UploadReservation] = {}
         self._active_extractions: set[Path] = set()
+        self._extraction_records: dict[Path, OwnedPath] = {}
+        self._retry_pending_cleanup()
+
+    def _sync_reservations_locked(self) -> None:
+        self._reserved_bytes = (
+            self._ledger.reserved_bytes + self._external_reserved_bytes
+        )
+        self._reserved_rigs = self._ledger.reserved_slots
+
+    def _retry_pending_cleanup(self) -> None:
+        with self._lock:
+            self._ledger.retry_cleanup(_remove_owned_path)
+            self._sync_reservations_locked()
+
+    @property
+    def _cleanup_pending(self) -> tuple[Path, ...]:
+        return self._ledger.pending_paths()
 
     def rig_path(self, name: str) -> Path:
         if not RIG_NAME_RE.fullmatch(name):
@@ -697,9 +734,7 @@ class RigStore:
                     entry, "installed rig asset is not owned by this user"
                 )
             files[entry.name] = child
-        parts = tuple(
-            part for part in AVATAR_PARTS if f"{part}.png" in files
-        )
+        parts = tuple(part for part in AVATAR_PARTS if f"{part}.png" in files)
         size = sum(metadata.st_size for metadata in files.values())
         return InstalledRig(
             name=path.name,
@@ -713,6 +748,8 @@ class RigStore:
             return []
         rigs = []
         for entry in sorted(self.directory.iterdir()):
+            if self._ledger.owns(entry):
+                continue
             try:
                 metadata = entry.lstat()
             except FileNotFoundError:
@@ -726,6 +763,8 @@ class RigStore:
 
         path = self.rig_path(name)
         if not _managed_directory_exists(self.directory):
+            raise StoreError(404, "rig_not_found", f"no installed rig {name!r}")
+        if self._ledger.owns(path):
             raise StoreError(404, "rig_not_found", f"no installed rig {name!r}")
         try:
             self._describe(path)
@@ -744,6 +783,8 @@ class RigStore:
         active = set(self._active_uploads) | self._active_extractions
         for entry in self.directory.iterdir():
             if entry in active:
+                continue
+            if self._ledger.owns(entry):
                 continue
             try:
                 total += _tree_size(entry)
@@ -775,27 +816,53 @@ class RigStore:
                 )
             self._reserved_bytes += amount
             reservation.reserved_bytes += amount
+            self._ledger.set_charge(
+                reservation._ownership,
+                reserved_bytes=reservation.reserved_bytes,
+            )
+            self._sync_reservations_locked()
 
     def _release_upload_locked(
         self, reservation: UploadReservation, *, remove: bool
     ) -> None:
-        if self._active_uploads.get(reservation.path) is not reservation:
+        if reservation._ownership not in self._ledger.records:
+            reservation.reserved_bytes = 0
             reservation._finish()
             return
         if remove:
-            try:
-                reservation.path.unlink()
-            except FileNotFoundError:
-                pass
-            # Any other unlink failure deliberately leaves the reservation,
-            # byte charge, and rig slot owned so abort() can be retried.
-        self._active_uploads.pop(reservation.path, None)
-        self._reserved_bytes = max(
-            0, self._reserved_bytes - reservation.reserved_bytes
-        )
-        self._reserved_rigs = max(0, self._reserved_rigs - 1)
+            error = self._ledger.cleanup(reservation._ownership, _remove_owned_path)
+            self._sync_reservations_locked()
+            if error is not None:
+                for path, active in tuple(self._active_uploads.items()):
+                    if active is reservation:
+                        self._active_uploads.pop(path, None)
+                if reservation._ownership.paths:
+                    reservation.path = reservation._ownership.paths[0]
+                    self._active_uploads[reservation.path] = reservation
+                raise error
+        else:
+            self._ledger.commit(reservation._ownership)
+        for path, active in tuple(self._active_uploads.items()):
+            if active is reservation:
+                self._active_uploads.pop(path, None)
         reservation.reserved_bytes = 0
         reservation._finish()
+        self._sync_reservations_locked()
+
+    def _detach_failed_upload_locked(self, reservation: UploadReservation) -> None:
+        """Queue failed cleanup without allowing it to mask the primary error."""
+
+        try:
+            self._ledger.mark_cleanup(reservation._ownership)
+        except OSError:
+            pass
+        self._ledger.cleanup(reservation._ownership, _remove_owned_path)
+        for path, active in tuple(self._active_uploads.items()):
+            if active is reservation:
+                self._active_uploads.pop(path, None)
+        reservation.reserved_bytes = 0
+        reservation._finish()
+        self._sync_reservations_locked()
 
     def _abort_reservation(self, reservation: UploadReservation) -> None:
         with self._lock:
@@ -807,6 +874,7 @@ class RigStore:
         try:
             _ensure_private_directory(self.directory)
             with self._lock:
+                self._retry_pending_cleanup()
                 _used, count = self._usage_locked()
                 if count + self._reserved_rigs >= self._cfg.max_rigs:
                     raise StoreError(
@@ -816,19 +884,30 @@ class RigStore:
                     )
                 while True:
                     path = self.directory / f".upload-{secrets.token_hex(16)}.zip"
+                    if path.exists() or path.is_symlink():
+                        continue
+                    ownership = self._ledger.begin(path, kind="file", reserved_slots=1)
                     try:
                         destination = _open_private_file(path)
+                        self._ledger.bind(ownership, path)
                         break
                     except FileExistsError:
+                        self._ledger.abandon_unbound(ownership)
                         continue
+                    except BaseException:
+                        self._ledger.mark_cleanup(ownership)
+                        self._ledger.cleanup(ownership, _remove_owned_path)
+                        self._sync_reservations_locked()
+                        raise
                 reservation = UploadReservation(
                     self,
                     path,
                     destination,
                     max_bytes=self._cfg.rig_zip_max_bytes,
+                    ownership=ownership,
                 )
                 self._active_uploads[path] = reservation
-                self._reserved_rigs += 1
+                self._sync_reservations_locked()
                 return reservation
         except StoreError:
             raise
@@ -845,9 +924,7 @@ class RigStore:
             raise StoreError(422, "invalid_rig", "rig archive contains no files")
         names = [info.filename.replace("\\", "/").lstrip("/") for info in files]
         roots = {name.split("/", 1)[0] for name in names if "/" in name}
-        strip_root = (
-            len(roots) == 1 and all("/" in name for name in names)
-        )
+        strip_root = len(roots) == 1 and all("/" in name for name in names)
         members: dict[str, zipfile.ZipInfo] = {}
         for info, name in zip(files, names):
             if strip_root:
@@ -865,28 +942,30 @@ class RigStore:
                     "and rig.yaml",
                 )
             if name in members:
-                raise StoreError(
-                    422, "invalid_rig", f"duplicate archive entry: {name}"
-                )
+                raise StoreError(422, "invalid_rig", f"duplicate archive entry: {name}")
             members[name] = info
         return members
 
-    def _reserve_extracted_locked(self, amount: int) -> None:
+    def _reserve_extracted_locked(self, ownership: OwnedPath, amount: int) -> None:
         used, _count = self._usage_locked()
         if used + self._reserved_bytes + amount > self._cfg.rig_storage_max_bytes:
             raise StoreError(
                 507,
                 "storage_full",
-                "compressed and extracted rig staging exceeds "
-                "rig_storage_max_bytes",
+                "compressed and extracted rig staging exceeds rig_storage_max_bytes",
             )
-        self._reserved_bytes += amount
+        self._ledger.set_charge(
+            ownership,
+            reserved_bytes=ownership.reserved_bytes + amount,
+        )
+        self._sync_reservations_locked()
 
     def _extract(
         self,
         archive: zipfile.ZipFile,
         destination: Path,
         extracted: list[int],
+        ownership: OwnedPath,
     ) -> None:
         # Bound the complete central-directory inventory, not just extracted
         # files. One optional explicit top-level directory record is tolerated
@@ -932,8 +1011,7 @@ class RigStore:
                         raise StoreError(
                             413,
                             "rig_too_large",
-                            "uncompressed rig exceeds "
-                            f"{self._cfg.rig_max_bytes} bytes",
+                            f"uncompressed rig exceeds {self._cfg.rig_max_bytes} bytes",
                         )
                     if (
                         name == "rig.yaml"
@@ -945,7 +1023,7 @@ class RigStore:
                             "rig.yaml exceeds "
                             f"{self._cfg.rig_manifest_max_bytes} bytes",
                         )
-                    self._reserve_extracted_locked(len(chunk))
+                    self._reserve_extracted_locked(ownership, len(chunk))
                     extracted[0] += len(chunk)
                     out.write(chunk)
 
@@ -1066,8 +1144,7 @@ class RigStore:
                     )
                 visited.add(identity)
                 return any(
-                    has_non_finite(key, depth + 1)
-                    or has_non_finite(item, depth + 1)
+                    has_non_finite(key, depth + 1) or has_non_finite(item, depth + 1)
                     for key, item in value.items()
                 )
             if isinstance(value, (list, tuple)):
@@ -1081,9 +1158,7 @@ class RigStore:
             return False
 
         if has_non_finite(raw):
-            raise StoreError(
-                422, "invalid_rig", "rig.yaml geometry must be finite"
-            )
+            raise StoreError(422, "invalid_rig", "rig.yaml geometry must be finite")
 
     def _secure_installed_rig(self, path: Path) -> None:
         _secure_existing(path, _PRIVATE_DIRECTORY_MODE, directory=True)
@@ -1095,17 +1170,15 @@ class RigStore:
     ) -> InstalledRig:
         """Validate and atomically install an uploaded rig archive."""
         final = self.rig_path(name)
-        reservation = (
-            zip_path if isinstance(zip_path, UploadReservation) else None
-        )
+        reservation = zip_path if isinstance(zip_path, UploadReservation) else None
         archive_path = reservation.path if reservation is not None else Path(zip_path)
         archive_file: BinaryIO | None = None
         external_reserved = 0
-        external_reserved_slot = False
         extracted = [0]
         staging: Path | None = None
-        published = False
+        extraction: OwnedPath | None = None
         installed: InstalledRig | None = None
+        primary: BaseException | None = None
         try:
             if reservation is not None:
                 if reservation._store is not self:
@@ -1113,10 +1186,7 @@ class RigStore:
                 reservation.seal()
             archive_file = _open_regular_file(archive_path)
             archive_size = os.fstat(archive_file.fileno()).st_size
-            if (
-                reservation is not None
-                and archive_size != reservation.reserved_bytes
-            ):
+            if reservation is not None and archive_size != reservation.reserved_bytes:
                 raise StoreError(
                     409,
                     "invalid_reservation",
@@ -1156,10 +1226,9 @@ class RigStore:
                             "storage_full",
                             "rig archive does not fit within rig_storage_max_bytes",
                         )
-                    self._reserved_bytes += archive_size
+                    self._external_reserved_bytes += archive_size
                     external_reserved = archive_size
-                    self._reserved_rigs += 1
-                    external_reserved_slot = True
+                    self._sync_reservations_locked()
                 if final.exists() or final.is_symlink():
                     raise StoreError(
                         409,
@@ -1168,15 +1237,38 @@ class RigStore:
                     )
                 while True:
                     staging = self.directory / f".staged-{secrets.token_hex(8)}"
+                    if staging.exists() or staging.is_symlink():
+                        continue
+                    extraction = self._ledger.begin(
+                        staging,
+                        kind="tree",
+                        reserved_slots=1,
+                    )
                     try:
                         _make_private_directory(staging)
+                        self._ledger.bind(extraction, staging)
                         break
                     except FileExistsError:
+                        self._ledger.abandon_unbound(extraction)
+                        extraction = None
                         continue
+                    except BaseException:
+                        self._ledger.mark_cleanup(extraction)
+                        self._ledger.cleanup(extraction, _remove_owned_path)
+                        extraction = None
+                        raise
+                assert extraction is not None
+                if reservation is not None:
+                    # One install consumes one rig slot even though the archive
+                    # and extracted tree coexist.  Transfer the slot before any
+                    # cleanup can detach the archive reservation.
+                    self._ledger.set_charge(reservation._ownership, reserved_slots=0)
+                self._sync_reservations_locked()
                 self._active_extractions.add(staging)
+                self._extraction_records[staging] = extraction
                 try:
                     with zipfile.ZipFile(archive_file) as archive:
-                        self._extract(archive, staging, extracted)
+                        self._extract(archive, staging, extracted, extraction)
                 except (
                     zipfile.BadZipFile,
                     zipfile.LargeZipFile,
@@ -1199,45 +1291,89 @@ class RigStore:
                     ).close()
                 except RigError as exc:
                     raise StoreError(422, "invalid_rig", str(exc)) from exc
-                os.replace(staging, final)
+                archive_file.close()
+                archive_file = None
+                self._ledger.prepare_rename(extraction, staging, final)
+                rename_noreplace(staging, final)
+                self._ledger.finish_rename(extraction, final)
                 self._active_extractions.discard(staging)
-                staging = None
-                published = True
+                self._extraction_records.pop(staging, None)
+                self._active_extractions.add(final)
+                self._extraction_records[final] = extraction
                 self._secure_installed_rig(final)
-                # The atomic rename made these bytes committed. Release their
-                # extraction reservation while holding the same quota lock.
-                self._reserved_bytes = max(
-                    0, self._reserved_bytes - extracted[0]
-                )
-                extracted[0] = 0
                 installed = self._describe(final)
-        except StoreError:
-            raise
-        except OSError as exc:
-            raise StoreError(
-                507, "insufficient_storage", "cannot install rig archive"
-            ) from exc
+                self._ledger.commit(extraction)
+                self._active_extractions.discard(final)
+                self._extraction_records.pop(final, None)
+                extracted[0] = 0
+                self._sync_reservations_locked()
+        except BaseException as exc:
+            primary = exc
         finally:
             if archive_file is not None:
-                archive_file.close()
+                try:
+                    archive_file.close()
+                except OSError as exc:
+                    if primary is None:
+                        primary = exc
             with self._lock:
-                if staging is not None:
-                    self._active_extractions.discard(staging)
-                    shutil.rmtree(staging, ignore_errors=True)
-                if extracted[0]:
-                    self._reserved_bytes = max(
-                        0, self._reserved_bytes - extracted[0]
-                    )
+                if primary is not None and extraction is not None:
+                    # If publication moved the inode, first try to restore its
+                    # hidden name.  Both candidates were durable before each
+                    # rename, so a second failure remains discoverable.
+                    try:
+                        current = self._ledger.reconcile(extraction)
+                    except OSError:
+                        current = ()
+                    if final in current and staging is not None:
+                        try:
+                            self._ledger.prepare_rename(extraction, final, staging)
+                            rename_noreplace(final, staging)
+                            self._ledger.finish_rename(extraction, staging)
+                        except OSError:
+                            try:
+                                self._ledger.reconcile(extraction)
+                            except OSError:
+                                pass
+                    try:
+                        self._ledger.mark_cleanup(extraction)
+                    except OSError:
+                        pass
+                    self._ledger.cleanup(extraction, _remove_owned_path)
+                    for path, record in tuple(self._extraction_records.items()):
+                        if record is extraction:
+                            self._extraction_records.pop(path, None)
+                            self._active_extractions.discard(path)
+                    if (
+                        reservation is not None
+                        and extraction not in self._ledger.records
+                        and reservation._ownership in self._ledger.records
+                    ):
+                        # Cleanup removed the tree, so the still-owned archive
+                        # resumes the failed install's single rig-slot charge.
+                        self._ledger.set_charge(
+                            reservation._ownership, reserved_slots=1
+                        )
                 if external_reserved:
-                    self._reserved_bytes = max(
-                        0, self._reserved_bytes - external_reserved
+                    self._external_reserved_bytes = max(
+                        0, self._external_reserved_bytes - external_reserved
                     )
-                if external_reserved_slot:
-                    self._reserved_rigs = max(0, self._reserved_rigs - 1)
                 if reservation is not None:
-                    self._release_upload_locked(reservation, remove=True)
-                if published and installed is None:
-                    shutil.rmtree(final, ignore_errors=True)
+                    try:
+                        self._release_upload_locked(reservation, remove=True)
+                    except OSError:
+                        self._detach_failed_upload_locked(reservation)
+                self._sync_reservations_locked()
+        if primary is not None:
+            if isinstance(primary, StoreError):
+                raise primary
+            if isinstance(primary, OSError):
+                raise StoreError(
+                    507,
+                    "insufficient_storage",
+                    "cannot install rig archive",
+                ) from primary
+            raise primary
         assert installed is not None
         return installed
 
@@ -1261,9 +1397,24 @@ class MediaStore:
         self.directory = Path(cfg.backgrounds_dir).expanduser()
         self._cfg = cfg
         self._lock = threading.RLock()
-        self._reserved_bytes = 0
-        self._reserved_files = 0
+        self._ledger = OwnershipLedger(self.directory)
+        self._reserved_bytes = self._ledger.reserved_bytes
+        self._reserved_files = self._ledger.reserved_slots
         self._active_uploads: dict[Path, UploadReservation] = {}
+        self._retry_pending_cleanup()
+
+    def _sync_reservations_locked(self) -> None:
+        self._reserved_bytes = self._ledger.reserved_bytes
+        self._reserved_files = self._ledger.reserved_slots
+
+    def _retry_pending_cleanup(self) -> None:
+        with self._lock:
+            self._ledger.retry_cleanup(_remove_owned_path)
+            self._sync_reservations_locked()
+
+    @property
+    def _cleanup_pending(self) -> tuple[Path, ...]:
+        return self._ledger.pending_paths()
 
     @staticmethod
     def kind_of(path: Path) -> str | None:
@@ -1278,9 +1429,7 @@ class MediaStore:
         if kind not in ("image", "video"):
             raise ValueError("media kind must be 'image' or 'video'")
         return (
-            self._cfg.image_max_bytes
-            if kind == "image"
-            else self._cfg.video_max_bytes
+            self._cfg.image_max_bytes if kind == "image" else self._cfg.video_max_bytes
         )
 
     def _usage_locked(self) -> tuple[int, int]:
@@ -1291,6 +1440,8 @@ class MediaStore:
         total = count = 0
         for entry in self.directory.iterdir():
             if entry in self._active_uploads:
+                continue
+            if self._ledger.owns(entry):
                 continue
             try:
                 total += _tree_size(entry)
@@ -1320,26 +1471,51 @@ class MediaStore:
                 )
             self._reserved_bytes += amount
             reservation.reserved_bytes += amount
+            self._ledger.set_charge(
+                reservation._ownership,
+                reserved_bytes=reservation.reserved_bytes,
+            )
+            self._sync_reservations_locked()
 
     def _release_upload_locked(
         self, reservation: UploadReservation, *, remove: bool
     ) -> None:
-        if self._active_uploads.get(reservation.path) is not reservation:
+        if reservation._ownership not in self._ledger.records:
+            reservation.reserved_bytes = 0
             reservation._finish()
             return
         if remove:
-            try:
-                reservation.path.unlink()
-            except FileNotFoundError:
-                pass
-            # Keep failed cleanup fully charged and retryable.
-        self._active_uploads.pop(reservation.path, None)
-        self._reserved_files = max(0, self._reserved_files - 1)
-        self._reserved_bytes = max(
-            0, self._reserved_bytes - reservation.reserved_bytes
-        )
+            error = self._ledger.cleanup(reservation._ownership, _remove_owned_path)
+            self._sync_reservations_locked()
+            if error is not None:
+                for path, active in tuple(self._active_uploads.items()):
+                    if active is reservation:
+                        self._active_uploads.pop(path, None)
+                if reservation._ownership.paths:
+                    reservation.path = reservation._ownership.paths[0]
+                    self._active_uploads[reservation.path] = reservation
+                raise error
+        else:
+            self._ledger.commit(reservation._ownership)
+        for path, active in tuple(self._active_uploads.items()):
+            if active is reservation:
+                self._active_uploads.pop(path, None)
         reservation.reserved_bytes = 0
         reservation._finish()
+        self._sync_reservations_locked()
+
+    def _detach_failed_upload_locked(self, reservation: UploadReservation) -> None:
+        try:
+            self._ledger.mark_cleanup(reservation._ownership)
+        except OSError:
+            pass
+        self._ledger.cleanup(reservation._ownership, _remove_owned_path)
+        for path, active in tuple(self._active_uploads.items()):
+            if active is reservation:
+                self._active_uploads.pop(path, None)
+        reservation.reserved_bytes = 0
+        reservation._finish()
+        self._sync_reservations_locked()
 
     def _abort_reservation(self, reservation: UploadReservation) -> None:
         with self._lock:
@@ -1350,12 +1526,15 @@ class MediaStore:
 
         if kind not in (None, "image", "video"):
             raise ValueError("media staging kind must be 'image' or 'video'")
-        maximum = self.max_bytes(kind) if kind is not None else max(
-            self._cfg.image_max_bytes, self._cfg.video_max_bytes
+        maximum = (
+            self.max_bytes(kind)
+            if kind is not None
+            else max(self._cfg.image_max_bytes, self._cfg.video_max_bytes)
         )
         try:
             _ensure_private_directory(self.directory)
             with self._lock:
+                self._retry_pending_cleanup()
                 _used, count = self._usage_locked()
                 if count + self._reserved_files >= self._cfg.max_files:
                     raise StoreError(
@@ -1365,16 +1544,30 @@ class MediaStore:
                     )
                 while True:
                     path = self.directory / f".upload-{secrets.token_hex(16)}.part"
+                    if path.exists() or path.is_symlink():
+                        continue
+                    ownership = self._ledger.begin(path, kind="file", reserved_slots=1)
                     try:
                         destination = _open_private_file(path)
+                        self._ledger.bind(ownership, path)
                         break
                     except FileExistsError:
+                        self._ledger.abandon_unbound(ownership)
                         continue
+                    except BaseException:
+                        self._ledger.mark_cleanup(ownership)
+                        self._ledger.cleanup(ownership, _remove_owned_path)
+                        self._sync_reservations_locked()
+                        raise
                 reservation = UploadReservation(
-                    self, path, destination, max_bytes=maximum
+                    self,
+                    path,
+                    destination,
+                    max_bytes=maximum,
+                    ownership=ownership,
                 )
                 self._active_uploads[path] = reservation
-                self._reserved_files += 1
+                self._sync_reservations_locked()
                 return reservation
         except StoreError:
             raise
@@ -1388,6 +1581,8 @@ class MediaStore:
             return []
         entries: list[Path] = []
         for entry in sorted(self.directory.iterdir()):
+            if self._ledger.owns(entry):
+                continue
             try:
                 metadata = entry.lstat()
             except FileNotFoundError:
@@ -1429,6 +1624,8 @@ class MediaStore:
         if not _managed_directory_exists(self.directory):
             raise StoreError(404, "media_not_found", "no such stored file")
         path = self.directory / name
+        if self._ledger.owns(path):
+            raise StoreError(404, "media_not_found", "no such stored file")
         try:
             metadata = path.lstat()
         except FileNotFoundError as exc:
@@ -1488,9 +1685,7 @@ class MediaStore:
                 or frame.ndim != 3
                 or frame.shape[2] != 3
             ):
-                raise StoreError(
-                    422, "invalid_media", "image upload cannot be decoded"
-                )
+                raise StoreError(422, "invalid_media", "image upload cannot be decoded")
             actual_height, actual_width = frame.shape[:2]
             if (actual_width, actual_height) != (width, height):
                 raise StoreError(
@@ -1593,15 +1788,14 @@ class MediaStore:
             with contextlib.suppress(Exception):
                 capture.release()
 
-    def commit(
-        self, staging: UploadReservation, name: str, kind: str
-    ) -> StoredMedia:
+    def commit(self, staging: UploadReservation, name: str, kind: str) -> StoredMedia:
         """Validate a fully-written staging file and publish it."""
         if not isinstance(staging, UploadReservation) or staging._store is not self:
             raise ValueError("media commit requires this store's reservation")
         final: Path | None = None
-        published = False
-        committed = False
+        source = staging.path
+        primary: BaseException | None = None
+        saved: StoredMedia | None = None
         try:
             maximum = self.max_bytes(kind)
             safe_name = sanitize_media_name(name, kind)
@@ -1635,30 +1829,55 @@ class MediaStore:
                 while final.exists() or final.is_symlink():
                     final = self.directory / f"{stem}-{attempt}{suffix}"
                     attempt += 1
-                os.replace(staging.path, final)
-                published = True
+                self._ledger.prepare_rename(staging._ownership, source, final)
+                rename_noreplace(source, final)
+                self._ledger.finish_rename(staging._ownership, final)
+                self._active_uploads.pop(source, None)
+                self._active_uploads[final] = staging
+                staging.path = final
                 # Atomic rename preserves the staging inode's mode, but the
                 # final descriptor is explicitly re-secured as part of commit.
                 _secure_existing(final, _PRIVATE_FILE_MODE, directory=False)
                 self._release_upload_locked(staging, remove=False)
-                committed = True
             kind_checked = self.kind_of(final)
             assert kind_checked == kind
-            return StoredMedia(
-                name=final.name, kind=kind, size=size, path=str(final)
-            )
-        except StoreError:
-            raise
-        except OSError as exc:
-            raise StoreError(
-                507, "insufficient_storage", "cannot publish media upload"
-            ) from exc
-        finally:
-            if staging.active:
-                staging.abort()
-            if published and not committed and final is not None:
-                with contextlib.suppress(OSError):
-                    final.unlink()
+            saved = StoredMedia(name=final.name, kind=kind, size=size, path=str(final))
+        except BaseException as exc:
+            primary = exc
+            with self._lock:
+                try:
+                    current = self._ledger.reconcile(staging._ownership)
+                except OSError:
+                    current = ()
+                original = source
+                # ``prepare_rename`` retains both names.  Prefer the original
+                # hidden name when a post-rename hardening check fails.
+                if final is not None and final in current and original is not None:
+                    try:
+                        self._ledger.prepare_rename(staging._ownership, final, original)
+                        rename_noreplace(final, original)
+                        self._ledger.finish_rename(staging._ownership, original)
+                        self._active_uploads.pop(final, None)
+                        self._active_uploads[original] = staging
+                        staging.path = original
+                    except OSError:
+                        try:
+                            self._ledger.reconcile(staging._ownership)
+                        except OSError:
+                            pass
+                self._detach_failed_upload_locked(staging)
+        if primary is not None:
+            if isinstance(primary, StoreError):
+                raise primary
+            if isinstance(primary, OSError):
+                raise StoreError(
+                    507,
+                    "insufficient_storage",
+                    "cannot publish media upload",
+                ) from primary
+            raise primary
+        assert saved is not None
+        return saved
 
     def remove(self, name: str, background_cfg) -> None:
         with self._lock:

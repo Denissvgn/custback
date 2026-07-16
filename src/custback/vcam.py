@@ -62,8 +62,13 @@ class PyVirtualCamOutput(VideoOutput):
             fmt=pyvirtualcam.PixelFormat.BGR,
             **kwargs,
         )
-        log.info("virtual camera started: %s (%dx%d @ %d fps)",
-                 self.cam.device, width, height, cfg.fps)
+        log.info(
+            "virtual camera started: %s (%dx%d @ %d fps)",
+            self.cam.device,
+            width,
+            height,
+            cfg.fps,
+        )
 
     def send(self, frame_bgr: np.ndarray) -> None:
         self.cam.send(frame_bgr)

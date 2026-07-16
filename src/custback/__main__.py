@@ -56,7 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mirror", action="store_true", help="mirror the camera")
     parser.add_argument(
-        "--synthetic", action="store_true",
+        "--synthetic",
+        action="store_true",
         help="use a synthetic test source instead of a real camera",
     )
     parser.add_argument("--mode", choices=MODES, help="background mode")
@@ -64,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", help="background video path (implies --mode video)")
     parser.add_argument(
         "--bg-camera",
-        help="second camera / stream URL as live backdrop (implies --mode camera)",
+        help="operator-approved local camera/device as live backdrop (implies --mode camera)",
     )
     parser.add_argument("--blur", type=int, help="blur strength (implies --mode blur)")
     parser.add_argument("--no-api", action="store_true", help="disable the HTTP API")
@@ -76,26 +77,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to the mode-0600 renderer-scoped frame token file",
     )
     parser.add_argument(
-        "--allow-non-loopback-api", action="store_true",
+        "--allow-non-loopback-api",
+        action="store_true",
         help="allow a TLS-protected API bind outside loopback",
     )
     parser.add_argument("--api-tls-cert", help="TLS certificate for the API")
     parser.add_argument("--api-tls-key", help="TLS private key for the API")
     show_token = parser.add_mutually_exclusive_group()
     show_token.add_argument(
-        "--show-api-token", action="store_true",
+        "--show-api-token",
+        action="store_true",
         help="print the resolved API token and exit",
     )
     show_token.add_argument(
-        "--show-renderer-token", action="store_true",
+        "--show-renderer-token",
+        action="store_true",
         help="provision and print the renderer-scoped frame token, then exit",
     )
     parser.add_argument(
-        "--no-vcam", action="store_true",
+        "--no-vcam",
+        action="store_true",
         help="do not open a virtual camera (serve frames only via the API)",
     )
     parser.add_argument(
-        "--preview", action="store_true",
+        "--preview",
+        action="store_true",
         help="show the processed output in an on-screen window (q/ESC quits)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -111,7 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable the default rotating diagnostics log",
     )
     parser.add_argument(
-        "--dump-config", metavar="PATH",
+        "--dump-config",
+        metavar="PATH",
         help="write the effective config to PATH and exit",
     )
     return parser
@@ -270,7 +277,9 @@ class _ApiRunner:
                 return
             if self.failed:
                 self.stop()
-                raise ApiStartupError(f"API startup failed: {self._error or 'server exited'}")
+                raise ApiStartupError(
+                    f"API startup failed: {self._error or 'server exited'}"
+                )
             threading.Event().wait(0.02)
         self.stop()
         raise ApiStartupError(f"API did not start within {timeout:g} seconds")
@@ -403,6 +412,7 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
     shutdown_reason = "normal"
     previous_signal_handlers: dict[signal.Signals, SignalHandler] = {}
     if threading.current_thread() is threading.main_thread():
+
         def request_shutdown(signum, _frame) -> None:
             nonlocal shutdown_reason
             if stop.is_set():
@@ -510,8 +520,10 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
                 from .preview import run_preview
 
                 watchdog = threading.Thread(
-                    target=_watch_pipeline, args=(pipeline, stop, api_runner),
-                    name="watchdog", daemon=True,
+                    target=_watch_pipeline,
+                    args=(pipeline, stop, api_runner),
+                    name="watchdog",
+                    daemon=True,
                 )
                 watchdog.start()
                 user_quit = run_preview(runtime, hub, stop, coordinator=pipeline)
@@ -576,7 +588,23 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv[:1] == ["migrate"]:
+        # Migration must inspect legacy YAML before the current strict runtime
+        # parser tries to load it.  It also must not initialize diagnostics or
+        # any camera/network resource merely to repair on-disk state.
+        from .migration import main as migration_main
+
+        return migration_main(effective_argv[1:], prog="custback migrate")
+    if effective_argv[:1] == ["avatar"]:
+        # Keep the canonical avatar surface available from every Python
+        # installation.  The separate ``custback-avatar`` console script is a
+        # compatibility alias that enters the same implementation directly.
+        from .avatar.__main__ import main as avatar_main
+
+        return avatar_main(effective_argv[1:], prog="custback avatar")
+
+    args = build_parser().parse_args(effective_argv)
     from .diagnostics import LoggingConfigurationError, configure_logging
 
     try:

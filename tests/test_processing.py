@@ -181,7 +181,9 @@ class TestCompositor:
     def test_edge_foreground_shape_mismatch_ignored(self):
         fg, bg = frame(value=200), frame(value=0)
         out = composite(
-            fg, bg, self.edge_mask(),
+            fg,
+            bg,
+            self.edge_mask(),
             edge_foreground=np.zeros((10, 10, 3), np.uint8),
         )
         assert tuple(out[36, 10]) == (200, 200, 200)
@@ -255,9 +257,7 @@ class TestBackdrops:
                 image_max_pixels=64,
             )
 
-    def test_image_backdrop_fully_decodes_with_pillow_before_opencv(
-        self, monkeypatch
-    ):
+    def test_image_backdrop_fully_decodes_with_pillow_before_opencv(self, monkeypatch):
         pytest.importorskip("cv2")
         open_calls = []
 
@@ -295,9 +295,7 @@ class TestBackdrops:
         )
 
         with pytest.raises(ValueError, match="invalid background image"):
-            create_backdrop(
-                BackgroundConfig(mode="image", image_path="corrupt.png")
-            )
+            create_backdrop(BackgroundConfig(mode="image", image_path="corrupt.png"))
         assert len(open_calls) == 2
 
     def test_video_backdrop_loops(self, tmp_path):
@@ -370,9 +368,7 @@ class TestBackdrops:
             backdrop.close()
 
     @pytest.mark.parametrize("reported_fps", [0.0, 0.25, 241.0, float("nan")])
-    def test_video_backdrop_bounds_bad_fps_metadata(
-        self, monkeypatch, reported_fps
-    ):
+    def test_video_backdrop_bounds_bad_fps_metadata(self, monkeypatch, reported_fps):
         pytest.importorskip("cv2")
         capture = FakeVideoCapture([10, 20], fps=reported_fps)
         monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", lambda _path: capture)
@@ -458,9 +454,7 @@ class TestBackdrops:
 
     def test_video_backdrop_learns_unknown_length_and_loops(self, monkeypatch):
         pytest.importorskip("cv2")
-        capture = FakeVideoCapture(
-            [10, 200], fps=2.0, reported_frame_count=0
-        )
+        capture = FakeVideoCapture([10, 200], fps=2.0, reported_frame_count=0)
         monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", lambda _path: capture)
         now = [0.0]
         backdrop = VideoBackdrop("unknown-length.avi", clock=lambda: now[0])
@@ -477,13 +471,9 @@ class TestBackdrops:
         finally:
             backdrop.close()
 
-    def test_video_backdrop_corrects_overstated_frame_count_at_eof(
-        self, monkeypatch
-    ):
+    def test_video_backdrop_corrects_overstated_frame_count_at_eof(self, monkeypatch):
         pytest.importorskip("cv2")
-        capture = FakeVideoCapture(
-            [10, 200], fps=2.0, reported_frame_count=3
-        )
+        capture = FakeVideoCapture([10, 200], fps=2.0, reported_frame_count=3)
         monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", lambda _path: capture)
         now = [0.0]
         backdrop = VideoBackdrop("overstated-length.avi", clock=lambda: now[0])
@@ -499,9 +489,7 @@ class TestBackdrops:
         finally:
             backdrop.close()
 
-    def test_video_backdrop_skips_small_gaps_then_seeks_large_gaps(
-        self, monkeypatch
-    ):
+    def test_video_backdrop_skips_small_gaps_then_seeks_large_gaps(self, monkeypatch):
         cv2 = pytest.importorskip("cv2")
         capture = FakeVideoCapture(range(20), fps=10.0)
         monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", lambda _path: capture)
@@ -524,9 +512,7 @@ class TestBackdrops:
         finally:
             backdrop.close()
 
-    def test_video_backdrop_uses_timestamp_seek_and_keeps_loop_phase(
-        self, monkeypatch
-    ):
+    def test_video_backdrop_uses_timestamp_seek_and_keeps_loop_phase(self, monkeypatch):
         cv2 = pytest.importorskip("cv2")
         capture = FakeVideoCapture(
             range(6), fps=2.0, timestamps_s=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
@@ -568,9 +554,7 @@ class TestBackdrops:
         pytest.importorskip("cv2")
         capture = FakeVideoCapture([10, 200], fps=2.0)
         capture.frames[1] = frame(h=5, w=7, value=200)
-        monkeypatch.setattr(
-            backgrounds_mod.cv2, "VideoCapture", lambda _path: capture
-        )
+        monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", lambda _path: capture)
         now = [0.0]
         backdrop = VideoBackdrop(
             "changing-resolution.avi",
@@ -610,8 +594,8 @@ class TestSegmentation:
         img = frame(value=15)
         img[20:52, 44:84] = 230  # bright centered "person"
         mask = seg.segment(img)
-        assert mask[36, 64] == 1.0        # inside the person
-        assert mask[5, 5] == 0.0          # dark corner
+        assert mask[36, 64] == 1.0  # inside the person
+        assert mask[5, 5] == 0.0  # dark corner
         assert 0.0 < mask.mean() < 1.0
 
     def test_refiner_damps_small_fluctuations(self):
@@ -645,9 +629,7 @@ class TestSegmentation:
         mask[:, 70:] = 1.0
         ideal = np.zeros((72, 128), np.float32)
         ideal[:, 64:] = 1.0
-        cfg = SegmentationConfig(
-            mask_blur=9, edge_refine=True, temporal_smoothing=0.0
-        )
+        cfg = SegmentationConfig(mask_blur=9, edge_refine=True, temporal_smoothing=0.0)
         refined = MaskRefiner(cfg).refine(mask, img)
         err_before = np.abs(mask - ideal).mean()
         err_after = np.abs(refined - ideal).mean()
@@ -662,9 +644,7 @@ class TestSegmentation:
         mask[:, mask_edge:] = 1.0
         ideal = np.zeros_like(mask)
         ideal[:, 64:] = 1.0
-        cfg = SegmentationConfig(
-            mask_blur=9, edge_refine=True, temporal_smoothing=0.0
-        )
+        cfg = SegmentationConfig(mask_blur=9, edge_refine=True, temporal_smoothing=0.0)
         refined = MaskRefiner(cfg).refine(mask, img)
         assert np.abs(refined - ideal).mean() < np.abs(mask - ideal).mean() * 0.5
 
@@ -686,9 +666,7 @@ class TestSegmentation:
         assert np.array_equal(refined, mask)
 
     @pytest.mark.parametrize("component_value", [0.0, 1.0])
-    def test_edge_snap_preserves_each_seedless_thin_component(
-        self, component_value
-    ):
+    def test_edge_snap_preserves_each_seedless_thin_component(self, component_value):
         pytest.importorskip("cv2")
         base_value = 1.0 - component_value
         mask = np.full((120, 180), base_value, np.float32)

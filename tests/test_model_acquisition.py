@@ -100,13 +100,19 @@ def test_cached_model_is_hashed_on_every_use_and_corruption_is_replaced(tmp_path
         assert timeout == 15.0
         return Response(payload)
 
-    assert acquire_model(spec_for(payload), tmp_path, opener=opener).read_bytes() == payload
+    assert (
+        acquire_model(spec_for(payload), tmp_path, opener=opener).read_bytes()
+        == payload
+    )
     assert calls == 1
-    assert acquire_model(
-        spec_for(payload),
-        tmp_path,
-        opener=lambda *_args, **_kwargs: pytest.fail("valid cache redownloaded"),
-    ) == model
+    assert (
+        acquire_model(
+            spec_for(payload),
+            tmp_path,
+            opener=lambda *_args, **_kwargs: pytest.fail("valid cache redownloaded"),
+        )
+        == model
+    )
 
 
 @pytest.mark.parametrize(

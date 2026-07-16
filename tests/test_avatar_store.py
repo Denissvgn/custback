@@ -191,15 +191,11 @@ def test_install_zip_enforces_entry_and_byte_limits(tmp_path):
             write_zip(tmp_path, {"torso.png": layer_png(), "head.png": layer_png()}),
         )
     assert excinfo.value.code == "rig_too_large"
-    noisy = np.random.default_rng(7).integers(
-        0, 255, size=(96, 64, 4), dtype=np.uint8
-    )
+    noisy = np.random.default_rng(7).integers(0, 255, size=(96, 64, 4), dtype=np.uint8)
     ok, big_layer = cv2.imencode(".png", noisy)
     assert ok and big_layer.size > 1024
     with pytest.raises(StoreError) as excinfo:
-        store.install_zip(
-            "big", write_zip(tmp_path, {"head.png": big_layer.tobytes()})
-        )
+        store.install_zip("big", write_zip(tmp_path, {"head.png": big_layer.tobytes()}))
     assert excinfo.value.code == "rig_too_large"
     assert store.list() == []
 
@@ -226,9 +222,7 @@ def test_install_zip_rejects_invalid_archives_and_rigs(tmp_path):
     ok, data = cv2.imencode(".png", opaque)
     assert ok
     with pytest.raises(StoreError) as excinfo:
-        store.install_zip(
-            "noalpha", write_zip(tmp_path, {"head.png": data.tobytes()})
-        )
+        store.install_zip("noalpha", write_zip(tmp_path, {"head.png": data.tobytes()}))
     assert excinfo.value.code == "invalid_rig"
     assert store.list() == []
     assert not any(store.directory.glob(".staged-*"))
@@ -258,9 +252,7 @@ def test_rig_headers_are_validated_with_pillow_before_opencv(tmp_path, monkeypat
     assert store.list() == []
 
 
-def test_rig_rejects_pillow_decompression_warning_before_opencv(
-    tmp_path, monkeypatch
-):
+def test_rig_rejects_pillow_decompression_warning_before_opencv(tmp_path, monkeypatch):
     store = RigStore(
         storage(
             tmp_path,
@@ -314,9 +306,7 @@ def test_rig_rejects_disguised_png_and_inconsistent_dimensions(tmp_path):
     ok, jpeg = cv2.imencode(".jpg", opaque)
     assert ok
     with pytest.raises(StoreError, match="invalid PNG") as excinfo:
-        store.install_zip(
-            "not-png", write_zip(tmp_path, {"head.png": jpeg.tobytes()})
-        )
+        store.install_zip("not-png", write_zip(tmp_path, {"head.png": jpeg.tobytes()}))
     assert excinfo.value.code == "invalid_rig"
 
     with pytest.raises(StoreError, match="does not match") as excinfo:
@@ -362,9 +352,7 @@ def test_rig_rejects_oversized_manifest_and_nonfinite_geometry(tmp_path):
                 tmp_path,
                 {
                     "head.png": layer_png(),
-                    "rig.yaml": (
-                        "pivot: [" + "9" * 1000 + ", 1]\n"
-                    ).encode(),
+                    "rig.yaml": ("pivot: [" + "9" * 1000 + ", 1]\n").encode(),
                 },
             ),
         )
@@ -385,9 +373,7 @@ def test_rig_rejects_oversized_manifest_and_nonfinite_geometry(tmp_path):
 
 
 def test_rig_quota_counts_compressed_and_extracted_staging_together(tmp_path):
-    noisy = np.random.default_rng(19).integers(
-        0, 255, size=(64, 64, 4), dtype=np.uint8
-    )
+    noisy = np.random.default_rng(19).integers(0, 255, size=(64, 64, 4), dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", noisy)
     assert ok and len(encoded) > 1024
     payload = encoded.tobytes()
@@ -406,17 +392,13 @@ def test_rig_quota_counts_compressed_and_extracted_staging_together(tmp_path):
 
 
 def test_rig_aggregate_byte_quota_includes_committed_rigs(tmp_path):
-    noisy = np.random.default_rng(29).integers(
-        0, 255, size=(64, 64, 4), dtype=np.uint8
-    )
+    noisy = np.random.default_rng(29).integers(0, 255, size=(64, 64, 4), dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", noisy)
     assert ok
     payload = encoded.tobytes()
     archive = write_zip(tmp_path, {"head.png": payload})
     limit = archive.stat().st_size + len(payload)
-    store = RigStore(
-        storage(tmp_path, max_rigs=2, rig_storage_max_bytes=limit)
-    )
+    store = RigStore(storage(tmp_path, max_rigs=2, rig_storage_max_bytes=limit))
     store.install_zip("first", archive)
     with pytest.raises(StoreError) as excinfo:
         store.install_zip("second", archive)
@@ -427,9 +409,7 @@ def test_rig_aggregate_byte_quota_includes_committed_rigs(tmp_path):
 
 
 def test_concurrent_rig_archive_reservations_cannot_exceed_quota(tmp_path):
-    noisy = np.random.default_rng(31).integers(
-        0, 255, size=(64, 64, 4), dtype=np.uint8
-    )
+    noisy = np.random.default_rng(31).integers(0, 255, size=(64, 64, 4), dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", noisy)
     assert ok
     archive = rig_zip({"head.png": encoded.tobytes()})
@@ -483,9 +463,7 @@ def test_pending_rig_uploads_reserve_aggregate_rig_slots(tmp_path):
     assert store._reserved_rigs == 0
 
 
-def test_post_rename_rig_permission_failure_removes_publication(
-    tmp_path, monkeypatch
-):
+def test_post_rename_rig_permission_failure_removes_publication(tmp_path, monkeypatch):
     store = RigStore(storage(tmp_path))
 
     def fail_secure(_path):
@@ -645,9 +623,7 @@ def test_media_quota_limits(tmp_path):
 
 
 def test_media_reservations_make_concurrent_chunk_quota_atomic(tmp_path):
-    noisy = np.random.default_rng(23).integers(
-        0, 255, size=(64, 64, 3), dtype=np.uint8
-    )
+    noisy = np.random.default_rng(23).integers(0, 255, size=(64, 64, 3), dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", noisy)
     assert ok
     payload = encoded.tobytes()
@@ -719,7 +695,7 @@ def test_failed_staging_unlink_remains_reserved_and_retryable(
 
     def fail_once(path, *args, **kwargs):
         nonlocal failed
-        if path == reservation.path and not failed:
+        if path.name.startswith(".custback-cleanup-") and not failed:
             failed = True
             raise OSError("staging unlink failed")
         return original_unlink(path, *args, **kwargs)
@@ -730,20 +706,26 @@ def test_failed_staging_unlink_remains_reserved_and_retryable(
     assert reservation.active
     assert store._active_uploads[reservation.path] is reservation
     assert store._reserved_bytes == len(b"reserved bytes")
-    assert getattr(
-        store,
-        "_reserved_files" if kind == "media" else "_reserved_rigs",
-    ) == 1
+    assert (
+        getattr(
+            store,
+            "_reserved_files" if kind == "media" else "_reserved_rigs",
+        )
+        == 1
+    )
     assert reservation.path.exists()
 
     reservation.abort()
     assert not reservation.active
     assert reservation.path not in store._active_uploads
     assert store._reserved_bytes == 0
-    assert getattr(
-        store,
-        "_reserved_files" if kind == "media" else "_reserved_rigs",
-    ) == 0
+    assert (
+        getattr(
+            store,
+            "_reserved_files" if kind == "media" else "_reserved_rigs",
+        )
+        == 0
+    )
     assert not reservation.path.exists()
 
 
@@ -804,9 +786,7 @@ def test_private_modes_hold_under_restrictive_umask(tmp_path):
         rig_store.directory / "private": 0o700,
         rig_store.directory / "private" / "head.png": 0o600,
     }
-    assert {
-        path: stat.S_IMODE(path.stat().st_mode) for path in expected
-    } == expected
+    assert {path: stat.S_IMODE(path.stat().st_mode) for path in expected} == expected
 
 
 def test_permission_doctor_repairs_modes_and_refuses_symlinks(tmp_path):
@@ -827,7 +807,11 @@ def test_permission_doctor_repairs_modes_and_refuses_symlinks(tmp_path):
 
     issues = audit_storage_permissions(cfg)
     assert {issue.path for issue in issues} == {
-        rigs, rigs / "old-rig", old_layer, media, old_media
+        rigs,
+        rigs / "old-rig",
+        old_layer,
+        media,
+        old_media,
     }
     repaired = set(repair_storage_permissions(cfg))
     assert repaired == {issue.path for issue in issues}
@@ -942,9 +926,7 @@ def test_render_avatar_thumbnail_builtin():
 
 def test_render_media_thumbnail_downscales(tmp_path):
     store = MediaStore(storage(tmp_path))
-    saved = store.commit(
-        staged(store, image_bytes(1280, 720)), "wide.png", "image"
-    )
+    saved = store.commit(staged(store, image_bytes(1280, 720)), "wide.png", "image")
     data = render_media_thumbnail(Path(saved.path), "image")
     width, height = jpeg_size(data)
     assert (width, height) == (256, 144)

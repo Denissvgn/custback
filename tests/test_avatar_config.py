@@ -1,12 +1,19 @@
 """Avatar-service configuration: strict validation and patch semantics."""
 
+import io
+import os
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from custback.avatar.__main__ import EXIT_CONFIG, _storage_permission_command
+from custback.avatar.__main__ import (
+    EXIT_CONFIG,
+    _storage_permission_command,
+    avatar_config_bytes,
+    export_avatar_config,
+)
 from custback.avatar.config import (
     AVATAR_PARTS,
     BUILTIN_AVATARS,
@@ -14,6 +21,7 @@ from custback.avatar.config import (
     AvatarConfigVersionConflictError,
     AvatarRuntime,
     RestartRequiredError,
+    StorageConfig,
 )
 
 
@@ -31,11 +39,47 @@ def test_defaults_are_valid_and_local_first():
     assert cfg.driver.backend == "auto"
 
 
+@pytest.mark.parametrize(
+    "layout",
+    ["identical", "rig-parent", "media-parent", "dotdot", "symlink-alias"],
+)
+def test_storage_roots_reject_canonical_overlap(tmp_path, layout):
+    rigs = tmp_path / "rigs"
+    media = tmp_path / "media"
+    if layout == "identical":
+        media = rigs
+    elif layout == "rig-parent":
+        media = rigs / "media"
+    elif layout == "media-parent":
+        rigs = media / "rigs"
+    elif layout == "dotdot":
+        media = tmp_path / "child" / ".." / "rigs"
+    else:
+        rigs.mkdir()
+        alias = tmp_path / "rigs-alias"
+        alias.symlink_to(rigs, target_is_directory=True)
+        media = alias
+
+    with pytest.raises(ValueError, match="separate, non-overlapping"):
+        StorageConfig.model_validate(
+            {"rigs_dir": str(rigs), "backgrounds_dir": str(media)}
+        )
+
+    valid = StorageConfig.model_validate(
+        {
+            "rigs_dir": str(tmp_path / "valid-rigs"),
+            "backgrounds_dir": str(tmp_path / "valid-media"),
+        }
+    )
+    assert valid.rigs_dir != valid.backgrounds_dir
+
+
 def test_appearance_choices_are_validated():
     for name in BUILTIN_AVATARS:
-        assert AvatarConfig.from_dict(
-            {"appearance": {"avatar": name}}
-        ).appearance.avatar == name
+        assert (
+            AvatarConfig.from_dict({"appearance": {"avatar": name}}).appearance.avatar
+            == name
+        )
     with pytest.raises(ValueError, match="unknown builtin avatar"):
         AvatarConfig.from_dict({"appearance": {"avatar": "zorp"}})
     with pytest.raises(ValueError):
@@ -227,9 +271,7 @@ def test_audio2face_destination_and_trust_are_restart_only():
 def test_runtime_mixed_patch_applies_nothing():
     runtime = AvatarRuntime(AvatarConfig())
     with pytest.raises(RestartRequiredError):
-        runtime.apply_patch(
-            {"appearance": {"scale": 0.5}, "api": {"port": 9000}}
-        )
+        runtime.apply_patch({"appearance": {"scale": 0.5}, "api": {"port": 9000}})
     state = runtime.read()
     assert state.version == 0
     assert state.config.appearance.scale == 1.0
@@ -358,3 +400,34 @@ def test_storage_permission_cli_check_and_fix(tmp_path, capsys):
     assert "storage permissions repaired" in capsys.readouterr().out
     assert (Path(rigs).stat().st_mode & 0o777) == 0o700
     assert (Path(media).stat().st_mode & 0o777) == 0o700
+
+
+def test_PKG_01_installed_avatar_template_exports_privately_without_overwrite(
+    tmp_path,
+    monkeypatch,
+):
+    canonical = Path("config/avatar.yaml").read_bytes()
+    assert avatar_config_bytes() == canonical
+
+    output = io.BytesIO()
+    assert export_avatar_config(None, output=output) == 0
+    assert output.getvalue() == canonical
+
+    destination = tmp_path / "avatar.yaml"
+    assert export_avatar_config(destination) == 0
+    assert destination.read_bytes() == canonical
+    assert os.stat(destination).st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        export_avatar_config(destination)
+
+    calls = []
+
+    def fake_avatar_main(argv, *, prog):
+        calls.append((argv, prog))
+        return 17
+
+    monkeypatch.setattr("custback.avatar.__main__.main", fake_avatar_main)
+    from custback.__main__ import main as custback_main
+
+    assert custback_main(["avatar", "--help"]) == 17
+    assert calls == [(["--help"], "custback avatar")]

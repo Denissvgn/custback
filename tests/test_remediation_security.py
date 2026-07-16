@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
+import socket
 from collections.abc import Callable
 
 import httpx
 import numpy as np
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 
+import custback.backgrounds as backgrounds_mod
 from custback.api.avatar_proxy import register_avatar_proxy
 from custback.avatar.config import Audio2FaceConfig, AvatarConfig
 from custback.config import AppConfig, RuntimeConfig
@@ -19,9 +23,7 @@ from custback.pipeline import Pipeline, RestartRequiredError, _Resources
 
 # Registry links retained after the strict expected-failure markers were
 # retired; every item below is now enforced by the permanent tests in this file.
-RESOLVED_PHASE_1_BLOCKERS = frozenset(
-    {"SEC-01", "TOKEN-01", "TRANS-01", "PRIV-01"}
-)
+RESOLVED_PHASE_1_BLOCKERS = frozenset({"SEC-01", "TOKEN-01", "TRANS-01", "PRIV-01"})
 
 
 def _run(awaitable):
@@ -106,12 +108,8 @@ def test_non_loopback_plaintext_endpoints_are_rejected(build_config):
 
 
 def test_numeric_loopback_plaintext_endpoints_remain_available():
-    core = AppConfig.from_dict(
-        {"avatar": {"url": "http://127.0.0.1:8711"}}
-    )
-    avatar = AvatarConfig.from_dict(
-        {"source": {"url": "ws://[::1]:8710"}}
-    )
+    core = AppConfig.from_dict({"avatar": {"url": "http://127.0.0.1:8711"}})
+    avatar = AvatarConfig.from_dict({"source": {"url": "ws://[::1]:8710"}})
 
     assert core.avatar.url == "http://127.0.0.1:8711"
     assert avatar.source.url == "ws://[::1]:8710"
@@ -175,6 +173,130 @@ def _remote_pipeline() -> tuple[Pipeline, AppConfig]:
 def _patterned_frame(offset: int = 0) -> np.ndarray:
     values = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
     return ((values + offset) % 251).astype(np.uint8)
+
+
+def test_SEC_02_hot_backdrop_authority_is_io_free(monkeypatch):
+    """Hostile hot source strings fail before capture, file, DNS, or network I/O."""
+
+    calls: list[tuple[str, object]] = []
+
+    def forbidden(kind):
+        def fail(*args, **_kwargs):
+            calls.append((kind, args[0] if args else None))
+            raise AssertionError(f"unexpected {kind} I/O")
+
+        return fail
+
+    monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", forbidden("capture"))
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden("dns"))
+    monkeypatch.setattr(socket, "create_connection", forbidden("network"))
+    monkeypatch.setattr(builtins, "open", forbidden("file"))
+
+    runtime = RuntimeConfig(AppConfig.from_dict({"background": {"mode": "color"}}))
+    pipeline = Pipeline(runtime, FrameHub())
+    payloads = (
+        "http://camera.example.test/live",
+        "rtsp://camera.example.test/live",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:2375/containers/json",
+        "/dev/video9",
+        "/run/secrets/core-api-token",
+    )
+
+    for source in payloads:
+        with pytest.raises((RestartRequiredError, ValidationError)):
+            pipeline.apply_config_patch(
+                {
+                    "background": {
+                        "mode": "camera",
+                        "camera_device": source,
+                    }
+                }
+            )
+        state = runtime.read()
+        assert state.version == 0
+        assert state.config.background.mode == "color"
+
+    legacy_runtime = RuntimeConfig(
+        AppConfig.from_dict(
+            {
+                "background": {
+                    "mode": "color",
+                    "camera_device": "/dev/video9",
+                }
+            }
+        )
+    )
+    with pytest.raises(RestartRequiredError):
+        Pipeline(legacy_runtime, FrameHub()).apply_config_patch(
+            {"background": {"camera_device": "/dev/video9"}}
+        )
+
+    target_runtime = RuntimeConfig(
+        AppConfig.from_dict({"backdrop_targets": {"side-camera": {"source": 2}}})
+    )
+    with pytest.raises(RestartRequiredError):
+        Pipeline(target_runtime, FrameHub()).apply_config_patch(
+            {"backdrop_targets": {"side-camera": {"source": 2}}}
+        )
+
+    assert calls == []
+
+
+def test_PRIV_01_replay_is_rejected_after_window_and_capacity(monkeypatch):
+    """Elapsed time and full bounded history can never make raw replay allowable."""
+
+    now = [0.0]
+    monkeypatch.setattr("custback.pipeline.time.monotonic", lambda: now[0])
+    raw = np.random.default_rng(78).integers(0, 256, (72, 128, 3), dtype=np.uint8)
+    current = np.random.default_rng(79).integers(0, 256, raw.shape, dtype=np.uint8)
+    pipeline = Pipeline(
+        RuntimeConfig(AppConfig()),
+        FrameHub(),
+        raw_fingerprint_capacity=2,
+    )
+    assert pipeline._remember_raw_frame(raw)
+
+    now[0] = 60.0
+    exact, exact_reason = pipeline._guard_remote_output(
+        raw.copy(), current, privacy_safe=True
+    )
+    ok, encoded = backgrounds_mod.cv2.imencode(
+        ".jpg", raw, [backgrounds_mod.cv2.IMWRITE_JPEG_QUALITY, 50]
+    )
+    assert ok
+    jpeg = backgrounds_mod.cv2.imdecode(encoded, backgrounds_mod.cv2.IMREAD_COLOR)
+    assert jpeg is not None
+    altered, altered_reason = pipeline._guard_remote_output(
+        jpeg, current, privacy_safe=True
+    )
+
+    assert pipeline._remember_raw_frame(
+        np.random.default_rng(80).integers(0, 256, raw.shape, dtype=np.uint8)
+    )
+    assert not pipeline._remember_raw_frame(
+        np.random.default_rng(81).integers(0, 256, raw.shape, dtype=np.uint8)
+    )
+    capacity, capacity_reason = pipeline._guard_remote_output(
+        raw.copy(),
+        np.random.default_rng(82).integers(0, 256, raw.shape, dtype=np.uint8),
+        privacy_safe=True,
+    )
+    capacity_jpeg, capacity_jpeg_reason = pipeline._guard_remote_output(
+        jpeg,
+        np.random.default_rng(83).integers(0, 256, raw.shape, dtype=np.uint8),
+        privacy_safe=True,
+    )
+
+    slate = Pipeline._privacy_slate(raw.shape)
+    assert exact_reason == "privacy-delayed-raw-echo"
+    assert altered_reason == "privacy-delayed-raw-echo"
+    assert capacity_reason == "privacy-history-exhausted"
+    assert capacity_jpeg_reason == "privacy-history-exhausted"
+    assert np.array_equal(exact, slate)
+    assert np.array_equal(altered, slate)
+    assert np.array_equal(capacity, slate)
+    assert np.array_equal(capacity_jpeg, slate)
 
 
 def test_remote_startup_preflight_never_sends_the_captured_frame():

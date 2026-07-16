@@ -1,6 +1,6 @@
 # Custback remediation plan
 
-Status: **RELEASE BLOCKED — Phase 5 corrective remediation is next**
+Status: **RELEASE BLOCKED — Phase 6 enforcement implemented; exact release-candidate qualification pending**
 
 This plan converts the findings from the July 2026 repository review into an
 implementation sequence. A completeness re-audit on 2026-07-16 found that six
@@ -10,10 +10,12 @@ below are retained as historical implementation records, but they no longer
 authorize a release. Phase 5 closes the corrective backlog; Phase 6 performs
 migration, artifact, stress, and two-host TLS validation.
 
-The machine-readable registry still reports `release_blocked=false`. The first
-Phase 5 change must reopen/add the blockers listed below and set that field to
-`true`. No package may be published from the current state, even if the existing
-`prepack` or `release:check` command reports success.
+The machine-readable registry now reports phase 6 with
+`release_blocked=true`. All seven Phase 5 blockers are resolved by exact
+executable regressions; `REL-01` is the only open entry. Ordinary `prepack` and
+release-check commands fail closed before publication. The final release-
+candidate commit must close `REL-01`, then pass the installed exact-commit Phase
+6 workflow; this implementation revision is not pre-qualified evidence.
 
 ## Target invariants
 
@@ -50,7 +52,8 @@ The remediated system must guarantee that:
 
 The original Phase 0–4 sequence is retained below for traceability. Current
 implementation order and parallelization rules are defined by the corrective PR
-sequence after Phase 6.
+sequence after Phase 6. Phase 6 implementation is present in this revision, but
+its dynamic release-candidate gates cannot authorize this dirty parent revision.
 
 ### Historical Phase 0 completion record
 
@@ -70,8 +73,8 @@ sequence after Phase 6.
 
 The machine-readable source of truth is
 `scripts/release/remediation-blockers.json`. `release:check` and `prepack`
-must fail while any entry remains open. The registry is presently stale with
-respect to this re-audit and must be corrected before production work resumes.
+must fail while any entry remains open. The registry is aligned with the
+corrective implementation: 27 entries are resolved and `REL-01` remains open.
 A blocker is closed only in the same change that removes its strict
 expected-failure marker and makes its acceptance test pass. Merely checking that
 a regression file contains the blocker ID is not evidence that the acceptance
@@ -589,6 +592,31 @@ only open entry, retains blocker phase 6, and keeps `release_blocked=true` until
 release enforcement is installed. Passing the ordinary unit suites is necessary
 but not sufficient.
 
+### Phase 5 completion record (2026-07-16)
+
+- The reviewed registry contract contains 28 entries: 27 resolved and only
+  phase-6 `REL-01` open, with `release_blocked=true`.
+- `SEC-02` now limits hot backdrop selection to immutable, operator-owned local
+  targets; unsafe source syntax is rejected before file, capture, DNS, or
+  network I/O, and source paths are absent from public configuration.
+- `PRIV-01` now maintains bounded session-wide replay evidence and fails closed
+  on capacity exhaustion without resetting across reconnects or mode changes.
+- `LIFE-01` linearizes renderer-session publication with stop/replace leases,
+  while `LIFE-02` retains the complete Audio2Face generation until terminal
+  worker ownership is proven.
+- `STOR-02` uses durable, inode-bound rename transactions and quota ownership
+  for core uploads, avatar media, and rigs, including restart-safe cleanup and
+  no-follow recovery.
+- `PKG-01` ships the canonical `custback avatar` surface and byte-identical
+  packaged config export through wheel, sdist, alias, and npm installs.
+- `PKG-02` keeps npm pack stdout shell-safe and proves the captured tarball is
+  installable. Package smoke is a separate non-authorizing diagnostic; normal
+  prepack and release checks still fail on `REL-01`.
+- Final local verification: 727 Python tests passed with one optional-backend
+  skip; 80 Node tests passed with the single intentional `REL-01` TODO. Exact
+  pytest and Node registry regressions, installed wheel/sdist/npm smoke, and
+  release fail-closed checks passed.
+
 ## Phase 6 — migration and end-to-end release validation
 
 ### Upgrade and migration matrix
@@ -710,6 +738,44 @@ unless it can verify that trusted provenance.
 Acceptance: deleting or failing any required job/evidence, reopening a blocker,
 changing a reviewed file, or substituting an artifact makes the publish job and
 full release check fail. Only the exact fully validated commit can publish.
+
+### Phase 6 implementation record (2026-07-16)
+
+- Added a no-follow, journaled Python config/store migrator with byte-exact
+  backups, explicit refusal of unsafe legacy remote targets, ownership-ledger
+  preservation, idempotent retry, and failpoint coverage at every durable
+  boundary.
+- Added the pre-upgrade npm bridge required before npm replaces a 0.3 package
+  directory. It relocates both direct and generational managed environments,
+  preserves extras plus active/rollback generations, rewrites owned metadata,
+  and converges after every durable boundary.
+- Added one strict manifest for publishable artifacts, legacy fixtures,
+  Python/Node/optional/runtime matrices, six 100-iteration stress families, 21
+  TLS scenarios, required job IDs, the aggregate gate, and publish job.
+- Added artifact-only migration qualification. Direct npm and PyPI registry
+  checks found no published 0.3 `custback` artifacts, so the workflow rebuilds
+  explicitly unpublished references once from reviewed commit
+  `f01baadfa3b1e2a1ef19eceda315eedf06fbe883`; reports and documentation never
+  describe those source reconstructions as released bytes.
+- Added the packaged two-host WSS/HTTPS harness with isolated container
+  addresses, independent ephemeral CAs and secrets, real hostname verification,
+  firewall removal, outage/reconnect/rotation/auth/certificate scenarios,
+  privacy-slate recording, pre-TLS no-payload capture, and finally-safe cleanup.
+- Added reviewed Ruff configuration, deterministic seeded stress tests,
+  recursive clean-tree rejection, exact npm/sdist payload allow-lists, and
+  build-once candidate digest recording.
+- Added a tag/manual production workflow that consumes the same three candidate
+  files everywhere. Migration and two-host matrix legs retain artifact-bound
+  reports; same-run evidence rejects report/runtime/host/digest drift and
+  is itself attested. Candidate and evidence attestations must verify before
+  the aggregate gate, full release check, or publish job can succeed.
+- Local unit, migration, stress, schema, workflow, and packaging checks verify
+  the enforcement machinery. The true multi-platform, CUDA, two-clean-host,
+  real-container, and signed-provenance gates remain dynamic release-candidate
+  work; no success is claimed for them in this implementation record.
+- `REL-01` intentionally remains open and `release_blocked` remains true. Its
+  final atomic close and the corresponding fail-closed contract digest/test
+  update belong only in the clean release-candidate revision.
 
 ## Corrective PR sequence
 

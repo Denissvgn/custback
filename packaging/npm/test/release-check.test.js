@@ -42,6 +42,7 @@ test('prepack verifies the non-recursive packlist and reserves artifact installs
   assert.equal(release.releasePlan([]).builtArtifacts, true);
   assert.equal(release.releasePlan(['--quick']).builtArtifacts, false);
   assert.throws(() => release.releasePlan(['--prepack', '--quick']), /invalid release/);
+  assert.throws(() => release.releasePlan(['--package-smoke']), /invalid release/);
   assert.throws(() => release.releasePlan(['--unknown']), /invalid release/);
 
   const source = fs.readFileSync(
@@ -196,26 +197,59 @@ test('npm artifact LICENSE must be byte-identical to the canonical source', (t) 
   );
 });
 
-test('remediation registry records all 26 blockers as resolved', () => {
+test('remediation registry records Phase 5 complete with only REL-01 open', () => {
+  const registry = release.remediationRegistry(root);
   const blockers = release.remediationBlockers(root);
-  assert.equal(blockers.length, 26);
+  assert.equal(registry.phase, 6);
+  assert.equal(registry.release_blocked, true);
+  assert.equal(blockers.length, 28);
+  assert.deepEqual(blockers.map((entry) => entry.id), [
+    'SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01', 'A2F-01',
+    'CFG-01', 'CFG-02', 'LIFE-01', 'LIFE-02', 'STOR-01', 'STOR-02',
+    'SEG-01', 'SEG-02', 'SEG-03', 'RENDER-01', 'RENDER-02', 'API-01',
+    'NPM-01', 'PKG-01', 'PKG-02', 'DEPLOY-01', 'MISC-01', 'MISC-02',
+    'LICENSE-01', 'PLATFORM-01', 'HYGIENE-01', 'SEC-02', 'REL-01',
+  ]);
+  assert.equal(blockers.filter((entry) => entry.status === 'resolved').length, 27);
   assert.deepEqual(
-    blockers.filter((entry) => entry.status === 'resolved').map((entry) => entry.id),
-    [
-      'SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01',
-      'A2F-01',
-      'CFG-01', 'CFG-02', 'LIFE-01', 'LIFE-02',
-      'STOR-01', 'STOR-02', 'SEG-01', 'SEG-02', 'SEG-03',
-      'RENDER-01', 'RENDER-02', 'API-01',
-      'NPM-01', 'PKG-01', 'PKG-02', 'DEPLOY-01',
-      'MISC-01', 'MISC-02',
-      'LICENSE-01', 'PLATFORM-01', 'HYGIENE-01',
-    ],
+    blockers.filter((entry) => entry.status === 'open').map((entry) => entry.id),
+    ['REL-01'],
   );
-  assert.deepEqual(blockers.filter((entry) => entry.status === 'open'), []);
+  assert.equal(blockers.find((entry) => entry.id === 'REL-01').phase, 6);
   assert.doesNotThrow(() => release.verifyBlockerRegressionCoverage(root));
-  assert.doesNotThrow(() => release.verifyNoReleaseBlockers(root));
+  assert.throws(() => release.verifyNoReleaseBlockers(root), /REL-01/);
 });
+
+function assertPhase6ReleaseIntegrity() {
+  const workflow = fs.readFileSync(
+    path.join(root, '.github', 'workflows', 'release.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /^\s{2}publish:\s*$/m);
+  assert.equal(
+    fs.existsSync(path.join(root, 'scripts', 'release', 'required-gates.json')),
+    true,
+    'the versioned required-gate allow-list is missing',
+  );
+  assert.match(workflow, /needs:\s*\[[^\]]*release-gate[^\]]*\]/s);
+}
+
+test(
+  'REL-01: production publish requires exact Phase 6 gate evidence',
+  { todo: 'REL-01 remains open until the exact clean release-candidate commit' },
+  () => {
+    assertPhase6ReleaseIntegrity();
+    release.verifyNoReleaseBlockers(root);
+  },
+);
+
+test(
+  'REL-01: open registry still blocks the installed Phase 6 publish machinery',
+  () => {
+    assert.doesNotThrow(assertPhase6ReleaseIntegrity);
+    assert.throws(() => release.verifyNoReleaseBlockers(root), /REL-01/);
+  },
+);
 
 test('remediation registry fails closed on missing, malformed, or inconsistent state', (t) => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-blocker-test-'));
@@ -236,12 +270,15 @@ test('remediation registry fails closed on missing, malformed, or inconsistent s
   );
 
   fs.writeFileSync(registryPath, JSON.stringify({
-    schema_version: 1,
+    schema_version: 2,
+    phase: 5,
     release_blocked: false,
     blockers: [
       {
         id: 'SEC-01', phase: 1, status: 'open', title: 'still open',
-        regression: 'tests/security.test.js',
+        regression: {
+          runner: 'node', file: 'tests/security.test.js', test: 'SEC-01 regression',
+        },
       },
     ],
   }));
@@ -251,22 +288,102 @@ test('remediation registry fails closed on missing, malformed, or inconsistent s
   );
 
   fs.writeFileSync(registryPath, JSON.stringify({
-    schema_version: 1,
+    schema_version: 2,
+    phase: 5,
     release_blocked: true,
     blockers: [
       {
         id: 'SEC-01', phase: 1, status: 'open', title: 'first',
-        regression: 'tests/security.test.js',
+        regression: {
+          runner: 'node', file: 'tests/security.test.js', test: 'SEC-01 first',
+        },
       },
       {
         id: 'SEC-01', phase: 1, status: 'resolved', title: 'duplicate',
-        regression: 'tests/security.test.js',
+        regression: {
+          runner: 'node', file: 'tests/security.test.js', test: 'SEC-01 duplicate',
+        },
       },
     ],
   }));
   assert.throws(
     () => release.remediationBlockers(fixture),
     /duplicate id SEC-01/,
+  );
+});
+
+test('remediation registry requires an exact executable test identifier', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-regression-id-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(fixture, 'scripts', 'release'), { recursive: true });
+  fs.mkdirSync(path.join(fixture, 'tests'));
+  fs.writeFileSync(
+    path.join(fixture, 'tests', 'regression.py'),
+    '# test_exact_node is mentioned but was never collected\n',
+  );
+  fs.writeFileSync(
+    path.join(fixture, 'scripts', 'release', 'remediation-blockers.json'),
+    JSON.stringify({
+      schema_version: 2,
+      phase: 5,
+      release_blocked: false,
+      blockers: [{
+        id: 'SEC-01', phase: 1, status: 'resolved', title: 'exact identifier',
+        regression: {
+          runner: 'pytest', test: 'tests/regression.py::test_exact_node',
+        },
+      }],
+    }),
+  );
+  assert.throws(
+    () => release.verifyBlockerRegressionCoverage(
+      fixture, { enforceReviewedContract: false },
+    ),
+    /pytest node is not defined/,
+  );
+});
+
+test('reviewed remediation contract rejects blocker or node substitution', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-blocker-contract-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const directory = path.join(fixture, 'scripts', 'release');
+  fs.mkdirSync(directory, { recursive: true });
+  const registry = JSON.parse(
+    fs.readFileSync(
+      path.join(root, 'scripts', 'release', 'remediation-blockers.json'),
+      'utf8',
+    ),
+  );
+  registry.blockers[0] = {
+    ...registry.blockers[0],
+    id: 'FAKE-99',
+    regression: registry.blockers[1].regression,
+  };
+  fs.writeFileSync(
+    path.join(directory, 'remediation-blockers.json'),
+    JSON.stringify(registry),
+  );
+  assert.throws(
+    () => release.verifyBlockerRegressionCoverage(fixture),
+    /reviewed Phase 5 blocker contract/,
+  );
+});
+
+test('exact Node regression outcome rejects missing and duplicate TAP names', () => {
+  const name = 'REL-01: exact TODO';
+  assert.equal(
+    release.exactNodeTapOutcome('REL-01', name, `ok 1 - ${name} # TODO open\n`),
+    `ok 1 - ${name} # TODO open`,
+  );
+  assert.throws(
+    () => release.exactNodeTapOutcome('REL-01', name, '1..0\n'),
+    /0 exact TAP outcomes/,
+  );
+  assert.throws(
+    () => release.exactNodeTapOutcome(
+      'REL-01', name, `ok 1 - ${name} # TODO open\nok 2 - ${name}\n`,
+    ),
+    /2 exact TAP outcomes/,
   );
 });
 

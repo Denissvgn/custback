@@ -29,7 +29,13 @@ ColorChannel = Annotated[int, Field(ge=0, le=255)]
 
 # Renderable avatar layers, in compositing order (torso first, hair last).
 AVATAR_PARTS: tuple[str, ...] = (
-    "torso", "head", "mouth", "nose", "eyes", "brows", "hair",
+    "torso",
+    "head",
+    "mouth",
+    "nose",
+    "eyes",
+    "brows",
+    "hair",
 )
 
 # Builtin presenter characters; the preset art lives in rig.py.
@@ -54,9 +60,7 @@ class RestartRequiredError(RuntimeError):
     def __init__(self, fields: tuple[str, ...], current_version: int):
         self.fields = fields
         self.current_version = current_version
-        super().__init__(
-            "restart required to apply: " + ", ".join(fields)
-        )
+        super().__init__("restart required to apply: " + ", ".join(fields))
 
 
 def _valid_ws_url(value: str) -> str:
@@ -330,24 +334,14 @@ class StorageConfig(_StrictModel):
     # Aggregate installed-rig limits are separate from scene-media storage.
     # Upload archives and extracted staging bytes count against this ceiling
     # while an installation is in flight.
-    rig_storage_max_bytes: int = Field(
-        default=1024 * 1024 * 1024, ge=1024, le=2**40
-    )
+    rig_storage_max_bytes: int = Field(default=1024 * 1024 * 1024, ge=1024, le=2**40)
     max_rigs: int = Field(default=100, ge=1, le=100_000)
     # Pillow checks these limits before any rig layer reaches OpenCV.  The
     # total cap accounts every base/expression layer in the archive.
-    rig_layer_max_pixels: int = Field(
-        default=16_777_216, ge=256, le=89_478_485
-    )
-    rig_total_max_pixels: int = Field(
-        default=134_217_728, ge=256, le=1_431_655_760
-    )
-    rig_manifest_max_bytes: int = Field(
-        default=64 * 1024, ge=256, le=16 * 1024 * 1024
-    )
-    storage_max_bytes: int = Field(
-        default=1024 * 1024 * 1024, ge=1024, le=2**40
-    )
+    rig_layer_max_pixels: int = Field(default=16_777_216, ge=256, le=89_478_485)
+    rig_total_max_pixels: int = Field(default=134_217_728, ge=256, le=1_431_655_760)
+    rig_manifest_max_bytes: int = Field(default=64 * 1024, ge=256, le=16 * 1024 * 1024)
+    storage_max_bytes: int = Field(default=1024 * 1024 * 1024, ge=1024, le=2**40)
     max_files: int = Field(default=100, ge=1, le=100_000)
 
     @field_validator("rigs_dir", "backgrounds_dir")
@@ -365,6 +359,20 @@ class StorageConfig(_StrictModel):
         if self.rig_total_max_pixels < self.rig_layer_max_pixels:
             raise ValueError(
                 "rig_total_max_pixels must be at least rig_layer_max_pixels"
+            )
+        try:
+            rigs = Path(self.rigs_dir).expanduser().resolve(strict=False)
+            backgrounds = Path(self.backgrounds_dir).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("storage directories must resolve safely") from exc
+        if (
+            rigs == backgrounds
+            or rigs in backgrounds.parents
+            or backgrounds in rigs.parents
+        ):
+            raise ValueError(
+                "rigs_dir and backgrounds_dir must be separate, non-overlapping "
+                "directories"
             )
         return self
 
@@ -421,7 +429,9 @@ class AvatarApiConfig(_StrictModel):
                 raise ValueError(f"invalid exact HTTP(S) origin: {origin!r}")
             normalized.append(canonical)
         if len(normalized) != len(set(normalized)):
-            raise ValueError("allowed_origins entries must be unique after normalization")
+            raise ValueError(
+                "allowed_origins entries must be unique after normalization"
+            )
         return tuple(normalized)
 
     @model_validator(mode="after")
@@ -515,8 +525,7 @@ def _validate_hot_changes(
     restart = tuple(
         field
         for field in changed
-        if field.split(".", 1)[0] not in HOT_SECTIONS
-        or field in RESTART_FIELDS
+        if field.split(".", 1)[0] not in HOT_SECTIONS or field in RESTART_FIELDS
     )
     if restart:
         raise RestartRequiredError(restart, current_version)
@@ -635,12 +644,8 @@ class AvatarRuntime:
         published = validated.model_copy(deep=True)
         with self._lock:
             if self._version != expected_version:
-                raise AvatarConfigVersionConflictError(
-                    expected_version, self._version
-                )
-            changed = _validate_hot_changes(
-                self._config, validated, self._version
-            )
+                raise AvatarConfigVersionConflictError(expected_version, self._version)
+            changed = _validate_hot_changes(self._config, validated, self._version)
             if not changed:
                 return AvatarConfigState(
                     self._config.model_copy(deep=True), self._version
@@ -662,9 +667,7 @@ class AvatarRuntime:
             coordinator = self._patch_coordinator
             if coordinator is None:
                 candidate = self._config.patched(patch)
-                changed = _validate_hot_changes(
-                    self._config, candidate, self._version
-                )
+                changed = _validate_hot_changes(self._config, candidate, self._version)
                 if not changed:
                     return AvatarConfigState(
                         self._config.model_copy(deep=True), self._version

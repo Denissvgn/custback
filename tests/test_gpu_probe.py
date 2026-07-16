@@ -5,7 +5,11 @@ from pathlib import Path
 
 import numpy as np
 
-from custback.gpu_probe import _CUDA_PROBE_MODEL, _profile_uses_cuda, probe_cuda_inference
+from custback.gpu_probe import (
+    _CUDA_PROBE_MODEL,
+    _profile_uses_cuda,
+    probe_cuda_inference,
+)
 
 
 class FakeOptions:
@@ -23,7 +27,9 @@ class FakeSession:
     def __init__(self, options, *, provider="CUDAExecutionProvider", output=None):
         self.options = options
         self.provider = provider
-        self.output = output if output is not None else np.asarray([3.0], dtype=np.float32)
+        self.output = (
+            output if output is not None else np.asarray([3.0], dtype=np.float32)
+        )
 
     def get_providers(self):
         return [self.provider]
@@ -57,7 +63,9 @@ class FakeOrt:
 
     SessionOptions = FakeOptions
 
-    def __init__(self, *, providers=None, session_provider="CUDAExecutionProvider", output=None):
+    def __init__(
+        self, *, providers=None, session_provider="CUDAExecutionProvider", output=None
+    ):
         self.providers = providers or ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.session_provider = session_provider
         self.output = output
@@ -120,38 +128,51 @@ def test_unregistered_cuda_does_not_construct_session():
 
 
 def test_profile_evidence_ignores_non_node_and_cpu_events():
-    assert _profile_uses_cuda([
-        {"cat": "Session", "args": {"provider": "CUDAExecutionProvider"}},
-        {
-            "cat": "Node",
-            "name": "cuda_probe_add_kernel_time",
-            "args": {"op_name": "Add", "provider": "CPUExecutionProvider"},
-        },
-    ]) is False
-    assert _profile_uses_cuda([
-        {
-            "cat": "Node",
-            "name": "cuda_probe_add_kernel_time",
-            "args": {"op_name": "Add", "provider": "CUDAExecutionProvider"},
-        },
-    ]) is True
+    assert (
+        _profile_uses_cuda(
+            [
+                {"cat": "Session", "args": {"provider": "CUDAExecutionProvider"}},
+                {
+                    "cat": "Node",
+                    "name": "cuda_probe_add_kernel_time",
+                    "args": {"op_name": "Add", "provider": "CPUExecutionProvider"},
+                },
+            ]
+        )
+        is False
+    )
+    assert (
+        _profile_uses_cuda(
+            [
+                {
+                    "cat": "Node",
+                    "name": "cuda_probe_add_kernel_time",
+                    "args": {"op_name": "Add", "provider": "CUDAExecutionProvider"},
+                },
+            ]
+        )
+        is True
+    )
 
 
 def test_profile_rejects_unrelated_cuda_node_when_probe_add_ran_on_cpu():
-    assert _profile_uses_cuda(
-        [
-            {
-                "cat": "Node",
-                "name": "cuda_probe_add_kernel_time",
-                "args": {"op_name": "Add", "provider": "CPUExecutionProvider"},
-            },
-            {
-                "cat": "Node",
-                "name": "Memcpy_kernel_time",
-                "args": {
-                    "op_name": "MemcpyFromHost",
-                    "provider": "CUDAExecutionProvider",
+    assert (
+        _profile_uses_cuda(
+            [
+                {
+                    "cat": "Node",
+                    "name": "cuda_probe_add_kernel_time",
+                    "args": {"op_name": "Add", "provider": "CPUExecutionProvider"},
                 },
-            },
-        ]
-    ) is False
+                {
+                    "cat": "Node",
+                    "name": "Memcpy_kernel_time",
+                    "args": {
+                        "op_name": "MemcpyFromHost",
+                        "provider": "CUDAExecutionProvider",
+                    },
+                },
+            ]
+        )
+        is False
+    )

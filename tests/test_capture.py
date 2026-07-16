@@ -51,9 +51,7 @@ class FakeCap:
         self.fail_forever = fail_forever
         self.delay = delay
         self.frame = (
-            np.full((height, width, 3), 17, np.uint8)
-            if frame is None
-            else frame
+            np.full((height, width, 3), 17, np.uint8) if frame is None else frame
         )
         self.set_calls = []
         self.read_calls = 0
@@ -207,9 +205,7 @@ def test_v4l2_auto_requests_mjpg_before_dimensions_and_reads_back_mode(monkeypat
     fake_cv2 = FakeCV2([cap])
     monkeypatch.setattr(capture_mod, "cv2", fake_cv2)
 
-    capture = OpenCVCapture(
-        CameraConfig(device="0", width=128, height=72, fps=30)
-    )
+    capture = OpenCVCapture(CameraConfig(device="0", width=128, height=72, fps=30))
     try:
         frame = wait_for_frame(capture)
         assert frame.shape == (72, 128, 3)
@@ -316,9 +312,7 @@ def test_auto_retries_once_when_v4l2_mjpg_does_not_stick(monkeypatch, caplog):
     assert len(fake_cv2.opened) == 2
 
 
-def test_auto_accepts_backend_format_after_one_failed_mjpg_retry(
-    monkeypatch, caplog
-):
+def test_auto_accepts_backend_format_after_one_failed_mjpg_retry(monkeypatch, caplog):
     locked = {FakeCV2.CAP_PROP_FOURCC}
     first = FakeCap(locked=locked)
     fallback = FakeCap(locked=locked)
@@ -379,9 +373,7 @@ def test_explicit_mjpeg_rejection_closes_handle(monkeypatch):
     cap = FakeCap(rejected={FakeCV2.CAP_PROP_FOURCC})
     monkeypatch.setattr(capture_mod, "cv2", FakeCV2([cap]))
     capture = OpenCVCapture(
-        CameraConfig(
-            width=128, height=72, fps=30, pixel_format="mjpeg"
-        )
+        CameraConfig(width=128, height=72, fps=30, pixel_format="mjpeg")
     )
     try:
         error = wait_for_error(capture, CaptureModeError)
@@ -422,9 +414,7 @@ def test_error_mode_fails_on_negotiated_mismatch(monkeypatch):
     cap = FakeCap(width=64, height=48, fps=10.0, locked=locked)
     monkeypatch.setattr(capture_mod, "cv2", FakeCV2([cap]))
     capture = OpenCVCapture(
-        CameraConfig(
-            width=128, height=72, fps=30, mode_mismatch="error"
-        )
+        CameraConfig(width=128, height=72, fps=30, mode_mismatch="error")
     )
     try:
         error = wait_for_error(capture, CaptureModeError)
@@ -440,9 +430,7 @@ def test_explicit_mjpeg_must_be_verified_after_first_frame(monkeypatch):
     )
     monkeypatch.setattr(capture_mod, "cv2", FakeCV2([cap]))
     capture = OpenCVCapture(
-        CameraConfig(
-            width=128, height=72, fps=30, pixel_format="mjpeg"
-        )
+        CameraConfig(width=128, height=72, fps=30, pixel_format="mjpeg")
     )
     try:
         error = wait_for_error(capture, CaptureModeError)

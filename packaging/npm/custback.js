@@ -86,7 +86,14 @@ function exportAvatarConfig(args, output = process.stdout) {
     output.write(contents);
     return 0;
   }
-  fs.writeFileSync(path.resolve(destination), contents, { flag: 'wx', mode: 0o600 });
+  const descriptor = fs.openSync(path.resolve(destination), 'wx', 0o600);
+  try {
+    fs.fchmodSync(descriptor, 0o600);
+    fs.writeFileSync(descriptor, contents);
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
   return 0;
 }
 

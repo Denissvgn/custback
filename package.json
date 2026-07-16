@@ -5,7 +5,8 @@
   "license": "MIT",
   "bin": {
     "custback": "packaging/npm/custback.js",
-    "custback-avatar": "packaging/npm/custback.js"
+    "custback-avatar": "packaging/npm/custback.js",
+    "custback-npm-migrate": "packaging/npm/migrate-legacy.js"
   },
   "scripts": {
     "postinstall": "node packaging/npm/install.js",
@@ -15,14 +16,25 @@
     "prepack": "node scripts/release/verify-release.js --prepack"
   },
   "files": [
+    ".github/workflows/*.yml",
     "LICENSE",
+    "REMEDIATION_PLAN.md",
     "packaging/npm/*.js",
+    "packaging/npm/test/*.test.js",
     "src/**/*.py",
+    "src/**/*.yaml",
+    "tests/*.py",
+    "tests/fixtures/migration/*",
     "config/*.yaml",
     "docs/*.md",
     "scripts/*.sh",
     "scripts/release/*.js",
+    "scripts/release/*.json",
+    "scripts/release/*.py",
+    "scripts/release/two-host/Dockerfile",
+    "scripts/release/two-host/*.py",
     "examples/*.py",
+    "MANIFEST.in",
     "pyproject.toml"
   ],
   "os": [
@@ -30,7 +42,7 @@
     "darwin"
   ],
   "engines": {
-    "node": ">=18"
+    "node": "^18.15.0 || ^20.0.0 || ^22.0.0"
   },
   "keywords": [
     "virtual-camera",

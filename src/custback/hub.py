@@ -14,6 +14,7 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 import numpy as np
 
@@ -160,10 +161,7 @@ class _AsyncSlotSubscription:
         deadline = None if timeout is None else self._loop.time() + timeout
         while not self._closed:
             with self._slot._cond:
-                if (
-                    self._slot._value is not None
-                    and self._slot._seq != last_seq
-                ):
+                if self._slot._value is not None and self._slot._seq != last_seq:
                     return self._slot._value, self._slot._seq
                 # Clear while holding the publisher's lock so an update cannot
                 # land in the gap between checking the sequence and waiting.
@@ -199,9 +197,9 @@ class _AsyncSlotSubscription:
 
 class FrameHub:
     def __init__(self, *, run_id: str = "") -> None:
-        self.output = _Slot()      # processed frames (what the vcam shows)
-        self.raw = _Slot()         # raw camera frames (for remote avatar svc)
-        self.remote_in = _Slot()   # frames rendered by the remote avatar svc
+        self.output = _Slot()  # processed frames (what the vcam shows)
+        self.raw = _Slot()  # raw camera frames (for remote avatar svc)
+        self.remote_in = _Slot()  # frames rendered by the remote avatar svc
         self.stats = Stats(run_id=run_id)
         self._stats_lock = threading.Lock()
         self._remote_clients = 0
@@ -218,9 +216,7 @@ class FrameHub:
         """Latest remote-rendered frame if it is fresh enough, else None."""
         return self.remote_frame_status(max_age_s)[0]
 
-    def remote_frame_status(
-        self, max_age_s: float
-    ) -> tuple[np.ndarray | None, str]:
+    def remote_frame_status(self, max_age_s: float) -> tuple[np.ndarray | None, str]:
         """Return a fresh frame or a deterministic local-fallback reason."""
         with self._stats_lock:
             if self._remote_clients == 0:
@@ -238,7 +234,9 @@ class FrameHub:
         return frame, ""
 
     # -- API side ------------------------------------------------------
-    def push_remote_frame(self, frame: np.ndarray, session_id: int | None = None) -> bool:
+    def push_remote_frame(
+        self, frame: np.ndarray, session_id: int | None = None
+    ) -> bool:
         """Publish a frame only for the currently connected remote session."""
         with self._stats_lock:
             if self._remote_clients == 0:
@@ -268,9 +266,49 @@ class FrameHub:
             if self._remote_clients == 0:
                 self.remote_in.clear()
 
-    def clear_remote_frames(self) -> None:
-        """Invalidate output from the current remote session on mode changes."""
+    def active_remote_session(self) -> int | None:
+        """Return the authenticated renderer epoch, if one is currently live."""
+
+        with self._stats_lock:
+            return self._remote_session if self._remote_clients > 0 else None
+
+    def remote_session_valid(self, session_id: int) -> bool:
+        """Check a renderer lease without granting access to any other route."""
+
+        with self._stats_lock:
+            return self._remote_clients > 0 and session_id == self._remote_session
+
+    def _invalidate_remote_session_locked(self, session_id: int | None) -> bool:
+        if session_id is not None and session_id != self._remote_session:
+            return False
+        had_session = self._remote_clients > 0
+        if had_session:
+            # Advance immediately so an old WebSocket cannot publish in the gap
+            # before the next authenticated connection arrives.
+            self._remote_session += 1
+        self._remote_clients = 0
+        self.stats.remote_connected = False
         self.remote_in.clear()
+        return had_session
+
+    def invalidate_remote_session(self, session_id: int | None = None) -> bool:
+        """Atomically revoke the renderer epoch and discard every queued frame."""
+
+        with self._stats_lock:
+            return self._invalidate_remote_session_locked(session_id)
+
+    def reset_remote_session(self, reset: Callable[[], None]) -> bool:
+        """Revoke stale output and reset privacy state at the same boundary."""
+
+        with self._stats_lock:
+            had_session = self._invalidate_remote_session_locked(None)
+            reset()
+            return had_session
+
+    def clear_remote_frames(self) -> None:
+        """Discard queued output without changing the authenticated epoch."""
+        with self._stats_lock:
+            self.remote_in.clear()
 
     def update_stats(self, **kwargs) -> None:
         with self._stats_lock:
@@ -325,15 +363,9 @@ class FrameHub:
                 "segmentation_ms": self._rounded_optional(
                     self.stats.segmentation_ms, 1
                 ),
-                "background_ms": self._rounded_optional(
-                    self.stats.background_ms, 1
-                ),
-                "composite_ms": self._rounded_optional(
-                    self.stats.composite_ms, 1
-                ),
-                "output_send_ms": self._rounded_optional(
-                    self.stats.output_send_ms, 1
-                ),
+                "background_ms": self._rounded_optional(self.stats.background_ms, 1),
+                "composite_ms": self._rounded_optional(self.stats.composite_ms, 1),
+                "output_send_ms": self._rounded_optional(self.stats.output_send_ms, 1),
                 "frame_processing_ms": self._rounded_optional(
                     self.stats.frame_processing_ms, 1
                 ),

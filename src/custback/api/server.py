@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ValidationError
+
 try:  # python-multipart >= 0.0.12 canonical namespace
     from python_multipart.exceptions import FormParserError, MultipartParseError
     from python_multipart.multipart import MultipartParser, parse_options_header
@@ -37,7 +38,6 @@ from .. import __version__
 from ..backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, VIDEO_EXTS
 from ..config import (
     MODES,
-    BackgroundConfig,
     CameraConfig,
     CompositingConfig,
     OutputConfig,
@@ -46,6 +46,7 @@ from ..config import (
     UploadLimits,
 )
 from ..hub import FrameHub
+from ..storage_tx import OwnedPath, OwnershipLedger, rename_noreplace
 from .security import SESSION_COOKIE, SecurityPolicy
 from .streaming import ConnectionLimiter, JpegBroadcaster, LeasedStreamingResponse
 
@@ -92,9 +93,7 @@ _IMAGE_FORMATS = {
     ".bmp": "BMP",
     ".webp": "WEBP",
 }
-_STAGED_UPLOAD_RE = re.compile(
-    r"\.upload-[0-9a-f]{32}(?:\.part|\.[a-z0-9]+)\Z"
-)
+_STAGED_UPLOAD_RE = re.compile(r"\.upload-[0-9a-f]{32}(?:\.part|\.[a-z0-9]+)\Z")
 _FINAL_UPLOAD_RE = re.compile(r"[0-9a-f]{32}\.[a-z0-9]+\Z")
 
 LOGIN_HTML = """<!doctype html>
@@ -204,9 +203,14 @@ def _state(runtime: RuntimeConfig):
 def _state_body(state) -> dict[str, Any]:
     # Serialize through an explicit allow-list model so a future private field
     # cannot leak merely because a manual deny-list was not updated.
-    return PublicAppConfig.model_validate(state.config.to_dict()).model_dump(
-        mode="python"
+    private = state.config
+    payload = private.to_dict()
+    background = payload["background"]
+    background["camera_targets"] = tuple(sorted(private.backdrop_targets))
+    background["camera_source_configured"] = bool(
+        private.background.camera_target or private.background.camera_device != ""
     )
+    return PublicAppConfig.model_validate(payload).model_dump(mode="python")
 
 
 def _upload_limits(runtime: RuntimeConfig) -> _UploadLimits:
@@ -276,9 +280,23 @@ class PublicAvatarRemoteConfig(BaseModel):
     read_timeout_s: float
 
 
+class PublicBackgroundConfig(BaseModel):
+    """Browser-safe backdrop state with operator sources removed."""
+
+    mode: str
+    image_path: str
+    video_path: str
+    camera_target: str
+    camera_targets: tuple[str, ...]
+    camera_source_configured: bool
+    color: tuple[int, int, int]
+    blur_strength: int
+    remote_fallback_mode: str
+
+
 class PublicAppConfig(BaseModel):
     camera: CameraConfig
-    background: BackgroundConfig
+    background: PublicBackgroundConfig
     segmentation: SegmentationConfig
     compositing: CompositingConfig
     output: OutputConfig
@@ -409,8 +427,12 @@ def _map_apply_error(exc: BaseException) -> HTTPException:
         if isinstance(exc, FileNotFoundError):
             return _error(422, "activation_failed", "staged background is unavailable")
         if isinstance(exc, FileExistsError):
-            return _error(409, "config_conflict", "background destination already exists")
-        return _error(507, "insufficient_storage", "background storage operation failed")
+            return _error(
+                409, "config_conflict", "background destination already exists"
+            )
+        return _error(
+            507, "insufficient_storage", "background storage operation failed"
+        )
     if isinstance(exc, ValidationError):
         errors = []
         for error in exc.errors(
@@ -451,7 +473,9 @@ async def _limited_json(
     *,
     media_types: frozenset[str] = frozenset({"application/json"}),
 ) -> Any:
-    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    media_type = (
+        request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    )
     if media_type not in media_types:
         raise _error(
             415,
@@ -472,7 +496,12 @@ async def _limited_json(
         chunks.append(chunk)
     try:
         return json.loads(b"".join(chunks))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
         raise _error(422, "invalid_content", "valid JSON content is required") from exc
 
 
@@ -492,13 +521,29 @@ class _UploadStore:
         self.directory = directory
         self.limits = limits
         self._lock = threading.Lock()
-        self._reserved_bytes = 0
-        self._reserved_files = 0
+        self._ledger = OwnershipLedger(self.directory)
+        self._reserved_bytes = self._ledger.reserved_bytes
+        self._reserved_files = self._ledger.reserved_slots
         self._active_temps: set[Path] = set()
-        self._cleanup_pending: dict[
-            Path, tuple[tuple[Path, ...], int, bool]
-        ] = {}
+        self._transactions: dict[Path, OwnedPath] = {}
+        self._cleanup_pending: dict[Path, tuple[tuple[Path, ...], int, bool]] = {}
         self._cleanup_retry_lock = threading.Lock()
+
+    @staticmethod
+    def _remove_owned_path(path: Path, kind: str) -> None:
+        if kind != "file":
+            raise OSError(errno.EINVAL, "core upload ownership must be a file")
+        path.unlink()
+
+    def _sync_reservations_locked(self) -> None:
+        self._reserved_bytes = self._ledger.reserved_bytes
+        self._reserved_files = self._ledger.reserved_slots
+
+    def _forget_transaction_locked(self, record: OwnedPath) -> None:
+        for initial, owned in tuple(self._transactions.items()):
+            if owned is record:
+                self._transactions.pop(initial, None)
+                self._cleanup_pending.pop(initial, None)
 
     def ensure_directory(self) -> None:
         """Create or repair the user-owned managed directory as mode 0700."""
@@ -532,11 +577,10 @@ class _UploadStore:
             descriptor = os.open(self.directory, flags)
             try:
                 opened = os.fstat(descriptor)
-                if (
-                    not stat.S_ISDIR(opened.st_mode)
-                    or (opened.st_dev, opened.st_ino)
-                    != (after.st_dev, after.st_ino)
-                ):
+                if not stat.S_ISDIR(opened.st_mode) or (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != (after.st_dev, after.st_ino):
                     raise OSError(
                         errno.EAGAIN,
                         "upload storage changed while securing it",
@@ -550,34 +594,67 @@ class _UploadStore:
         if not self.directory.is_dir():
             return total, count
         for path in self.directory.iterdir():
-            if (
-                path.is_file()
-                and not path.is_symlink()
-            ):
+            if path.is_file() and not path.is_symlink():
                 # In-progress files are represented by reservations. Hidden
                 # files left by a dead process have no reservation and must
                 # count toward both aggregate quotas until safely reclaimed.
                 if path in self._active_temps:
                     continue
+                if self._ledger.owns(path):
+                    continue
                 count += 1
-                with contextlib.suppress(OSError):
-                    total += path.stat().st_size
+                # A stat failure must not turn an on-disk inode into zero-byte
+                # quota usage.  Fail the quota scan and therefore the upload.
+                total += path.stat().st_size
         return total, count
 
     def _reserve_file(self, temporary: Path) -> None:
         with self._lock:
             _total, count = self._usage()
             if count + self._reserved_files >= self.limits.max_files:
-                raise _error(507, "upload_quota_exceeded", "background file quota reached")
-            self._reserved_files += 1
+                raise _error(
+                    507, "upload_quota_exceeded", "background file quota reached"
+                )
+            if temporary.exists() or temporary.is_symlink():
+                raise FileExistsError(
+                    f"upload staging path already exists: {temporary.name}"
+                )
+            record = self._ledger.begin(temporary, kind="file", reserved_slots=1)
+            self._transactions[temporary] = record
+            self._sync_reservations_locked()
             self._active_temps.add(temporary)
 
-    def _reserve_bytes(self, amount: int) -> None:
+    def _reserve_bytes(self, amount: int, temporary: Path | None = None) -> None:
         with self._lock:
             total, _count = self._usage()
             if total + self._reserved_bytes + amount > self.limits.storage_max_bytes:
-                raise _error(507, "upload_quota_exceeded", "background storage quota reached")
-            self._reserved_bytes += amount
+                raise _error(
+                    507, "upload_quota_exceeded", "background storage quota reached"
+                )
+            record = self._ledger.find(
+                temporary if temporary is not None else next(iter(self._active_temps))
+            )
+            if record is None:
+                raise ValueError("upload byte reservation has no owner")
+            self._ledger.set_charge(
+                record, reserved_bytes=record.reserved_bytes + amount
+            )
+            self._sync_reservations_locked()
+
+    def _bind_created(self, temporary: Path) -> None:
+        with self._lock:
+            record = self._ledger.find(temporary)
+            if record is None:
+                raise ValueError("upload staging has no ownership record")
+            self._ledger.bind(record, temporary)
+
+    def _abandon_unbound(self, temporary: Path) -> None:
+        with self._lock:
+            record = self._transactions.pop(temporary, None)
+            if record is not None:
+                self._ledger.abandon_unbound(record)
+            self._active_temps.discard(temporary)
+            self._sync_reservations_locked()
 
     def _release(
         self, temporary: Path, reserved_bytes: int, reserved_file: bool
@@ -589,17 +666,15 @@ class _UploadStore:
         self, temporary: Path, reserved_bytes: int, reserved_file: bool
     ) -> None:
         self._active_temps.discard(temporary)
-        if reserved_file:
-            self._reserved_files = max(0, self._reserved_files - 1)
-        self._reserved_bytes = max(0, self._reserved_bytes - reserved_bytes)
+        self._sync_reservations_locked()
 
     def _commit(self, temporary: Path, staged: Path, reserved_bytes: int) -> None:
-        """Publish only a hidden staged file and release its reservation."""
+        """Move an owned upload to its hidden activation name."""
         with self._lock:
-            self._replace_private(temporary, staged)
+            self._rename_private_owned(temporary, staged)
             self._active_temps.discard(temporary)
-            self._reserved_files = max(0, self._reserved_files - 1)
-            self._reserved_bytes = max(0, self._reserved_bytes - reserved_bytes)
+            self._active_temps.add(staged)
+            self._sync_reservations_locked()
 
     @staticmethod
     def _open_private_file(path: Path):
@@ -646,19 +721,45 @@ class _UploadStore:
         finally:
             os.close(descriptor)
 
-    @classmethod
-    def _replace_private(cls, source: Path, destination: Path) -> None:
-        """Rename one owned file and explicitly reassert mode 0600."""
+    def _rename_private_owned(self, source: Path, destination: Path) -> None:
+        """Rename/harden while retaining both possible names on failure."""
 
-        os.replace(source, destination)
+        record = self._ledger.find(source, destination)
+        if record is None:
+            raise ValueError("upload rename has no ownership record")
+        self._ledger.prepare_rename(record, source, destination)
+        rename_noreplace(source, destination)
         try:
-            cls._secure_private_file(destination)
-        except BaseException:
-            # Restore the caller's ownership state when post-rename hardening
-            # fails; transaction cleanup can then remove the original path.
-            with contextlib.suppress(OSError):
-                os.replace(destination, source)
-            raise
+            self._ledger.finish_rename(record, destination)
+            self._secure_private_file(destination)
+        except BaseException as primary:
+            # Rollback is best effort, but unlike the historical helper its
+            # failure cannot discard ownership: both candidates were persisted
+            # before either rename and reconcile follows the inode.
+            try:
+                if destination in self._ledger.reconcile(record):
+                    self._ledger.prepare_rename(record, destination, source)
+                    rename_noreplace(destination, source)
+                    self._ledger.finish_rename(record, source)
+            except OSError:
+                try:
+                    self._ledger.reconcile(record)
+                except OSError:
+                    pass
+            raise primary
+
+    def _finish_transaction(self, *paths: Path) -> None:
+        """Transfer a successfully activated inode to committed disk usage."""
+
+        with self._lock:
+            record = self._ledger.find(*paths)
+            if record is None:
+                return
+            self._ledger.commit(record)
+            for path in record.paths:
+                self._active_temps.discard(path)
+            self._forget_transaction_locked(record)
+            self._sync_reservations_locked()
 
     @staticmethod
     def _sync_and_close(destination: Any) -> None:
@@ -683,6 +784,40 @@ class _UploadStore:
                 destination.close()
         paths = tuple(path for path in (temporary, staged) if path is not None)
         with self._cleanup_retry_lock:
+            with self._lock:
+                record = self._transactions.get(temporary) or self._ledger.find(*paths)
+                if record is not None:
+                    try:
+                        self._ledger.mark_cleanup(record)
+                    except OSError:
+                        pass
+                    error: OSError | None = None
+                    # Retain the historical bounded immediate retry, but keep
+                    # the durable record and quota charge after all attempts.
+                    for _attempt in range(3):
+                        error = self._ledger.cleanup(record, self._remove_owned_path)
+                        if error is None:
+                            break
+                    if error is not None:
+                        actual = record.paths
+                        self._active_temps.update(actual)
+                        self._cleanup_pending[temporary] = (
+                            actual,
+                            record.reserved_bytes,
+                            bool(record.reserved_slots),
+                        )
+                        self._sync_reservations_locked()
+                        log.warning(
+                            "cannot remove failed upload staging file(s): %s",
+                            ", ".join(path.name for path in actual),
+                        )
+                        return
+                    for path in paths:
+                        self._active_temps.discard(path)
+                    self._cleanup_pending.pop(temporary, None)
+                    self._transactions.pop(temporary, None)
+                    self._sync_reservations_locked()
+                    return
             remaining = self._unlink_cleanup_paths(paths)
             if remaining:
                 # Keep the reservation/active-file ownership until a later
@@ -725,9 +860,38 @@ class _UploadStore:
 
         with self._cleanup_retry_lock:
             with self._lock:
+                self._ledger.retry_cleanup(self._remove_owned_path)
+                pending_records = tuple(
+                    record
+                    for record in self._ledger.records
+                    if record.state == "cleanup"
+                )
+                self._active_temps = {
+                    path for record in pending_records for path in record.paths
+                } | {
+                    path
+                    for path in self._active_temps
+                    if self._ledger.find(path) is not None
+                    and self._ledger.find(path).state == "active"
+                }
+                for temporary, record in tuple(self._cleanup_pending.items()):
+                    owned = self._ledger.find(*record[0])
+                    if owned is None:
+                        self._cleanup_pending.pop(temporary, None)
+                        self._transactions.pop(temporary, None)
+                    else:
+                        self._cleanup_pending[temporary] = (
+                            owned.paths,
+                            owned.reserved_bytes,
+                            bool(owned.reserved_slots),
+                        )
+                self._sync_reservations_locked()
+            with self._lock:
                 pending = tuple(self._cleanup_pending.items())
             for temporary, record in pending:
                 paths, reserved_bytes, reserved_file = record
+                if self._ledger.find(*paths) is not None:
+                    continue
                 remaining = self._unlink_cleanup_paths(paths)
                 with self._lock:
                     if self._cleanup_pending.get(temporary) != record:
@@ -740,9 +904,7 @@ class _UploadStore:
                         )
                     else:
                         self._cleanup_pending.pop(temporary, None)
-                        self._release_locked(
-                            temporary, reserved_bytes, reserved_file
-                        )
+                        self._release_locked(temporary, reserved_bytes, reserved_file)
 
     @staticmethod
     def _active_background_path(config: Any) -> str:
@@ -784,11 +946,38 @@ class _UploadStore:
         ):
             raise ValueError("invalid failed-upload cleanup paths")
         with self._lock:
-            targets = (staged, final) if final_owned else (staged,)
-            for path in targets:
-                if not self._is_active(path, config):
-                    with contextlib.suppress(FileNotFoundError):
-                        path.unlink()
+            record = self._ledger.find(staged, final)
+            if record is None:
+                return
+            current = self._ledger.reconcile(record)
+            if any(self._is_active(path, config) for path in current):
+                self._ledger.commit(record)
+                for path in current:
+                    self._active_temps.discard(path)
+                self._forget_transaction_locked(record)
+                self._sync_reservations_locked()
+                return
+            try:
+                self._ledger.mark_cleanup(record)
+            except OSError:
+                pass
+            error = self._ledger.cleanup(record, self._remove_owned_path)
+            self._sync_reservations_locked()
+            if error is not None:
+                self._cleanup_pending.setdefault(
+                    staged,
+                    (
+                        record.paths,
+                        record.reserved_bytes,
+                        bool(record.reserved_slots),
+                    ),
+                )
+                self._active_temps.update(record.paths)
+                raise error
+            self._active_temps.discard(staged)
+            self._active_temps.discard(final)
+            self._forget_transaction_locked(record)
+            self._cleanup_pending.pop(staged, None)
 
     def promote(self, staged: Path, final: Path) -> None:
         if (
@@ -803,38 +992,52 @@ class _UploadStore:
             if staged.is_symlink() or not staged.is_file():
                 raise FileNotFoundError(f"staged upload is unavailable: {staged.name}")
             if final.exists() or final.is_symlink():
-                raise FileExistsError(f"upload destination already exists: {final.name}")
-            self._replace_private(staged, final)
+                raise FileExistsError(
+                    f"upload destination already exists: {final.name}"
+                )
+            self._rename_private_owned(staged, final)
+            self._active_temps.discard(staged)
+            self._active_temps.add(final)
 
     def rollback_promotion(self, staged: Path, final: Path) -> None:
         with self._lock:
             if final.is_symlink() or not final.is_file():
                 raise FileNotFoundError(f"promoted upload is unavailable: {final.name}")
             if staged.exists() or staged.is_symlink():
-                raise FileExistsError(f"upload staging path already exists: {staged.name}")
-            self._replace_private(final, staged)
+                raise FileExistsError(
+                    f"upload staging path already exists: {staged.name}"
+                )
+            self._rename_private_owned(final, staged)
+            self._active_temps.discard(final)
+            self._active_temps.add(staged)
 
     def cleanup_staged(self, config: Any) -> None:
-        """Reclaim crash-left hidden files unless effective config references one."""
+        """Recover only explicitly marked crash-left owned inodes."""
         try:
             os.lstat(self.directory)
         except FileNotFoundError:
             return
         self.ensure_directory()
         with self._lock:
-            for path in self.directory.iterdir():
-                if (
-                    _STAGED_UPLOAD_RE.fullmatch(path.name) is not None
-                    and path.is_file()
-                    and not path.is_symlink()
-                    and not self._is_active(path, config)
+            for record in tuple(self._ledger.records):
+                current = self._ledger.reconcile(record)
+                if record.state == "committed" or any(
+                    self._is_active(path, config) for path in current
                 ):
-                    try:
-                        path.unlink()
-                    except OSError:
-                        # It remains included in _usage(), so cleanup failure
-                        # cannot turn into an aggregate-quota bypass.
-                        log.warning("cannot remove stale staged upload %s", path)
+                    self._ledger.commit(record)
+                    continue
+                try:
+                    self._ledger.mark_cleanup(record)
+                except OSError:
+                    pass
+                error = self._ledger.cleanup(record, self._remove_owned_path)
+                if error is not None:
+                    self._active_temps.update(record.paths)
+                    log.warning(
+                        "cannot remove marked staged upload %s",
+                        ", ".join(path.name for path in record.paths),
+                    )
+            self._sync_reservations_locked()
 
     async def save(self, request: Request, kind: str) -> _SavedUpload:
         """Parse one multipart file directly into an owned mode-0600 file.
@@ -843,16 +1046,22 @@ class _UploadStore:
         would spool the complete multipart body before endpoint limits run.
         """
         maximum = (
-            self.limits.image_max_bytes if kind == "image" else self.limits.video_max_bytes
+            self.limits.image_max_bytes
+            if kind == "image"
+            else self.limits.video_max_bytes
         )
         content_type = request.headers.get("content-type", "")
         try:
             media_type, options = parse_options_header(content_type.encode("latin-1"))
         except (UnicodeEncodeError, ValueError) as exc:
-            raise _error(415, "unsupported_media_type", "invalid multipart Content-Type") from exc
+            raise _error(
+                415, "unsupported_media_type", "invalid multipart Content-Type"
+            ) from exc
         boundary = options.get(b"boundary")
         if media_type != b"multipart/form-data" or not boundary:
-            raise _error(415, "unsupported_media_type", "multipart/form-data is required")
+            raise _error(
+                415, "unsupported_media_type", "multipart/form-data is required"
+            )
 
         content_length = request.headers.get("content-length")
         if content_length:
@@ -865,7 +1074,9 @@ class _UploadStore:
                         limit=maximum,
                     )
             except ValueError as exc:
-                raise _error(400, "invalid_content_length", "invalid Content-Length") from exc
+                raise _error(
+                    400, "invalid_content_length", "invalid Content-Length"
+                ) from exc
 
         try:
             mkdir_result = await _to_thread_terminal(self.ensure_directory)
@@ -916,15 +1127,31 @@ class _UploadStore:
         def on_headers_finished() -> None:
             nonlocal current_file, file_seen, original, suffix, staged, final
             if file_seen:
-                raise _error(422, "invalid_multipart", "exactly one file part is required")
-            disposition, values = parse_options_header(headers.get(b"content-disposition"))
+                raise _error(
+                    422, "invalid_multipart", "exactly one file part is required"
+                )
+            disposition, values = parse_options_header(
+                headers.get(b"content-disposition")
+            )
             filename = values.get(b"filename")
-            if disposition != b"form-data" or values.get(b"name") != b"file" or not filename:
-                raise _error(422, "invalid_multipart", "a file field named 'file' is required")
+            if (
+                disposition != b"form-data"
+                or values.get(b"name") != b"file"
+                or not filename
+            ):
+                raise _error(
+                    422, "invalid_multipart", "a file field named 'file' is required"
+                )
             if headers.get(b"content-transfer-encoding", b"binary").lower() not in {
-                b"binary", b"8bit", b"7bit"
+                b"binary",
+                b"8bit",
+                b"7bit",
             }:
-                raise _error(415, "unsupported_media_type", "encoded multipart files are unsupported")
+                raise _error(
+                    415,
+                    "unsupported_media_type",
+                    "encoded multipart files are unsupported",
+                )
             original = Path(filename.decode("latin-1").replace("\\", "/")).name
             if not original or "\x00" in original:
                 raise _error(400, "missing_filename", "upload filename is required")
@@ -938,7 +1165,9 @@ class _UploadStore:
                     allowed=sorted(allowed),
                 )
             declared = headers.get(b"content-type", b"").decode("latin-1").lower()
-            expected = (_IMAGE_MEDIA_TYPES if kind == "image" else _VIDEO_MEDIA_TYPES)[suffix]
+            expected = (_IMAGE_MEDIA_TYPES if kind == "image" else _VIDEO_MEDIA_TYPES)[
+                suffix
+            ]
             if declared not in expected:
                 raise _error(
                     415,
@@ -962,7 +1191,7 @@ class _UploadStore:
                     f"{kind} exceeds {maximum} byte limit",
                     limit=maximum,
                 )
-            self._reserve_bytes(length)
+            self._reserve_bytes(length, temporary)
             reserved_bytes += length
             destination.write(data[start:end])
             size += length
@@ -978,17 +1207,27 @@ class _UploadStore:
             message_complete = True
 
         try:
-            reserve_result = await _to_thread_terminal(
-                self._reserve_file, temporary
-            )
+            reserve_result = await _to_thread_terminal(self._reserve_file, temporary)
             reserved_file = True
             if reserve_result.cancellation is not None:
                 raise reserve_result.cancellation
 
-            open_result = await _to_thread_terminal(
-                self._open_private_file, temporary
-            )
+            try:
+                open_result = await _to_thread_terminal(
+                    self._open_private_file, temporary
+                )
+            except FileExistsError as exc:
+                await _to_thread_terminal(self._abandon_unbound, temporary)
+                handed_off = True  # the colliding inode was never ours
+                raise _error(
+                    507,
+                    "insufficient_storage",
+                    "upload staging name collided",
+                ) from exc
             destination = open_result.value
+            bind_result = await _to_thread_terminal(self._bind_created, temporary)
+            if bind_result.cancellation is not None:
+                raise bind_result.cancellation
             if open_result.cancellation is not None:
                 raise open_result.cancellation
             parser = MultipartParser(
@@ -1008,7 +1247,12 @@ class _UploadStore:
             async for received in request.stream():
                 body_size += len(received)
                 if body_size > maximum + MULTIPART_OVERHEAD_BYTES:
-                    raise _error(413, "upload_too_large", "multipart request is too large", limit=maximum)
+                    raise _error(
+                        413,
+                        "upload_too_large",
+                        "multipart request is too large",
+                        limit=maximum,
+                    )
                 for offset in range(0, len(received), UPLOAD_CHUNK_BYTES):
                     write_result = await _to_thread_terminal(
                         parser.write,
@@ -1019,9 +1263,7 @@ class _UploadStore:
             finalize_result = await _to_thread_terminal(parser.finalize)
             if finalize_result.cancellation is not None:
                 raise finalize_result.cancellation
-            sync_result = await _to_thread_terminal(
-                self._sync_and_close, destination
-            )
+            sync_result = await _to_thread_terminal(self._sync_and_close, destination)
             destination = None
             if sync_result.cancellation is not None:
                 raise sync_result.cancellation
@@ -1043,15 +1285,17 @@ class _UploadStore:
             staged_owned = staged
             if commit_result.cancellation is not None:
                 raise commit_result.cancellation
-            saved = _SavedUpload(
-                staged, final, original, size, width, height, kind
-            )
+            saved = _SavedUpload(staged, final, original, size, width, height, kind)
             handed_off = True
             return saved
         except (FormParserError, MultipartParseError) as exc:
-            raise _error(422, "invalid_multipart", "malformed multipart upload") from exc
+            raise _error(
+                422, "invalid_multipart", "malformed multipart upload"
+            ) from exc
         except OSError as exc:
-            raise _error(507, "insufficient_storage", "cannot store background") from exc
+            raise _error(
+                507, "insufficient_storage", "cannot store background"
+            ) from exc
         finally:
             if not handed_off:
                 cleanup_result = await _to_thread_terminal(
@@ -1097,10 +1341,9 @@ class _UploadStore:
                     # does not fully decompress pixel data. Reopen and load so
                     # corrupt compressed payloads never reach OpenCV.
                     with Image.open(path) as decoded:
-                        if (
-                            decoded.format != _IMAGE_FORMATS.get(suffix)
-                            or decoded.size != (width, height)
-                        ):
+                        if decoded.format != _IMAGE_FORMATS.get(
+                            suffix
+                        ) or decoded.size != (width, height):
                             raise ValueError("image changed during validation")
                         decoded.load()
             except HTTPException:
@@ -1184,11 +1427,7 @@ class _UploadStore:
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     break
-                if (
-                    frame.dtype != np.uint8
-                    or frame.ndim != 3
-                    or frame.shape[2] != 3
-                ):
+                if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
                     raise _error(
                         422, "invalid_media", "video contains an invalid frame"
                     )
@@ -1218,6 +1457,8 @@ class _UploadStore:
             raise _error(404, "background_not_found", "background does not exist")
         with self._lock:
             path = self.directory / identifier
+            if self._ledger.owns(path):
+                raise _error(404, "background_not_found", "background does not exist")
             if path.is_symlink():
                 raise _error(404, "background_not_found", "background does not exist")
             try:
@@ -1228,7 +1469,9 @@ class _UploadStore:
                 raise _error(404, "background_not_found", "background does not exist")
 
             if self._is_active(resolved, config):
-                raise _error(409, "background_in_use", "active background cannot be deleted")
+                raise _error(
+                    409, "background_in_use", "active background cannot be deleted"
+                )
             resolved.unlink()
 
 
@@ -1250,7 +1493,9 @@ class _StagedCleanupQueue:
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
 
-    def submit(self, saved: _SavedUpload, final_owned: threading.Event) -> threading.Event:
+    def submit(
+        self, saved: _SavedUpload, final_owned: threading.Event
+    ) -> threading.Event:
         done = threading.Event()
         self._tasks.put(_CleanupTask(saved, final_owned, done))
         with self._lock:
@@ -1320,7 +1565,9 @@ class _StagedCleanupQueue:
 async def _deny_ws(ws: WebSocket, status: int, code: int, detail: str) -> None:
     response = JSONResponse({"detail": detail}, status_code=status)
     denial = getattr(ws, "send_denial_response", None)
-    if denial is not None and "websocket.http.response" in ws.scope.get("extensions", {}):
+    if denial is not None and "websocket.http.response" in ws.scope.get(
+        "extensions", {}
+    ):
         await denial(response)
     else:
         await ws.close(code=code, reason=detail)
@@ -1401,9 +1648,7 @@ def create_app(
         origins = request.headers.getlist("origin")
         authorizations = request.headers.getlist("authorization")
         valid_header_shape = (
-            len(hosts) == 1
-            and len(origins) <= 1
-            and len(authorizations) <= 1
+            len(hosts) == 1 and len(origins) <= 1 and len(authorizations) <= 1
         )
         host = hosts[0] if len(hosts) == 1 else None
         origin = origins[0] if len(origins) == 1 else None
@@ -1411,7 +1656,12 @@ def create_app(
         try:
             if not valid_header_shape or not security.context_allowed(host, origin):
                 response: Response = JSONResponse(
-                    {"detail": {"code": "forbidden_origin", "message": "request context rejected"}},
+                    {
+                        "detail": {
+                            "code": "forbidden_origin",
+                            "message": "request context rejected",
+                        }
+                    },
                     status_code=403,
                 )
             elif request.url.path == "/auth/session" and request.method == "POST":
@@ -1530,9 +1780,7 @@ def create_app(
                 "required": True,
                 "content": {
                     "application/json": {"schema": {"type": "object"}},
-                    "application/merge-patch+json": {
-                        "schema": {"type": "object"}
-                    },
+                    "application/merge-patch+json": {"schema": {"type": "object"}},
                 },
             }
         },
@@ -1541,9 +1789,7 @@ def create_app(
         patch = await _limited_json(
             request,
             CONFIG_REQUEST_MAX_BYTES,
-            media_types=frozenset(
-                {"application/json", "application/merge-patch+json"}
-            ),
+            media_types=frozenset({"application/json", "application/merge-patch+json"}),
         )
         if not isinstance(patch, dict):
             raise _error(422, "invalid_content", "config patch must be a JSON object")
@@ -1562,6 +1808,7 @@ def create_app(
                 for p in store.directory.iterdir()
                 if p.is_file()
                 and not p.is_symlink()
+                and not store._ledger.owns(p)
                 and not p.name.startswith(".upload-")
                 and p.suffix.lower() in IMAGE_EXTS | VIDEO_EXTS
             )
@@ -1593,6 +1840,7 @@ def create_app(
             suffix not in IMAGE_EXTS | VIDEO_EXTS
             or not path.is_file()
             or path.is_symlink()
+            or store._ledger.owns(path)
         ):
             raise _error(404, "media_not_found", "no such stored file")
         stat_result = path.stat()
@@ -1635,18 +1883,34 @@ def create_app(
         def discard_failed_candidate() -> threading.Event:
             return cleanup_queue.submit(saved, promoted)
 
-        def cleanup_cancelled_failure(
+        def settle_activation_ownership(
             completed: concurrent.futures.Future,
         ) -> None:
             try:
                 completed.result()
             except BaseException:
                 discard_failed_candidate()
+            else:
+                try:
+                    store._finish_transaction(saved.path, saved.final_path)
+                except OSError:
+                    # The active config remains authoritative.  Its durable
+                    # ownership record is charged and startup recovery will
+                    # adopt it rather than deleting the active inode.
+                    log.warning(
+                        "cannot yet finalize activated upload ownership %s",
+                        saved.final_path,
+                        exc_info=True,
+                    )
+
+        # Settlement belongs to the authoritative concurrent future, not the
+        # request task.  It therefore runs even if cancellation lands after
+        # apply succeeds or while an asyncio worker would be admitted.
+        apply_future.add_done_callback(settle_activation_ownership)
 
         try:
             state = await asyncio.shield(asyncio.wrap_future(apply_future))
         except asyncio.CancelledError:
-            apply_future.add_done_callback(cleanup_cancelled_failure)
             raise
         except BaseException as exc:
             cleanup_done = discard_failed_candidate()
@@ -1657,6 +1921,18 @@ def create_app(
             if isinstance(exc, HTTPException):
                 raise
             raise _map_apply_error(exc) from exc
+        try:
+            await asyncio.to_thread(
+                store._finish_transaction, saved.path, saved.final_path
+            )
+        except OSError:
+            # Activation has already committed.  Keep the ownership charge and
+            # let active-config-aware restart recovery adopt this exact inode.
+            log.warning(
+                "cannot yet finalize activated upload ownership %s",
+                saved.final_path,
+                exc_info=True,
+            )
         body = {
             "id": saved.final_path.name,
             "original_name": saved.original_name,
@@ -1680,9 +1956,7 @@ def create_app(
                     "schema": {
                         "type": "object",
                         "required": ["file"],
-                        "properties": {
-                            "file": {"type": "string", "format": "binary"}
-                        },
+                        "properties": {"file": {"type": "string", "format": "binary"}},
                     }
                 }
             },
@@ -1732,9 +2006,7 @@ def create_app(
             200: {
                 "description": "Latest composited frame as JPEG",
                 "content": {
-                    "image/jpeg": {
-                        "schema": {"type": "string", "format": "binary"}
-                    }
+                    "image/jpeg": {"schema": {"type": "string", "format": "binary"}}
                 },
             }
         },
@@ -1781,9 +2053,13 @@ def create_app(
                         if jpeg is None:
                             continue
                         yield (
-                            f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
-                            f"Content-Length: {len(jpeg)}\r\n\r\n"
-                        ).encode() + jpeg + b"\r\n"
+                            (
+                                f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
+                                f"Content-Length: {len(jpeg)}\r\n\r\n"
+                            ).encode()
+                            + jpeg
+                            + b"\r\n"
+                        )
             finally:
                 # Direct iterator consumers and the response wrapper may both
                 # release; ConnectionLease is deliberately idempotent.
@@ -1804,9 +2080,7 @@ def create_app(
             len(hosts) != 1
             or len(origins) > 1
             or len(authorizations) > 1
-            or not security.context_allowed(
-                hosts[0], origins[0] if origins else None
-            )
+            or not security.context_allowed(hosts[0], origins[0] if origins else None)
         ):
             await _deny_ws(ws, 403, 4403, "request origin or host rejected")
             return
@@ -1815,8 +2089,8 @@ def create_app(
             authorization,
             ws.cookies.get(SESSION_COOKIE),
         )
-        renderer_authenticated = (
-            stream == "raw" and security.renderer_bearer_valid(authorization)
+        renderer_authenticated = stream == "raw" and security.renderer_bearer_valid(
+            authorization
         )
         if not (management_authenticated or renderer_authenticated):
             await _deny_ws(ws, 401, 4401, "valid route credential required")
@@ -1838,9 +2112,7 @@ def create_app(
         remote_session = None
         try:
             await ws.accept()
-            remote_session = (
-                hub.remote_client_connected() if stream == "raw" else None
-            )
+            remote_session = hub.remote_client_connected() if stream == "raw" else None
             jpegs = raw_jpegs if stream == "raw" else output_jpegs
             stop = asyncio.Event()
             ws_limit = int(
@@ -1855,6 +2127,14 @@ def create_app(
                 async with jpegs.subscribe() as subscription:
                     seq = -1
                     while not stop.is_set():
+                        if remote_session is not None and not hub.remote_session_valid(
+                            remote_session
+                        ):
+                            await ws.close(
+                                code=1012,
+                                reason="renderer session invalidated",
+                            )
+                            return
                         jpeg, seq = await subscription.get(seq, 0.5)
                         if jpeg is not None:
                             await ws.send_bytes(jpeg)

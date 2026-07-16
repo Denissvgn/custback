@@ -180,16 +180,16 @@ async def _receive_body_to(
     async for chunk in request.stream():
         total += len(chunk)
         if total > max_bytes:
-            raise _error(
-                413, "upload_too_large", f"{kind} exceeds {max_bytes} bytes"
-            )
+            raise _error(413, "upload_too_large", f"{kind} exceeds {max_bytes} bytes")
         result = await _to_thread_terminal(destination.write, chunk)
         if result.cancellation is not None:
             raise result.cancellation
     return total
 
 
-def resolve_avatar_api_token(token_file: str, *, environ: Mapping[str, str] | None = None):
+def resolve_avatar_api_token(
+    token_file: str, *, environ: Mapping[str, str] | None = None
+):
     """Resolve the avatar control-plane token (its own env var and file)."""
     env = os.environ if environ is None else environ
     from_env = env.get(AVATAR_TOKEN_ENV, "")
@@ -251,9 +251,7 @@ class PublicAvatarConfigPatchResponse(BaseModel):
 def _public_config(config: AvatarConfig) -> dict[str, Any]:
     """Serialize only fields in the browser-safe public contract."""
 
-    return PublicAvatarConfig.model_validate(config.to_dict()).model_dump(
-        mode="python"
-    )
+    return PublicAvatarConfig.model_validate(config.to_dict()).model_dump(mode="python")
 
 
 def create_avatar_app(
@@ -312,14 +310,24 @@ def create_avatar_app(
                 origins[0] if len(origins) == 1 else None,
             ):
                 response: Response = JSONResponse(
-                    {"detail": {"code": "forbidden_origin", "message": "request context rejected"}},
+                    {
+                        "detail": {
+                            "code": "forbidden_origin",
+                            "message": "request context rejected",
+                        }
+                    },
                     status_code=403,
                 )
             elif not security.bearer_valid(
                 authorizations[0] if len(authorizations) == 1 else None
             ):
                 response = JSONResponse(
-                    {"detail": {"code": "unauthorized", "message": "valid API token required"}},
+                    {
+                        "detail": {
+                            "code": "unauthorized",
+                            "message": "valid API token required",
+                        }
+                    },
                     status_code=401,
                     headers={"WWW-Authenticate": "Bearer"},
                 )
@@ -429,9 +437,7 @@ def create_avatar_app(
                 media_types=_ZIP_MEDIA_TYPES,
                 kind="rig archive",
             )
-            result = await _to_thread_terminal(
-                rig_store.install_zip, name, staging
-            )
+            result = await _to_thread_terminal(rig_store.install_zip, name, staging)
             installed = result.value
             if result.cancellation is not None:
                 raise result.cancellation
@@ -522,9 +528,7 @@ def create_avatar_app(
                 media_types=media_types,
                 kind=kind,
             )
-            result = await _to_thread_terminal(
-                media_store.commit, staging, name, kind
-            )
+            result = await _to_thread_terminal(media_store.commit, staging, name, kind)
             saved = result.value
             if result.cancellation is not None:
                 raise result.cancellation
@@ -595,9 +599,7 @@ def create_avatar_app(
         patch = await _limited_json(
             request,
             CONFIG_REQUEST_MAX_BYTES,
-            media_types=frozenset(
-                {"application/json", "application/merge-patch+json"}
-            ),
+            media_types=frozenset({"application/json", "application/merge-patch+json"}),
         )
         if not isinstance(patch, dict):
             raise _error(422, "invalid_content", "config patch must be a JSON object")
@@ -711,9 +713,13 @@ def create_avatar_app(
                         if jpeg is None:
                             continue
                         yield (
-                            f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
-                            f"Content-Length: {len(jpeg)}\r\n\r\n"
-                        ).encode() + jpeg + b"\r\n"
+                            (
+                                f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
+                                f"Content-Length: {len(jpeg)}\r\n\r\n"
+                            ).encode()
+                            + jpeg
+                            + b"\r\n"
+                        )
             finally:
                 lease.release()
 

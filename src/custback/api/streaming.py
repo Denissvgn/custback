@@ -80,14 +80,14 @@ class JpegBroadcaster:
         self._latest_error: BaseException | None = None
         self._running_seq = -1
         self._running_job: concurrent.futures.Future[bytes] | None = None
-        self._running_delivery: (
-            concurrent.futures.Future[tuple[bytes, int]] | None
-        ) = None
+        self._running_delivery: concurrent.futures.Future[tuple[bytes, int]] | None = (
+            None
+        )
         self._pending_seq = -1
         self._pending_frame: Any | None = None
-        self._pending_delivery: (
-            concurrent.futures.Future[tuple[bytes, int]] | None
-        ) = None
+        self._pending_delivery: concurrent.futures.Future[tuple[bytes, int]] | None = (
+            None
+        )
 
     def subscribe(self) -> "JpegSubscription":
         return JpegSubscription(self, self._slot.subscribe())
@@ -171,9 +171,9 @@ class JpegBroadcaster:
                     return cached
 
             if self._running_job is None:
-                delivery: concurrent.futures.Future[
-                    tuple[bytes, int]
-                ] = concurrent.futures.Future()
+                delivery: concurrent.futures.Future[tuple[bytes, int]] = (
+                    concurrent.futures.Future()
+                )
                 created_job = self._start_locked(frame, seq, delivery)
             elif seq <= self._running_seq:
                 delivery = self._running_delivery

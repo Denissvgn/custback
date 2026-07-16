@@ -8,6 +8,38 @@ permissions:
   contents: read
 
 jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: python -m pip install --upgrade 'pip>=23,<27'
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip check
+      - run: python -m ruff check src tests examples scripts/release
+      - run: python -m ruff format --check src tests examples scripts/release
+
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade 'pip>=23,<27'
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip check
+      - run: timeout 180s python -m pytest -q tests/test_phase6_stress.py
+        env:
+          CUSTBACK_STRESS_ITERATIONS: "100"
+          CUSTBACK_STRESS_SEED: "0xC057BAC6"
+
   python-core:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -25,6 +57,8 @@ jobs:
       - run: python -m pip install -e '.[dev]'
       - run: python -m pip check
       - run: timeout 180s python -m pytest -q
+      - if: matrix.python-version == '3.12'
+        run: node scripts/release/verify-release.js --regressions=pytest
 
   opencv-compatibility:
     runs-on: ubuntu-latest
@@ -151,7 +185,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        node-version: ["18.15.0", "20", "22"]
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -160,7 +194,16 @@ jobs:
           cache: npm
       - run: CUSTBACK_SKIP_INSTALL=1 npm ci --ignore-scripts
       - run: npm test
-      - run: npm pack --dry-run --json
+      - if: matrix.node-version == '18.15.0'
+        run: node scripts/release/verify-release.js --regressions=node
+      - name: Prove lifecycle publication remains blocked by REL-01
+        run: |
+          if npm pack --dry-run --json >"$RUNNER_TEMP/pack.out" 2>"$RUNNER_TEMP/pack.err"; then
+            echo "npm prepack unexpectedly authorized publication" >&2
+            exit 1
+          fi
+          grep -q 'REL-01' "$RUNNER_TEMP/pack.err"
+          npm pack --dry-run --json --ignore-scripts
 
   package-smoke:
     runs-on: ${{ matrix.os }}
@@ -178,6 +221,6 @@ jobs:
         with:
           node-version: 20
       - run: python -m pip install --upgrade 'pip>=23,<27' 'build>=1.2,<2'
-      - run: npm run release:check
+      - run: node scripts/release/package-smoke.js
         env:
           CUSTBACK_RELEASE_TMPDIR: ${{ runner.temp }}

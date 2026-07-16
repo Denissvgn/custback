@@ -22,9 +22,7 @@ class FakeCV2:
     LINE_AA = 16
     error = type("error", (Exception,), {})
 
-    def __init__(
-        self, keys=(ord("q"),), fail_named_window=False, fail_wait_key=False
-    ):
+    def __init__(self, keys=(ord("q"),), fail_named_window=False, fail_wait_key=False):
         self.keys = list(keys)
         self.fail_named_window = fail_named_window
         self.fail_wait_key = fail_wait_key
@@ -98,6 +96,7 @@ def feed(hub, n=20, interval=0.01):
         for _ in range(n):
             hub.publish_output(np.zeros((72, 128, 3), np.uint8))
             time.sleep(interval)
+
     t = threading.Thread(target=run, daemon=True)
     t.start()
     return t
@@ -139,13 +138,13 @@ def test_preview_shows_frames_and_quits_on_q(monkeypatch):
     stop = threading.Event()
     feed(hub)
     preview_mod.run_preview(make_runtime(), hub, stop)
-    assert stop.is_set()          # quitting the preview stops the app
+    assert stop.is_set()  # quitting the preview stops the app
     assert len(fake.shown) >= 1
     assert fake.destroyed
 
 
 def test_preview_stops_when_stop_event_set(monkeypatch):
-    fake = FakeCV2(keys=[])       # user never presses a key
+    fake = FakeCV2(keys=[])  # user never presses a key
     monkeypatch.setattr(preview_mod, "cv2", fake)
     hub = hub_with_frame()
     stop = threading.Event()
@@ -162,7 +161,7 @@ def test_preview_headless_fallback(monkeypatch):
     fake = FakeCV2(fail_named_window=True)
     monkeypatch.setattr(preview_mod, "cv2", fake)
     stop = threading.Event()
-    stop.set()                    # return immediately from the fallback wait
+    stop.set()  # return immediately from the fallback wait
     preview_mod.run_preview(make_runtime(), hub_with_frame(), stop)
     assert fake.shown == []
 
@@ -492,10 +491,26 @@ class TestPreviewController:
         ctl = make_controller(runtime)
         ctl.handle_key(ord("5"))
         assert runtime.snapshot().background.mode == "passthrough"
-        assert "camera_device" in ctl.current_message()
+        assert "camera_target" in ctl.current_message()
 
     def test_camera_mode_accepts_integer_zero_device(self):
         runtime = make_runtime(mode="passthrough", camera_device=0)
+        ctl = make_controller(runtime)
+        ctl.handle_key(ord("5"))
+        assert runtime.snapshot().background.mode == "camera"
+
+    def test_camera_mode_accepts_operator_target_id(self):
+        runtime = RuntimeConfig(
+            AppConfig.from_dict(
+                {
+                    "background": {
+                        "mode": "passthrough",
+                        "camera_target": "side-camera",
+                    },
+                    "backdrop_targets": {"side-camera": {"source": 2}},
+                }
+            )
+        )
         ctl = make_controller(runtime)
         ctl.handle_key(ord("5"))
         assert runtime.snapshot().background.mode == "camera"

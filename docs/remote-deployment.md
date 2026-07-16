@@ -101,7 +101,11 @@ api:
   host: 0.0.0.0
   port: 8711
   allow_non_loopback: true
-  allowed_origins: [https://meeting.example:8710]
+  # Include the renderer's own public HTTPS origin for Host validation and the
+  # meeting origin for browser/control-plane origin checks.
+  allowed_origins:
+    - https://renderer.example:8711
+    - https://meeting.example:8710
   token_file: /etc/custback/avatar-control-token
   tls_certfile: /etc/custback/tls/renderer.crt
   tls_keyfile: /etc/custback/tls/renderer.key

@@ -1,0 +1,331 @@
+{
+  "schema_version": 1,
+  "manifest_id": "custback-phase6-v1",
+  "artifacts": [
+    {
+      "id": "python-wheel",
+      "filename_pattern": "^custback-[0-9]+\\.[0-9]+\\.[0-9]+(?:[A-Za-z0-9_.+-]*)?-py3-none-any\\.whl$"
+    },
+    {
+      "id": "python-sdist",
+      "filename_pattern": "^custback-[0-9]+\\.[0-9]+\\.[0-9]+(?:[A-Za-z0-9_.+-]*)?\\.tar\\.gz$"
+    },
+    {
+      "id": "npm-tarball",
+      "filename_pattern": "^custback-[0-9]+\\.[0-9]+\\.[0-9]+(?:[A-Za-z0-9_.+-]*)?\\.tgz$"
+    }
+  ],
+  "legacy_fixtures": [
+    {
+      "id": "reference-0.3.0-wheel",
+      "kind": "source-rebuilt-artifact",
+      "format_version": "0.3.0-wheel"
+    },
+    {
+      "id": "reference-0.3.0-sdist",
+      "kind": "source-rebuilt-artifact",
+      "format_version": "0.3.0-sdist"
+    },
+    {
+      "id": "reference-0.3.0-npm",
+      "kind": "source-rebuilt-artifact",
+      "format_version": "0.3.0-npm"
+    },
+    {
+      "id": "npm-legacy-text-stamp-package-local",
+      "kind": "npm-state",
+      "format_version": "legacy-text-stamp"
+    },
+    {
+      "id": "npm-install-stamp-v2-package-local",
+      "kind": "npm-state",
+      "format_version": "install-stamp-v2"
+    },
+    {
+      "id": "npm-install-stamp-v3-package-local",
+      "kind": "npm-state",
+      "format_version": "install-stamp-v3"
+    },
+    {
+      "id": "npm-prefix-generations-v1",
+      "kind": "npm-state",
+      "format_version": "prefix-generations-v1"
+    },
+    {
+      "id": "npm-promotion-journal-v1-prepared",
+      "kind": "npm-state",
+      "format_version": "promotion-journal-v1-prepared"
+    },
+    {
+      "id": "npm-promotion-journal-v1-committed",
+      "kind": "npm-state",
+      "format_version": "promotion-journal-v1-committed"
+    },
+    {
+      "id": "config-camera-device-local",
+      "kind": "core-config",
+      "format_version": "camera-device-local-v1"
+    },
+    {
+      "id": "config-camera-device-remote",
+      "kind": "core-config",
+      "format_version": "camera-device-remote-v1"
+    },
+    {
+      "id": "core-store-pre-ownership-ledger",
+      "kind": "core-store",
+      "format_version": "pre-ownership-ledger"
+    },
+    {
+      "id": "avatar-store-pre-ownership-ledger",
+      "kind": "avatar-store",
+      "format_version": "pre-ownership-ledger"
+    }
+  ],
+  "matrices": {
+    "python": [
+      {
+        "id": "ubuntu-python-3.10",
+        "os": "ubuntu",
+        "python": "3.10",
+        "artifact_ids": ["python-wheel", "python-sdist"]
+      },
+      {
+        "id": "ubuntu-python-3.11",
+        "os": "ubuntu",
+        "python": "3.11",
+        "artifact_ids": ["python-wheel", "python-sdist"]
+      },
+      {
+        "id": "ubuntu-python-3.12",
+        "os": "ubuntu",
+        "python": "3.12",
+        "artifact_ids": ["python-wheel", "python-sdist"]
+      },
+      {
+        "id": "ubuntu-python-3.13",
+        "os": "ubuntu",
+        "python": "3.13",
+        "artifact_ids": ["python-wheel", "python-sdist"]
+      },
+      {
+        "id": "ubuntu-python-3.14",
+        "os": "ubuntu",
+        "python": "3.14",
+        "artifact_ids": ["python-wheel", "python-sdist"]
+      },
+      {
+        "id": "macos-python-3.12",
+        "os": "macos",
+        "python": "3.12",
+        "artifact_ids": ["python-wheel", "python-sdist"]
+      }
+    ],
+    "node": [
+      {
+        "id": "ubuntu-node-18",
+        "os": "ubuntu",
+        "node": "18",
+        "artifact_ids": ["npm-tarball"]
+      },
+      {
+        "id": "ubuntu-node-20",
+        "os": "ubuntu",
+        "node": "20",
+        "artifact_ids": ["npm-tarball"]
+      },
+      {
+        "id": "ubuntu-node-22",
+        "os": "ubuntu",
+        "node": "22",
+        "artifact_ids": ["npm-tarball"]
+      },
+      {
+        "id": "macos-node-20",
+        "os": "macos",
+        "node": "20",
+        "artifact_ids": ["npm-tarball"]
+      }
+    ],
+    "migration": [
+      {
+        "id": "ubuntu-migration-python-3.10-node-18",
+        "os": "ubuntu",
+        "python": "3.10",
+        "node": "18",
+        "artifact_ids": ["python-wheel", "python-sdist", "npm-tarball"]
+      },
+      {
+        "id": "ubuntu-migration-python-3.11-node-20",
+        "os": "ubuntu",
+        "python": "3.11",
+        "node": "20",
+        "artifact_ids": ["python-wheel", "python-sdist", "npm-tarball"]
+      },
+      {
+        "id": "ubuntu-migration-python-3.12-node-22",
+        "os": "ubuntu",
+        "python": "3.12",
+        "node": "22",
+        "artifact_ids": ["python-wheel", "python-sdist", "npm-tarball"]
+      },
+      {
+        "id": "ubuntu-migration-python-3.13-node-20",
+        "os": "ubuntu",
+        "python": "3.13",
+        "node": "20",
+        "artifact_ids": ["python-wheel", "python-sdist", "npm-tarball"]
+      },
+      {
+        "id": "ubuntu-migration-python-3.14-node-20",
+        "os": "ubuntu",
+        "python": "3.14",
+        "node": "20",
+        "artifact_ids": ["python-wheel", "python-sdist", "npm-tarball"]
+      },
+      {
+        "id": "macos-migration-python-3.12-node-20",
+        "os": "macos",
+        "python": "3.12",
+        "node": "20",
+        "artifact_ids": ["python-wheel", "python-sdist", "npm-tarball"]
+      }
+    ],
+    "platform": [
+      {
+        "id": "ubuntu-x86_64-artifacts",
+        "os": "ubuntu",
+        "arch": "x86_64"
+      },
+      {
+        "id": "macos-native-artifacts",
+        "os": "macos",
+        "arch": "native"
+      },
+      {
+        "id": "cuda-linux-x86_64-hardware",
+        "os": "ubuntu",
+        "arch": "x86_64"
+      }
+    ],
+    "optional_backends": [
+      {
+        "id": "mediapipe-python-3.11-wheel",
+        "os": "ubuntu",
+        "python": "3.11",
+        "contract": "wheel-execution"
+      },
+      {
+        "id": "mediapipe-python-3.12-wheel",
+        "os": "ubuntu",
+        "python": "3.12",
+        "contract": "wheel-execution"
+      },
+      {
+        "id": "rvm-python-3.11-wheel",
+        "os": "ubuntu",
+        "python": "3.11",
+        "contract": "wheel-execution"
+      },
+      {
+        "id": "rvm-python-3.12-wheel",
+        "os": "ubuntu",
+        "python": "3.12",
+        "contract": "wheel-execution"
+      },
+      {
+        "id": "audio2face-python-3.12-source",
+        "os": "ubuntu",
+        "python": "3.12",
+        "contract": "source-protocol"
+      },
+      {
+        "id": "audio2face-python-3.12-wheel",
+        "os": "ubuntu",
+        "python": "3.12",
+        "contract": "wheel-protocol"
+      },
+      {
+        "id": "gpu-python-3.12-linux-x86_64-resolution",
+        "os": "ubuntu",
+        "python": "3.12",
+        "contract": "dependency-resolution"
+      },
+      {
+        "id": "cuda-python-3.12-linux-x86_64-execution",
+        "os": "ubuntu",
+        "python": "3.12",
+        "contract": "hardware-execution"
+      }
+    ]
+  },
+  "stress_families": [
+    {"id": "concurrent-patch-activation", "minimum_iterations": 100},
+    {"id": "session-cancellation-reconnect", "minimum_iterations": 100},
+    {"id": "stream-connection-caps", "minimum_iterations": 100},
+    {"id": "upload-reservations", "minimum_iterations": 100},
+    {"id": "cleanup-retries", "minimum_iterations": 100},
+    {"id": "audio2face-shutdown", "minimum_iterations": 100}
+  ],
+  "tls_scenarios": [
+    "nominal-rendering",
+    "renderer-outage",
+    "stale-renderer-output",
+    "wrong-renderer-token",
+    "wrong-control-token",
+    "renderer-untrusted-ca",
+    "renderer-expired-certificate",
+    "renderer-wrong-host-certificate",
+    "control-untrusted-ca",
+    "control-expired-certificate",
+    "control-wrong-host-certificate",
+    "renderer-firewall-path-removed",
+    "control-firewall-path-removed",
+    "renderer-reconnect",
+    "credential-and-ca-rotation",
+    "privacy-slate-startup",
+    "privacy-slate-frame-plane-failure",
+    "control-error-mapping",
+    "failed-tls-handshake-no-payload",
+    "clean-host-repeat-a",
+    "clean-host-repeat-b"
+  ],
+  "required_gates": [
+    "remediation-regressions",
+    "python",
+    "node",
+    "optional-backends",
+    "migrations",
+    "ruff",
+    "stress",
+    "artifact-integrity",
+    "clean-tree",
+    "two-host-tls",
+    "two-clean-hosts",
+    "cuda-hardware",
+    "provenance"
+  ],
+  "workflow": {
+    "required_job_ids": [
+      "python-core",
+      "opencv-compatibility",
+      "dependency-bounds",
+      "optional-backends",
+      "audio2face-contract",
+      "node",
+      "package-smoke",
+      "artifact-build",
+      "artifact-validation",
+      "migrations",
+      "ruff",
+      "stress",
+      "clean-tree",
+      "two-host-tls",
+      "two-clean-hosts",
+      "cuda-hardware",
+      "phase6-evidence"
+    ],
+    "aggregate_job_id": "release-gate",
+    "publish_job_id": "publish"
+  }
+}

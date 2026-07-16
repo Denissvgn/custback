@@ -147,8 +147,14 @@ def stack(tmp_path):
 
 def test_all_routes_require_bearer_auth(stack):
     for path in (
-        "/status", "/config", "/avatars", "/video/snapshot.jpg", "/openapi.json",
-        "/rigs", "/backgrounds", "/avatars/casey/thumbnail.jpg",
+        "/status",
+        "/config",
+        "/avatars",
+        "/video/snapshot.jpg",
+        "/openapi.json",
+        "/rigs",
+        "/backgrounds",
+        "/avatars/casey/thumbnail.jpg",
     ):
         response = stack.get(path)
         assert response.status_code == 401, path
@@ -160,9 +166,7 @@ def test_all_routes_require_bearer_auth(stack):
 
 
 def test_foreign_origin_is_rejected(stack):
-    response = stack.get(
-        "/status", headers={**AUTH, "Origin": "http://evil.example"}
-    )
+    response = stack.get("/status", headers={**AUTH, "Origin": "http://evil.example"})
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "forbidden_origin"
 
@@ -241,9 +245,7 @@ def test_get_and_patch_config_with_versions(stack):
 
 
 def test_patch_restart_sections_return_409(stack):
-    response = stack.patch(
-        "/config", headers=AUTH, json={"api": {"port": 9999}}
-    )
+    response = stack.patch("/config", headers=AUTH, json={"api": {"port": 9999}})
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert detail["code"] == "restart_required"
@@ -283,9 +285,7 @@ def test_noop_patch_activates_startup_generation_or_reports_failure(tmp_path):
     )
     app = create_avatar_app(runtime, service, security=security)
     try:
-        response = Stack(app, runtime, service).patch(
-            "/config", headers=AUTH, json={}
-        )
+        response = Stack(app, runtime, service).patch("/config", headers=AUTH, json={})
         assert response.status_code == 422
         assert response.json()["detail"]["code"] == "activation_failed"
         assert runtime.version == 0
@@ -362,9 +362,7 @@ def test_mjpeg_stream_connection_limit_returns_429(stack):
 
 
 def test_mjpeg_stream_encodes_async_frame_and_releases_lease(stack):
-    route = next(
-        route for route in stack.app.routes if route.path == "/video/mjpeg"
-    )
+    route = next(route for route in stack.app.routes if route.path == "/video/mjpeg")
     limiter = stack.app.state.stream_connections
 
     async def scenario():
@@ -411,7 +409,13 @@ def test_avatars_reports_rigs_and_driver_modes(stack):
     assert modes["voice"]["configured"] is False  # no audio2face.url yet
     for mode in body["modes"]:
         assert set(mode) >= {
-            "id", "backend", "label", "available", "reason", "configured", "active"
+            "id",
+            "backend",
+            "label",
+            "available",
+            "reason",
+            "configured",
+            "active",
         }
 
 
@@ -430,7 +434,8 @@ def test_audio2face_wav_availability_does_not_require_microphone(monkeypatch):
     )
 
     wav_mode = next(
-        mode for mode in avatar_api_mod.driver_modes(wav_config)
+        mode
+        for mode in avatar_api_mod.driver_modes(wav_config)
         if mode["backend"] == "audio2face"
     )
     assert wav_mode["available"] is True
@@ -447,7 +452,8 @@ def test_audio2face_wav_availability_does_not_require_microphone(monkeypatch):
         }
     )
     microphone_mode = next(
-        mode for mode in avatar_api_mod.driver_modes(microphone_config)
+        mode
+        for mode in avatar_api_mod.driver_modes(microphone_config)
         if mode["backend"] == "audio2face"
     )
     assert microphone_mode["available"] is False

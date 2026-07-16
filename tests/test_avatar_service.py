@@ -120,9 +120,7 @@ def run_async(awaitable):
         for task in pending:
             task.cancel()
         if pending:
-            loop.run_until_complete(
-                asyncio.gather(*pending, return_exceptions=True)
-            )
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
         asyncio.set_event_loop(None)
 
@@ -270,10 +268,7 @@ def test_service_reconnects_after_source_drops(token_file):
             stop = asyncio.Event()
             runner = asyncio.create_task(service.run(stop))
             await _wait_for(
-                lambda: (
-                    fake.sessions >= 3
-                    and service.stats_dict()["reconnects"] >= 2
-                ),
+                lambda: fake.sessions >= 3 and service.stats_dict()["reconnects"] >= 2,
                 message="reconnections",
             )
             stats = service.stats_dict()

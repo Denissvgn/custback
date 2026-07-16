@@ -98,7 +98,10 @@ def test_renderer_client_token_is_never_provisioned_implicitly(tmp_path):
 def test_renderer_token_uses_its_own_environment_variable(tmp_path):
     resolved = resolve_renderer_token(
         tmp_path / "missing",
-        environ={"CUSTBACK_RENDERER_TOKEN": RENDERER_TOKEN, "CUSTBACK_API_TOKEN": TOKEN},
+        environ={
+            "CUSTBACK_RENDERER_TOKEN": RENDERER_TOKEN,
+            "CUSTBACK_API_TOKEN": TOKEN,
+        },
     )
     assert resolved.value == RENDERER_TOKEN
 
@@ -125,9 +128,7 @@ def test_core_provisions_distinct_management_and_renderer_credentials(
     assert stat.S_IMODE(management_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(renderer_path.stat().st_mode) == 0o600
     assert policy.bearer_valid(f"Bearer {management_path.read_text().strip()}")
-    assert policy.renderer_bearer_valid(
-        f"Bearer {renderer_path.read_text().strip()}"
-    )
+    assert policy.renderer_bearer_valid(f"Bearer {renderer_path.read_text().strip()}")
     assert not policy.bearer_valid(f"Bearer {renderer_path.read_text().strip()}")
 
 

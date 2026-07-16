@@ -91,24 +91,45 @@ class AvatarPreset:
 # Keys must match config.BUILTIN_AVATARS (the config layer validates names).
 AVATAR_PRESETS: dict[str, AvatarPreset] = {
     "casey": AvatarPreset(
-        skin=(140, 178, 235), skin_shadow=(110, 148, 205),
-        hair=(46, 62, 88), shirt=(120, 86, 36), shirt_trim=(90, 62, 24),
-        iris=(96, 122, 46), lip=(98, 84, 190), hair_style="swept",
+        skin=(140, 178, 235),
+        skin_shadow=(110, 148, 205),
+        hair=(46, 62, 88),
+        shirt=(120, 86, 36),
+        shirt_trim=(90, 62, 24),
+        iris=(96, 122, 46),
+        lip=(98, 84, 190),
+        hair_style="swept",
     ),
     "robin": AvatarPreset(
-        skin=(66, 100, 148), skin_shadow=(48, 76, 116),
-        hair=(34, 30, 26), shirt=(150, 96, 44), shirt_trim=(110, 68, 30),
-        iris=(40, 36, 32), lip=(84, 66, 140), hair_style="short", glasses=True,
+        skin=(66, 100, 148),
+        skin_shadow=(48, 76, 116),
+        hair=(34, 30, 26),
+        shirt=(150, 96, 44),
+        shirt_trim=(110, 68, 30),
+        iris=(40, 36, 32),
+        lip=(84, 66, 140),
+        hair_style="short",
+        glasses=True,
     ),
     "alex": AvatarPreset(
-        skin=(160, 196, 242), skin_shadow=(128, 162, 210),
-        hair=(90, 168, 200), shirt=(84, 124, 64), shirt_trim=(58, 92, 44),
-        iris=(150, 110, 60), lip=(110, 96, 196), hair_style="long",
+        skin=(160, 196, 242),
+        skin_shadow=(128, 162, 210),
+        hair=(90, 168, 200),
+        shirt=(84, 124, 64),
+        shirt_trim=(58, 92, 44),
+        iris=(150, 110, 60),
+        lip=(110, 96, 196),
+        hair_style="long",
     ),
     "nova": AvatarPreset(
-        skin=(120, 162, 214), skin_shadow=(92, 132, 182),
-        hair=(40, 58, 124), shirt=(116, 64, 108), shirt_trim=(84, 44, 78),
-        iris=(60, 96, 120), lip=(96, 72, 176), hair_style="curly",
+        skin=(120, 162, 214),
+        skin_shadow=(92, 132, 182),
+        hair=(40, 58, 124),
+        shirt=(116, 64, 108),
+        shirt_trim=(84, 44, 78),
+        iris=(60, 96, 120),
+        lip=(96, 72, 176),
+        hair_style="curly",
     ),
 }
 
@@ -136,12 +157,9 @@ def alpha_over(base: np.ndarray, layer: np.ndarray) -> None:
     source_alpha = layer[..., 3:4].astype(np.float32) / 255.0
     destination_alpha = base[..., 3:4].astype(np.float32) / 255.0
     out_alpha = source_alpha + destination_alpha * (1.0 - source_alpha)
-    numerator = (
-        layer[..., :3].astype(np.float32) * source_alpha
-        + base[..., :3].astype(np.float32)
-        * destination_alpha
-        * (1.0 - source_alpha)
-    )
+    numerator = layer[..., :3].astype(np.float32) * source_alpha + base[..., :3].astype(
+        np.float32
+    ) * destination_alpha * (1.0 - source_alpha)
     out_rgb = np.zeros_like(numerator)
     np.divide(numerator, out_alpha, out=out_rgb, where=out_alpha > 0.0)
     base[..., :3] = np.clip(np.rint(out_rgb), 0, 255).astype(np.uint8)
@@ -355,9 +373,7 @@ class BuiltinRig(Rig):
         cv2.line(canvas, (240, 548), (240, self.HEIGHT), (*self._SHIRT_TRIM, 255), 3)
         for button_y in (596, 668, 740):
             cv2.circle(canvas, (240, button_y), 6, (*self._SHIRT_TRIM, 255), -1)
-        cv2.ellipse(
-            canvas, (240, 470), (54, 26), 0, 0, 180, (*self._SKIN, 255), -1
-        )
+        cv2.ellipse(canvas, (240, 470), (54, 26), 0, 0, 180, (*self._SKIN, 255), -1)
 
     # -- head group ------------------------------------------------------
     def _draw_head(self, canvas: np.ndarray, _state: FaceState) -> None:
@@ -392,7 +408,8 @@ class BuiltinRig(Rig):
     def _draw_brows(self, canvas: np.ndarray, state: FaceState) -> None:
         raise_amount = (
             state.channel("browInnerUp")
-            + (state.channel("browOuterUpLeft") + state.channel("browOuterUpRight")) / 2.0
+            + (state.channel("browOuterUpLeft") + state.channel("browOuterUpRight"))
+            / 2.0
         ) / 2.0
         for cx, down in (
             (178, state.channel("browDownLeft")),
@@ -400,20 +417,30 @@ class BuiltinRig(Rig):
         ):
             dy = int(round(-20.0 * raise_amount + 10.0 * down))
             cv2.ellipse(
-                canvas, (cx, 196 + dy), (34, 10), 0, 190, 350,
-                (*self._BROW, 255), self._brow_px,
+                canvas,
+                (cx, 196 + dy),
+                (34, 10),
+                0,
+                190,
+                350,
+                (*self._BROW, 255),
+                self._brow_px,
             )
 
     def _draw_eyes(self, canvas: np.ndarray, state: FaceState) -> None:
         factor = self._feature_scale
         eye_rx = max(8, int(round(30.0 * factor)))
         look_x = (
-            state.channel("eyeLookOutRight") + state.channel("eyeLookInLeft")
-            - state.channel("eyeLookOutLeft") - state.channel("eyeLookInRight")
+            state.channel("eyeLookOutRight")
+            + state.channel("eyeLookInLeft")
+            - state.channel("eyeLookOutLeft")
+            - state.channel("eyeLookInRight")
         ) / 2.0
         look_y = (
-            state.channel("eyeLookDownLeft") + state.channel("eyeLookDownRight")
-            - state.channel("eyeLookUpLeft") - state.channel("eyeLookUpRight")
+            state.channel("eyeLookDownLeft")
+            + state.channel("eyeLookDownRight")
+            - state.channel("eyeLookUpLeft")
+            - state.channel("eyeLookUpRight")
         ) / 2.0
         for cx, blink, wide in (
             (180, state.channel("eyeBlinkLeft"), state.channel("eyeWideLeft")),
@@ -423,21 +450,48 @@ class BuiltinRig(Rig):
             half_height = max(1, int(round(19.0 * factor * min(openness, 1.4))))
             if openness <= 0.12:  # closed: draw the lid line only
                 cv2.line(
-                    canvas, (cx - eye_rx + 4, 240), (cx + eye_rx - 4, 240),
-                    (*self._SKIN_SHADOW, 255), 5,
+                    canvas,
+                    (cx - eye_rx + 4, 240),
+                    (cx + eye_rx - 4, 240),
+                    (*self._SKIN_SHADOW, 255),
+                    5,
                 )
                 continue
             cv2.ellipse(
-                canvas, (cx, 240), (eye_rx, half_height), 0, 0, 360,
-                (*self._EYE_WHITE, 255), -1,
+                canvas,
+                (cx, 240),
+                (eye_rx, half_height),
+                0,
+                0,
+                360,
+                (*self._EYE_WHITE, 255),
+                -1,
             )
             ix = cx + int(round(12.0 * factor * look_x))
             iy = 240 + int(round(min(half_height - 4, 8) * look_y))
-            cv2.circle(canvas, (ix, iy), max(3, int(round(12 * factor))), (*self._IRIS, 255), -1)
-            cv2.circle(canvas, (ix, iy), max(2, int(round(6 * factor))), (*self._PUPIL, 255), -1)
+            cv2.circle(
+                canvas,
+                (ix, iy),
+                max(3, int(round(12 * factor))),
+                (*self._IRIS, 255),
+                -1,
+            )
+            cv2.circle(
+                canvas,
+                (ix, iy),
+                max(2, int(round(6 * factor))),
+                (*self._PUPIL, 255),
+                -1,
+            )
             cv2.ellipse(
-                canvas, (cx, 240), (eye_rx, half_height), 0, 0, 360,
-                (*self._SKIN_SHADOW, 255), 2,
+                canvas,
+                (cx, 240),
+                (eye_rx, half_height),
+                0,
+                0,
+                360,
+                (*self._SKIN_SHADOW, 255),
+                2,
             )
         if self._glasses:
             self._draw_glasses(canvas)
@@ -451,12 +505,18 @@ class BuiltinRig(Rig):
         cv2.line(canvas, (340, 236), (366, 228), (*frame_color, 255), 5)
 
     def _draw_nose(self, canvas: np.ndarray, _state: FaceState) -> None:
-        cv2.ellipse(canvas, (240, 292), (12, 8), 0, 0, 180, (*self._SKIN_SHADOW, 255), 4)
+        cv2.ellipse(
+            canvas, (240, 292), (12, 8), 0, 0, 180, (*self._SKIN_SHADOW, 255), 4
+        )
 
     def _draw_mouth(self, canvas: np.ndarray, state: FaceState) -> None:
         jaw = state.channel("jawOpen")
-        smile = (state.channel("mouthSmileLeft") + state.channel("mouthSmileRight")) / 2.0
-        frown = (state.channel("mouthFrownLeft") + state.channel("mouthFrownRight")) / 2.0
+        smile = (
+            state.channel("mouthSmileLeft") + state.channel("mouthSmileRight")
+        ) / 2.0
+        frown = (
+            state.channel("mouthFrownLeft") + state.channel("mouthFrownRight")
+        ) / 2.0
         pucker = max(state.channel("mouthPucker"), state.channel("mouthFunnel"))
         center_y = 348 + int(round(10.0 * jaw))
         half_width = max(14, int(round(46.0 * (1.0 + 0.25 * smile - 0.45 * pucker))))
@@ -464,8 +524,14 @@ class BuiltinRig(Rig):
         corner_dy = int(round(-14.0 * smile + 12.0 * frown))
         if jaw > 0.06:
             cv2.ellipse(
-                canvas, (240, center_y), (half_width, open_half), 0, 0, 360,
-                (*self._MOUTH_INNER, 255), -1,
+                canvas,
+                (240, center_y),
+                (half_width, open_half),
+                0,
+                0,
+                360,
+                (*self._MOUTH_INNER, 255),
+                -1,
             )
             if open_half > 10:
                 cv2.rectangle(
@@ -476,8 +542,14 @@ class BuiltinRig(Rig):
                     -1,
                 )
             cv2.ellipse(
-                canvas, (240, center_y), (half_width, open_half), 0, 0, 360,
-                (*self._LIP, 255), self._lip_open_px,
+                canvas,
+                (240, center_y),
+                (half_width, open_half),
+                0,
+                0,
+                360,
+                (*self._LIP, 255),
+                self._lip_open_px,
             )
         else:
             # Closed lips: a parabola whose corners rise with smiles and
@@ -486,8 +558,12 @@ class BuiltinRig(Rig):
             ys = center_y + corner_dy * (xs / half_width) ** 2
             points = np.stack([240 + xs, ys], axis=1).astype(np.int32)
             cv2.polylines(
-                canvas, [points], False, (*self._LIP, 255),
-                self._lip_closed_px, cv2.LINE_AA,
+                canvas,
+                [points],
+                False,
+                (*self._LIP, 255),
+                self._lip_closed_px,
+                cv2.LINE_AA,
             )
 
     # -- style post-processing -------------------------------------------
@@ -610,9 +686,7 @@ class LayeredRig(Rig):
                 manifest.is_file()
                 and manifest.stat().st_size > self._rig_manifest_max_bytes
             ):
-                raise RigError(
-                    f"rig.yaml exceeds {self._rig_manifest_max_bytes} bytes"
-                )
+                raise RigError(f"rig.yaml exceeds {self._rig_manifest_max_bytes} bytes")
         except OSError as exc:
             raise RigError("cannot inspect rig.yaml") from exc
 
@@ -700,8 +774,7 @@ class LayeredRig(Rig):
                     isinstance(value, list)
                     and len(value) == 2
                     and all(
-                        isinstance(item, (int, float))
-                        and not isinstance(item, bool)
+                        isinstance(item, (int, float)) and not isinstance(item, bool)
                         for item in value
                     )
                 ):
@@ -714,9 +787,7 @@ class LayeredRig(Rig):
                     ):
                         converted = candidate
                 if converted is None:
-                    raise RigError(
-                        f"rig.yaml {key} must be [x, y] finite numbers"
-                    )
+                    raise RigError(f"rig.yaml {key} must be [x, y] finite numbers")
                 setattr(self, f"_{key}", converted)
         if "head_parts" in raw:
             value = raw["head_parts"]
@@ -743,8 +814,7 @@ class LayeredRig(Rig):
                     isinstance(window, list)
                     and len(window) == 2
                     and all(
-                        isinstance(item, (int, float))
-                        and not isinstance(item, bool)
+                        isinstance(item, (int, float)) and not isinstance(item, bool)
                         for item in window
                     )
                 ):
@@ -770,7 +840,9 @@ class LayeredRig(Rig):
 
     def _layer_for(self, part: str, state: FaceState) -> np.ndarray:
         if part == "eyes" and "eyes_closed" in self._variants:
-            blink = (state.channel("eyeBlinkLeft") + state.channel("eyeBlinkRight")) / 2.0
+            blink = (
+                state.channel("eyeBlinkLeft") + state.channel("eyeBlinkRight")
+            ) / 2.0
             if blink >= _BLINK_THRESHOLD:
                 return self._variants["eyes_closed"]
         if part == "mouth" and "mouth_open" in self._variants:

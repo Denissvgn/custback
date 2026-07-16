@@ -201,9 +201,7 @@ def test_CFG_02_avatar_nested_patch_preserves_audio2face_siblings():
             }
         }
     )
-    candidate = original.patched(
-        {"driver": {"audio2face": {"url": "127.0.0.2:52000"}}}
-    )
+    candidate = original.patched({"driver": {"audio2face": {"url": "127.0.0.2:52000"}}})
     assert candidate.driver.audio2face.url == "grpc://127.0.0.2:52000"
     assert candidate.driver.audio2face.audio_source == "voice.wav"
     assert candidate.driver.audio2face.sample_rate == 48_000
@@ -397,9 +395,7 @@ def test_CFG_01_partial_candidate_construction_closes_staged_driver(
             self.close_calls += 1
 
     runtime = AvatarRuntime(AvatarConfig.from_dict({"driver": {"backend": "idle"}}))
-    service = AvatarService(
-        runtime, driver_factory=lambda *_args, **_kwargs: Driver()
-    )
+    service = AvatarService(runtime, driver_factory=lambda *_args, **_kwargs: Driver())
     service.activate_initial()
     before = service._components
     patch = {"driver": {"backend": "auto"}}
@@ -469,12 +465,8 @@ def test_CFG_01_concurrent_avatar_patches_cas_or_conflict(monkeypatch):
             errors.append(exc)
 
     workers = [
-        threading.Thread(
-            target=apply, args=({"appearance": {"scale": 0.6}},)
-        ),
-        threading.Thread(
-            target=apply, args=({"appearance": {"offset_x": 0.2}},)
-        ),
+        threading.Thread(target=apply, args=({"appearance": {"scale": 0.6}},)),
+        threading.Thread(target=apply, args=({"appearance": {"offset_x": 0.2}},)),
     ]
     try:
         for worker in workers:
@@ -564,9 +556,7 @@ def test_CFG_01_concurrent_driver_preparation_linearizes_to_conflict(monkeypatch
     def apply(backend):
         try:
             patch = {"backend": backend}
-            results.append(
-                service.apply_config_patch({"driver": patch})
-            )
+            results.append(service.apply_config_patch({"driver": patch}))
         except BaseException as exc:
             errors.append(exc)
 
@@ -677,9 +667,7 @@ def test_CFG_01_slow_asset_preparation_cannot_publish_after_timeout(monkeypatch)
         with pytest.raises(
             AvatarReconfigurationUnavailable, match="activation deadline"
         ):
-            service.apply_config_patch(
-                {"driver": {"backend": "auto"}}, timeout=0.05
-            )
+            service.apply_config_patch({"driver": {"backend": "auto"}}, timeout=0.05)
         assert entered.is_set()
         assert time.monotonic() - started < 0.5
         assert runtime.version == 0
@@ -712,9 +700,7 @@ def test_LIFE_01_close_owns_timed_out_asset_preparation(monkeypatch):
     monkeypatch.setattr(avatar_service_mod, "prepare_driver", blocked_prepare)
     try:
         with pytest.raises(AvatarReconfigurationUnavailable):
-            service.apply_config_patch(
-                {"driver": {"backend": "auto"}}, timeout=0.05
-            )
+            service.apply_config_patch({"driver": {"backend": "auto"}}, timeout=0.05)
         assert entered.is_set()
         with pytest.raises(
             AvatarReconfigurationUnavailable, match="asset preparation worker"
@@ -751,9 +737,7 @@ def test_LIFE_01_async_close_bounds_and_owns_asset_preparation(monkeypatch):
     monkeypatch.setattr(avatar_service_mod, "prepare_driver", blocked_prepare)
     try:
         with pytest.raises(AvatarReconfigurationUnavailable):
-            service.apply_config_patch(
-                {"driver": {"backend": "auto"}}, timeout=0.05
-            )
+            service.apply_config_patch({"driver": {"backend": "auto"}}, timeout=0.05)
         assert entered.is_set()
         started = time.monotonic()
         with pytest.raises(
@@ -916,9 +900,7 @@ def test_LIFE_01_cancelled_staging_close_failure_poison_is_terminal():
     service.activate_initial()
     try:
         with pytest.raises(AvatarReconfigurationUnavailable):
-            service.apply_config_patch(
-                {"driver": {"backend": "auto"}}, timeout=0.05
-            )
+            service.apply_config_patch({"driver": {"backend": "auto"}}, timeout=0.05)
         assert trial_entered.is_set()
         assert runtime.version == 0
 
@@ -1044,9 +1026,7 @@ def test_LIFE_01_failed_component_close_is_owned_and_retryable():
 
     driver = FlakyDriver()
     runtime = AvatarRuntime(AvatarConfig.from_dict({"driver": {"backend": "idle"}}))
-    service = AvatarService(
-        runtime, driver_factory=lambda *_args, **_kwargs: driver
-    )
+    service = AvatarService(runtime, driver_factory=lambda *_args, **_kwargs: driver)
     service.activate_initial()
 
     with pytest.raises(AvatarReconfigurationUnavailable, match="survived teardown"):
@@ -1215,9 +1195,7 @@ class _RecordingOutput:
         self.frames.append(frame.copy())
 
 
-def _mask_resources(
-    cfg: AppConfig, frame: np.ndarray, mask: np.ndarray
-) -> _Resources:
+def _mask_resources(cfg: AppConfig, frame: np.ndarray, mask: np.ndarray) -> _Resources:
     return _Resources(
         cfg=cfg,
         version=0,
@@ -1329,9 +1307,7 @@ def test_SEG_03_remote_nan_mask_uses_input_independent_fallback():
     for value in (20, 220):
         raw = np.full((16, 16, 3), value, dtype=np.uint8)
         resources = _nan_resources(cfg, raw)
-        output, reason = pipeline._local_composite(
-            resources, raw, privacy_safe=True
-        )
+        output, reason = pipeline._local_composite(resources, raw, privacy_safe=True)
         outputs.append(output)
         reasons.append(reason)
     assert all(reasons)
@@ -1465,11 +1441,7 @@ def test_MISC_02_deep_yaml_is_reported_as_value_error(tmp_path, loader):
 
 def test_MISC_02_combined_cli_overrides_are_validated_as_one_candidate(tmp_path):
     config_path = tmp_path / "camera.yaml"
-    config_path.write_text(
-        "camera:\n"
-        "  fps: 60\n"
-        "  recovery_timeout_s: 3.0\n"
-    )
+    config_path.write_text("camera:\n  fps: 60\n  recovery_timeout_s: 3.0\n")
     args = build_parser().parse_args(
         [
             "--config",

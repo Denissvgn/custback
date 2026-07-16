@@ -11,8 +11,8 @@ real camera ──► segmentation ──► compositor ──► virtual camera
                      (preview, control, avatar frame forwarding)
 ```
 
-* **Backgrounds**: static image, **live backdrops** (looping video file, a
-  second camera, or a network stream URL), blur, solid color, passthrough.
+* **Backgrounds**: static image, **live backdrops** (looping video file or an
+  operator-approved local camera), blur, solid color, passthrough.
 * **Rendering quality**: true alpha matting (RVM), edge-aware mask
   refinement, light wrap, color-spill removal, person-free background blur —
   see [Rendering quality & GPU](#rendering-quality--gpu-acceleration).
@@ -56,6 +56,8 @@ Wrapper subcommands:
 | `custback rebuild [--extras LIST]` | build and validate a new venv generation, then switch to it atomically; an explicit empty list clears extras |
 | `custback avatar …` | run the bundled stage-2 avatar service; the npm `custback-avatar` binary is a compatibility alias |
 | `custback avatar config export [PATH]` | print the bundled annotated avatar YAML, or create `PATH` without overwriting it |
+| `custback avatar --smoke` | initialize and tear down the installed idle renderer without camera or network access |
+| `custback-npm-migrate --prefix PREFIX` | pre-upgrade bridge for a package-local npm venv created by custback 0.3 |
 | anything else | passed through to the app (`custback --help`) |
 
 Environment overrides: `CUSTBACK_VENV=/dedicated/path` relocates the private
@@ -75,11 +77,25 @@ Each installer subprocess is bounded to 15 minutes by default
 (`CUSTBACK_INSTALL_TIMEOUT_MS` accepts a positive millisecond override); doctor
 probes use a 60-second bound (`CUSTBACK_DOCTOR_TIMEOUT_MS`).
 
-When upgrading from a package-local legacy npm venv, custback reads valid old
-extras metadata but builds a fresh generation at the durable prefix-scoped
-target. It never relocates the old venv because Python launcher shebangs contain
-absolute paths. Existing generations at the durable target remain available
-for rollback across npm package replacement.
+An ordinary npm replacement removes the package-local venv used by custback
+0.3 before the new package's lifecycle script can inspect it. Run the candidate
+package's bridge **before** that first upgrade; it validates the old ownership
+stamp, moves the venv to the prefix-scoped target, rewrites its absolute launcher
+paths, and persists the explicit extras intent. For a global install:
+
+```bash
+CANDIDATE=custback@0.4.0  # or an absolute path to the candidate .tgz
+PREFIX=$(npm prefix --global)
+CUSTBACK_SKIP_INSTALL=1 npx --yes --package "$CANDIDATE" \
+  custback-npm-migrate --prefix "$PREFIX"
+npm install --global "$CANDIDATE"
+```
+
+The command is restart-safe at every durable boundary and refuses symlinked,
+unowned, cross-filesystem, or colliding targets. Do not run the final `npm
+install` if it reports an error. Upgrades after this bridge preserve the active
+and rollback generations plus selected extras automatically because they live
+outside the replaceable package directory.
 
 ### Manual (pip)
 
@@ -117,7 +133,6 @@ custback --mode blur                        # blurred real background
 custback --image ~/walls/office.jpg         # static backdrop
 custback --video ~/walls/beach_loop.mp4     # live backdrop (loops)
 custback --bg-camera 2                      # live backdrop from a second camera
-custback --bg-camera rtsp://cam/stream     # ... or a network stream
 custback --mode color                       # green-screen style solid color
 custback -c config/default.yaml             # everything from YAML
 custback --synthetic --no-vcam              # hardware-free demo (test pattern)
@@ -125,6 +140,12 @@ custback --mode blur --preview              # verify on screen (q/ESC quits)
 custback --camera-pixel-format backend       # opt out of V4L2 MJPEG negotiation
 custback --camera-mode-mismatch error        # fail instead of warning on mismatch
 ```
+
+Live-camera sources are startup authority. Remote URI schemes are rejected
+because OpenCV cannot enforce verified TLS, redirect, proxy, and address-class
+policy. Operators can define immutable local sources under `backdrop_targets`
+in YAML and set `background.camera_target` to a public ID; the hot API may
+select another configured ID but cannot supply a path, URL, or backend option.
 
 On Linux/V4L2, the default `camera.pixel_format: auto` requests MJPEG before
 the dimensions and rate. This avoids the common silent 720p YUYV fallback to
@@ -373,6 +394,7 @@ new scripts and examples should use the canonical subcommand.
 custback --mode remote &                       # custback shows what the avatar service returns
 custback avatar                                # connects to ws://127.0.0.1:8710, renders the avatar
 custback avatar config export ./avatar.yaml    # export the bundled annotated template
+custback avatar --smoke                        # hardware-free installed-package check
 custback avatar -c ./avatar.yaml               # run everything from YAML
 custback avatar --avatar robin --style realistic --framing bust
                                         # a different presenter, soft-shaded,
@@ -477,7 +499,38 @@ validated source FPS is otherwise used, with a documented nominal 30 FPS for
 invalid or variable-rate metadata. A decode failure retains the last good
 frame.
 
-## Migrating to 0.3.0
+## Migrating from 0.3 to 0.4
+
+Run the installed migrator before starting 0.4 with an existing configuration:
+
+```bash
+custback migrate --config ~/.config/custback/config.yaml \
+  --target-id legacy-camera
+custback migrate --audit-storage
+# After reviewing the audit:
+custback migrate --repair-storage
+```
+
+A numeric or absolute-local legacy `background.camera_device` becomes an
+operator-owned `backdrop_targets.legacy-camera` entry selected by
+`background.camera_target`. The command retains a private byte-exact backup,
+uses a digest-bound durable journal and atomic same-directory replacement, and
+can be rerun after interruption. URI, remote, relative, conflicting, symlinked,
+or otherwise ambiguous sources exit with status 4 and require explicit operator
+action; they are never converted into hot network authority.
+
+Storage audit is no-follow and non-mutating. Repair first rejects symlinks,
+special files, foreign ownership, overlapping roots, and inode changes, then
+sets safe managed directories to `0700` and regular assets to `0600`. Durable
+upload/cleanup ownership ledgers live beside the payload roots and are not
+changed or dropped. Use `--core-store`, `--avatar-rigs-store`, and
+`--avatar-backgrounds-store` to audit non-default locations.
+
+The npm 0.3 package-local runtime needs the separate pre-upgrade bridge shown in
+[npm installation](#via-npm-recommended); npm removes that directory before a new
+postinstall can recover it.
+
+## Legacy 0.3 client changes
 
 This release intentionally breaks the old unauthenticated control plane:
 
@@ -507,7 +560,7 @@ This release intentionally breaks the old unauthenticated control plane:
 | --- | --- |
 | `capture.py` | camera sources (OpenCV, synthetic test pattern) |
 | `segmentation.py` | person mask: RVM matting (CUDA/CPU) / MediaPipe / heuristic fallback; bounded marker-watershed refinement + adaptive temporal smoothing |
-| `backgrounds.py` | backdrop providers: image, video loop, second camera/stream, person-free blur, color |
+| `backgrounds.py` | backdrop providers: image, video loop, approved local camera target, person-free blur, color |
 | `compositor.py` | alpha blending of person over backdrop; light wrap + color-spill removal |
 | `diagnostics.py` | secure rotating logs, run correlation, and safe config audit records |
 | `gpu_probe.py` | real CUDA inference/profile capability probe for installer and doctor |
@@ -525,8 +578,13 @@ The whole pipeline is testable without a camera, virtual camera, or mediapipe:
 ```bash
 pytest
 npm test
-npm run release:check -- --quick  # metadata and npm packlist; suitable during development
+npm run release:check -- --quick  # intentionally fails closed while REL-01 is open
 ```
+
+While `REL-01` is open, use the exact diagnostic regressions and CI's
+non-authorizing package-smoke job for development evidence. All ordinary
+`prepack` and `release:check` modes remain publication gates and therefore
+exit nonzero before packaging.
 
 The full artifact gate creates and installs several isolated Python environments.
 Point it at a pre-existing disk-backed directory so those environments do not
@@ -547,3 +605,28 @@ slower build hosts. A force-killed gate cannot run its cleanup handler and may
 leave a `custback-release-*` directory in the configured base; after confirming
 that no gate is running, inspect and remove that exact abandoned directory
 before retrying.
+
+### Phase 6 release qualification
+
+The reviewed gate inventory lives in
+`scripts/release/required-gates.json`. The production
+`.github/workflows/release.yml` workflow builds the wheel, sdist, and npm
+tarball once from one clean commit, records their SHA-256 digests, and passes
+those files unchanged to every runtime, optional-backend, migration, stress,
+clean-tree, and two-host job. Migration and isolated-host jobs emit strict
+artifact-bound reports; evidence assembly rejects a missing, duplicated,
+wrong-runtime, wrong-host-class, or substituted report.
+
+No `custback` 0.3 artifact is available from the npm or PyPI registries. The
+migration gate therefore rebuilds explicitly unpublished reference artifacts
+once from reviewed commit `f01baadfa3b1e2a1ef19eceda315eedf06fbe883` and labels
+them as source reconstructions. It does not represent them as previously
+published bytes.
+
+`REL-01` deliberately remains open in this implementation revision. The final
+release-candidate revision must close that registry entry and update its
+fail-closed contract in the same commit, then obtain a fresh successful Phase 6
+run. The aggregate gate and publish job reverify the exact GitHub run context,
+commit, artifact digests, report bindings, candidate attestations, and the
+attestation on the evidence document itself;
+the publish job uploads those qualified files without rebuilding them.

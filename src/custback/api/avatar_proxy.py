@@ -55,6 +55,7 @@ class _ClosingStreamingResponse(StreamingResponse):
             # headers raises.  The upstream connection is still ours then.
             await self._close_upstream()
 
+
 _STATIC_ROUTES = frozenset(
     {
         ("GET", "status"),
@@ -117,11 +118,7 @@ def _read_avatar_client_token(token_file: str) -> str:
         raise SecurityConfigurationError(
             f"avatar API token path {path} must be a regular non-symlink file"
         )
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -354,9 +351,7 @@ def register_avatar_proxy(
             )
         except httpx.HTTPError as exc:
             log.warning("avatar proxy request failed: %s", type(exc).__name__)
-            return _proxy_error(
-                502, "avatar_unreachable", "the avatar request failed"
-            )
+            return _proxy_error(502, "avatar_unreachable", "the avatar request failed")
         if upstream.status_code in {401, 403}:
             await upstream.aclose()
             log.warning(

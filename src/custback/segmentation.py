@@ -260,8 +260,10 @@ def acquire_model(
         raise ValueError(f"unsafe model filename: {spec.filename!r}")
     if not spec.url.startswith("https://"):
         raise ValueError("managed model URLs must use HTTPS")
-    if spec.size <= 0 or len(spec.sha256) != 64 or any(
-        char not in "0123456789abcdef" for char in spec.sha256
+    if (
+        spec.size <= 0
+        or len(spec.sha256) != 64
+        or any(char not in "0123456789abcdef" for char in spec.sha256)
     ):
         raise ValueError(f"invalid integrity metadata for {spec.filename}")
     directory = Path(model_dir) if model_dir is not None else DEFAULT_MODEL_DIR
@@ -323,7 +325,9 @@ def acquire_model(
         except ModelAcquisitionError:
             raise
         except Exception as exc:
-            raise ModelAcquisitionError(f"could not acquire {spec.filename}: {exc}") from exc
+            raise ModelAcquisitionError(
+                f"could not acquire {spec.filename}: {exc}"
+            ) from exc
         finally:
             try:
                 temporary.unlink()
@@ -460,9 +464,7 @@ class HeuristicSegmenter(Segmenter):
 class MediaPipeSegmenter(Segmenter):
     """MediaPipe Tasks ImageSegmenter with the selfie segmentation model."""
 
-    def __init__(
-        self, cfg: SegmentationConfig, *, allow_model_download: bool = True
-    ):
+    def __init__(self, cfg: SegmentationConfig, *, allow_model_download: bool = True):
         import mediapipe as mp
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision as mp_vision
@@ -522,21 +524,18 @@ class RVMSegmenter(Segmenter):
 
     produces_matte = True
 
-    def __init__(
-        self, cfg: SegmentationConfig, *, allow_model_download: bool = True
-    ):
+    def __init__(self, cfg: SegmentationConfig, *, allow_model_download: bool = True):
         import onnxruntime as ort
 
         if cfg.model_path and Path(cfg.model_path).suffix.lower() == ".onnx":
             model_path = Path(cfg.model_path)
         else:
-            model_path = acquire_model(
-                RVM_MODEL, allow_download=allow_model_download
-            )
+            model_path = acquire_model(RVM_MODEL, allow_download=allow_model_download)
 
         available = ort.get_available_providers()
         preferred = [
-            p for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider")
+            p
+            for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider")
             if p in available
         ]
         options = ort.SessionOptions()
@@ -643,14 +642,13 @@ def _watershed_edge_snap(
             return clipped
 
         unknown = (sure_fg == 0) & (sure_bg == 0)
+
         # Erosion can remove a small connected component completely even when
         # another, larger component supplies the global foreground/background
         # marker. Watershed would then have no seed representing that component
         # and classify it away. Protect each seedless component and its bounded
         # uncertainty band independently.
-        def seedless_components(
-            binary: np.ndarray, seeds: np.ndarray
-        ) -> np.ndarray:
+        def seedless_components(binary: np.ndarray, seeds: np.ndarray) -> np.ndarray:
             contours, hierarchy = cv2.findContours(
                 binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -739,7 +737,9 @@ class MaskRefiner:
         self.cfg = cfg
         self._prev: np.ndarray | None = None
 
-    def refine(self, mask: np.ndarray, frame_bgr: np.ndarray | None = None) -> np.ndarray:
+    def refine(
+        self, mask: np.ndarray, frame_bgr: np.ndarray | None = None
+    ) -> np.ndarray:
         if cv2 is not None:
             # Snap first. A later user-requested grow/shrink must remain an
             # intentional halo-control offset rather than being undone here.
@@ -820,9 +820,7 @@ def create_segmenter(
         )
     if backend in ("auto", "rvm") and (prepared is None or "rvm" in prepared):
         try:
-            seg = RVMSegmenter(
-                cfg, allow_model_download=preparation is None
-            )
+            seg = RVMSegmenter(cfg, allow_model_download=preparation is None)
             log.info("using rvm matting backend on %s", seg.device)
             return seg
         except Exception as exc:
@@ -833,9 +831,7 @@ def create_segmenter(
         prepared is None or "mediapipe" in prepared
     ):
         try:
-            seg = MediaPipeSegmenter(
-                cfg, allow_model_download=preparation is None
-            )
+            seg = MediaPipeSegmenter(cfg, allow_model_download=preparation is None)
             log.info("using mediapipe segmentation backend on %s", seg.device)
             return seg
         except Exception as exc:

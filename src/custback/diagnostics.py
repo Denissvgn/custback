@@ -22,9 +22,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_LOG_BYTES = 5 * 1024 * 1024
 DEFAULT_LOG_BACKUPS = 3
-LOG_FORMAT = (
-    "%(asctime)s %(levelname)s %(name)s [run=%(run_id)s]: %(message)s"
-)
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s [run=%(run_id)s]: %(message)s"
 _URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>'\"]+")
 _SAFE_CONFIG_STRINGS = {
     "background.mode",
@@ -112,7 +110,9 @@ class _RedactingFormatter(logging.Formatter):
         return redact_sensitive_text(super().format(record))
 
 
-def sanitized_config_summary(config: object, fields: tuple[str, ...] | list[str]) -> str:
+def sanitized_config_summary(
+    config: object, fields: tuple[str, ...] | list[str]
+) -> str:
     """Summarize acknowledged values using a deliberately narrow whitelist."""
 
     if hasattr(config, "model_dump"):
@@ -382,9 +382,7 @@ def configure_logging(
             resolved_run_id, path, False, target_logger, tuple(handlers)
         )
 
-    return LoggingSession(
-        resolved_run_id, path, True, target_logger, tuple(handlers)
-    )
+    return LoggingSession(resolved_run_id, path, True, target_logger, tuple(handlers))
 
 
 def changed_field_names(patch: Mapping[str, object]) -> tuple[str, ...]:

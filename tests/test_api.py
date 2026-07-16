@@ -34,7 +34,7 @@ else:  # Starlette < 1 uses the original httpx client contract.
 from custback.api.security import SecurityPolicy
 import custback.api.server as server_mod
 from custback.api.server import _UploadLimits, _UploadStore, create_app
-from custback.config import AppConfig, RuntimeConfig
+from custback.config import AppConfig, ConfigState, RuntimeConfig
 from custback.hub import FrameHub
 from custback.pipeline import Pipeline
 
@@ -75,9 +75,7 @@ def run_async(awaitable):
         for task in pending:
             task.cancel()
         if pending:
-            loop.run_until_complete(
-                asyncio.gather(*pending, return_exceptions=True)
-            )
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
         asyncio.set_event_loop(None)
 
@@ -160,9 +158,7 @@ class ASGIWebSocket:
             "state": {},
             "extensions": {},
         }
-        self.task = asyncio.create_task(
-            self.app(scope, self._receive, self._send)
-        )
+        self.task = asyncio.create_task(self.app(scope, self._receive, self._send))
         await self.incoming.put({"type": "websocket.connect"})
         message = await asyncio.wait_for(self.outgoing.get(), 2.0)
         if message["type"] == "websocket.close":
@@ -234,9 +230,7 @@ def stack(tmp_path):
         renderer_token=RENDERER_TOKEN,
     )
     upload_dir = tmp_path / "uploads"
-    app = create_app(
-        runtime, hub, pipeline, security=security, upload_dir=upload_dir
-    )
+    app = create_app(runtime, hub, pipeline, security=security, upload_dir=upload_dir)
     yield Stack(app, runtime, hub, pipeline, upload_dir)
     pipeline.stop()
 
@@ -298,10 +292,30 @@ def test_status_and_config_with_bearer(stack):
     assert "token_file" not in config.json()["avatar"]
 
 
-def test_exact_origin_is_enforced_even_with_token(stack):
-    rejected = stack.get(
-        "/status", headers={**AUTH, "Origin": "https://evil.example"}
+def test_public_config_exposes_only_backdrop_target_ids():
+    secret_source = "/run/operator/private/camera-device"
+    cfg = AppConfig.from_dict(
+        {
+            "background": {"mode": "camera", "camera_target": "side-camera"},
+            "backdrop_targets": {
+                "side-camera": {"source": secret_source},
+                "desk-camera": {"source": 2},
+            },
+        }
     )
+
+    public = server_mod._state_body(ConfigState(cfg, 7))
+    background = public["background"]
+    assert background["camera_target"] == "side-camera"
+    assert background["camera_targets"] == ("desk-camera", "side-camera")
+    assert background["camera_source_configured"] is True
+    assert "camera_device" not in background
+    assert "backdrop_targets" not in public
+    assert secret_source not in repr(public)
+
+
+def test_exact_origin_is_enforced_even_with_token(stack):
+    rejected = stack.get("/status", headers={**AUTH, "Origin": "https://evil.example"})
     assert rejected.status_code == 403
     allowed = stack.get("/status", headers={**AUTH, "Origin": ORIGIN})
     assert allowed.status_code == 200
@@ -390,6 +404,25 @@ def test_restart_only_patch_is_409_and_atomic(stack):
     assert current.version == 0
     assert current.config.camera.width == 128
     assert current.config.background.mode == "color"
+
+
+def test_hot_camera_backdrop_source_patch_is_restart_required(stack):
+    response = stack.patch(
+        "/config",
+        json={
+            "background": {
+                "mode": "camera",
+                "camera_device": "/run/secrets/operator-camera",
+            }
+        },
+        headers=AUTH,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "restart_required"
+    assert response.json()["detail"]["fields"] == ["background.camera_device"]
+    assert stack.runtime.version == 0
+    assert stack.runtime.snapshot().background.mode == "color"
 
 
 def test_invalid_patch_is_422(stack):
@@ -486,9 +519,7 @@ def test_upload_is_hidden_until_preflight_and_atomic_activation(
         assert release.wait(2.0)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(
-        stack.pipeline, "apply_staged_config_patch", delayed_apply
-    )
+    monkeypatch.setattr(stack.pipeline, "apply_staged_config_patch", delayed_apply)
 
     async def scenario():
         request = asyncio.create_task(
@@ -671,9 +702,12 @@ def test_delete_rejects_active_then_removes_inactive_background(stack, tmp_path)
         ).json()
     identifier = uploaded["id"]
     assert stack.delete(f"/backgrounds/{identifier}", headers=AUTH).status_code == 409
-    assert stack.patch(
-        "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
-    ).status_code == 200
+    assert (
+        stack.patch(
+            "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
+        ).status_code
+        == 200
+    )
     deleted = stack.delete(f"/backgrounds/{identifier}", headers=AUTH)
     assert deleted.status_code == 204
     assert deleted.headers["x-config-version"] == "2"
@@ -694,14 +728,15 @@ def test_delete_and_reactivation_are_serialized_without_dangling_config(
         ).json()
     identifier = body["id"]
     stored = stack.upload_dir / identifier
-    assert stack.patch(
-        "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
-    ).status_code == 200
+    assert (
+        stack.patch(
+            "/config", json={"background": {"mode": "passthrough"}}, headers=AUTH
+        ).status_code
+        == 200
+    )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        deletion = pool.submit(
-            stack.delete, f"/backgrounds/{identifier}", headers=AUTH
-        )
+        deletion = pool.submit(stack.delete, f"/backgrounds/{identifier}", headers=AUTH)
         activation = pool.submit(
             stack.patch,
             "/config",
@@ -824,9 +859,9 @@ def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
     assert "requestBody" in schema["paths"]["/auth/session"]["post"]
     assert "requestBody" in schema["paths"]["/config"]["patch"]
     get_config = schema["paths"]["/config"]["get"]
-    public_config_ref = get_config["responses"]["200"]["content"][
-        "application/json"
-    ]["schema"]["$ref"]
+    public_config_ref = get_config["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]["$ref"]
     assert public_config_ref.endswith("/PublicAppConfig")
     schemas = schema["components"]["schemas"]
     assert {
@@ -840,42 +875,40 @@ def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
         "tls_certfile",
         "tls_keyfile",
     }.isdisjoint(schemas["PublicAvatarRemoteConfig"]["properties"])
-    patch_schema = schema["paths"]["/config"]["patch"]["responses"]["200"][
-        "content"
-    ]["application/json"]["schema"]
+    assert "camera_device" not in schemas["PublicBackgroundConfig"]["properties"]
+    patch_schema = schema["paths"]["/config"]["patch"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
     assert patch_schema["$ref"].endswith("/_ConfigPatchResponse")
     for path in ("/background/image", "/background/video"):
         operation = schema["paths"][path]["post"]
         assert "multipart/form-data" in operation["requestBody"]["content"]
         assert "201" in operation["responses"]
-        response_schema = operation["responses"]["201"]["content"][
-            "application/json"
-        ]["schema"]
+        response_schema = operation["responses"]["201"]["content"]["application/json"][
+            "schema"
+        ]
         assert response_schema["$ref"].endswith("/_UploadResponse")
-    assert schema["paths"]["/status"]["get"]["responses"]["200"][
-        "content"
-    ]["application/json"]["schema"]["$ref"].endswith("/_StatusResponse")
-    assert schema["paths"]["/backgrounds"]["get"]["responses"]["200"][
-        "content"
-    ]["application/json"]["schema"]["$ref"].endswith(
-        "/_BackgroundListResponse"
-    )
-    snapshot_content = schema["paths"]["/video/snapshot.jpg"]["get"][
-        "responses"
-    ]["200"]["content"]
-    assert set(snapshot_content) == {"image/jpeg"}
-    assert snapshot_content["image/jpeg"]["schema"]["format"] == "binary"
-    mjpeg_content = schema["paths"]["/video/mjpeg"]["get"]["responses"][
+    assert schema["paths"]["/status"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["$ref"].endswith("/_StatusResponse")
+    assert schema["paths"]["/backgrounds"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["$ref"].endswith("/_BackgroundListResponse")
+    snapshot_content = schema["paths"]["/video/snapshot.jpg"]["get"]["responses"][
         "200"
     ]["content"]
+    assert set(snapshot_content) == {"image/jpeg"}
+    assert snapshot_content["image/jpeg"]["schema"]["format"] == "binary"
+    mjpeg_content = schema["paths"]["/video/mjpeg"]["get"]["responses"]["200"][
+        "content"
+    ]
     assert set(mjpeg_content) == {"multipart/x-mixed-replace"}
-    assert mjpeg_content["multipart/x-mixed-replace"]["schema"][
-        "format"
-    ] == "binary"
+    assert mjpeg_content["multipart/x-mixed-replace"]["schema"]["format"] == "binary"
 
 
 def test_websocket_round_trip(stack):
     stack.pipeline.apply_config_patch({"background": {"mode": "remote"}})
+
     async def scenario():
         websocket = await ASGIWebSocket(
             stack.app,
@@ -894,11 +927,31 @@ def test_websocket_round_trip(stack):
 
             deadline = time.monotonic() + 5.0
             while (
-                time.monotonic() < deadline
-                and stack.hub.remote_in.latest()[0] is None
+                time.monotonic() < deadline and stack.hub.remote_in.latest()[0] is None
             ):
                 await asyncio.sleep(0.02)
             assert stack.hub.remote_in.latest()[0] is not None
+        finally:
+            await websocket.close()
+
+    run_async(scenario())
+
+
+def test_invalidated_renderer_epoch_closes_websocket(stack):
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
+        ).connect()
+        try:
+            await websocket.receive_bytes()
+            session = stack.hub.active_remote_session()
+            assert session is not None
+            assert stack.hub.invalidate_remote_session(session)
+            closed = await websocket.receive_close()
+            assert closed.code == 1012
+            assert closed.reason == "renderer session invalidated"
         finally:
             await websocket.close()
 
@@ -956,7 +1009,9 @@ def _multipart_request(data: bytes, *, filename: str = "exact.png") -> Request:
         + filename.encode()
         + b'"\r\nContent-Type: image/png\r\n\r\n'
         + data
-        + b"\r\n--" + boundary + b"--\r\n"
+        + b"\r\n--"
+        + boundary
+        + b"--\r\n"
     )
     delivered = False
 
@@ -1107,7 +1162,7 @@ def test_upload_store_accounts_actual_bytes_and_rejects_quota(tmp_path):
     ]
 
 
-def test_crash_left_staged_upload_counts_toward_quota_and_is_reclaimed(tmp_path):
+def test_unmarked_staged_lookalike_counts_toward_quota_but_is_not_deleted(tmp_path):
     directory = tmp_path / "crash-quota"
     directory.mkdir()
     orphan = directory / (".upload-" + ("a" * 32) + ".png")
@@ -1130,7 +1185,9 @@ def test_crash_left_staged_upload_counts_toward_quota_and_is_reclaimed(tmp_path)
     assert caught.value.status_code == 507
     assert orphan.exists()
     store.cleanup_staged(AppConfig())
-    assert not orphan.exists()
+    # A filename pattern is not an ownership capability.  Restart recovery
+    # only removes inodes named by a durable custback transaction record.
+    assert orphan.exists()
 
 
 def test_upload_quota_reservation_is_atomic_under_race(tmp_path):
@@ -1155,7 +1212,10 @@ def test_upload_quota_reservation_is_atomic_under_race(tmp_path):
             return exc
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = [future.result(5.0) for future in (pool.submit(attempt), pool.submit(attempt))]
+        results = [
+            future.result(5.0)
+            for future in (pool.submit(attempt), pool.submit(attempt))
+        ]
     assert sorted(
         201 if not isinstance(result, HTTPException) else result.status_code
         for result in results
@@ -1250,9 +1310,7 @@ def test_upload_fsync_does_not_block_the_event_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(server_mod.os, "fsync", slow_fsync)
 
     async def scenario():
-        upload = asyncio.create_task(
-            store.save(_multipart_request(payload), "image")
-        )
+        upload = asyncio.create_task(store.save(_multipart_request(payload), "image"))
         try:
             deadline = time.monotonic() + 1.0
             while not entered.is_set() and time.monotonic() < deadline:
@@ -1310,9 +1368,7 @@ def test_upload_cancellation_waits_for_mutating_worker_and_cleans_ownership(
     monkeypatch.setattr(owner, attribute, blocked)
 
     async def scenario():
-        upload = asyncio.create_task(
-            store.save(_multipart_request(payload), "image")
-        )
+        upload = asyncio.create_task(store.save(_multipart_request(payload), "image"))
         try:
             deadline = time.monotonic() + 1.0
             while not entered.is_set() and time.monotonic() < deadline:
@@ -1343,6 +1399,7 @@ def test_failed_upload_unlink_keeps_ownership_until_retry(tmp_path, monkeypatch)
     temporary = directory / ".upload-retry.part"
     store._reserve_file(temporary)
     temporary.write_bytes(b"owned staging bytes")
+    store._bind_created(temporary)
     store._reserve_bytes(temporary.stat().st_size)
     size = temporary.stat().st_size
     original_unlink = Path.unlink
@@ -1350,7 +1407,11 @@ def test_failed_upload_unlink_keeps_ownership_until_retry(tmp_path, monkeypatch)
 
     def fail_first_cleanup_attempts(path, *args, **kwargs):
         nonlocal failures
-        if path == temporary and failures:
+        if (
+            path.parent == directory
+            and path.name.startswith(".custback-cleanup-")
+            and failures
+        ):
             failures -= 1
             raise PermissionError(errno.EACCES, "temporary unlink failure")
         return original_unlink(path, *args, **kwargs)
@@ -1358,14 +1419,16 @@ def test_failed_upload_unlink_keeps_ownership_until_retry(tmp_path, monkeypatch)
     monkeypatch.setattr(Path, "unlink", fail_first_cleanup_attempts)
     store._cleanup_save(None, temporary, None, size, True)
 
-    assert temporary.exists()
+    pending_paths = store._cleanup_pending[temporary][0]
+    assert len(pending_paths) == 1 and pending_paths[0].exists()
+    assert not temporary.exists()
     assert temporary in store._cleanup_pending
-    assert temporary in store._active_temps
+    assert pending_paths[0] in store._active_temps
     assert store._reserved_files == 1
     assert store._reserved_bytes == size
 
     store._retry_pending_cleanup()
-    assert not temporary.exists()
+    assert not pending_paths[0].exists()
     assert store._cleanup_pending == {}
     assert store._active_temps == set()
     assert store._reserved_files == 0
@@ -1481,9 +1544,7 @@ def test_pillow_decompression_bomb_is_mapped_without_opencv_decode(
     assert caught.value.detail["code"] == "image_dimensions_exceeded"
 
 
-def test_websocket_jpeg_header_bomb_is_rejected_before_opencv(
-    monkeypatch
-):
+def test_websocket_jpeg_header_bomb_is_rejected_before_opencv(monkeypatch):
     monkeypatch.setattr(
         server_mod.Image,
         "open",
@@ -1574,9 +1635,7 @@ def test_video_later_frame_limit_rejects_the_whole_upload(tmp_path, monkeypatch)
 
     capture = Capture()
     monkeypatch.setattr(server_mod.cv2, "VideoCapture", lambda _path: capture)
-    store = _UploadStore(
-        tmp_path, _UploadLimits(video_max_width=6, video_max_height=4)
-    )
+    store = _UploadStore(tmp_path, _UploadLimits(video_max_width=6, video_max_height=4))
     with pytest.raises(HTTPException) as caught:
         store._validate(path, "video")
     assert caught.value.status_code == 422

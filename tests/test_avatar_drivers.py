@@ -40,15 +40,18 @@ def test_idle_driver_is_deterministic_and_present():
     second = driver.update(None, 2.5)
     assert first.present and second.present
     assert first.blendshapes == second.blendshapes
-    assert (first.yaw, first.pitch, first.roll) == (second.yaw, second.pitch, second.roll)
+    assert (first.yaw, first.pitch, first.roll) == (
+        second.yaw,
+        second.pitch,
+        second.roll,
+    )
     assert abs(first.yaw) < 0.1  # gentle sway only
 
 
 def test_idle_driver_blinks_periodically():
     driver = IdleDriver()
     blinks = [
-        driver.update(None, t / 100.0).channel("eyeBlinkLeft")
-        for t in range(0, 800)
+        driver.update(None, t / 100.0).channel("eyeBlinkLeft") for t in range(0, 800)
     ]
     assert max(blinks) > 0.9  # a full blink happens
     assert min(blinks) == 0.0  # and the eyes reopen
@@ -139,9 +142,7 @@ def _fake_vision_bindings():
     return bindings, captured
 
 
-def test_prepared_managed_model_is_acquired_once_and_reused(
-    monkeypatch, tmp_path
-):
+def test_prepared_managed_model_is_acquired_once_and_reused(monkeypatch, tmp_path):
     model = tmp_path / "managed.task"
     model.write_bytes(b"model")
     bindings, captured = _fake_vision_bindings()
@@ -172,9 +173,7 @@ def test_prepared_managed_model_is_acquired_once_and_reused(
     assert captured["closed"] is True
 
 
-def test_prepared_custom_model_is_not_revalidated_on_render_lane(
-    monkeypatch, tmp_path
-):
+def test_prepared_custom_model_is_not_revalidated_on_render_lane(monkeypatch, tmp_path):
     model = tmp_path / "custom.task"
     model.write_bytes(b"custom")
     bindings, captured = _fake_vision_bindings()
@@ -186,9 +185,7 @@ def test_prepared_custom_model_is_not_revalidated_on_render_lane(
             AssertionError("a custom model must not use managed acquisition")
         ),
     )
-    cfg = DriverConfig(
-        backend="vision", vision={"model_path": str(model)}
-    )
+    cfg = DriverConfig(backend="vision", vision={"model_path": str(model)})
 
     preparation = prepare_driver(cfg)
     model.unlink()  # construction consumes the prepared result without stat I/O
@@ -208,15 +205,11 @@ def test_prepare_driver_preserves_auto_fallback_for_missing_custom_model(
             AssertionError("custom path validation must happen before imports")
         ),
     )
-    auto = DriverConfig(
-        backend="auto", vision={"model_path": str(missing)}
-    )
+    auto = DriverConfig(backend="auto", vision={"model_path": str(missing)})
     preparation = prepare_driver(auto)
     assert create_driver(auto, preparation=preparation).name == "idle"
 
-    vision = DriverConfig(
-        backend="vision", vision={"model_path": str(missing)}
-    )
+    vision = DriverConfig(backend="vision", vision={"model_path": str(missing)})
     with pytest.raises(DriverUnavailableError, match="does not exist"):
         prepare_driver(vision)
 
@@ -225,9 +218,7 @@ def test_prepare_auto_does_not_acquire_managed_model_without_bindings(monkeypatc
     monkeypatch.setattr(
         drivers_mod,
         "_load_vision_bindings",
-        lambda: (_ for _ in ()).throw(
-            DriverUnavailableError("mediapipe unavailable")
-        ),
+        lambda: (_ for _ in ()).throw(DriverUnavailableError("mediapipe unavailable")),
     )
     monkeypatch.setattr(
         drivers_mod,
@@ -251,13 +242,9 @@ def test_create_driver_rejects_preparation_for_a_different_candidate(
     second.write_bytes(b"second")
     bindings, _captured = _fake_vision_bindings()
     monkeypatch.setattr(drivers_mod, "_load_vision_bindings", lambda: bindings)
-    original = DriverConfig(
-        backend="vision", vision={"model_path": str(first)}
-    )
+    original = DriverConfig(backend="vision", vision={"model_path": str(first)})
     preparation = prepare_driver(original)
-    changed = DriverConfig(
-        backend="vision", vision={"model_path": str(second)}
-    )
+    changed = DriverConfig(backend="vision", vision={"model_path": str(second)})
 
     with pytest.raises(ValueError, match="does not match"):
         create_driver(changed, preparation=preparation)
@@ -295,9 +282,7 @@ def _write_wav(path, *, rate=16000, channels=1, width=2, frames=1600):
         wav.setnchannels(channels)
         wav.setsampwidth(width)
         wav.setframerate(rate)
-        tone = (
-            np.sin(np.linspace(0, 40 * np.pi, frames)) * 12_000
-        ).astype("<i2")
+        tone = (np.sin(np.linspace(0, 40 * np.pi, frames)) * 12_000).astype("<i2")
         if channels == 2:
             tone = np.repeat(tone, 2)
         wav.writeframes(tone.tobytes())
@@ -645,9 +630,7 @@ def test_audio2face_close_interrupts_source_before_rpc_registration(monkeypatch)
             return ()
 
     protocol = SimpleNamespace(
-        grpc=SimpleNamespace(
-            insecure_channel=lambda _url, **_kwargs: Channel()
-        ),
+        grpc=SimpleNamespace(insecure_channel=lambda _url, **_kwargs: Channel()),
         stub_class=Stub,
         audio_header=AudioHeader,
         audio_stream_header=lambda **kwargs: kwargs,
@@ -681,9 +664,7 @@ def test_audio2face_release_failure_is_terminal_and_retryable():
                 raise RuntimeError("native channel survived")
 
     channel = Channel()
-    driver = Audio2FaceDriver(
-        Audio2FaceConfig(url="grpc://127.0.0.1:52000")
-    )
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
     driver._channel = channel
 
     driver._release_channel(channel)
@@ -718,9 +699,7 @@ def test_audio2face_rejected_call_cancel_failure_is_reclaimed_on_close():
                 raise RuntimeError("native call survived")
 
     call = Call()
-    driver = Audio2FaceDriver(
-        Audio2FaceConfig(url="grpc://127.0.0.1:52000")
-    )
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
 
     class Stub:
         def __init__(self, _channel):
@@ -732,9 +711,7 @@ def test_audio2face_rejected_call_cancel_failure_is_reclaimed_on_close():
             return call
 
     protocol = SimpleNamespace(
-        grpc=SimpleNamespace(
-            insecure_channel=lambda _url, **_kwargs: channel
-        ),
+        grpc=SimpleNamespace(insecure_channel=lambda _url, **_kwargs: channel),
         stub_class=Stub,
     )
 
@@ -841,14 +818,10 @@ def test_audio2face_loopback_channel_disables_environment_proxying():
         def ProcessAudioStream(self, _requests):
             return ()
 
-    driver = Audio2FaceDriver(
-        Audio2FaceConfig(url="grpc://127.0.0.1:52000")
-    )
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
     driver._run_session(SimpleNamespace(grpc=Grpc, stub_class=Stub), object())
 
-    assert calls == [
-        ("127.0.0.1:52000", (("grpc.enable_http_proxy", 0),))
-    ]
+    assert calls == [("127.0.0.1:52000", (("grpc.enable_http_proxy", 0),))]
 
 
 def test_audio2face_rejects_malformed_ca_eagerly_without_disclosing_path(tmp_path):

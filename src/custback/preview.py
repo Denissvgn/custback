@@ -33,8 +33,7 @@ from pathlib import Path
 # the user supplied so we can remove only OpenCV's broken defaults while
 # preserving intentional overrides.
 _QT_ENV_BEFORE_CV2 = {
-    key: os.environ.get(key)
-    for key in ("QT_QPA_FONTDIR", "QT_QPA_PLATFORM")
+    key: os.environ.get(key) for key in ("QT_QPA_FONTDIR", "QT_QPA_PLATFORM")
 }
 
 from .backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, list_background_files
@@ -62,11 +61,11 @@ MODE_KEYS = {
     ord("5"): "camera",
 }
 COLOR_PRESETS: list[tuple[int, int, int]] = [
-    (18, 100, 32),      # green
-    (140, 90, 20),      # blue
-    (60, 60, 60),       # gray
-    (245, 245, 245),    # white
-    (0, 0, 0),          # black
+    (18, 100, 32),  # green
+    (140, 90, 20),  # blue
+    (60, 60, 60),  # gray
+    (245, 245, 245),  # white
+    (0, 0, 0),  # black
 ]
 BLUR_STEP = 10
 BLUR_MIN, BLUR_MAX = 3, 151
@@ -159,9 +158,7 @@ def _normalize_highgui_environment(
     module = cv2 if cv2_module is None else cv2_module
     module_file = getattr(module, "__file__", None)
     expected_cv2_font_dir = (
-        Path(module_file).resolve().parent / "qt" / "fonts"
-        if module_file
-        else None
+        Path(module_file).resolve().parent / "qt" / "fonts" if module_file else None
     )
     looks_opencv_injected = bool(
         font_dir
@@ -459,15 +456,22 @@ class _PreviewController:
     def _set_mode(self, mode: str) -> None:
         cfg = self.runtime.snapshot().background
         patch: dict = {"mode": mode}
-        if mode in ("image", "video") and not (cfg.image_path if mode == "image" else cfg.video_path):
-            files = [f for f in list_background_files(self.backgrounds_dir)
-                     if (f.suffix.lower() in IMAGE_EXTS) == (mode == "image")]
+        if mode in ("image", "video") and not (
+            cfg.image_path if mode == "image" else cfg.video_path
+        ):
+            files = [
+                f
+                for f in list_background_files(self.backgrounds_dir)
+                if (f.suffix.lower() in IMAGE_EXTS) == (mode == "image")
+            ]
             if not files:
                 self.flash(f"no background {mode} files in {self.backgrounds_dir}")
                 return
             patch["image_path" if mode == "image" else "video_path"] = str(files[0])
-        if mode == "camera" and cfg.camera_device == "":
-            self.flash("set background.camera_device first (API/CLI) — no default second camera")
+        if mode == "camera" and cfg.camera_device == "" and not cfg.camera_target:
+            self.flash(
+                "configure background.camera_target or a startup camera device first"
+            )
             return
         self._update({"background": patch})
         self.flash(f"mode -> {mode}")
@@ -541,9 +545,7 @@ def _status_overlay_lines(
     device = str(stats.get("segmentation_device") or "unknown").lower()
     output_backend = str(stats.get("output_backend") or "unknown")
     version = stats.get("config_version", 0)
-    status.append(
-        f"SEG {backend}/{device}  OUTPUT {output_backend}  CONFIG v{version}"
-    )
+    status.append(f"SEG {backend}/{device}  OUTPUT {output_backend}  CONFIG v{version}")
 
     capture_parts: list[str] = []
     width, height = stats.get("capture_width"), stats.get("capture_height")
@@ -609,8 +611,16 @@ def _draw_bar(
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
     for i, line in enumerate(lines):
         color = colors[i] if colors and i < len(colors) else (255, 255, 255)
-        cv2.putText(frame, line, (10, y0 + 20 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, color, 1, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            line,
+            (10, y0 + 20 + i * 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def _draw_overlay(frame, stats: dict, controller: _PreviewController):
@@ -679,7 +689,9 @@ def run_preview(
         while not stop.is_set():
             frame, seq = hub.output.get(seq, timeout=0.2)
             if frame is not None:
-                cv2.imshow(WINDOW_TITLE, _draw_overlay(frame, hub.stats_dict(), controller))
+                cv2.imshow(
+                    WINDOW_TITLE, _draw_overlay(frame, hub.stats_dict(), controller)
+                )
             # waitKey pumps the GUI event loop; required even without frames.
             key = cv2.waitKey(1) & 0xFF
             if key in QUIT_KEYS:

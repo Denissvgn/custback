@@ -10,6 +10,7 @@
  */
 
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -131,6 +132,7 @@ test(
     const expectedBins = {
       custback: 'packaging/npm/custback.js',
       'custback-avatar': 'packaging/npm/custback.js',
+      'custback-npm-migrate': 'packaging/npm/migrate-legacy.js',
     };
 
     assert.deepEqual(pkg.bin, expectedBins);
@@ -182,6 +184,95 @@ test(
       skipsPayloadVerification && claimsPayloadVerified,
       false,
       'a skipped payload check and a payload-verified success message cannot coexist',
+    );
+  },
+);
+
+test(
+  'PKG-02: npm pack --silent stdout is one installable filename',
+  (t) => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-pack-contract-'));
+    const checkout = path.join(fixture, 'checkout');
+    const destination = path.join(fixture, 'pack');
+    const cache = path.join(fixture, 'cache');
+    const prefix = path.join(fixture, 'prefix');
+    const version = json('package.json').version;
+    t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+    fs.cpSync(root, checkout, {
+      recursive: true,
+      filter(source) {
+        const relative = path.relative(root, source);
+        const parts = relative.split(path.sep);
+        return !parts.some((part) => [
+          '.agents', '.codex', '.git', '.pytest_cache', '.venv', '__pycache__',
+          'build', 'dist', 'node_modules',
+        ].includes(part) || part.endsWith('.egg-info') ||
+          part.endsWith('.custback-generations')) &&
+          !relative.endsWith('.tgz') && !relative.endsWith('.whl') &&
+          !relative.endsWith('.tar.gz') && !relative.endsWith('.pyc') &&
+          !/(^|[\\/])onnxruntime_profile__.*\.json$/.test(relative);
+      },
+    });
+    fs.mkdirSync(destination);
+
+    // Phase 5 intentionally keeps the real tree release-blocked by REL-01.
+    // Close the copied registry only to exercise npm's post-prepack stdout
+    // contract; this fixture is not release evidence.
+    const registryPath = path.join(
+      checkout, 'scripts', 'release', 'remediation-blockers.json',
+    );
+    const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+    registry.release_blocked = false;
+    registry.blockers = registry.blockers.map((blocker) => {
+      const regression = { ...blocker.regression };
+      delete regression.guard;
+      return { ...blocker, status: 'resolved', regression };
+    });
+    fs.writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+    const fixtureReleasePath = path.join(
+      checkout, 'scripts', 'release', 'verify-release.js',
+    );
+    const fixtureRelease = require(fixtureReleasePath);
+    const closedDigest = fixtureRelease.remediationContractDigest(
+      fixtureRelease.remediationRegistry(checkout),
+    );
+    const fixtureReleaseSource = fs.readFileSync(fixtureReleasePath, 'utf8');
+    fs.writeFileSync(
+      fixtureReleasePath,
+      fixtureReleaseSource.replace(
+        /const REVIEWED_REMEDIATION_CONTRACT_SHA256\s*=\s*\n?\s*'[^']+';/,
+        `const REVIEWED_REMEDIATION_CONTRACT_SHA256 = '${closedDigest}';`,
+      ),
+    );
+
+    const packed = spawnSync('npm', [
+      'pack', '--silent', '--pack-destination', destination, '--cache', cache,
+    ], {
+      cwd: checkout,
+      encoding: 'utf8',
+      timeout: 120_000,
+      env: { ...process.env, CUSTBACK_SKIP_INSTALL: '1' },
+    });
+    assert.equal(packed.error, undefined, packed.error && packed.error.message);
+    assert.equal(packed.status, 0, packed.stderr);
+    const filename = `custback-${version}.tgz`;
+    assert.equal(packed.stdout, `${filename}\n`);
+
+    const tarball = path.join(destination, filename);
+    assert.equal(fs.statSync(tarball).isFile(), true);
+    const installed = spawnSync('npm', [
+      'install', '--prefix', prefix, '--cache', cache, tarball,
+    ], {
+      cwd: fixture,
+      encoding: 'utf8',
+      timeout: 120_000,
+      env: { ...process.env, CUSTBACK_SKIP_INSTALL: '1' },
+    });
+    assert.equal(installed.error, undefined, installed.error && installed.error.message);
+    assert.equal(installed.status, 0, installed.stderr);
+    assert.equal(
+      fs.statSync(path.join(prefix, 'node_modules', 'custback', 'package.json')).isFile(),
+      true,
     );
   },
 );

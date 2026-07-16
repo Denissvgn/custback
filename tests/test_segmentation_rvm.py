@@ -85,7 +85,8 @@ def test_segment_returns_mask_and_clean_foreground(cpu_ort):
 def test_device_cpu_and_cuda(cpu_ort, monkeypatch):
     assert RVMSegmenter(rvm_cfg()).device == "cpu"
     monkeypatch.setitem(
-        sys.modules, "onnxruntime",
+        sys.modules,
+        "onnxruntime",
         fake_ort(["CUDAExecutionProvider", "CPUExecutionProvider"]),
     )
     assert RVMSegmenter(rvm_cfg()).device == "cuda"

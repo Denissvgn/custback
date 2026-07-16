@@ -104,11 +104,7 @@ def _resolve_token(
             raise SecurityConfigurationError(
                 f"API token path {path} must be a regular non-symlink file"
             )
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(path, flags)
         except OSError as exc:
@@ -139,7 +135,9 @@ def _resolve_token(
         try:
             value = encoded.decode("ascii")
         except UnicodeDecodeError as exc:
-            raise SecurityConfigurationError(f"API token file {path} must be ASCII") from exc
+            raise SecurityConfigurationError(
+                f"API token file {path} must be ASCII"
+            ) from exc
         return ResolvedToken(_validate_token(value), path=path)
 
     if not create:
@@ -319,7 +317,10 @@ def validate_bind_security(
             "api.tls_certfile and api.tls_keyfile must be configured together"
         )
     if cert:
-        for label, value in (("certificate", tls_certfile), ("private key", tls_keyfile)):
+        for label, value in (
+            ("certificate", tls_certfile),
+            ("private key", tls_keyfile),
+        ):
             if not Path(value).is_file():
                 raise SecurityConfigurationError(f"TLS {label} does not exist: {value}")
     if is_loopback_host(host):
@@ -417,7 +418,9 @@ def validate_outbound_endpoint(
         # malformed or out-of-range port latent until the network call.
         parsed_port = parsed.port
     except ValueError as exc:
-        raise SecurityConfigurationError(f"{label} has an invalid port or host") from exc
+        raise SecurityConfigurationError(
+            f"{label} has an invalid port or host"
+        ) from exc
 
     allowed, plaintext = _OUTBOUND_SCHEMES[kind]
     scheme = parsed.scheme.lower()
@@ -502,9 +505,7 @@ def validate_client_tls(
         ("client private key", keyfile),
     ):
         if value and not Path(value).expanduser().is_file():
-            raise SecurityConfigurationError(
-                f"{label} TLS {path_label} does not exist"
-            )
+            raise SecurityConfigurationError(f"{label} TLS {path_label} does not exist")
 
 
 def create_client_ssl_context(
@@ -611,7 +612,11 @@ class SessionStore:
         max_sessions: int = MAX_BROWSER_SESSIONS,
     ):
         self.ttl_s = ttl_s
-        if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions < 1:
+        if (
+            not isinstance(max_sessions, int)
+            or isinstance(max_sessions, bool)
+            or max_sessions < 1
+        ):
             raise ValueError("max_sessions must be a positive integer")
         self.max_sessions = max_sessions
         self._sessions: dict[str, float] = {}
@@ -674,14 +679,20 @@ class SecurityPolicy:
             or isinstance(self.session_ttl_s, bool)
             or self.session_ttl_s < 60
         ):
-            raise SecurityConfigurationError("session TTL must be an integer of at least 60 seconds")
+            raise SecurityConfigurationError(
+                "session TTL must be an integer of at least 60 seconds"
+            )
         if not self.allowed_origins:
-            raise SecurityConfigurationError("at least one exact API origin is required")
+            raise SecurityConfigurationError(
+                "at least one exact API origin is required"
+            )
         normalized_origins: set[str] = set()
         for origin in self.allowed_origins:
             canonical = canonical_origin(origin)
             if canonical is None:
-                raise SecurityConfigurationError(f"invalid exact API origin: {origin!r}")
+                raise SecurityConfigurationError(
+                    f"invalid exact API origin: {origin!r}"
+                )
             normalized_origins.add(canonical)
         if len(normalized_origins) != len(self.allowed_origins):
             raise SecurityConfigurationError(
@@ -718,7 +729,9 @@ class SecurityPolicy:
         raw_origins = frozenset(allowed_origins) or default_origins(host, port, tls=tls)
         normalized_origins = {canonical_origin(origin) for origin in raw_origins}
         if None in normalized_origins:
-            invalid = next(origin for origin in raw_origins if canonical_origin(origin) is None)
+            invalid = next(
+                origin for origin in raw_origins if canonical_origin(origin) is None
+            )
             raise SecurityConfigurationError(f"invalid exact API origin: {invalid!r}")
         origins = frozenset(normalized_origins)
         expected_scheme = "https" if tls else "http"
@@ -767,7 +780,10 @@ class SecurityPolicy:
             return False
         if origin is not None:
             normalized_origin = canonical_origin(origin)
-            if normalized_origin is None or normalized_origin not in self.allowed_origins:
+            if (
+                normalized_origin is None
+                or normalized_origin not in self.allowed_origins
+            ):
                 return False
         return True
 

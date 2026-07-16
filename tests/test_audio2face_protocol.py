@@ -110,9 +110,7 @@ def test_driver_uses_generated_in_process_audio2face_service():
             )
 
     server = grpc.server(ThreadPoolExecutor(max_workers=1))
-    audio2face_pb2_grpc.add_A2FControllerServiceServicer_to_server(
-        Service(), server
-    )
+    audio2face_pb2_grpc.add_A2FControllerServiceServicer_to_server(Service(), server)
     port = server.add_insecure_port("127.0.0.1:0")
     assert port > 0
     server.start()

@@ -13,7 +13,11 @@ from custback.avatar.config import (
     AppearanceConfig,
     AvatarBackgroundConfig,
 )
-from custback.avatar.renderer import blurred_room, compose_avatar, create_avatar_backdrop
+from custback.avatar.renderer import (
+    blurred_room,
+    compose_avatar,
+    create_avatar_backdrop,
+)
 from custback.avatar.rig import (
     AVATAR_PRESETS,
     BuiltinRig,
@@ -153,7 +157,9 @@ def test_builtin_head_pose_moves_head_but_not_torso():
     base = rig.render(FaceState.neutral(), ALL_PARTS)
     assert not np.array_equal(base, posed)
     torso_only = frozenset({"torso"})
-    assert np.array_equal(rig.render(state, torso_only), rig.render(FaceState.neutral(), torso_only))
+    assert np.array_equal(
+        rig.render(state, torso_only), rig.render(FaceState.neutral(), torso_only)
+    )
 
 
 def _assert_follow_pose_switch_preserves_expression(rig):
@@ -197,7 +203,7 @@ def test_builtin_avatars_render_distinct_characters():
     }
     names = list(sprites)
     for index, first in enumerate(names):
-        for second in names[index + 1:]:
+        for second in names[index + 1 :]:
             assert not np.array_equal(sprites[first], sprites[second]), (first, second)
 
 
@@ -251,12 +257,27 @@ def rig_dir(tmp_path):
     directory = tmp_path / "rig"
     directory.mkdir()
     size = (200, 100)
-    _write_layer(directory / "torso.png", size, (255, 0, 0), (slice(150, 200), slice(20, 80)))
-    _write_layer(directory / "head.png", size, (0, 255, 0), (slice(20, 150), slice(25, 75)))
-    _write_layer(directory / "eyes.png", size, (0, 0, 255), (slice(60, 70), slice(35, 65)))
-    _write_layer(directory / "eyes_closed.png", size, (0, 0, 128), (slice(64, 68), slice(35, 65)))
-    _write_layer(directory / "mouth.png", size, (255, 255, 0), (slice(110, 120), slice(40, 60)))
-    _write_layer(directory / "mouth_open.png", size, (0, 255, 255), (slice(105, 125), slice(40, 60)))
+    _write_layer(
+        directory / "torso.png", size, (255, 0, 0), (slice(150, 200), slice(20, 80))
+    )
+    _write_layer(
+        directory / "head.png", size, (0, 255, 0), (slice(20, 150), slice(25, 75))
+    )
+    _write_layer(
+        directory / "eyes.png", size, (0, 0, 255), (slice(60, 70), slice(35, 65))
+    )
+    _write_layer(
+        directory / "eyes_closed.png", size, (0, 0, 128), (slice(64, 68), slice(35, 65))
+    )
+    _write_layer(
+        directory / "mouth.png", size, (255, 255, 0), (slice(110, 120), slice(40, 60))
+    )
+    _write_layer(
+        directory / "mouth_open.png",
+        size,
+        (0, 255, 255),
+        (slice(105, 125), slice(40, 60)),
+    )
     return directory
 
 
@@ -316,7 +337,9 @@ def test_layered_rig_rejects_bad_manifests_and_layers(rig_dir, tmp_path):
     with pytest.raises(RigError, match="no part layers"):
         LayeredRig(empty)
 
-    _write_layer(rig_dir / "hair.png", (50, 50), (1, 2, 3), (slice(0, 10), slice(0, 10)))
+    _write_layer(
+        rig_dir / "hair.png", (50, 50), (1, 2, 3), (slice(0, 10), slice(0, 10))
+    )
     with pytest.raises(RigError, match="does not match"):
         LayeredRig(rig_dir)
 
@@ -363,9 +386,7 @@ def test_direct_rig_rejects_invalid_png_before_opencv(monkeypatch, tmp_path):
         LayeredRig(directory)
 
 
-def test_direct_rig_rejects_layer_pixel_bomb_before_opencv(
-    monkeypatch, tmp_path
-):
+def test_direct_rig_rejects_layer_pixel_bomb_before_opencv(monkeypatch, tmp_path):
     directory = tmp_path / "rig"
     directory.mkdir()
     _write_layer(
@@ -427,9 +448,7 @@ def test_direct_rig_rejects_non_uint8_opencv_decode(monkeypatch, tmp_path):
         LayeredRig(directory)
 
 
-def test_direct_rig_rejects_oversized_manifest_before_opencv(
-    monkeypatch, tmp_path
-):
+def test_direct_rig_rejects_oversized_manifest_before_opencv(monkeypatch, tmp_path):
     directory = tmp_path / "rig"
     directory.mkdir()
     _write_layer(
@@ -544,7 +563,9 @@ def test_compose_avatar_alpha_blends_soft_edges():
 
 
 def test_create_avatar_backdrop_modes(tmp_path):
-    color = create_avatar_backdrop(AvatarBackgroundConfig(mode="color", color=(1, 2, 3)))
+    color = create_avatar_backdrop(
+        AvatarBackgroundConfig(mode="color", color=(1, 2, 3))
+    )
     frame = color.frame(32, 16)
     assert frame.shape == (16, 32, 3)
     assert (frame == (1, 2, 3)).all()
@@ -562,9 +583,7 @@ def test_avatar_image_backdrop_uses_configured_pixel_cap_before_opencv(
     tmp_path, monkeypatch
 ):
     image_path = tmp_path / "oversized.png"
-    assert cv2.imwrite(
-        str(image_path), np.full((9, 9, 3), 9, dtype=np.uint8)
-    )
+    assert cv2.imwrite(str(image_path), np.full((9, 9, 3), 9, dtype=np.uint8))
     monkeypatch.setattr(
         backgrounds_mod.cv2,
         "imread",

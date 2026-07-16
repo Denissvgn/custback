@@ -6,8 +6,11 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 import sys
+from importlib import resources
+from pathlib import Path
 
 from typing import get_args
 
@@ -28,9 +31,9 @@ EXIT_CONFIG = 2
 EXIT_API = 3
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, prog: str = "custback-avatar") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="custback-avatar",
+        prog=prog,
         description=(
             "Avatar renderer for custback: consumes raw camera frames over "
             "the custback WebSocket API and returns avatar frames "
@@ -81,14 +84,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--parts",
         help=f"comma-separated visible parts from: {', '.join(AVATAR_PARTS)}",
     )
-    parser.add_argument("--scale", type=float, help="avatar height / frame height (0.1-3)")
+    parser.add_argument(
+        "--scale", type=float, help="avatar height / frame height (0.1-3)"
+    )
     parser.add_argument("--offset-x", type=float, help="horizontal shift, -1..1")
-    parser.add_argument("--offset-y", type=float, help="vertical shift, -1..1 (negative = up)")
+    parser.add_argument(
+        "--offset-y", type=float, help="vertical shift, -1..1 (negative = up)"
+    )
     parser.add_argument(
         "--bg-mode", choices=("color", "image", "video", "blur"), help="background mode"
     )
-    parser.add_argument("--bg-image", help="background image path (implies --bg-mode image)")
-    parser.add_argument("--bg-video", help="background video path (implies --bg-mode video)")
+    parser.add_argument(
+        "--bg-image", help="background image path (implies --bg-mode image)"
+    )
+    parser.add_argument(
+        "--bg-video", help="background video path (implies --bg-mode video)"
+    )
     parser.add_argument("--no-api", action="store_true", help="disable the control API")
     parser.add_argument("--api-host", help="control API bind host (default 127.0.0.1)")
     parser.add_argument("--api-port", type=int, help="control API port (default 8711)")
@@ -96,14 +107,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--api-token-file", help="path to the mode-0600 avatar API token file"
     )
     parser.add_argument(
-        "--allow-non-loopback-api", action="store_true",
+        "--allow-non-loopback-api",
+        action="store_true",
         help="allow a TLS-protected control API bind outside loopback",
     )
     parser.add_argument("--api-tls-cert", help="TLS certificate for the control API")
     parser.add_argument("--api-tls-key", help="TLS private key for the control API")
     parser.add_argument(
-        "--show-api-token", action="store_true",
+        "--show-api-token",
+        action="store_true",
         help="print the resolved avatar control API token and exit",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="initialize and tear down a hardware-free idle renderer, then exit",
     )
     storage_permissions = parser.add_mutually_exclusive_group()
     storage_permissions.add_argument(
@@ -122,10 +140,56 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-file", metavar="PATH", help="write a rotating diagnostics log to PATH"
     )
     parser.add_argument(
-        "--dump-config", metavar="PATH",
+        "--dump-config",
+        metavar="PATH",
         help="write the effective config to PATH and exit",
     )
     return parser
+
+
+def avatar_config_bytes() -> bytes:
+    """Return the installed, annotated avatar configuration template."""
+
+    return resources.files("custback.avatar").joinpath("avatar.yaml").read_bytes()
+
+
+def export_avatar_config(
+    destination: str | os.PathLike[str] | None,
+    *,
+    output=None,
+) -> int:
+    """Print or exclusively create a private copy of the bundled template."""
+
+    contents = avatar_config_bytes()
+    if destination is None or os.fspath(destination) == "-":
+        stream = output if output is not None else sys.stdout.buffer
+        stream.write(contents)
+        return 0
+
+    path = Path(destination).expanduser()
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    return 0
+
+
+def _config_export_destination(argv: list[str]) -> str | None | object:
+    """Parse the command without letting the runtime parser consume it."""
+
+    if argv[:2] != ["config", "export"]:
+        return _NOT_CONFIG_EXPORT
+    if len(argv) > 3:
+        raise ValueError("usage: custback avatar config export [PATH]")
+    return argv[2] if len(argv) == 3 else None
+
+
+_NOT_CONFIG_EXPORT = object()
 
 
 def config_from_args(args: argparse.Namespace) -> AvatarConfig:
@@ -227,6 +291,27 @@ def _storage_permission_command(cfg: AvatarConfig, *, fix: bool) -> int:
     return 0
 
 
+def _hardware_free_smoke() -> int:
+    """Exercise installed renderer resources without sockets or hardware."""
+
+    from .service import AvatarService
+
+    cfg = AvatarConfig.from_dict(
+        {
+            "driver": {"backend": "idle"},
+            "background": {"mode": "color"},
+            "api": {"enabled": False},
+        }
+    )
+    service = AvatarService(AvatarRuntime(cfg))
+    try:
+        service.activate_initial()
+    finally:
+        service.close()
+    print("avatar hardware-free smoke ok")
+    return 0
+
+
 def _security_policy(cfg: AvatarConfig):
     from ..api.security import (
         SecurityConfigurationError,
@@ -309,7 +394,9 @@ def run(cfg: AvatarConfig) -> int:
             scheme = "https" if cfg.api.tls_certfile else "http"
             log.info(
                 "avatar control API ready at %s://%s:%s",
-                scheme, cfg.api.host, cfg.api.port,
+                scheme,
+                cfg.api.host,
+                cfg.api.port,
             )
         log.info(
             "avatar service starting: driver=%s rig=%s avatar=%s style=%s "
@@ -340,8 +427,21 @@ def run(cfg: AvatarConfig) -> int:
     return exit_code
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def main(argv: list[str] | None = None, *, prog: str = "custback-avatar") -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        destination = _config_export_destination(effective_argv)
+    except ValueError as exc:
+        print(f"{prog}: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    if destination is not _NOT_CONFIG_EXPORT:
+        try:
+            return export_avatar_config(destination)
+        except (OSError, ValueError) as exc:
+            print(f"{prog}: cannot export avatar config: {exc}", file=sys.stderr)
+            return EXIT_CONFIG
+
+    args = build_parser(prog=prog).parse_args(effective_argv)
     from ..diagnostics import LoggingConfigurationError, configure_logging
 
     try:
@@ -366,6 +466,12 @@ def main(argv: list[str] | None = None) -> int:
                 cfg,
                 fix=args.fix_storage_permissions,
             )
+        if args.smoke:
+            try:
+                return _hardware_free_smoke()
+            except Exception:
+                log.exception("avatar hardware-free smoke failed")
+                return EXIT_RUNTIME
         if args.dump_config:
             cfg.save(args.dump_config)
             print(f"config written to {args.dump_config}")

@@ -189,6 +189,18 @@ class _PendingInterruption:
     error: BaseException | None = None
 
 
+@dataclass
+class _OwnedAudio2FaceGeneration:
+    """All native identities retained until their worker is terminal."""
+
+    source: AudioSource | None
+    call: Any | None
+    channel: Any | None
+    worker: threading.Thread | None
+    interruptions: list[_PendingInterruption] = field(default_factory=list)
+    completed_interruptions: set[tuple[str, int]] = field(default_factory=set)
+
+
 def _load_protocol() -> _Protocol:
     try:
         import grpc
@@ -283,6 +295,7 @@ class Audio2FaceDriver(FaceDriver):
         self._channel: Any | None = None
         self._survivors: list[tuple[str, Any, BaseException]] = []
         self._interruptions: list[_PendingInterruption] = []
+        self._owned_generation: _OwnedAudio2FaceGeneration | None = None
         self._closed = False
         self._last_error: str = ""
 
@@ -366,19 +379,34 @@ class Audio2FaceDriver(FaceDriver):
 
     def _close_owned(self, deadline: float) -> None:
         with self._lifecycle_lock:
-            # Remove ownership before invoking user/native methods. The worker's
-            # finally blocks therefore cannot double-close resources that this
-            # thread is using to interrupt it.
-            source, self._source = self._source, None
-            call, self._call = self._call, None
-            channel, self._channel = self._channel, None
-            worker = self._worker
+            generation = self._owned_generation
+            if generation is None:
+                # Move every active identity into one terminal-ownership
+                # generation. The individual fields are cleared so worker
+                # finally blocks cannot double-close resources while close()
+                # interrupts them, but the driver retains the complete set
+                # until the exact worker is joined.
+                generation = _OwnedAudio2FaceGeneration(
+                    source=self._source,
+                    call=self._call,
+                    channel=self._channel,
+                    worker=self._worker,
+                )
+                self._owned_generation = generation
+                self._source = None
+                self._call = None
+                self._channel = None
+            worker = generation.worker
             survivors, self._survivors = self._survivors, []
             pending, self._interruptions = self._interruptions, []
 
         # Closing the capture first wakes a request generator blocked in read().
         # Cancelling the RPC then wakes a response iterator blocked in next().
-        owned = [("source", source), ("call", call), ("channel", channel)]
+        owned = [
+            ("source", generation.source),
+            ("call", generation.call),
+            ("channel", generation.channel),
+        ]
         owned.extend((kind, resource) for kind, resource, _error in survivors)
         retry: list[tuple[str, Any]] = []
         still_pending: list[_PendingInterruption] = []
@@ -386,13 +414,29 @@ class Audio2FaceDriver(FaceDriver):
             if interruption.done.is_set():
                 if interruption.error is not None:
                     retry.append((interruption.kind, interruption.resource))
+                else:
+                    generation.completed_interruptions.add(
+                        self._interruption_key(interruption.kind, interruption.resource)
+                    )
             else:
                 # A completion racing this observation remains conservatively
                 # owned and is classified on the next settle/retry pass.
                 still_pending.append(interruption)
         pending = still_pending
-        pending.extend(self._begin_interruptions(owned + retry, deadline))
+        busy = {self._interruption_key(item.kind, item.resource) for item in pending}
+        candidates = [
+            (kind, resource)
+            for kind, resource in owned
+            if resource is not None
+            and self._interruption_key(kind, resource)
+            not in generation.completed_interruptions
+            and self._interruption_key(kind, resource) not in busy
+        ]
+        candidates.extend(retry)
+        pending.extend(self._begin_interruptions(candidates, deadline))
+        self._retain_generation_interruptions(generation, pending)
         failures, active = self._settle_interruptions(pending, deadline)
+        self._record_completed_interruptions(generation, pending, failures, active)
         self._retain_interruptions(active)
 
         if worker is threading.current_thread():
@@ -405,12 +449,8 @@ class Audio2FaceDriver(FaceDriver):
             if worker.is_alive():
                 self._remember_survivors(failures)
                 raise DriverUnavailableError(
-                    "audio2face worker did not stop within "
-                    f"{_CLOSE_TIMEOUT_S:.1f}s"
+                    f"audio2face worker did not stop within {_CLOSE_TIMEOUT_S:.1f}s"
                 )
-            with self._lifecycle_lock:
-                if self._worker is worker:
-                    self._worker = None
 
         # Registration/release can race the first ownership snapshot. Once the
         # worker is terminal no more resources can appear, so retry every late
@@ -421,11 +461,13 @@ class Audio2FaceDriver(FaceDriver):
             [(kind, resource) for kind, resource, _error in late],
             deadline,
         )
-        late_failures, late_active = self._settle_interruptions(
-            late_pending, deadline
-        )
+        self._retain_generation_interruptions(generation, late_pending)
+        late_failures, late_active = self._settle_interruptions(late_pending, deadline)
         failures.extend(late_failures)
         active.extend(late_active)
+        self._record_completed_interruptions(
+            generation, late_pending, late_failures, late_active
+        )
         self._retain_interruptions(late_active)
         if active:
             self._remember_survivors(failures)
@@ -446,6 +488,45 @@ class Audio2FaceDriver(FaceDriver):
                 "audio2face close exceeded its "
                 f"{_CLOSE_TIMEOUT_S:.1f}s shutdown deadline"
             )
+        with self._lifecycle_lock:
+            if self._worker is worker:
+                self._worker = None
+            if self._owned_generation is generation:
+                self._owned_generation = None
+
+    @staticmethod
+    def _interruption_key(kind: str, resource: Any) -> tuple[str, int]:
+        return kind, id(resource)
+
+    @staticmethod
+    def _retain_generation_interruptions(
+        generation: _OwnedAudio2FaceGeneration,
+        pending: list[_PendingInterruption],
+    ) -> None:
+        for interruption in pending:
+            if not any(interruption is saved for saved in generation.interruptions):
+                generation.interruptions.append(interruption)
+
+    @classmethod
+    def _record_completed_interruptions(
+        cls,
+        generation: _OwnedAudio2FaceGeneration,
+        pending: list[_PendingInterruption],
+        failures: list[tuple[str, Any, BaseException]],
+        active: list[_PendingInterruption],
+    ) -> None:
+        """Remember successful attempts without racing terminal ownership."""
+
+        unresolved = {
+            cls._interruption_key(kind, resource) for kind, resource, _error in failures
+        }
+        unresolved.update(
+            cls._interruption_key(item.kind, item.resource) for item in active
+        )
+        for interruption in pending:
+            key = cls._interruption_key(interruption.kind, interruption.resource)
+            if key not in unresolved:
+                generation.completed_interruptions.add(key)
 
     def _begin_interruptions(
         self,
@@ -490,9 +571,7 @@ class Audio2FaceDriver(FaceDriver):
                         daemon=True,
                     )
                     interruption.thread.start()
-                    interruption.entered.wait(
-                        max(0.0, deadline - time.monotonic())
-                    )
+                    interruption.entered.wait(max(0.0, deadline - time.monotonic()))
                 except BaseException as exc:
                     interruption.error = exc
                     interruption.done.set()
@@ -528,16 +607,12 @@ class Audio2FaceDriver(FaceDriver):
                 active.append(interruption)
         return failures, active
 
-    def _retain_interruptions(
-        self, pending: list[_PendingInterruption]
-    ) -> None:
+    def _retain_interruptions(self, pending: list[_PendingInterruption]) -> None:
         if not pending:
             return
         with self._lifecycle_lock:
             for interruption in pending:
-                if not any(
-                    interruption is saved for saved in self._interruptions
-                ):
+                if not any(interruption is saved for saved in self._interruptions):
                     self._interruptions.append(interruption)
 
     def _remember_survivor(
@@ -562,11 +637,7 @@ class Audio2FaceDriver(FaceDriver):
         """Publish a channel unless shutdown already owns the lifecycle."""
 
         with self._lifecycle_lock:
-            if (
-                self._closed
-                or self._stop.is_set()
-                or self._channel is not None
-            ):
+            if self._closed or self._stop.is_set() or self._channel is not None:
                 return False
             self._channel = channel
             return True
@@ -616,8 +687,7 @@ class Audio2FaceDriver(FaceDriver):
     def healthy(self) -> bool:
         _weights, updated_at = self._state.snapshot()
         return (
-            updated_at is not None
-            and (time.monotonic() - updated_at) <= _STALE_AFTER_S
+            updated_at is not None and (time.monotonic() - updated_at) <= _STALE_AFTER_S
         )
 
     @property
@@ -747,10 +817,7 @@ class Audio2FaceDriver(FaceDriver):
         state = FaceState(
             present=True, yaw=yaw, pitch=pitch, roll=roll, timestamp=timestamp
         )
-        stale = (
-            updated_at is None
-            or (time.monotonic() - updated_at) > _STALE_AFTER_S
-        )
+        stale = updated_at is None or (time.monotonic() - updated_at) > _STALE_AFTER_S
         if not stale:
             for name, value in weights.items():
                 state.set_channel(name, value)

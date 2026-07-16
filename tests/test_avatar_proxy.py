@@ -309,14 +309,10 @@ def test_proxy_route_contract_rejects_ambiguous_parameter_segments(path):
         "/avatar/avatars/casey%5Cescape/thumbnail.jpg",
     ],
 )
-def test_encoded_proxy_path_ambiguity_performs_no_upstream_io(
-    path, monkeypatch
-):
+def test_encoded_proxy_path_ambiguity_performs_no_upstream_io(path, monkeypatch):
     monkeypatch.setenv("CUSTBACK_AVATAR_API_TOKEN", AVATAR_TOKEN)
     runtime = RuntimeConfig(
-        AppConfig.from_dict(
-            {"avatar": {"url": "https://trusted-avatar.example:8711"}}
-        )
+        AppConfig.from_dict({"avatar": {"url": "https://trusted-avatar.example:8711"}})
     )
     calls = []
 
@@ -345,9 +341,7 @@ def test_proxy_does_not_leak_core_credentials(stack):
 async def _direct_avatar_request(stack) -> int:
     factory_client = getattr(stack.app.state, "avatar_proxy_client", None)
     assert factory_client is not None
-    response = await factory_client.get(
-        "https://avatar-host:8711/status", headers=AUTH
-    )
+    response = await factory_client.get("https://avatar-host:8711/status", headers=AUTH)
     return response.status_code
 
 
@@ -396,9 +390,7 @@ def test_avatar_url_validation():
         AppConfig.from_dict({"avatar": {"url": "http://host:8711/path"}})
     with pytest.raises(ValueError):
         AppConfig.from_dict({"avatar": {"url": "http://avatar.example:8711"}})
-    loopback = AppConfig.from_dict(
-        {"avatar": {"url": "http://127.0.0.1:8711"}}
-    )
+    loopback = AppConfig.from_dict({"avatar": {"url": "http://127.0.0.1:8711"}})
     assert loopback.avatar.url == "http://127.0.0.1:8711"
     cfg = AppConfig.from_dict({"avatar": {"url": "https://gb10.local:8711/"}})
     assert cfg.avatar.url == "https://gb10.local:8711"
@@ -422,9 +414,7 @@ def test_avatar_proxy_tls_configuration_is_structural_and_secure(tmp_path):
             }
         )
     with pytest.raises(ValueError, match="configured secure endpoint"):
-        AppConfig.from_dict(
-            {"avatar": {"url": "", "tls_ca_file": str(ca_file)}}
-        )
+        AppConfig.from_dict({"avatar": {"url": "", "tls_ca_file": str(ca_file)}})
     with pytest.raises(ValueError, match="plaintext"):
         AppConfig.from_dict(
             {
@@ -612,9 +602,7 @@ def test_proxy_maps_upstream_auth_rejection_without_forwarding_body(
 ):
     monkeypatch.setenv("CUSTBACK_AVATAR_API_TOKEN", AVATAR_TOKEN)
     runtime = RuntimeConfig(
-        AppConfig.from_dict(
-            {"avatar": {"url": "https://trusted-avatar.example:8711"}}
-        )
+        AppConfig.from_dict({"avatar": {"url": "https://trusted-avatar.example:8711"}})
     )
     upstream_responses = []
 
@@ -640,9 +628,7 @@ def test_proxy_maps_upstream_auth_rejection_without_forwarding_body(
 def test_proxy_maps_request_construction_error(monkeypatch):
     monkeypatch.setenv("CUSTBACK_AVATAR_API_TOKEN", AVATAR_TOKEN)
     runtime = RuntimeConfig(
-        AppConfig.from_dict(
-            {"avatar": {"url": "https://trusted-avatar.example:8711"}}
-        )
+        AppConfig.from_dict({"avatar": {"url": "https://trusted-avatar.example:8711"}})
     )
 
     class InvalidBuildClient:
@@ -664,9 +650,7 @@ def test_proxy_maps_request_construction_error(monkeypatch):
 def test_proxy_never_follows_upstream_redirects(monkeypatch):
     monkeypatch.setenv("CUSTBACK_AVATAR_API_TOKEN", AVATAR_TOKEN)
     runtime = RuntimeConfig(
-        AppConfig.from_dict(
-            {"avatar": {"url": "https://trusted-avatar.example:8711"}}
-        )
+        AppConfig.from_dict({"avatar": {"url": "https://trusted-avatar.example:8711"}})
     )
     calls = []
 
@@ -706,9 +690,7 @@ def test_proxy_stream_closes_upstream_when_sending_headers_fails():
         closed = True
 
     async def scenario():
-        response = avatar_proxy_module._ClosingStreamingResponse(
-            body(), close=close
-        )
+        response = avatar_proxy_module._ClosingStreamingResponse(body(), close=close)
         blocked_receive = asyncio.Event()
 
         async def receive():

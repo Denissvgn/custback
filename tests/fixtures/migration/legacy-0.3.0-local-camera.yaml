@@ -1,0 +1,54 @@
+# Derived from the custback 0.3.0 default configuration for migration testing.
+camera:
+  device: 0
+  width: 1280
+  height: 720
+  fps: 30
+  mirror: false
+  synthetic: false
+background:
+  mode: camera
+  blur_strength: 31
+  image_path: ""
+  video_path: ""
+  camera_device: /dev/video2
+  color: [18, 100, 32]
+  remote_fallback_mode: blur
+segmentation:
+  backend: auto
+  model_path: ""
+  delegate: cpu
+  rvm_downsample: 0.0
+  threshold: 0.5
+  mask_blur: 7
+  edge_refine: true
+  mask_shift: 0
+  temporal_smoothing: 0.35
+compositing:
+  light_wrap: 0.25
+  use_model_foreground: true
+output:
+  backend: auto
+  device: ""
+  fps: 30
+  preview: false
+api:
+  enabled: true
+  host: 127.0.0.1
+  port: 8710
+  remote_timeout_ms: 250
+  allow_non_loopback: false
+  allowed_origins: []
+  token_file: ~/.config/custback/api-token
+  session_ttl_s: 28800
+  tls_certfile: ""
+  tls_keyfile: ""
+  ws_max_bytes: 16777216
+  uploads:
+    image_max_bytes: 20971520
+    video_max_bytes: 268435456
+    image_max_pixels: 16777216
+    video_max_width: 3840
+    video_max_height: 2160
+    storage_max_bytes: 2147483648
+    max_files: 100

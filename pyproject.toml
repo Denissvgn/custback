@@ -51,6 +51,7 @@ dev = [
     "pytest-timeout>=2.3,<3",
     "httpx>=0.27,<0.29",
     "httpx2>=2,<3",
+    "ruff>=0.12,<1",
 ]
 
 [project.scripts]
@@ -60,7 +61,36 @@ custback-avatar = "custback.avatar.__main__:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"custback.avatar" = ["avatar.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 timeout = 30
 timeout_method = "thread"
+
+[tool.ruff]
+required-version = ">=0.12,<1"
+target-version = "py310"
+line-length = 88
+src = ["src", "tests", "examples", "scripts/release"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# These tests intentionally import optional dependencies after importorskip.
+"tests/*.py" = ["E402"]
+"src/custback/preview.py" = ["E402"]
+# Narrow, reviewed pre-Phase-6 debt; new files receive the complete ruleset.
+"src/custback/avatar/api.py" = ["F401"]
+"tests/test_api_security.py" = ["F401"]
+"tests/test_capture.py" = ["F401"]
+"tests/test_phase5_storage.py" = ["F841"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = false
+docstring-code-format = false

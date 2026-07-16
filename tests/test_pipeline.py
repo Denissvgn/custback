@@ -325,9 +325,7 @@ def test_expired_deadline_before_future_wait_still_owns_candidate(monkeypatch):
     candidate = current.patched({"segmentation": {"threshold": 0.61}})
     request = pipeline_mod._PatchRequest(candidate, runtime.version)
     try:
-        with pytest.raises(
-            ReconfigurationUnavailable, match="preparation exceeded"
-        ):
+        with pytest.raises(ReconfigurationUnavailable, match="preparation exceeded"):
             pipeline._prepare_patch_request(
                 request,
                 current,
@@ -378,9 +376,7 @@ def test_expired_deadline_after_successful_prep_discards_before_enqueue(
 
     monkeypatch.setattr(pipeline, "_remaining", cross_deadline)
     try:
-        with pytest.raises(
-            ReconfigurationUnavailable, match="preparation exceeded"
-        ):
+        with pytest.raises(ReconfigurationUnavailable, match="preparation exceeded"):
             pipeline.apply_config_patch(
                 {"segmentation": {"threshold": 0.61}}, timeout=1.0
             )
@@ -679,9 +675,7 @@ def test_staged_patch_rejects_a_resource_that_does_not_match_final_config():
 
 
 def test_remote_mode_uses_pushed_frames_and_falls_back():
-    runtime = make_runtime(
-        mode="remote", remote_fallback_mode="color", color=[1, 2, 3]
-    )
+    runtime = make_runtime(mode="remote", remote_fallback_mode="color", color=[1, 2, 3])
     pipeline, hub = run_pipeline(runtime)
     remote_session = None
     try:
@@ -920,6 +914,94 @@ def test_runtime_privacy_gate_protects_vcam_and_preview(monkeypatch):
         pipeline.stop()
 
 
+def test_privacy_capacity_exhaustion_revokes_renderer_and_slates_all_sinks(
+    monkeypatch,
+):
+    raw = np.arange(72 * 128 * 3, dtype=np.uint32).reshape(72, 128, 3)
+    raw = (raw % 251).astype(np.uint8)
+
+    class FixedCapture:
+        def read(self):
+            return raw.copy()
+
+        def close(self):
+            pass
+
+    class RecordingOutput:
+        paces = False
+        fallback_active = False
+        fallback_reason = ""
+
+        def __init__(self):
+            self.frames = []
+
+        def send(self, frame):
+            self.frames.append(frame.copy())
+
+        def close(self):
+            pass
+
+    output = RecordingOutput()
+    monkeypatch.setattr(pipeline_mod, "open_capture", lambda _cfg: FixedCapture())
+    monkeypatch.setattr(pipeline_mod, "open_output", lambda *_args, **_kwargs: output)
+    runtime = make_runtime(mode="remote", remote_fallback_mode="color")
+    hub = FrameHub()
+    pipeline = Pipeline(runtime, hub, raw_fingerprint_capacity=2)
+    pipeline.start()
+    first_session = hub.remote_client_connected()
+    second_session = None
+    try:
+        deadline = time.monotonic() + 2.0
+        while hub.remote_session_valid(first_session) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert not hub.remote_session_valid(first_session)
+        assert pipeline._privacy_history_exhausted
+        assert not hub.push_remote_frame(raw.copy(), first_session)
+
+        # Reauthentication cannot turn exhausted evidence into an allow.
+        second_session = hub.remote_client_connected()
+        assert hub.push_remote_frame(raw.copy(), second_session)
+        deadline = time.monotonic() + 2.0
+        while hub.remote_session_valid(second_session) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert not hub.remote_session_valid(second_session)
+
+        slate = Pipeline._privacy_slate(raw.shape)
+        preview, _timestamp = hub.output.latest()
+        assert preview is not None
+        assert np.array_equal(preview, slate)
+        assert output.frames
+        assert all(np.array_equal(frame, slate) for frame in output.frames)
+        assert hub.stats_dict()["remote_fallback_reason"] == "privacy-history-exhausted"
+    finally:
+        if second_session is not None:
+            hub.remote_client_disconnected(second_session)
+        hub.remote_client_disconnected(first_session)
+        pipeline.stop()
+
+
+def test_prior_session_raw_echo_remains_rejected():
+    hub = FrameHub()
+    pipeline = Pipeline(make_runtime(mode="remote"), hub)
+    prior = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
+    prior = (prior % 251).astype(np.uint8)
+    current = ((prior.astype(np.uint16) + 97) % 251).astype(np.uint8)
+
+    first_session = hub.remote_client_connected()
+    pipeline._record_remote_raw_frame(prior)
+    hub.remote_client_disconnected(first_session)
+    second_session = hub.remote_client_connected()
+    pipeline._record_remote_raw_frame(current)
+    try:
+        guarded, reason = pipeline._guard_remote_output(
+            prior.copy(), current, privacy_safe=True
+        )
+        assert reason == "privacy-delayed-raw-echo"
+        assert np.array_equal(guarded, Pipeline._privacy_slate(current.shape))
+    finally:
+        hub.remote_client_disconnected(second_session)
+
+
 def test_remote_sessions_clear_frames_and_reject_prior_session_replay():
     hub = FrameHub()
     first_session = hub.remote_client_connected()
@@ -935,6 +1017,24 @@ def test_remote_sessions_clear_frames_and_reject_prior_session_replay():
     assert not hub.push_remote_frame(frame, first_session)
     assert hub.remote_frame_status(1.0) == (None, "stale")
     hub.remote_client_disconnected(next_session)
+
+
+def test_remote_session_invalidation_is_linearized_with_frame_ownership():
+    hub = FrameHub()
+    session = hub.remote_client_connected()
+    frame = np.full((4, 6, 3), 17, np.uint8)
+    assert hub.push_remote_frame(frame, session)
+
+    assert hub.invalidate_remote_session(session)
+    assert not hub.remote_session_valid(session)
+    assert hub.remote_frame_status(1.0) == (None, "no-client")
+    assert not hub.push_remote_frame(frame, session)
+
+    replacement = hub.remote_client_connected()
+    assert replacement != session
+    assert hub.remote_session_valid(replacement)
+    assert hub.push_remote_frame(frame, replacement)
+    hub.remote_client_disconnected(replacement)
 
 
 def test_malformed_and_wrong_sized_remote_frames_use_privacy_slate():
@@ -1016,9 +1116,7 @@ def test_local_remote_fallback_failure_fails_closed_to_nonraw_frame():
     )
     pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
     raw = np.full((24, 32, 3), 80, np.uint8)
-    fallback, reason = pipeline._local_composite(
-        resources, raw, privacy_safe=True
-    )
+    fallback, reason = pipeline._local_composite(resources, raw, privacy_safe=True)
     assert reason == "local-failure"
     assert not np.array_equal(fallback, raw)
 
@@ -1114,6 +1212,14 @@ def test_restart_only_patch_rejected_and_noop_does_not_bump_version():
         ),
         ({"api": {"uploads": {"max_files": 50}}}, ["api.uploads.max_files"]),
         (
+            {"background": {"camera_device": 2}},
+            ["background.camera_device"],
+        ),
+        (
+            {"backdrop_targets": {"side-camera": {"source": 2}}},
+            ["backdrop_targets.side-camera"],
+        ),
+        (
             {"avatar": {"url": "https://avatar.example:8711"}},
             ["avatar.url"],
         ),
@@ -1132,14 +1238,12 @@ def test_every_restart_only_field_is_classified(patch, expected):
 def test_backdrop_preparation_key_includes_decode_limits(monkeypatch):
     cfg = AppConfig.from_dict(
         {
-            "background": {"mode": "color"},
+            "background": {"mode": "image", "image_path": "/operator/image.png"},
             "segmentation": {"backend": "heuristic"},
             "output": {"backend": "null"},
         }
     )
-    candidate = cfg.patched(
-        {"api": {"uploads": {"image_max_pixels": 1_024}}}
-    )
+    candidate = cfg.patched({"api": {"uploads": {"image_max_pixels": 1_024}}})
     observed = []
 
     class Backdrop:
@@ -1154,9 +1258,7 @@ def test_backdrop_preparation_key_includes_decode_limits(monkeypatch):
 
     monkeypatch.setattr(pipeline_mod, "create_backdrop", record_create)
     prepared = Pipeline._prepare_activation_off_lane(cfg, candidate)
-    resources = pipeline_mod._Resources(
-        cfg, 0, None, None, object(), object(), None
-    )
+    resources = pipeline_mod._Resources(cfg, 0, None, None, object(), object(), None)
     pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
     staged = pipeline._stage_activation(resources, candidate, prepared)
 
@@ -1169,6 +1271,73 @@ def test_backdrop_preparation_key_includes_decode_limits(monkeypatch):
             "video_max_height": cfg.api.uploads.video_max_height,
         }
     ]
+
+
+def test_operator_backdrop_target_selection_is_transactional(monkeypatch):
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {"synthetic": True, "width": 128, "height": 72, "fps": 60},
+            "background": {"mode": "color", "camera_target": "side-camera"},
+            "backdrop_targets": {
+                "side-camera": {"source": 2},
+                "broken-camera": {"source": 3},
+            },
+            "segmentation": {"backend": "heuristic"},
+            "output": {"backend": "null", "fps": 60},
+            "api": {"enabled": False},
+        }
+    )
+    created = []
+
+    class Backdrop:
+        def __init__(self, identifier):
+            self.identifier = identifier
+            self.closed = False
+
+        def frame(self, width, height):
+            return np.zeros((height, width, 3), np.uint8)
+
+        def reset_stats(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    def create(cfg, **kwargs):
+        target = kwargs.get("camera_target")
+        identifier = target.identifier if target is not None else cfg.mode
+        if identifier == "broken-camera":
+            raise RuntimeError("configured target failed")
+        backdrop = Backdrop(identifier)
+        created.append(backdrop)
+        return backdrop
+
+    monkeypatch.setattr(pipeline_mod, "create_backdrop", create)
+    runtime = RuntimeConfig(cfg)
+    pipeline, _hub = run_pipeline(runtime)
+    try:
+        initial = created[-1]
+        selected_state = pipeline.apply_config_patch({"background": {"mode": "camera"}})
+        selected = created[-1]
+        assert selected_state.version == 1
+        assert selected.identifier == "side-camera"
+        assert selected is not initial
+
+        # An unused presentation setting must not reopen startup authority.
+        unrelated = pipeline.apply_config_patch({"background": {"color": [9, 8, 7]}})
+        assert unrelated.version == 2
+        assert created[-1] is selected
+
+        with pytest.raises(ActivationError, match="configured target failed"):
+            pipeline.apply_config_patch(
+                {"background": {"camera_target": "broken-camera"}}
+            )
+        current = runtime.read()
+        assert current.version == 2
+        assert current.config.background.camera_target == "side-camera"
+        assert not selected.closed
+    finally:
+        pipeline.stop()
 
 
 def test_concurrent_patches_are_serialized_and_one_conflicts():
@@ -1284,7 +1453,9 @@ def test_success_ack_precedes_exactly_once_old_resource_close(monkeypatch):
         last_foreground = None
 
         def segment(self, _frame):
-            raise AssertionError("working segmenter must not be used by background trial")
+            raise AssertionError(
+                "working segmenter must not be used by background trial"
+            )
 
         def close(self):
             pass
@@ -1323,13 +1494,13 @@ def test_success_ack_precedes_exactly_once_old_resource_close(monkeypatch):
     resources = pipeline_mod._Resources(
         cfg, 0, None, Segmenter(), Refiner(), old, Output()
     )
-    monkeypatch.setattr(
-        pipeline_mod, "create_backdrop", lambda _cfg, **_kwargs: new
-    )
+    monkeypatch.setattr(pipeline_mod, "create_backdrop", lambda _cfg, **_kwargs: new)
     # Hub post-install failures are non-critical and must not roll back or
     # strand newly installed resource pointers.
     monkeypatch.setattr(
-        hub, "clear_remote_frames", lambda: (_ for _ in ()).throw(RuntimeError("clear"))
+        hub,
+        "invalidate_remote_session",
+        lambda: (_ for _ in ()).throw(RuntimeError("invalidate")),
     )
     monkeypatch.setattr(
         hub, "update_stats", lambda **_kw: (_ for _ in ()).throw(RuntimeError("stats"))
@@ -1409,9 +1580,7 @@ def test_failed_background_trial_preserves_working_processing_state(monkeypatch)
         cfg, 0, None, segmenter, refiner, backdrop, None
     )
     pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
-    monkeypatch.setattr(
-        pipeline_mod, "create_backdrop", lambda _cfg, **_kwargs: bad
-    )
+    monkeypatch.setattr(pipeline_mod, "create_backdrop", lambda _cfg, **_kwargs: bad)
     candidate = cfg.patched({"background": {"color": [2, 2, 2]}})
     prepared = pipeline._prepare_activation_off_lane(cfg, candidate)
     activation = pipeline._stage_activation(resources, candidate, prepared)
@@ -1589,9 +1758,7 @@ def test_video_counters_reset_when_leaving_the_provider(monkeypatch):
     monkeypatch.setattr(
         pipeline_mod,
         "create_backdrop",
-        lambda cfg, **_kwargs: VideoStatsBackdrop()
-        if cfg.mode == "video"
-        else None,
+        lambda cfg, **_kwargs: VideoStatsBackdrop() if cfg.mode == "video" else None,
     )
     runtime = make_runtime(mode="video", video_path="fake.mp4")
     pipeline, hub = run_pipeline(runtime)

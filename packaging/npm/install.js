@@ -133,7 +133,10 @@ function sourceDigest(pkgRoot = PKG_ROOT) {
     path.join(pkgRoot, 'package.json'),
     path.join(pkgRoot, 'pyproject.toml'),
     ...walkFiles(path.join(pkgRoot, 'config'), (file) => /\.ya?ml$/i.test(file)),
-    ...walkFiles(path.join(pkgRoot, 'src', 'custback'), (file) => file.endsWith('.py')),
+    ...walkFiles(
+      path.join(pkgRoot, 'src', 'custback'),
+      (file) => file.endsWith('.py') || /\.ya?ml$/i.test(file),
+    ),
     ...walkFiles(path.join(pkgRoot, 'scripts'), (file) => file.endsWith('.sh')),
     ...walkFiles(path.join(pkgRoot, 'packaging', 'npm'), (file) =>
       file.endsWith('.js') && !file.includes(`${path.sep}test${path.sep}`)),

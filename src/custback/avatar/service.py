@@ -18,7 +18,7 @@ import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
 
@@ -92,6 +92,8 @@ def _close_error(resource: Any, label: str) -> BaseException | None:
         log.exception("cannot close avatar %s", label)
         return exc
     return None
+
+
 class _LatestBytes:
     """Latest-value slot for the newest raw frame (drops the backlog)."""
 
@@ -253,6 +255,18 @@ class _RenderPublication:
     face_present: bool
     width: int
     height: int
+    session_epoch: int | None = None
+    frame_sequence: int = -1
+
+
+@dataclass
+class _RenderSessionLease:
+    """Linearization token for one renderer WebSocket connection."""
+
+    epoch: int
+    active: bool = True
+    last_accounted_send: int = -1
+    last_publication: int = -1
 
 
 class AvatarService:
@@ -303,6 +317,9 @@ class AvatarService:
         self._storage_epoch = 0
         self._defer_render_publication = False
         self._pending_render_publication: _RenderPublication | None = None
+        self._publication_lock = threading.Lock()
+        self._next_session_epoch = 0
+        self._active_session_lease: _RenderSessionLease | None = None
         self._stats_lock = threading.Lock()
         self._stats: dict[str, Any] = {
             "connected": False,
@@ -466,9 +483,7 @@ class AvatarService:
     def _remaining(deadline: float) -> float:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ReconfigurationUnavailable(
-                "avatar activation deadline expired"
-            )
+            raise ReconfigurationUnavailable("avatar activation deadline expired")
         return remaining
 
     def _future_result(self, future: Future[_T], deadline: float) -> _T:
@@ -559,10 +574,7 @@ class AvatarService:
         rig_selector = resolve_rig_selector(
             candidate.appearance.rig, candidate.storage.rigs_dir
         )
-        if (
-            rig_selector != "builtin"
-            and not is_rig_directory(rig_selector)
-        ):
+        if rig_selector != "builtin" and not is_rig_directory(rig_selector):
             raise FileNotFoundError("candidate rig is unavailable")
         active_background = (
             candidate.background.image_path
@@ -571,10 +583,7 @@ class AvatarService:
             if candidate.background.mode == "video"
             else ""
         )
-        if (
-            active_background
-            and not Path(active_background).expanduser().is_file()
-        ):
+        if active_background and not Path(active_background).expanduser().is_file():
             raise FileNotFoundError("candidate background is unavailable")
         if (
             candidate.driver.backend == "vision"
@@ -586,13 +595,10 @@ class AvatarService:
         rig_key = self._rig_key(candidate, rig_selector)
         background_key = self._background_key(candidate)
         driver_preparation = None
-        if (
-            self._driver_factory is create_driver
-            and (not snapshot.active or snapshot.driver_key != driver_key)
+        if self._driver_factory is create_driver and (
+            not snapshot.active or snapshot.driver_key != driver_key
         ):
-            driver_preparation = self._prepare_driver_off_lane(
-                candidate, deadline
-            )
+            driver_preparation = self._prepare_driver_off_lane(candidate, deadline)
         return _PreparedActivation(
             candidate.model_copy(deep=True),
             expected_version,
@@ -654,10 +660,7 @@ class AvatarService:
             else:
                 rig = current.rig
 
-            if (
-                current.version < 0
-                or current.background_key != prepared.background_key
-            ):
+            if current.version < 0 or current.background_key != prepared.background_key:
                 backdrop = create_avatar_backdrop(
                     cfg.background,
                     image_max_pixels=cfg.storage.image_max_pixels,
@@ -665,9 +668,7 @@ class AvatarService:
                     video_max_height=cfg.storage.video_max_height,
                 )
                 if backdrop is not None:
-                    staged.callback(
-                        self._close_or_defer, backdrop, "staged backdrop"
-                    )
+                    staged.callback(self._close_or_defer, backdrop, "staged backdrop")
             else:
                 backdrop = current.backdrop
 
@@ -697,13 +698,15 @@ class AvatarService:
             staged.close()
             raise
 
-    def _trial_generation(
-        self, current: _Components, candidate: _Components
-    ) -> None:
+    def _trial_generation(self, current: _Components, candidate: _Components) -> None:
         """Exercise staged identities without advancing reused live state."""
 
         cfg = candidate.config
-        assert cfg is not None and candidate.driver is not None and candidate.rig is not None
+        assert (
+            cfg is not None
+            and candidate.driver is not None
+            and candidate.rig is not None
+        )
         frame = np.full(_TRIAL_FRAME_SHAPE, 48, dtype=np.uint8)
         if candidate.driver is not current.driver:
             face = candidate.driver.update(frame.copy(), 0.0)
@@ -789,6 +792,7 @@ class AvatarService:
                     request.done.set()
                     return
                 if request.publish:
+
                     def activate(next_version: int) -> None:
                         nonlocal old
                         generation.version = next_version
@@ -821,9 +825,11 @@ class AvatarService:
         except BaseException as exc:
             if ownership is not None:
                 ownership.close()
-            error = exc if isinstance(
-                exc, (ConfigConflictError, ReconfigurationUnavailable)
-            ) else ActivationError(str(exc))
+            error = (
+                exc
+                if isinstance(exc, (ConfigConflictError, ReconfigurationUnavailable))
+                else ActivationError(str(exc))
+            )
             with request.lock:
                 if request.result is None:
                     request.error = error
@@ -983,7 +989,9 @@ class AvatarService:
         if request.error is not None:
             raise request.error
         if request.result is None:
-            raise ReconfigurationUnavailable("avatar storage mutation returned no result")
+            raise ReconfigurationUnavailable(
+                "avatar storage mutation returned no result"
+            )
         return request.result
 
     # -- rendering (the same lane; one call in flight at a time) -----------
@@ -999,16 +1007,65 @@ class AvatarService:
             output_height=publication.height,
         )
 
-    def _publish_render_if_current(
-        self, publication: _RenderPublication
+    def _publish_render_if_current(self, publication: _RenderPublication) -> bool:
+        # Cancellation and every externally visible local side effect share
+        # this lock. A callback that was queued before cancellation therefore
+        # cannot turn a terminal render result back into a publication merely
+        # because the component version is still current.
+        with self._publication_lock:
+            lease = self._active_session_lease
+            if (
+                lease is None
+                or not lease.active
+                or publication.session_epoch != lease.epoch
+                or publication.frame_sequence < 0
+                or publication.frame_sequence > lease.last_accounted_send
+                or publication.frame_sequence <= lease.last_publication
+                or self._lifecycle_error is not None
+                or self._components.version != publication.version
+            ):
+                return False
+            lease.last_publication = publication.frame_sequence
+            self._publish_render(publication)
+            return True
+
+    def _begin_render_session(self) -> _RenderSessionLease:
+        """Create the sole publication lease for a renderer connection."""
+
+        with self._publication_lock:
+            current = self._active_session_lease
+            if current is not None and current.active:
+                raise ReconfigurationUnavailable(
+                    "another avatar renderer session is still active"
+                )
+            self._next_session_epoch += 1
+            lease = _RenderSessionLease(self._next_session_epoch)
+            self._active_session_lease = lease
+            return lease
+
+    def _invalidate_render_session(self, lease: _RenderSessionLease) -> None:
+        """Make every later callback for ``lease`` permanently discard-only."""
+
+        with self._publication_lock:
+            lease.active = False
+            if self._active_session_lease is lease:
+                self._active_session_lease = None
+
+    def _account_completed_send(
+        self, lease: _RenderSessionLease, frame_sequence: int
     ) -> bool:
-        if (
-            self._lifecycle_error is not None
-            or self._components.version != publication.version
-        ):
-            return False
-        self._publish_render(publication)
-        return True
+        """Linearize one completed WebSocket send, at most once."""
+
+        with self._publication_lock:
+            if (
+                self._active_session_lease is not lease
+                or not lease.active
+                or frame_sequence <= lease.last_accounted_send
+            ):
+                return False
+            lease.last_accounted_send = frame_sequence
+            self._count("frames_sent")
+            return True
 
     def _process_deferred(
         self, data: bytes
@@ -1038,9 +1095,7 @@ class AvatarService:
             raise self._lifecycle_error
         cfg = components.config
         if cfg is None or components.driver is None or components.rig is None:
-            raise ReconfigurationUnavailable(
-                "avatar generation is not activated"
-            )
+            raise ReconfigurationUnavailable("avatar generation is not activated")
         frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
             self._count("render_failures")
@@ -1117,6 +1172,7 @@ class AvatarService:
             raise cancellation
 
     async def _session(self, ws, stop: asyncio.Event) -> None:
+        lease = self._begin_render_session()
         slot = _LatestBytes()
 
         async def receiver() -> None:
@@ -1128,6 +1184,7 @@ class AvatarService:
 
         async def renderer() -> None:
             seq = -1
+            frame_sequence = -1
             last_sent = 0.0
             while True:
                 data, seq = await slot.get(seq, 0.5)
@@ -1147,7 +1204,15 @@ class AvatarService:
                 if stop.is_set():
                     return
                 if payload is not None:
+                    frame_sequence += 1
+                    if publication is not None:
+                        publication = replace(
+                            publication,
+                            session_epoch=lease.epoch,
+                            frame_sequence=frame_sequence,
+                        )
                     await ws.send(payload)
+                    self._account_completed_send(lease, frame_sequence)
                     if publication is not None:
                         await self._await_lane_future(
                             self._submit_lane(
@@ -1155,11 +1220,15 @@ class AvatarService:
                             )
                         )
                     last_sent = asyncio.get_running_loop().time()
-                    self._count("frames_sent")
 
-        stopper = asyncio.create_task(stop.wait())
-        tasks = {asyncio.create_task(receiver()), asyncio.create_task(renderer())}
+        stopper = None
+        tasks: set[asyncio.Task] = set()
         try:
+            stopper = asyncio.create_task(stop.wait())
+            tasks = {
+                asyncio.create_task(receiver()),
+                asyncio.create_task(renderer()),
+            }
             done, _pending = await asyncio.wait(
                 tasks | {stopper}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -1167,10 +1236,19 @@ class AvatarService:
                 if task is not stopper:
                     task.result()  # propagate the session failure
         finally:
-            stopper.cancel()
+            # This is the cancellation linearization point. It must run before
+            # cancelling the renderer, whose authoritative lane future is then
+            # drained by _await_lane_future.
+            self._invalidate_render_session(lease)
+            if stopper is not None:
+                stopper.cancel()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, stopper, return_exceptions=True)
+            await asyncio.gather(
+                *tasks,
+                *(() if stopper is None else (stopper,)),
+                return_exceptions=True,
+            )
 
     async def run(self, stop: asyncio.Event) -> None:
         """Connect, render, and reconnect with backoff until ``stop`` is set."""
@@ -1228,9 +1306,7 @@ class AvatarService:
                 except Exception as exc:
                     # Never log the URL or token; the type name is enough to
                     # distinguish refused/timeout/handshake/closed cases.
-                    self._update_stats(
-                        connected=False, last_error=type(exc).__name__
-                    )
+                    self._update_stats(connected=False, last_error=type(exc).__name__)
                     log.warning(
                         "custback stream unavailable (%s); retrying",
                         type(exc).__name__,
@@ -1282,9 +1358,7 @@ class AvatarService:
             self._closing = True
             self._close_future = cast(
                 Future[None],
-                self._executor.submit(
-                    self._lane_entry, self._close_components_on_lane
-                ),
+                self._executor.submit(self._lane_entry, self._close_components_on_lane),
             )
             return self._close_future
 
@@ -1317,18 +1391,14 @@ class AvatarService:
                     return
                 with self._executor_lock:
                     if not self._closed:
-                        self._executor.shutdown(
-                            wait=False, cancel_futures=False
-                        )
+                        self._executor.shutdown(wait=False, cancel_futures=False)
                         self._closed = True
 
             future.add_done_callback(stop_executor_when_terminal)
 
     def _live_asset_threads(self) -> tuple[threading.Thread, ...]:
         with self._asset_threads_lock:
-            live = tuple(
-                worker for worker in self._asset_threads if worker.is_alive()
-            )
+            live = tuple(worker for worker in self._asset_threads if worker.is_alive())
             self._asset_threads.intersection_update(live)
             return live
 

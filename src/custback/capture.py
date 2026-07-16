@@ -245,9 +245,7 @@ class OpenCVCapture(CaptureSource):
             # be selected before dimensions and rate to avoid a silent YUYV
             # fallback such as 1280x720@10.
             if request_mjpeg:
-                accepted = cap.set(
-                    cv2.CAP_PROP_FOURCC, float(_fourcc_value("MJPG"))
-                )
+                accepted = cap.set(cv2.CAP_PROP_FOURCC, float(_fourcc_value("MJPG")))
                 if self.cfg.pixel_format == "mjpeg" and not bool(accepted):
                     raise CaptureModeError(
                         "camera "
@@ -425,9 +423,7 @@ class OpenCVCapture(CaptureSource):
                     negotiated,
                 )
             else:
-                log.info(
-                    "camera negotiated on %s: %s", backend, negotiated
-                )
+                log.info("camera negotiated on %s: %s", backend, negotiated)
 
         if self.cfg.pixel_format == "mjpeg" and fourcc not in {"MJPG", "JPEG"}:
             return CaptureModeError(
@@ -443,9 +439,7 @@ class OpenCVCapture(CaptureSource):
         return None
 
     # -- reader -------------------------------------------------------
-    def _reader_loop(
-        self, cap: Any, stop: threading.Event, generation: int
-    ) -> None:
+    def _reader_loop(self, cap: Any, stop: threading.Event, generation: int) -> None:
         negotiated = False
         try:
             while not stop.is_set():
@@ -501,7 +495,9 @@ class OpenCVCapture(CaptureSource):
                     if self.cfg.mirror:
                         frame = cv2.flip(frame, 1)
                 except BaseException as exc:
-                    self._set_fatal(CaptureError(f"camera frame conversion failed: {exc}"))
+                    self._set_fatal(
+                        CaptureError(f"camera frame conversion failed: {exc}")
+                    )
                     return
 
                 recovered = False
@@ -525,8 +521,7 @@ class OpenCVCapture(CaptureSource):
                     self._capture_timestamps.append(finished)
                     while (
                         self._capture_timestamps
-                        and finished - self._capture_timestamps[0]
-                        > self._RATE_WINDOW_S
+                        and finished - self._capture_timestamps[0] > self._RATE_WINDOW_S
                     ):
                         self._capture_timestamps.popleft()
                     read_ms = (finished - started) * 1000.0
@@ -630,9 +625,7 @@ class OpenCVCapture(CaptureSource):
         return None
 
     # -- recovery -----------------------------------------------------
-    def _log_capture_transition(
-        self, state: str, message: str, *args: object
-    ) -> None:
+    def _log_capture_transition(self, state: str, message: str, *args: object) -> None:
         with self._lock:
             if self._last_capture_log_state == state:
                 return
@@ -692,7 +685,7 @@ class OpenCVCapture(CaptureSource):
             self._auto_mjpeg_retries = 0
         self._log_capture_transition(
             "stalled",
-            "camera capture stalled; releasing device and starting bounded recovery"
+            "camera capture stalled; releasing device and starting bounded recovery",
         )
         if not self._stop_current_worker():
             return
@@ -946,8 +939,7 @@ class SyntheticCapture(CaptureSource):
                 capture_fps = 0.0
             target_met = (
                 None
-                if self._first_frame_at is None
-                or now - self._first_frame_at < 2.0
+                if self._first_frame_at is None or now - self._first_frame_at < 2.0
                 else capture_fps >= self.cfg.fps * 0.9
             )
             return CaptureHealth(

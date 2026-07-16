@@ -53,31 +53,59 @@ _VIDEO_STATS_DEFAULTS: dict[str, object] = {
     "background_video_decode_failures": 0,
 }
 
-# Retain only compact downsampled fingerprints, bounded by both time and the
-# maximum supported capture rate (240 fps). This detects delayed renderer
-# echoes without keeping historical raw camera images.
-_RAW_FINGERPRINT_HISTORY = 1024
-_RAW_FINGERPRINT_WINDOW_S = 3.0
+# Retain compact downsampled fingerprints for the complete pipeline session.
+# The bound is a fail-closed admission limit, never an eviction policy: once it
+# is reached, the renderer session is invalidated and output remains the slate.
+_RAW_FINGERPRINT_HISTORY = 1_000_000
 _RAW_FINGERPRINT_SIZE = (16, 12)
 _RAW_ECHO_PIXEL_TOLERANCE = 3
 _RAW_ECHO_CHANGED_FRACTION = 0.02
 _RAW_ECHO_MEAN_DELTA = 4.0
-_RAW_ECHO_HASH_DISTANCE = 16
-_RAW_ECHO_MEAN_COLOR_DELTA = 24.0
 _RAW_ECHO_LOWRES_MEAN_DELTA = 20.0
 _RAW_ECHO_LOWRES_CORRELATION = 0.93
 
 
-def _backdrop_key(cfg: AppConfig) -> tuple[object, int, int, int]:
-    """Inputs whose changes require a fresh backdrop preflight."""
+def _backdrop_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Only inputs consumed by the currently selected backdrop resource."""
 
-    uploads = cfg.api.uploads
-    return (
-        cfg.background,
-        uploads.image_max_pixels,
-        uploads.video_max_width,
-        uploads.video_max_height,
+    background = cfg.background
+    mode = (
+        background.remote_fallback_mode
+        if background.mode == "remote"
+        else background.mode
     )
+    if mode == "passthrough":
+        return ("passthrough",)
+    if mode == "blur":
+        return ("blur", background.blur_strength)
+    if mode == "color":
+        return ("color", background.color)
+    if mode == "image":
+        return ("image", background.image_path, cfg.api.uploads.image_max_pixels)
+    if mode == "video":
+        return (
+            "video",
+            background.video_path,
+            cfg.api.uploads.video_max_width,
+            cfg.api.uploads.video_max_height,
+        )
+    if mode == "camera":
+        target = cfg.resolved_backdrop_target()
+        if target is None:
+            raise ValueError("camera backdrop target is not configured")
+        return ("camera", target.identifier, target.source)
+    raise ValueError(f"unknown background mode: {mode!r}")
+
+
+def _build_backdrop(cfg: AppConfig) -> Any:
+    kwargs: dict[str, Any] = {
+        "image_max_pixels": cfg.api.uploads.image_max_pixels,
+        "video_max_width": cfg.api.uploads.video_max_width,
+        "video_max_height": cfg.api.uploads.video_max_height,
+    }
+    if _backdrop_key(cfg)[0] == "camera":
+        kwargs["camera_target"] = cfg.resolved_backdrop_target()
+    return create_backdrop(cfg.background, **kwargs)
 
 
 def _ewma(previous: float | None, sample: float, alpha: float = 0.1) -> float:
@@ -133,9 +161,94 @@ class _PrivacyViolation(ValueError):
 
 @dataclass(frozen=True)
 class _RawFingerprint:
-    perceptual_hash: int
-    means: tuple[int, int, int]
+    jpeg_features: tuple[int, ...]
     thumbnail: np.ndarray
+
+
+class _RawReplayHistory:
+    """Compact, bounded Bloom-style index with no permissive eviction."""
+
+    _MAX_BYTES = 16 * 1024 * 1024
+    _MIN_BYTES = 4 * 1024
+    _JPEG_QUANTIZATION_WIDTH = 64
+    _JPEG_QUANTIZATION_STEP = 4
+    _MATCHING_SIGNATURES = 8
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self._byte_count = min(
+            self._MAX_BYTES,
+            max(self._MIN_BYTES, capacity * 64),
+        )
+        self._bits: bytearray | None = None
+        self._count = 0
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __bool__(self) -> bool:
+        return self._count > 0
+
+    def clear(self) -> None:
+        self._bits = None
+        self._count = 0
+
+    @staticmethod
+    def _keys(fingerprint: _RawFingerprint):
+        # JPEG preserves low-frequency block/DC values even when edge-based
+        # perceptual hashes flip near equal comparisons.  Hash the complete
+        # coarse feature vector under sixteen overlapping quantizers.  A small
+        # JPEG drift crosses only a subset of their staggered boundaries, so
+        # multiple whole-frame keys remain identical without retaining a
+        # reversible historical thumbnail.
+        width = _RawReplayHistory._JPEG_QUANTIZATION_WIDTH
+        step = _RawReplayHistory._JPEG_QUANTIZATION_STEP
+        for phase_index, offset in enumerate(range(0, width, step)):
+            key = phase_index
+            for value in fingerprint.jpeg_features:
+                quantized = min(3, (value + offset) // width)
+                key = (key << 2) | quantized
+            yield key
+
+    @staticmethod
+    def _positions(key: int, bit_count: int):
+        mask = (1 << 64) - 1
+        for salt in (
+            0x9E3779B97F4A7C15,
+            0xD1B54A32D192ED03,
+            0x94D049BB133111EB,
+        ):
+            value = (key + salt) & mask
+            value ^= value >> 30
+            value = (value * 0xBF58476D1CE4E5B9) & mask
+            value ^= value >> 27
+            value = (value * 0x94D049BB133111EB) & mask
+            value ^= value >> 31
+            yield value % bit_count
+
+    def append(self, fingerprint: _RawFingerprint) -> None:
+        if self._bits is None:
+            self._bits = bytearray(self._byte_count)
+        bit_count = len(self._bits) * 8
+        for key in self._keys(fingerprint):
+            for position in self._positions(key, bit_count):
+                self._bits[position >> 3] |= 1 << (position & 7)
+        self._count += 1
+
+    def matches(self, fingerprint: _RawFingerprint) -> bool:
+        if self._bits is None:
+            return False
+        bit_count = len(self._bits) * 8
+        matches = 0
+        for key in self._keys(fingerprint):
+            if all(
+                self._bits[position >> 3] & (1 << (position & 7))
+                for position in self._positions(key, bit_count)
+            ):
+                matches += 1
+                if matches >= self._MATCHING_SIGNATURES:
+                    return True
+        return False
 
 
 def _safe_close(resource: Any, label: str) -> None:
@@ -265,6 +378,8 @@ def _restart_only_changes(old: AppConfig, new: AppConfig) -> list[str]:
         if path.startswith("camera.")
         or path.startswith("output.")
         or (path.startswith("api.") and path != "api.remote_timeout_ms")
+        or path == "background.camera_device"
+        or path.startswith("backdrop_targets.")
         or path in AVATAR_PROXY_RESTART_ONLY_FIELDS
     ]
 
@@ -276,7 +391,14 @@ class Pipeline:
         hub: FrameHub,
         *,
         model_preparation: SegmenterPreparation | None = None,
+        raw_fingerprint_capacity: int = _RAW_FINGERPRINT_HISTORY,
     ):
+        if (
+            not isinstance(raw_fingerprint_capacity, int)
+            or isinstance(raw_fingerprint_capacity, bool)
+            or raw_fingerprint_capacity < 1
+        ):
+            raise ValueError("raw fingerprint capacity must be a positive integer")
         self.runtime = runtime
         self.hub = hub
         self._stop = threading.Event()
@@ -305,9 +427,10 @@ class Pipeline:
         self._runtime_writer = runtime._coordinator_writer()
         self._model_preparation = model_preparation
         self._fallback_log_states: dict[str, tuple[bool, str]] = {}
-        self._recent_raw_fingerprints: deque[tuple[float, _RawFingerprint]] = deque(
-            maxlen=_RAW_FINGERPRINT_HISTORY
-        )
+        self._raw_fingerprint_capacity = raw_fingerprint_capacity
+        self._recent_raw_fingerprints = _RawReplayHistory(raw_fingerprint_capacity)
+        self._privacy_history_exhausted = False
+        self._privacy_invalidated_session: int | None = None
         self._latest_raw_frame: np.ndarray | None = None
 
     def start(self, timeout: float | None = None) -> None:
@@ -325,8 +448,6 @@ class Pipeline:
             self._error = None
             self._active_state = None
             self._fallback_log_states.clear()
-            self._recent_raw_fingerprints.clear()
-            self._latest_raw_frame = None
             with self._preparation_lock:
                 if self._preparation_executor is not None:
                     raise ReconfigurationUnavailable(
@@ -379,7 +500,9 @@ class Pipeline:
         for teardown in teardown_threads:
             teardown.join(max(0.0, deadline - time.monotonic()))
         with self._teardown_lock:
-            survivors = [worker for worker in self._teardown_threads if worker.is_alive()]
+            survivors = [
+                worker for worker in self._teardown_threads if worker.is_alive()
+            ]
         preparation_error: ReconfigurationUnavailable | None = None
         try:
             # Always initiate executor shutdown, even if another worker has
@@ -405,9 +528,7 @@ class Pipeline:
     @property
     def running(self) -> bool:
         return (
-            self._error is None
-            and self._thread is not None
-            and self._thread.is_alive()
+            self._error is None and self._thread is not None and self._thread.is_alive()
         )
 
     def apply_config_patch(
@@ -418,6 +539,18 @@ class Pipeline:
         origin: str = "internal",
     ) -> ConfigState:
         """Validate, activate, commit, and acknowledge a hot configuration patch."""
+        if isinstance(patch, dict):
+            restart_fields = []
+            background_patch = patch.get("background")
+            if (
+                isinstance(background_patch, dict)
+                and "camera_device" in background_patch
+            ):
+                restart_fields.append("background.camera_device")
+            if "backdrop_targets" in patch:
+                restart_fields.append("backdrop_targets")
+            if restart_fields:
+                raise RestartRequiredError(restart_fields, self.runtime.version)
         while True:
             base = self.runtime.read()
             candidate = base.config.patched(patch)
@@ -635,9 +768,7 @@ class Pipeline:
             raise
         return self._submit_patch(request, remaining)
 
-    def _shutdown_preparation_executor(
-        self, deadline: float, timeout: float
-    ) -> None:
+    def _shutdown_preparation_executor(self, deadline: float, timeout: float) -> None:
         with self._preparation_condition:
             executor = self._preparation_executor
             if executor is None:
@@ -658,9 +789,7 @@ class Pipeline:
             if self._preparation_executor is executor:
                 self._preparation_executor = None
 
-    def _submit_patch(
-        self, request: _PatchRequest, timeout: float
-    ) -> ConfigState:
+    def _submit_patch(self, request: _PatchRequest, timeout: float) -> ConfigState:
         try:
             self._enqueue_request(request)
         except BaseException:
@@ -682,12 +811,12 @@ class Pipeline:
         if request.error is not None:
             raise request.error
         if request.result is None:  # defensive invariant
-            raise ReconfigurationUnavailable("pipeline returned no configuration result")
+            raise ReconfigurationUnavailable(
+                "pipeline returned no configuration result"
+            )
         return request.result
 
-    def _enqueue_request(
-        self, request: _PatchRequest | _MutationRequest
-    ) -> None:
+    def _enqueue_request(self, request: _PatchRequest | _MutationRequest) -> None:
         """Atomically enqueue only while the frame worker still accepts work."""
 
         with self._request_enqueue_lock:
@@ -748,17 +877,10 @@ class Pipeline:
                 segmenter = create_segmenter(cfg.segmentation)
             startup.callback(_safe_close, segmenter, "segmenter")
             refiner = refiner_for(cfg.segmentation, segmenter)
-            backdrop = create_backdrop(
-                cfg.background,
-                image_max_pixels=cfg.api.uploads.image_max_pixels,
-                video_max_width=cfg.api.uploads.video_max_width,
-                video_max_height=cfg.api.uploads.video_max_height,
-            )
+            backdrop = _build_backdrop(cfg)
             if backdrop is not None:
                 startup.callback(_safe_close, backdrop, "backdrop")
-            output = open_output(
-                cfg.output, cfg.camera.width, cfg.camera.height
-            )
+            output = open_output(cfg.output, cfg.camera.width, cfg.camera.height)
             startup.callback(_safe_close, output, "video output")
             resources = _Resources(
                 cfg, state.version, capture, segmenter, refiner, backdrop, output
@@ -769,11 +891,12 @@ class Pipeline:
     def _run(self) -> None:
         resources: _Resources | None = None
         try:
+            # Reset replay evidence only after every stale renderer lease and
+            # queued remote frame have been invalidated at one hub boundary.
+            self.hub.reset_remote_session(self._reset_raw_replay_history)
             state = self.runtime.read()
             resources = self._open_resources(state)
             self._active_state = state
-            if state.config.background.mode == "remote":
-                self.hub.clear_remote_frames()
             initial_output = self._preflight(resources)
             self._update_identity_stats(resources)
             self._startup_done.set()
@@ -829,12 +952,7 @@ class Pipeline:
                     candidate.segmentation, activation.segmenter
                 )
             if _backdrop_key(candidate) != _backdrop_key(current):
-                activation.backdrop = create_backdrop(
-                    candidate.background,
-                    image_max_pixels=candidate.api.uploads.image_max_pixels,
-                    video_max_width=candidate.api.uploads.video_max_width,
-                    video_max_height=candidate.api.uploads.video_max_height,
-                )
+                activation.backdrop = _build_backdrop(candidate)
                 activation.replace_backdrop = True
         except Exception as exc:
             activation.discard()
@@ -970,11 +1088,10 @@ class Pipeline:
         """Run non-critical hub side effects without invalidating a commit."""
         if old_cfg.background.mode != resources.cfg.background.mode:
             try:
-                self.hub.clear_remote_frames()
+                self.hub.invalidate_remote_session()
             except Exception:
-                log.exception("cannot clear remote frames after mode switch")
-            self._recent_raw_fingerprints.clear()
-            self._latest_raw_frame = None
+                log.exception("cannot invalidate remote session after mode switch")
+                self._privacy_history_exhausted = True
         try:
             self._update_identity_stats(resources)
         except Exception:
@@ -1009,9 +1126,7 @@ class Pipeline:
             return
         if storage_epoch != request.storage_epoch:
             self._schedule_discard_activation(activation)
-            request.fail(
-                ActivationError("candidate assets changed during preparation")
-            )
+            request.fail(ActivationError("candidate assets changed during preparation"))
             return
         try:
             activation = self._stage_activation(
@@ -1045,6 +1160,7 @@ class Pipeline:
                 request.done.set()
                 return
             try:
+
                 def activate(next_version: int) -> None:
                     nonlocal old_backdrop, old_segmenter, old_cfg
                     promoted = False
@@ -1089,9 +1205,7 @@ class Pipeline:
         self._schedule_close(old_backdrop, "replaced backdrop")
         self._schedule_close(old_segmenter, "replaced segmenter")
 
-    def _schedule_discard_activation(
-        self, activation: _Activation | None
-    ) -> None:
+    def _schedule_discard_activation(self, activation: _Activation | None) -> None:
         if activation is None:
             return
         if activation.replace_backdrop:
@@ -1118,9 +1232,7 @@ class Pipeline:
                 request.mutate(resources.cfg.model_copy(deep=True))
                 request.result = self.runtime.read()
                 if request.result.version != resources.version:
-                    raise ConfigConflictError(
-                        resources.version, request.result.version
-                    )
+                    raise ConfigConflictError(resources.version, request.result.version)
                 with self._storage_epoch_lock:
                     self._storage_epoch += 1
             except BaseException as exc:
@@ -1157,7 +1269,9 @@ class Pipeline:
             # The new config/resource pair was committed before teardown was
             # scheduled. Thread exhaustion must not revoke that success or kill
             # the frame worker; retain the old resource for shutdown cleanup.
-            log.exception("cannot schedule %s teardown; deferring until shutdown", label)
+            log.exception(
+                "cannot schedule %s teardown; deferring until shutdown", label
+            )
 
     def _drain_deferred_closes(self) -> None:
         """Close resources whose post-commit teardown thread could not start."""
@@ -1174,12 +1288,9 @@ class Pipeline:
             if hasattr(resources.capture, "health_snapshot")
             else None
         )
-        output_fallback = bool(
-            getattr(resources.output, "fallback_active", False)
-        )
-        segmentation_fallback = (
-            cfg.segmentation.backend == "auto"
-            and isinstance(resources.segmenter, HeuristicSegmenter)
+        output_fallback = bool(getattr(resources.output, "fallback_active", False))
+        segmentation_fallback = cfg.segmentation.backend == "auto" and isinstance(
+            resources.segmenter, HeuristicSegmenter
         )
         video_stats = (
             resources.backdrop.stats_dict()
@@ -1224,9 +1335,7 @@ class Pipeline:
         self._log_fallback_transition(
             "output",
             output_fallback,
-            getattr(resources.output, "fallback_reason", "")
-            if output_fallback
-            else "",
+            getattr(resources.output, "fallback_reason", "") if output_fallback else "",
         )
         self._log_fallback_transition(
             "segmentation",
@@ -1234,9 +1343,7 @@ class Pipeline:
             "ml-backend-unavailable" if segmentation_fallback else "",
         )
 
-    def _log_fallback_transition(
-        self, kind: str, active: bool, reason: str
-    ) -> None:
+    def _log_fallback_transition(self, kind: str, active: bool, reason: str) -> None:
         """Emit one record only when a fallback state or reason changes."""
 
         state = (active, reason if active else "")
@@ -1374,42 +1481,60 @@ class Pipeline:
             _RAW_FINGERPRINT_SIZE,
             interpolation=cv2.INTER_AREA,
         )
-        sample = cv2.resize(
-            thumbnail,
-            (9, 8),
+        coarse = cv2.resize(
+            frame,
+            (4, 3),
             interpolation=cv2.INTER_AREA,
         ).astype(np.uint16)
-        gray = (
-            sample[..., 0] * 29
-            + sample[..., 1] * 150
-            + sample[..., 2] * 77
+        luminance = (
+            coarse[..., 0] * 29 + coarse[..., 1] * 150 + coarse[..., 2] * 77
         ) >> 8
-        comparisons = gray[:, 1:] >= gray[:, :-1]
-        packed = np.packbits(comparisons.reshape(-1), bitorder="little").tobytes()
-        perceptual_hash = int.from_bytes(packed, "little")
         means = tuple(
             int(value)
             for value in np.rint(thumbnail.mean(axis=(0, 1), dtype=np.float64))
         )
+        jpeg_features = tuple(int(value) for value in luminance.reshape(-1)) + means
         thumbnail.setflags(write=False)
         return _RawFingerprint(
-            perceptual_hash=perceptual_hash,
-            means=means,  # type: ignore[arg-type]
+            jpeg_features=jpeg_features,
             thumbnail=thumbnail,
         )
 
-    def _remember_raw_frame(self, frame: np.ndarray) -> None:
+    def _reset_raw_replay_history(self) -> None:
+        """Begin a new pipeline privacy session after renderer invalidation."""
+
+        self._recent_raw_fingerprints.clear()
+        self._privacy_history_exhausted = False
+        self._privacy_invalidated_session = None
+        self._latest_raw_frame = None
+
+    def _remember_raw_frame(self, frame: np.ndarray) -> bool:
         # Keep one current copy for the precise near-raw comparison. Historical
         # frames are represented only by small, non-reversible fingerprints.
         self._latest_raw_frame = frame.copy()
-        now = time.monotonic()
-        self._recent_raw_fingerprints.append((now, self._raw_fingerprint(frame)))
-        while (
-            self._recent_raw_fingerprints
-            and now - self._recent_raw_fingerprints[0][0]
-            > _RAW_FINGERPRINT_WINDOW_S
-        ):
-            self._recent_raw_fingerprints.popleft()
+        if self._privacy_history_exhausted:
+            return False
+        if len(self._recent_raw_fingerprints) >= self._raw_fingerprint_capacity:
+            # Never evict evidence into a permissive state.  The caller revokes
+            # the renderer lease before any subsequent publication can proceed.
+            self._privacy_history_exhausted = True
+            return False
+        self._recent_raw_fingerprints.append(self._raw_fingerprint(frame))
+        return True
+
+    def _record_remote_raw_frame(self, frame: np.ndarray) -> None:
+        """Remember frames exposed to a renderer and revoke on exhaustion."""
+
+        session = self.hub.active_remote_session()
+        if session is None:
+            self._latest_raw_frame = frame.copy()
+            return
+        if self._remember_raw_frame(frame):
+            return
+        if self._privacy_invalidated_session == session:
+            return
+        self.hub.invalidate_remote_session(session)
+        self._privacy_invalidated_session = session
 
     @staticmethod
     def _lowres_raw_similarity(
@@ -1470,27 +1595,7 @@ class Pipeline:
         if not self._recent_raw_fingerprints:
             return False
         candidate_fingerprint = self._raw_fingerprint(candidate)
-        now = time.monotonic()
-        while (
-            self._recent_raw_fingerprints
-            and now - self._recent_raw_fingerprints[0][0]
-            > _RAW_FINGERPRINT_WINDOW_S
-        ):
-            self._recent_raw_fingerprints.popleft()
-        for _captured_at, raw_fingerprint in self._recent_raw_fingerprints:
-            if (
-                candidate_fingerprint.perceptual_hash
-                ^ raw_fingerprint.perceptual_hash
-            ).bit_count() > _RAW_ECHO_HASH_DISTANCE:
-                continue
-            if max(
-                abs(candidate_fingerprint.means[index] - raw_fingerprint.means[index])
-                for index in range(3)
-            ) > _RAW_ECHO_MEAN_COLOR_DELTA:
-                continue
-            if self._lowres_raw_similarity(candidate, raw_fingerprint.thumbnail):
-                return True
-        return False
+        return self._recent_raw_fingerprints.matches(candidate_fingerprint)
 
     def _guard_remote_output(
         self,
@@ -1503,6 +1608,8 @@ class Pipeline:
 
         if not privacy_safe:
             return candidate, ""
+        if self._privacy_history_exhausted:
+            return self._privacy_slate(raw.shape), "privacy-history-exhausted"
         try:
             self._validate_output_frame(candidate, raw)
         except Exception:
@@ -1558,7 +1665,7 @@ class Pipeline:
                     privacy_safe=False,
                 )
             if remote_mode:
-                self._remember_raw_frame(frame)
+                self._record_remote_raw_frame(frame)
                 # Exercise the configured fallback without publishing it. A
                 # remote startup probes the real output backend only with the
                 # fixed slate, never with a camera-derived composite.
@@ -1648,9 +1755,7 @@ class Pipeline:
                 return frame, ""
             bg = backdrop.frame(frame.shape[1], frame.shape[0])
             if timings is not None:
-                timings["background_ms"] = (
-                    time.monotonic_ns() - started
-                ) / 1_000_000.0
+                timings["background_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
             edge_fg = (
                 resources.segmenter.last_foreground
                 if cfg.compositing.use_model_foreground
@@ -1666,9 +1771,7 @@ class Pipeline:
             )
             self._validate_output_frame(rendered, frame)
             if timings is not None:
-                timings["composite_ms"] = (
-                    time.monotonic_ns() - started
-                ) / 1_000_000.0
+                timings["composite_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
             return (
                 rendered,
                 "",
@@ -1704,8 +1807,7 @@ class Pipeline:
         initial_sends = 1 if initial_output is not None else 0
         frames_in = frames_out = initial_sends
         initial_remote_slate = (
-            initial_output is not None
-            and resources.cfg.background.mode == "remote"
+            initial_output is not None and resources.cfg.background.mode == "remote"
         )
         remote_used = 0
         fallback_count = 1 if initial_remote_slate else 0
@@ -1755,7 +1857,7 @@ class Pipeline:
                 fallback_active = False
                 fallback_reason = ""
                 if mode == "remote":
-                    self._remember_raw_frame(frame)
+                    self._record_remote_raw_frame(frame)
                 else:
                     self._latest_raw_frame = frame.copy()
 
@@ -1837,12 +1939,8 @@ class Pipeline:
             last_output = out_frame
 
             send_started = time.monotonic_ns()
-            resources.output.send(
-                out_frame.copy() if mode == "remote" else out_frame
-            )
-            output_send_ms = (
-                time.monotonic_ns() - send_started
-            ) / 1_000_000.0
+            resources.output.send(out_frame.copy() if mode == "remote" else out_frame)
+            output_send_ms = (time.monotonic_ns() - send_started) / 1_000_000.0
             stage_ewma["output_send_ms"] = _ewma(
                 stage_ewma["output_send_ms"], output_send_ms
             )
@@ -1903,21 +2001,13 @@ class Pipeline:
                 capture_fourcc=getattr(capture_health, "fourcc", None),
                 capture_width=getattr(capture_health, "width", None),
                 capture_height=getattr(capture_health, "height", None),
-                capture_fps_reported=getattr(
-                    capture_health, "fps_reported", None
-                ),
+                capture_fps_reported=getattr(capture_health, "fps_reported", None),
                 capture_frames_read=getattr(capture_health, "frames_read", frames_in),
-                capture_dropped_frames=getattr(
-                    capture_health, "dropped_frames", 0
-                ),
-                capture_read_failures=getattr(
-                    capture_health, "read_failures", 0
-                ),
+                capture_dropped_frames=getattr(capture_health, "dropped_frames", 0),
+                capture_read_failures=getattr(capture_health, "read_failures", 0),
                 capture_restarts=getattr(capture_health, "restarts", 0),
                 capture_stalled=getattr(capture_health, "stalled", False),
-                capture_frame_age_ms=getattr(
-                    capture_health, "frame_age_ms", None
-                ),
+                capture_frame_age_ms=getattr(capture_health, "frame_age_ms", None),
                 capture_read_ms=getattr(capture_health, "read_ms", None),
                 segmentation_ms=stage_ewma["segmentation_ms"],
                 background_ms=stage_ewma["background_ms"],

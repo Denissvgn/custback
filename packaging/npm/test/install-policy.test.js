@@ -338,6 +338,7 @@ test('launcher exposes durable extras flags, avatar alias dispatch, and config e
   t.after(() => fs.rmSync(path.dirname(destination), { recursive: true, force: true }));
   assert.equal(launcher.exportAvatarConfig([destination]), 0);
   assert.deepEqual(fs.readFileSync(destination), fs.readFileSync(launcher.AVATAR_CONFIG));
+  assert.equal(fs.statSync(destination).mode & 0o777, 0o600);
   assert.throws(() => launcher.exportAvatarConfig([destination]), /EEXIST/);
 });
 

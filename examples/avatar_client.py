@@ -32,8 +32,10 @@ def renderer_token() -> str:
     token = os.environ.get("CUSTBACK_RENDERER_TOKEN", "").strip()
     if not token:
         token = (
-            Path.home() / ".config" / "custback" / "renderer-token"
-        ).read_text().strip()
+            (Path.home() / ".config" / "custback" / "renderer-token")
+            .read_text()
+            .strip()
+        )
     if len(token) < 32:
         raise RuntimeError("custback renderer token is missing or invalid")
     return token
@@ -42,8 +44,15 @@ def renderer_token() -> str:
 def transform(frame: np.ndarray) -> np.ndarray:
     """Placeholder avatar effect: posterize + label."""
     out = (frame // 64) * 64
-    cv2.putText(out, "AVATAR (remote)", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+    cv2.putText(
+        out,
+        "AVATAR (remote)",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 255, 255),
+        2,
+    )
     return out
 
 

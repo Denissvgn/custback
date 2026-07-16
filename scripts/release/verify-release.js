@@ -4,6 +4,7 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -13,6 +14,8 @@ const zlib = require('zlib');
 const ROOT = path.resolve(__dirname, '..', '..');
 const managed = require(path.join(ROOT, 'packaging', 'npm', 'managed-venv'));
 const installer = require(path.join(ROOT, 'packaging', 'npm', 'install'));
+const phase6Evidence = require(path.join(ROOT, 'scripts', 'release', 'phase6-evidence'));
+const evidenceAssembly = require(path.join(ROOT, 'scripts', 'release', 'assemble-evidence'));
 const configuredTimeout = Number(process.env.CUSTBACK_RELEASE_TIMEOUT_MS);
 const COMMAND_TIMEOUT_MS = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0
   ? configuredTimeout
@@ -32,6 +35,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/api/webui.py',
   'custback/avatar/__init__.py',
   'custback/avatar/__main__.py',
+  'custback/avatar/avatar.yaml',
   'custback/avatar/api.py',
   'custback/avatar/audio2face.py',
   'custback/avatar/config.py',
@@ -49,9 +53,11 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/diagnostics.py',
   'custback/gpu_probe.py',
   'custback/hub.py',
+  'custback/migration.py',
   'custback/pipeline.py',
   'custback/preview.py',
   'custback/segmentation.py',
+  'custback/storage_tx.py',
   'custback/vcam.py',
 ];
 const REVIEWED_PYTHON_TESTS = [
@@ -73,6 +79,11 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_gpu_probe.py',
   'tests/test_model_acquisition.py',
   'tests/test_pipeline.py',
+  'tests/test_phase5_lifecycle.py',
+  'tests/test_phase5_storage.py',
+  'tests/test_phase6_migration.py',
+  'tests/test_phase6_stress.py',
+  'tests/test_phase6_two_host_system.py',
   'tests/test_preview.py',
   'tests/test_processing.py',
   'tests/test_remediation_runtime.py',
@@ -80,10 +91,18 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_segmentation_rvm.py',
   'tests/test_streaming.py',
   'tests/test_webui.py',
+  'tests/fixtures/migration/expected-0.4.0-local-camera.yaml',
+  'tests/fixtures/migration/legacy-0.3.0-default.yaml',
+  'tests/fixtures/migration/legacy-0.3.0-local-camera.yaml',
+  'tests/fixtures/migration/provenance.json',
 ];
 const REVIEWED_NPM_PAYLOAD = [
+  '.github/workflows/ci.yml',
+  '.github/workflows/release.yml',
   'LICENSE',
+  'MANIFEST.in',
   'README.md',
+  'REMEDIATION_PLAN.md',
   'config/avatar.yaml',
   'config/default.yaml',
   'docs/remote-deployment.md',
@@ -92,11 +111,35 @@ const REVIEWED_NPM_PAYLOAD = [
   'packaging/npm/custback.js',
   'packaging/npm/install.js',
   'packaging/npm/managed-venv.js',
+  'packaging/npm/migrate-legacy.js',
+  'packaging/npm/test/install-policy.test.js',
+  'packaging/npm/test/managed-venv.test.js',
+  'packaging/npm/test/candidate-build.test.js',
+  'packaging/npm/test/clean-tree.test.js',
+  'packaging/npm/test/evidence-assembly.test.js',
+  'packaging/npm/test/migration-qualification.test.js',
+  'packaging/npm/test/phase6-evidence.test.js',
+  'packaging/npm/test/phase6-migration.test.js',
+  'packaging/npm/test/release-check.test.js',
+  'packaging/npm/test/release-workflow.test.js',
+  'packaging/npm/test/remediation-phase0.test.js',
   'pyproject.toml',
   'scripts/install_linux.sh',
   'scripts/install_macos.sh',
+  'scripts/release/package-smoke.js',
+  'scripts/release/assemble-evidence.js',
+  'scripts/release/build-candidate.js',
+  'scripts/release/phase6-evidence.js',
+  'scripts/release/qualify-migrations.js',
+  'scripts/release/required-gates.json',
+  'scripts/release/two-host-system-test.py',
+  'scripts/release/two-host/Dockerfile',
+  'scripts/release/two-host/probe.py',
+  'scripts/release/verify-clean-tree.js',
   'scripts/release/verify-release.js',
+  'scripts/release/remediation-blockers.json',
   ...REVIEWED_PYTHON_MODULES.map((name) => `src/${name}`),
+  ...REVIEWED_PYTHON_TESTS,
 ];
 const REVIEWED_BUILD_REQUIREMENTS = ['setuptools>=77,<84'];
 const REVIEWED_CORE_DEPENDENCIES = [
@@ -129,6 +172,7 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
     'pytest-timeout>=2.3,<3',
     'httpx>=0.27,<0.29',
     'httpx2>=2,<3',
+    'ruff>=0.12,<1',
   ],
 };
 const REVIEWED_CONSOLE_SCRIPTS = {
@@ -141,6 +185,8 @@ const REVIEWED_ACTIONS = new Set([
   'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
 ]);
 const REVIEWED_LICENSE_COPYRIGHT = 'Copyright (c) 2026 Bramen';
+const REVIEWED_REMEDIATION_CONTRACT_SHA256 =
+  'd60119dc48db2a8327348b788da1bef6218f4bf5211dadc74178fdd505042cda';
 const REVIEWED_NPM_METADATA = {
   name: 'custback',
   description: 'Virtual camera with background replacement for meeting apps (Ubuntu / Debian / macOS)',
@@ -148,6 +194,7 @@ const REVIEWED_NPM_METADATA = {
   bin: {
     custback: 'packaging/npm/custback.js',
     'custback-avatar': 'packaging/npm/custback.js',
+    'custback-npm-migrate': 'packaging/npm/migrate-legacy.js',
   },
   scripts: {
     postinstall: 'node packaging/npm/install.js',
@@ -157,18 +204,29 @@ const REVIEWED_NPM_METADATA = {
     prepack: 'node scripts/release/verify-release.js --prepack',
   },
   files: [
+    '.github/workflows/*.yml',
     'LICENSE',
+    'REMEDIATION_PLAN.md',
     'packaging/npm/*.js',
+    'packaging/npm/test/*.test.js',
     'src/**/*.py',
+    'src/**/*.yaml',
+    'tests/*.py',
+    'tests/fixtures/migration/*',
     'config/*.yaml',
     'docs/*.md',
     'scripts/*.sh',
     'scripts/release/*.js',
+    'scripts/release/*.json',
+    'scripts/release/*.py',
+    'scripts/release/two-host/Dockerfile',
+    'scripts/release/two-host/*.py',
     'examples/*.py',
+    'MANIFEST.in',
     'pyproject.toml',
   ],
   os: ['linux', 'darwin'],
-  engines: { node: '>=18' },
+  engines: { node: '^18.15.0 || ^20.0.0 || ^22.0.0' },
   keywords: [
     'virtual-camera',
     'background-replacement',
@@ -301,7 +359,16 @@ function verifyLicenseMetadata(root = ROOT) {
   }
 }
 
-function remediationBlockers(root = ROOT) {
+function verifyAvatarConfigTemplate(root = ROOT) {
+  const canonicalPath = path.join(root, 'config', 'avatar.yaml');
+  const packagePath = path.join(root, 'src', 'custback', 'avatar', 'avatar.yaml');
+  if (!fs.existsSync(canonicalPath) || !fs.existsSync(packagePath) ||
+      !fs.readFileSync(canonicalPath).equals(fs.readFileSync(packagePath))) {
+    fail('Python package avatar template must be byte-identical to config/avatar.yaml');
+  }
+}
+
+function remediationRegistry(root = ROOT) {
   const registryPath = path.join(root, 'scripts', 'release', 'remediation-blockers.json');
   if (!fs.existsSync(registryPath)) {
     fail('release remediation blocker registry is missing');
@@ -312,8 +379,12 @@ function remediationBlockers(root = ROOT) {
   } catch (err) {
     fail(`release remediation blocker registry is invalid JSON: ${err.message}`);
   }
-  if (!registry || registry.schema_version !== 1 || !Array.isArray(registry.blockers)) {
-    fail('release remediation blocker registry must use schema_version 1 with a blockers array');
+  if (!registry || registry.schema_version !== 2 ||
+      !Number.isSafeInteger(registry.phase) || registry.phase < 1 ||
+      !Array.isArray(registry.blockers)) {
+    fail(
+      'release remediation blocker registry must use schema_version 2 with a phase and blockers array'
+    );
   }
   const seen = new Set();
   const blockers = registry.blockers.map((entry) => {
@@ -322,34 +393,201 @@ function remediationBlockers(root = ROOT) {
         !Number.isSafeInteger(entry.phase) || entry.phase < 1 ||
         !['open', 'resolved'].includes(entry.status) ||
         typeof entry.title !== 'string' || entry.title.trim() === '' ||
-        typeof entry.regression !== 'string' || entry.regression.trim() === '' ||
-        path.isAbsolute(entry.regression) ||
-        entry.regression.split(/[\\/]/).includes('..')) {
+        !entry.regression || typeof entry.regression !== 'object' ||
+        !['pytest', 'node'].includes(entry.regression.runner) ||
+        typeof entry.regression.test !== 'string' ||
+        entry.regression.test.trim() !== entry.regression.test ||
+        entry.regression.test === '') {
       fail('release remediation blocker registry contains an invalid entry');
+    }
+    const regression = { ...entry.regression };
+    if (regression.runner === 'pytest') {
+      const parts = regression.test.split('::');
+      if (parts.length !== 2 || !parts[0].endsWith('.py') ||
+          !/^test_[A-Za-z0-9_]+$/.test(parts[1]) ||
+          path.isAbsolute(parts[0]) || parts[0].split(/[\\/]/).includes('..') ||
+          Object.hasOwn(regression, 'file') || Object.hasOwn(regression, 'guard')) {
+        fail(`${entry.id} has an invalid pytest regression node id`);
+      }
+      regression.file = parts[0];
+    } else {
+      if (typeof regression.file !== 'string' ||
+          !regression.file.endsWith('.test.js') || path.isAbsolute(regression.file) ||
+          regression.file.split(/[\\/]/).includes('..') ||
+          (Object.hasOwn(regression, 'guard') &&
+           (entry.status !== 'open' || typeof regression.guard !== 'string' ||
+            regression.guard.trim() !== regression.guard || regression.guard === ''))) {
+        fail(`${entry.id} has an invalid Node regression identifier`);
+      }
     }
     if (seen.has(entry.id)) {
       fail(`release remediation blocker registry contains duplicate id ${entry.id}`);
     }
     seen.add(entry.id);
-    return { ...entry };
+    return { ...entry, regression };
   });
   const open = blockers.filter((entry) => entry.status === 'open');
   if (registry.release_blocked !== (open.length > 0)) {
     fail('release_blocked must be true exactly while remediation blockers remain open');
   }
-  return blockers;
+  return { ...registry, blockers };
 }
 
-function verifyBlockerRegressionCoverage(root = ROOT) {
-  for (const blocker of remediationBlockers(root)) {
-    const regressionPath = path.join(root, blocker.regression);
+function remediationBlockers(root = ROOT) {
+  return remediationRegistry(root).blockers;
+}
+
+function remediationContractDigest(registry) {
+  const contract = {
+    phase: registry.phase,
+    release_blocked: registry.release_blocked,
+    blockers: registry.blockers.map((blocker) => ({
+      id: blocker.id,
+      phase: blocker.phase,
+      status: blocker.status,
+      title: blocker.title,
+      regression: blocker.regression.runner === 'pytest'
+        ? {
+          runner: blocker.regression.runner,
+          test: blocker.regression.test,
+        }
+        : {
+          runner: blocker.regression.runner,
+          file: blocker.regression.file,
+          test: blocker.regression.test,
+          ...(blocker.regression.guard ? { guard: blocker.regression.guard } : {}),
+        },
+    })),
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(contract)).digest('hex');
+}
+
+function verifyBlockerRegressionCoverage(
+  root = ROOT,
+  { enforceReviewedContract = true } = {},
+) {
+  const registry = remediationRegistry(root);
+  if (enforceReviewedContract &&
+      remediationContractDigest(registry) !== REVIEWED_REMEDIATION_CONTRACT_SHA256) {
+    fail('remediation registry does not match the reviewed Phase 5 blocker contract');
+  }
+  for (const blocker of registry.blockers) {
+    const regressionPath = path.join(root, blocker.regression.file);
     if (!fs.existsSync(regressionPath) || !fs.statSync(regressionPath).isFile()) {
-      fail(`${blocker.id} regression file is missing: ${blocker.regression}`);
+      fail(`${blocker.id} regression file is missing: ${blocker.regression.file}`);
     }
     const source = fs.readFileSync(regressionPath, 'utf8');
-    if (!source.includes(blocker.id)) {
-      fail(`${blocker.id} is not referenced by ${blocker.regression}`);
+    if (blocker.regression.runner === 'pytest') {
+      const functionName = blocker.regression.test.split('::')[1];
+      const definition = new RegExp(
+        `^(?:async\\s+)?def\\s+${functionName}\\s*\\(`,
+        'm',
+      );
+      if (!definition.test(source)) {
+        fail(`${blocker.id} pytest node is not defined: ${blocker.regression.test}`);
+      }
+    } else {
+      for (const testName of [blocker.regression.test, blocker.regression.guard].filter(Boolean)) {
+        if (!source.includes(JSON.stringify(testName)) &&
+            !source.includes(`'${testName.replaceAll("'", "\\'")}'`)) {
+          fail(`${blocker.id} Node test is not defined exactly: ${testName}`);
+        }
+      }
     }
+  }
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function exactNodeTapOutcome(blockerId, testName, stdout) {
+  const linePattern = new RegExp(
+    `^(?:not )?ok\\s+\\d+\\s+-\\s+${escapeRegex(testName)}(?:\\s+#.*)?$`,
+  );
+  const outcomes = String(stdout || '').split(/\r?\n/)
+    .map((line) => line.trim()).filter((line) => linePattern.test(line));
+  if (outcomes.length !== 1) {
+    fail(
+      `${blockerId} Node regression produced ${outcomes.length} exact TAP outcomes: ${testName}`
+    );
+  }
+  return outcomes[0];
+}
+
+function runNodeRegression(blocker, root = ROOT) {
+  const runNamed = (testName) => {
+    const result = spawnSync(process.execPath, [
+      '--test-reporter=tap',
+      '--test-name-pattern', `^${escapeRegex(testName)}$`,
+      blocker.regression.file,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: COMMAND_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    if (result.error) fail(`${blocker.id} Node regression could not start: ${result.error.message}`);
+    return {
+      result,
+      outcome: exactNodeTapOutcome(blocker.id, testName, result.stdout),
+    };
+  };
+
+  const acceptance = runNamed(blocker.regression.test);
+  if (blocker.status === 'resolved') {
+    if (acceptance.result.status !== 0 || /#\s*(?:TODO|SKIP)\b/i.test(acceptance.outcome) ||
+        acceptance.outcome.startsWith('not ok')) {
+      fail(`${blocker.id} resolved Node regression did not pass normally:\n${acceptance.result.stdout}\n${acceptance.result.stderr}`);
+    }
+    return;
+  }
+  if (acceptance.result.status !== 0 || !/#\s*TODO\b/i.test(acceptance.outcome)) {
+    fail(`${blocker.id} open Node regression must produce a TODO result`);
+  }
+  if (!blocker.regression.guard) {
+    fail(`${blocker.id} open Node TODO is missing an unexpected-pass guard`);
+  }
+  const guard = runNamed(blocker.regression.guard);
+  if (guard.result.status !== 0 || !guard.outcome || guard.outcome.startsWith('not ok') ||
+      /#\s*(?:TODO|SKIP)\b/i.test(guard.outcome)) {
+    fail(`${blocker.id} Node TODO guard did not prove the known failure:\n${guard.result.stdout}\n${guard.result.stderr}`);
+  }
+}
+
+function runPytestRegression(blocker, root = ROOT) {
+  const python = process.env.PYTHON || 'python3';
+  const result = spawnSync(
+    python,
+    ['-m', 'pytest', '-q', blocker.regression.test],
+    {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: COMMAND_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+    },
+  );
+  if (result.error) fail(`${blocker.id} pytest regression could not start: ${result.error.message}`);
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+  if (blocker.status === 'resolved') {
+    if (result.status !== 0 || /\b(?:skipped|xfailed|xpassed)\b/i.test(output) ||
+        !/\bpassed\b/i.test(output)) {
+      fail(`${blocker.id} resolved pytest regression did not pass normally:\n${output}`);
+    }
+  } else if (result.status !== 0 || !/\bxfailed\b/i.test(output) || /\bxpassed\b/i.test(output)) {
+    fail(`${blocker.id} open pytest regression did not produce a strict expected failure:\n${output}`);
+  }
+}
+
+function runBlockerRegressionTests(runner = 'all', root = ROOT) {
+  if (!['all', 'pytest', 'node'].includes(runner)) {
+    fail(`unknown remediation regression runner: ${runner}`);
+  }
+  verifyBlockerRegressionCoverage(root);
+  for (const blocker of remediationBlockers(root)) {
+    if (runner !== 'all' && blocker.regression.runner !== runner) continue;
+    if (blocker.regression.runner === 'pytest') runPytestRegression(blocker, root);
+    else runNodeRegression(blocker, root);
   }
 }
 
@@ -576,7 +814,7 @@ function expectedNpmPayload(root) {
 function verifyNpmPayload(names, root) {
   const forbidden = names.filter((name) =>
     /(^|\/)\.venv(?:\/|$)/.test(name) || name.includes('custback-generations') ||
-    name.startsWith('packaging/npm/test/') || name.endsWith('.tgz') || name.endsWith('.whl') ||
+    name.endsWith('.tgz') || name.endsWith('.whl') ||
     name.endsWith('.tar.gz') || name.includes('__pycache__') || name.endsWith('.pyc') ||
     /(^|\/)onnxruntime_profile__.*\.json$/.test(name) ||
     name === 'debug.txt' || name === 'uninstall.log');
@@ -745,6 +983,20 @@ function verifyCiWorkflow(root = ROOT) {
   if (/\bnpm\s+install\b/.test(workflow) || !/\bnpm\s+ci\b/.test(workflow)) {
     fail('CI must use npm ci and must not use npm install');
   }
+  if (!/^\s{2}package-smoke:\s*$/m.test(workflow) ||
+      !workflow.includes('node scripts/release/package-smoke.js')) {
+    fail('CI must require the non-authorizing installed package smoke job');
+  }
+  if (!/^\s{2}ruff:\s*$/m.test(workflow) ||
+      !workflow.includes('python -m ruff check src tests examples scripts/release') ||
+      !workflow.includes('python -m ruff format --check src tests examples scripts/release')) {
+    fail('CI must require the reviewed Ruff lint and format gates');
+  }
+  if (!/^\s{2}stress:\s*$/m.test(workflow) ||
+      !workflow.includes('tests/test_phase6_stress.py') ||
+      !workflow.includes('CUSTBACK_STRESS_ITERATIONS: "100"')) {
+    fail('CI must require the deterministic Phase 6 stress gate');
+  }
 }
 
 function verifyPlatformScope(root = ROOT) {
@@ -790,6 +1042,142 @@ function verifyPlatformScope(root = ROOT) {
   }
 }
 
+function verifyPhase6Contracts(root = ROOT) {
+  const manifestPath = path.join(root, 'scripts', 'release', 'required-gates.json');
+  const manifest = phase6Evidence.loadManifest(manifestPath);
+  const workflowPath = path.join(root, '.github', 'workflows', 'release.yml');
+  let metadata;
+  try {
+    metadata = fs.lstatSync(workflowPath);
+  } catch (err) {
+    fail(`Phase 6 release workflow is missing: ${err.message}`);
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    fail('Phase 6 release workflow must be a regular, non-symlink file');
+  }
+  verifyReleaseWorkflow(root, manifest);
+  const registry = remediationRegistry(root);
+  if (registry.phase !== 6 || !registry.blockers.some((entry) => entry.id === 'REL-01')) {
+    fail('Phase 6 registry and required-gate manifest are inconsistent');
+  }
+  return manifest;
+}
+
+function verifyReleaseWorkflow(root = ROOT, manifest = phase6Evidence.loadManifest()) {
+  const workflowPath = path.join(root, '.github', 'workflows', 'release.yml');
+  const source = fs.readFileSync(workflowPath, 'utf8');
+  const jobsOffset = source.indexOf('\njobs:\n');
+  if (jobsOffset < 0) fail('Phase 6 workflow has no jobs mapping');
+  const jobsSource = source.slice(jobsOffset + 1);
+  const jobIds = [...jobsSource.matchAll(/^  ([a-z0-9]+(?:-[a-z0-9]+)*):$/gm)]
+    .map((match) => match[1]);
+  const expected = [
+    ...manifest.workflow.required_job_ids,
+    manifest.workflow.aggregate_job_id,
+    manifest.workflow.publish_job_id,
+  ];
+  if (!isDeepStrictEqual([...jobIds].sort(), [...expected].sort())) {
+    fail('Phase 6 workflow job IDs do not exactly match required-gates.json');
+  }
+  const reviewedActions = new Set([
+    ...REVIEWED_ACTIONS,
+    'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+    'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+    'actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6',
+  ]);
+  const uses = [...source.matchAll(/^\s*-\s+uses:\s+([^\s#]+)/gm)]
+    .map((match) => match[1]);
+  if (!uses.length || uses.some((action) => !reviewedActions.has(action))) {
+    fail('Phase 6 workflow contains an unreviewed or unpinned action');
+  }
+  const requiredSnippets = [
+    'node scripts/release/build-candidate.js --output',
+    'actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6',
+    'node scripts/release/assemble-evidence.js assemble',
+    'node scripts/release/qualify-migrations.js',
+    'merge-multiple: true',
+    '--result "$RUNNER_TEMP/two-host-',
+    'node scripts/release/phase6-evidence.js validate-trusted',
+    'gh attestation verify',
+    'if: ${{ always() }}',
+    'needs: [release-gate]',
+    'python -m twine upload --non-interactive "$wheel" "$sdist"',
+    'npm publish "$tarball" --access public --provenance',
+  ];
+  const missing = requiredSnippets.filter((snippet) => !source.includes(snippet));
+  if (missing.length) {
+    fail(`Phase 6 workflow is missing release enforcement: ${missing.join(', ')}`);
+  }
+}
+
+function readRegularJson(filename, label) {
+  if (typeof filename !== 'string' || !path.isAbsolute(filename)) {
+    fail(`${label} path must be absolute`);
+  }
+  let metadata;
+  try {
+    metadata = fs.lstatSync(filename);
+  } catch (err) {
+    fail(`${label} is unavailable: ${err.message}`);
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    fail(`${label} must be a regular, non-symlink file`);
+  }
+  try {
+    return JSON.parse(fs.readFileSync(filename, 'utf8'));
+  } catch (err) {
+    fail(`${label} is invalid JSON: ${err.message}`);
+  }
+}
+
+function verifyQualifiedCandidate(version, root = ROOT, env = process.env) {
+  const artifactDirectory = env.CUSTBACK_RELEASE_CANDIDATE_DIR;
+  const evidencePath = env.CUSTBACK_PHASE6_EVIDENCE;
+  if (!artifactDirectory || !evidencePath) {
+    fail(
+      'full release:check requires CUSTBACK_RELEASE_CANDIDATE_DIR and ' +
+      'CUSTBACK_PHASE6_EVIDENCE from the current release workflow run'
+    );
+  }
+  const resolvedArtifacts = path.resolve(artifactDirectory);
+  const directoryMetadata = fs.lstatSync(resolvedArtifacts);
+  if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+    fail('release candidate directory must be a regular, non-symlink directory');
+  }
+  const manifest = verifyPhase6Contracts(root);
+  const candidatePath = path.join(resolvedArtifacts, 'candidate-manifest.json');
+  const candidate = readRegularJson(candidatePath, 'release candidate manifest');
+  evidenceAssembly.validateCandidate(candidate, manifest, env);
+  if (candidate.source.version !== version) {
+    fail('release candidate version does not match source metadata');
+  }
+  const head = spawnSync('git', ['-C', root, 'rev-parse', '--verify', 'HEAD'], {
+    encoding: 'utf8', timeout: Math.min(COMMAND_TIMEOUT_MS, 30 * 1000),
+  });
+  if (head.error || head.status !== 0 || head.stdout.trim() !== candidate.source.commit) {
+    fail('release candidate commit does not match the checked-out source commit');
+  }
+  const evidence = phase6Evidence.loadEvidence(evidencePath);
+  phase6Evidence.validateEvidence(evidence, manifest, {
+    trusted: true,
+    env,
+    artifactPaths: phase6Evidence.artifactPathsFromDirectory(
+      evidence,
+      resolvedArtifacts,
+    ),
+  });
+  if (!isDeepStrictEqual(evidence.artifacts, candidate.artifacts) ||
+      evidence.provenance.commit !== candidate.source.commit) {
+    fail('trusted evidence does not describe the exact release candidate');
+  }
+  phase6Evidence.verifyGithubAttestations(
+    evidence,
+    phase6Evidence.artifactPathsFromDirectory(evidence, resolvedArtifacts),
+    { env, evidencePath: path.resolve(evidencePath) },
+  );
+  return candidate;
+}
+
 function verifyPack(version, root = ROOT) {
   const cache = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-npm-cache-'));
   try {
@@ -804,16 +1192,21 @@ function verifyPack(version, root = ROOT) {
     for (const required of [
       'LICENSE',
       'README.md',
+      'REMEDIATION_PLAN.md',
+      '.github/workflows/ci.yml',
       'docs/remote-deployment.md',
       'package.json',
       'packaging/npm/custback.js',
       'packaging/npm/install.js',
       'packaging/npm/managed-venv.js',
+      'packaging/npm/migrate-legacy.js',
       'config/default.yaml',
       'pyproject.toml',
       'scripts/install_linux.sh',
       'scripts/install_macos.sh',
+      'scripts/release/package-smoke.js',
       'scripts/release/verify-release.js',
+      'scripts/release/remediation-blockers.json',
       'src/custback/__init__.py',
       'src/custback/__main__.py',
     ]) {
@@ -923,6 +1316,7 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
   const buildTools = path.join(temporaryRoot, 'build-tools-venv');
   verifyReviewedSourceFiles(root, [
     'LICENSE',
+    'MANIFEST.in',
     'README.md',
     'pyproject.toml',
     ...REVIEWED_PYTHON_MODULES.map((name) => `src/${name}`),
@@ -1062,6 +1456,7 @@ with tarfile.open(sdist_path, "r:gz") as archive:
     prefix = f"custback-{version}"
     expected = {
         f"{prefix}/LICENSE",
+        f"{prefix}/MANIFEST.in",
         f"{prefix}/PKG-INFO",
         f"{prefix}/README.md",
         f"{prefix}/pyproject.toml",
@@ -1128,7 +1523,35 @@ with tarfile.open(sdist_path, "r:gz") as archive:
       ]);
       runChecked(venvPython, ['-m', 'pip', 'check']);
       runChecked(venvPython, ['-c', importProbe]);
-      runChecked(venvPython, ['-m', 'custback', '--help']);
+      const installedCustback = path.join(venv, 'bin', 'custback');
+      const installedAvatar = path.join(venv, 'bin', 'custback-avatar');
+      const exportedConfig = path.join(temporaryRoot, `${kind}-avatar.yaml`);
+      runChecked(installedCustback, ['--help']);
+      runChecked(installedCustback, ['avatar', '--help']);
+      runChecked(installedAvatar, ['--help']);
+      runChecked(installedCustback, ['avatar', '--smoke']);
+      runChecked(installedCustback, ['avatar', 'config', 'export', exportedConfig]);
+      if (!fs.readFileSync(exportedConfig).equals(
+        fs.readFileSync(path.join(root, 'config', 'avatar.yaml'))
+      )) {
+        fail(`${kind} installed avatar config export differs from the canonical template`);
+      }
+      if ((fs.statSync(exportedConfig).mode & 0o777) !== 0o600) {
+        fail(`${kind} installed avatar config export is not mode 0600`);
+      }
+      const overwrite = spawnSync(
+        installedAvatar,
+        ['config', 'export', exportedConfig],
+        { encoding: 'utf8', timeout: COMMAND_TIMEOUT_MS },
+      );
+      if (overwrite.error || overwrite.status !== 2 ||
+          !/(?:exist|EEXIST|cannot export)/i.test(overwrite.stderr || '') ||
+          !fs.readFileSync(exportedConfig).equals(
+            fs.readFileSync(path.join(root, 'config', 'avatar.yaml'))
+          )) {
+        fail(`${kind} installed avatar config did not refuse overwrite safely`);
+      }
+      fs.rmSync(exportedConfig);
     });
   }
 
@@ -1172,7 +1595,35 @@ function verifyNpmArtifactInstall(version, temporaryRoot, root = ROOT) {
     env: smokeEnv,
   });
   const launcher = path.join(prefix, 'bin', 'custback');
+  const avatarLauncher = path.join(prefix, 'bin', 'custback-avatar');
+  const exportedConfig = path.join(temporaryRoot, 'npm-avatar.yaml');
   runChecked(launcher, ['--help'], { env: smokeEnv });
+  runChecked(launcher, ['avatar', '--help'], { env: smokeEnv });
+  runChecked(avatarLauncher, ['--help'], { env: smokeEnv });
+  runChecked(launcher, ['avatar', '--smoke'], { env: smokeEnv });
+  runChecked(launcher, ['avatar', 'config', 'export', exportedConfig], {
+    env: smokeEnv,
+  });
+  if (!fs.readFileSync(exportedConfig).equals(
+    fs.readFileSync(path.join(root, 'config', 'avatar.yaml'))
+  )) {
+    fail('npm installed avatar config export differs from the canonical template');
+  }
+  if ((fs.statSync(exportedConfig).mode & 0o777) !== 0o600) {
+    fail('npm installed avatar config export is not mode 0600');
+  }
+  const npmOverwrite = spawnSync(
+    avatarLauncher,
+    ['config', 'export', exportedConfig],
+    { encoding: 'utf8', timeout: COMMAND_TIMEOUT_MS, env: smokeEnv },
+  );
+  if (npmOverwrite.error || npmOverwrite.status !== 1 ||
+      !/(?:exist|EEXIST|cannot export)/i.test(npmOverwrite.stderr || '') ||
+      !fs.readFileSync(exportedConfig).equals(
+        fs.readFileSync(path.join(root, 'config', 'avatar.yaml'))
+      )) {
+    fail('npm installed avatar config did not refuse overwrite safely');
+  }
   runChecked(launcher, ['rebuild'], { env: smokeEnv });
   runChecked(launcher, ['doctor'], { env: smokeEnv });
   const stamp = JSON.parse(fs.readFileSync(path.join(managedVenv, managed.INSTALL_STAMP), 'utf8'));
@@ -1218,18 +1669,53 @@ function releasePlan(argv) {
       ? 'metadata and non-recursive npm packlist verified'
       : quick
         ? 'metadata and npm packlist verified (quick mode)'
-        : 'metadata, npm packlist, and built artifacts verified',
+        : 'metadata, npm packlist, and exact qualified artifacts verified',
   };
+}
+
+function verifyPackageSmoke(root = ROOT) {
+  // Installed-artifact acceptance remains runnable while REL-01 is open, but
+  // this function never authorizes or publishes a release candidate.
+  const version = verifyVersions(root);
+  verifyDependencies(root);
+  verifyLicenseMetadata(root);
+  verifyAvatarConfigTemplate(root);
+  verifyDocs(root);
+  verifyCiWorkflow(root);
+  verifyPhase6Contracts(root);
+  verifyPlatformScope(root);
+  verifyBlockerRegressionCoverage(root);
+  const stale = staleArtifacts(root);
+  if (stale.length) {
+    fail(`stale release artifacts must be removed before package smoke: ${stale.join(', ')}`);
+  }
+  verifyPack(version, root);
+  verifyBuiltArtifacts(version, root);
+  return version;
 }
 
 function main(argv = process.argv.slice(2)) {
   try {
+    const regressionMode = argv.length === 1 &&
+      argv[0].match(/^--regressions=(all|pytest|node)$/);
+    if (regressionMode) {
+      // This proves registry-linked outcomes but is deliberately
+      // non-authorizing: an open blocker still makes every ordinary release
+      // mode fail below.
+      runBlockerRegressionTests(regressionMode[1]);
+      console.log(
+        `[custback release] ${regressionMode[1]} remediation regressions verified (diagnostic only)`
+      );
+      return 0;
+    }
     const plan = releasePlan(argv);
     const version = verifyVersions();
     verifyDependencies();
     verifyLicenseMetadata();
+    verifyAvatarConfigTemplate();
     verifyDocs();
     verifyCiWorkflow();
+    verifyPhase6Contracts();
     verifyPlatformScope();
     verifyNoReleaseBlockers();
     const stale = staleArtifacts();
@@ -1237,11 +1723,18 @@ function main(argv = process.argv.slice(2)) {
       fail(`stale release artifacts must be removed before release: ${stale.join(', ')}`);
     }
     // --ignore-scripts makes this safe to call from prepack without invoking
-    // the prepack lifecycle recursively. Artifact builds/installs are reserved
-    // for the explicit, full release:check path.
+    // the prepack lifecycle recursively. The full path consumes the exact
+    // once-built candidate and trusted same-run evidence; it never rebuilds.
     verifyPack(version);
-    if (plan.builtArtifacts) verifyBuiltArtifacts(version);
-    console.log(`[custback release] ${plan.success} for ${version}`);
+    if (plan.builtArtifacts) verifyQualifiedCandidate(version);
+    const successLine = `[custback release] ${plan.success} for ${version}`;
+    if (argv.includes('--prepack')) {
+      // npm owns lifecycle stdout: `npm pack --silent` must emit only the
+      // generated tarball filename so shell command substitution is safe.
+      console.error(successLine);
+    } else {
+      console.log(successLine);
+    }
     return 0;
   } catch (err) {
     console.error(`[custback release] ${err.message}`);
@@ -1253,6 +1746,7 @@ module.exports = {
   canonicalLicense,
   createReleaseTemporaryRoot,
   extraArtifactProfiles,
+  exactNodeTapOutcome,
   filesystemIsMemoryBacked,
   main,
   parseNpmPackPayload,
@@ -1260,10 +1754,14 @@ module.exports = {
   releaseBuildJobs,
   releasePlan,
   remediationBlockers,
+  remediationContractDigest,
+  remediationRegistry,
+  runBlockerRegressionTests,
   staleArtifacts,
   verifyDependencies,
   verifyDocs,
   verifyBuiltArtifacts,
+  verifyAvatarConfigTemplate,
   verifyBlockerRegressionCoverage,
   verifyCiWorkflow,
   verifyLicenseMetadata,
@@ -1273,7 +1771,11 @@ module.exports = {
   verifyNoReleaseBlockers,
   verifyPack,
   verifyPlatformScope,
+  verifyPhase6Contracts,
+  verifyPackageSmoke,
   verifyPythonArtifacts,
+  verifyQualifiedCandidate,
+  verifyReleaseWorkflow,
   verifyVersions,
   withDisposableDirectory,
   withTemporaryEnvironment,

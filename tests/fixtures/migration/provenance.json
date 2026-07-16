@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release": "0.3.0",
+  "source_commit": "f01baadfa3b1e2a1ef19eceda315eedf06fbe883",
+  "source_path": "config/default.yaml",
+  "publication_status": "unpublished-reference-commit",
+  "source_sha256": "d060c287b3cd1b0ca23b379b641e9b1df511ead5212c80e90d56502804e93043",
+  "fixtures": {
+    "legacy-0.3.0-default.yaml": {
+      "derivation": "byte-identical source file",
+      "sha256": "d060c287b3cd1b0ca23b379b641e9b1df511ead5212c80e90d56502804e93043"
+    },
+    "legacy-0.3.0-local-camera.yaml": {
+      "derivation": "comments removed; background.mode=camera; background.camera_device=/dev/video2",
+      "sha256": "3d721e04d8d75c97d08706886f179616aa3d070792f56218d04f5bdcf9b49144"
+    },
+    "expected-0.4.0-local-camera.yaml": {
+      "derivation": "custback migrate --target-id legacy-camera applied to legacy-0.3.0-local-camera.yaml",
+      "sha256": "d9d2bbdd68a2ad084285ec119fd2f5f68a7be4bcc9b4ed985b7dd26d5c5ba46f"
+    }
+  }
+}

@@ -18,7 +18,7 @@ from typing import Callable
 
 import numpy as np
 
-from .config import BackgroundConfig
+from .config import BackgroundConfig, ResolvedBackdropTarget
 from .diagnostics import sanitized_source
 
 try:
@@ -54,7 +54,9 @@ def list_background_files(directory: Path) -> list[Path]:
     if not directory.is_dir():
         return []
     exts = IMAGE_EXTS | VIDEO_EXTS
-    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in exts)
+    return sorted(
+        p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in exts
+    )
 
 
 def _fit(frame: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -158,9 +160,9 @@ class ImageBackdrop(BackdropProvider):
                 # verify() validates the container without decoding pixels.
                 # Reopen and force decompression before OpenCV sees the path.
                 with Image.open(path) as decoded:
-                    if (
-                        decoded.format != expected_format
-                        or decoded.size != (width, height)
+                    if decoded.format != expected_format or decoded.size != (
+                        width,
+                        height,
                     ):
                         raise ValueError("background image changed during validation")
                     decoded.load()
@@ -192,9 +194,7 @@ class ImageBackdrop(BackdropProvider):
             or image.shape[2] != 3
             or image.shape[:2] != (height, width)
         ):
-            raise ValueError(
-                f"invalid background image: {sanitized_source(path)}"
-            )
+            raise ValueError(f"invalid background image: {sanitized_source(path)}")
         self._image = image
         self._cache: np.ndarray | None = None
 
@@ -242,14 +242,11 @@ class VideoBackdrop(BackdropProvider):
             metadata_height = float(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         except (TypeError, ValueError, OverflowError):
             metadata_width = metadata_height = 0.0
-        if (
-            (math.isfinite(metadata_width) and metadata_width > max_width)
-            or (math.isfinite(metadata_height) and metadata_height > max_height)
+        if (math.isfinite(metadata_width) and metadata_width > max_width) or (
+            math.isfinite(metadata_height) and metadata_height > max_height
         ):
             self.cap.release()
-            raise ValueError(
-                "background video metadata exceeds configured dimensions"
-            )
+            raise ValueError("background video metadata exceeds configured dimensions")
         try:
             source_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
         except (TypeError, ValueError, OverflowError):
@@ -287,9 +284,7 @@ class VideoBackdrop(BackdropProvider):
         self._last_reliable_source_index: int | None = None
         self._container_timing = False
         self._last_pts_step_s = 1.0 / self._fps
-        self._duration_s = (
-            self._frame_count / self._fps if self._frame_count else 0.0
-        )
+        self._duration_s = self._frame_count / self._fps if self._frame_count else 0.0
         self._pending: tuple[np.ndarray, int, int, float | None] | None = None
         self._retry_not_before_s = 0.0
         self._last_raw: np.ndarray | None = None
@@ -395,8 +390,7 @@ class VideoBackdrop(BackdropProvider):
             ):
                 remaining_intervals = max(1, self._frame_count - last_index)
                 candidate = (
-                    last_pts - origin
-                    + self._last_pts_step_s * remaining_intervals
+                    last_pts - origin + self._last_pts_step_s * remaining_intervals
                 )
                 if candidate > 0.0 and math.isfinite(candidate):
                     self._duration_s = candidate
@@ -533,6 +527,7 @@ class VideoBackdrop(BackdropProvider):
             if self._frame_count
             else self._source_index + steps
         )
+
         # The one-frame look-ahead has already consumed the first stale frame,
         # so grab begins with offset two. Keep the currently displayed frame
         # untouched until retrieve() succeeds.
@@ -742,9 +737,7 @@ class VideoBackdrop(BackdropProvider):
 
         if self._pending is not None:
             _, source_index, logical_index, pts_s = self._pending
-            if elapsed_s + 1e-9 >= self._deadline_s(
-                source_index, logical_index, pts_s
-            ):
+            if elapsed_s + 1e-9 >= self._deadline_s(source_index, logical_index, pts_s):
                 # A phase-preserving seek requires a duration. For containers
                 # with unknown length, make bounded sequential progress until
                 # EOF reveals the count instead of guessing a non-looping seek.
@@ -775,9 +768,7 @@ class VideoBackdrop(BackdropProvider):
         else:
             self._frames_reused += 1
         opportunities = self._frames_displayed + self._frames_skipped
-        skip_ratio = (
-            self._frames_skipped / opportunities if opportunities else 0.0
-        )
+        skip_ratio = self._frames_skipped / opportunities if opportunities else 0.0
         if (
             not self._skip_warning_emitted
             and opportunities >= 30
@@ -827,11 +818,19 @@ class VideoBackdrop(BackdropProvider):
 
 
 class CameraBackdrop(BackdropProvider):
-    """Live backdrop from a second camera or a network stream URL."""
+    """Live backdrop from one validated, operator-owned local target."""
 
-    def __init__(self, device: int | str):
+    def __init__(self, target: ResolvedBackdropTarget | int | str):
         if cv2 is None:
             raise RuntimeError("opencv-python is required for camera backdrops")
+        if isinstance(target, ResolvedBackdropTarget):
+            self.target = target
+            device = target.source
+        else:
+            # Direct construction remains available to local callers/tests, but
+            # the application pipeline always supplies an immutable snapshot.
+            self.target = ResolvedBackdropTarget("", target)
+            device = target
         if isinstance(device, str) and device.isdigit():
             device = int(device)
         self.cap = cv2.VideoCapture(device)
@@ -873,7 +872,9 @@ class BlurBackdrop(BackdropProvider):
         self.strength = strength if strength % 2 == 1 else strength + 1
         self._frame: np.ndarray | None = None
 
-    def set_source_frame(self, frame: np.ndarray, mask: np.ndarray | None = None) -> None:
+    def set_source_frame(
+        self, frame: np.ndarray, mask: np.ndarray | None = None
+    ) -> None:
         if cv2 is None:  # box-blur-ish fallback: downscale/upscale by striding
             small = frame[:: self.strength, :: self.strength]
             self._frame = np.repeat(
@@ -917,6 +918,7 @@ class BlurBackdrop(BackdropProvider):
 def create_backdrop(
     cfg: BackgroundConfig,
     *,
+    camera_target: ResolvedBackdropTarget | None = None,
     image_max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS,
     video_max_width: int = 3840,
     video_max_height: int = 2160,
@@ -940,5 +942,13 @@ def create_backdrop(
             max_height=video_max_height,
         )
     if mode == "camera":
-        return CameraBackdrop(cfg.camera_device)
+        if camera_target is None:
+            if cfg.camera_target:
+                raise ValueError(
+                    "camera target was not resolved by the configuration owner"
+                )
+            if cfg.camera_device == "":
+                raise ValueError("camera backdrop source is not configured")
+            camera_target = ResolvedBackdropTarget("", cfg.camera_device)
+        return CameraBackdrop(camera_target)
     raise ValueError(f"unknown background mode: {mode!r}")
