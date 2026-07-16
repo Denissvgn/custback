@@ -16,18 +16,26 @@ accepts it.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
 import os
 import re
 import secrets
 import shutil
+import stat
 import threading
+import warnings
 import zipfile
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, BinaryIO
 
 import numpy as np
+import yaml
+from yaml.events import AliasEvent
 
 from ..backgrounds import IMAGE_EXTS, VIDEO_EXTS
 from .config import (
@@ -36,7 +44,13 @@ from .config import (
     StorageConfig,
 )
 from .renderer import compose_avatar
-from .rig import RigError, create_rig
+from .rig import (
+    DEFAULT_RIG_LAYER_MAX_PIXELS,
+    DEFAULT_RIG_MANIFEST_MAX_BYTES,
+    DEFAULT_RIG_TOTAL_MAX_PIXELS,
+    RigError,
+    create_rig,
+)
 from .state import FaceState
 
 try:
@@ -55,6 +69,25 @@ log = logging.getLogger(__name__)
 RIG_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 _MEDIA_STEM_MAX = 48
 _ZIP_READ_CHUNK = 1024 * 1024
+_PRIVATE_DIRECTORY_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+
+_IMAGE_FORMATS = {
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".png": "PNG",
+    ".bmp": "BMP",
+    ".webp": "WEBP",
+}
+
+
+class _RigManifestLoader(yaml.SafeLoader):
+    """SafeLoader variant rejecting aliases and their recursive/amplified graphs."""
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(AliasEvent):
+            raise yaml.YAMLError("rig.yaml aliases are not allowed")
+        return super().compose_node(parent, index)
 
 # The only files a rig archive may carry (optionally under one shared
 # top-level directory, which is flattened away).
@@ -77,6 +110,379 @@ class StoreError(Exception):
         super().__init__(message)
 
 
+def _owned_by_current_user(metadata: os.stat_result) -> bool:
+    """Return whether ``metadata`` belongs to this process's effective user."""
+
+    getuid = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+    return getuid is None or metadata.st_uid == getuid()
+
+
+def _unsafe_storage(path: Path, message: str) -> StoreError:
+    return StoreError(409, "unsafe_storage_path", f"{message}: {path}")
+
+
+def _open_flags(*, directory: bool = False, writable: bool = False) -> int:
+    flags = os.O_WRONLY if writable else os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    elif not writable:
+        # Refuse a raced FIFO/device without waiting on it.
+        flags |= getattr(os, "O_NONBLOCK", 0)
+    return flags
+
+
+def _secure_existing(path: Path, mode: int, *, directory: bool) -> None:
+    """Apply an exact private mode without following a final symlink."""
+
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        raise
+    if stat.S_ISLNK(before.st_mode):
+        raise _unsafe_storage(path, "managed storage cannot be a symlink")
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(before.st_mode):
+        kind = "directory" if directory else "regular file"
+        raise _unsafe_storage(path, f"managed storage is not a {kind}")
+    if not _owned_by_current_user(before):
+        raise _unsafe_storage(path, "managed storage is not owned by this user")
+
+    # A restrictive umask can create a mode-000 inode. Its owner may chmod it
+    # but cannot bind it with os.open first. Repair by name only after a
+    # no-follow lstat/ownership check, then verify the inode identity before
+    # opening and fchmod'ing the authoritative descriptor.
+    required_owner_bits = (
+        stat.S_IRUSR | stat.S_IXUSR if directory else stat.S_IRUSR
+    )
+    if stat.S_IMODE(before.st_mode) & required_owner_bits != required_owner_bits:
+        os.chmod(path, mode, follow_symlinks=False)
+        after = path.lstat()
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or not expected_type(after.st_mode)
+            or not _owned_by_current_user(after)
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise _unsafe_storage(path, "managed storage changed while securing")
+
+    descriptor = os.open(path, _open_flags(directory=directory))
+    try:
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            raise _unsafe_storage(path, "managed storage changed while opening")
+        if not expected_type(current.st_mode):
+            raise _unsafe_storage(path, "managed storage changed type while opening")
+        if not _owned_by_current_user(current):
+            raise _unsafe_storage(path, "managed storage is not owned by this user")
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create/repair one managed directory as exactly mode 0700."""
+
+    path.mkdir(parents=True, mode=_PRIVATE_DIRECTORY_MODE, exist_ok=True)
+    _secure_existing(path, _PRIVATE_DIRECTORY_MODE, directory=True)
+
+
+def _managed_directory_exists(path: Path) -> bool:
+    """Validate a read root without following or changing it."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        raise _unsafe_storage(path, "managed storage cannot be a symlink")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _unsafe_storage(path, "managed storage is not a directory")
+    if not _owned_by_current_user(metadata):
+        raise _unsafe_storage(path, "managed storage is not owned by this user")
+    return True
+
+
+def _make_private_directory(path: Path) -> None:
+    """Exclusively create one private managed child directory."""
+
+    path.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
+    try:
+        _secure_existing(path, _PRIVATE_DIRECTORY_MODE, directory=True)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.rmdir()
+        raise
+
+
+def _open_private_file(path: Path) -> BinaryIO:
+    """Exclusively bind a no-follow mode-0600 file and return it writable."""
+
+    descriptor: int | None = None
+    created = False
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags, _PRIVATE_FILE_MODE)
+        created = True
+        # Both permissive and restrictive umasks converge on the exact mode.
+        os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+        destination = os.fdopen(descriptor, "wb")
+        descriptor = None
+        return destination
+    except BaseException:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            descriptor = None
+        if created:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        raise
+    finally:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+def _open_regular_file(path: Path) -> BinaryIO:
+    """Open an existing regular file for reading without following symlinks."""
+
+    descriptor = os.open(path, _open_flags())
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _unsafe_storage(path, "upload source is not a regular file")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _tree_size(path: Path) -> int:
+    """Count regular-file bytes below ``path`` without following symlinks."""
+
+    metadata = path.lstat()
+    if stat.S_ISREG(metadata.st_mode):
+        return metadata.st_size
+    if not stat.S_ISDIR(metadata.st_mode):
+        # Symlinks and special entries still consume a conservative inode-sized
+        # quota charge, without ever following their targets.
+        return metadata.st_size
+    total = 0
+    for child in path.iterdir():
+        total += _tree_size(child)
+    return total
+
+
+@dataclass(frozen=True)
+class StoragePermissionIssue:
+    """One managed path whose privacy contract needs operator attention."""
+
+    path: Path
+    expected_mode: int
+    actual_mode: int
+    reason: str  # mode | symlink | owner | type | unreadable
+
+
+def _permission_nodes(root: Path):
+    """Yield a no-follow snapshot of a managed tree."""
+
+    try:
+        metadata = root.lstat()
+    except FileNotFoundError:
+        return
+    yield root, metadata
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return
+    for child in children:
+        yield from _permission_nodes(child)
+
+
+def audit_storage_permissions(
+    cfg: StorageConfig,
+) -> tuple[StoragePermissionIssue, ...]:
+    """Audit existing avatar stores without following or changing any path."""
+
+    issues: list[StoragePermissionIssue] = []
+    for root in (
+        Path(cfg.rigs_dir).expanduser(),
+        Path(cfg.backgrounds_dir).expanduser(),
+    ):
+        for path, metadata in _permission_nodes(root):
+            is_directory = stat.S_ISDIR(metadata.st_mode)
+            expected = (
+                _PRIVATE_DIRECTORY_MODE if is_directory else _PRIVATE_FILE_MODE
+            )
+            actual = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISLNK(metadata.st_mode):
+                reason = "symlink"
+            elif not _owned_by_current_user(metadata):
+                reason = "owner"
+            elif not (is_directory or stat.S_ISREG(metadata.st_mode)):
+                reason = "type"
+            elif actual != expected:
+                reason = "mode"
+            else:
+                continue
+            issues.append(
+                StoragePermissionIssue(path, expected, actual, reason)
+            )
+    return tuple(issues)
+
+
+def repair_storage_permissions(cfg: StorageConfig) -> tuple[Path, ...]:
+    """Repair user-owned modes, refusing symlinks/non-owned/special paths.
+
+    Snapshots are repeated because a mode-000 directory cannot be traversed
+    until its own mode is repaired. Unsafe entries are never followed or
+    changed; making an inaccessible parent private may reveal one on the next
+    pass, at which point repair stops with ``unsafe_storage_path``.
+    """
+
+    repaired: list[Path] = []
+    repaired_set: set[Path] = set()
+    while True:
+        issues = audit_storage_permissions(cfg)
+        unsafe = [issue for issue in issues if issue.reason != "mode"]
+        if unsafe:
+            issue = unsafe[0]
+            raise _unsafe_storage(
+                issue.path,
+                f"cannot repair managed storage ({issue.reason})",
+            )
+        if not issues:
+            break
+        # Secure deepest visible entries first, then their containing dirs.
+        for issue in sorted(
+            issues, key=lambda item: len(item.path.parts), reverse=True
+        ):
+            _secure_existing(
+                issue.path,
+                issue.expected_mode,
+                directory=issue.expected_mode == _PRIVATE_DIRECTORY_MODE,
+            )
+            if issue.path not in repaired_set:
+                repaired.append(issue.path)
+                repaired_set.add(issue.path)
+    return tuple(repaired)
+
+
+class UploadReservation(os.PathLike[str]):
+    """Store-owned private staging file with chunk-level quota accounting."""
+
+    def __init__(
+        self,
+        store: Any,
+        path: Path,
+        destination: BinaryIO,
+        *,
+        max_bytes: int,
+    ) -> None:
+        self._store = store
+        self.path = path
+        self._destination: BinaryIO | None = destination
+        self.max_bytes = max_bytes
+        self.reserved_bytes = 0
+        self._active = True
+        self._io_lock = threading.RLock()
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    def stat(self) -> os.stat_result:
+        with self._io_lock:
+            if self._destination is not None:
+                return os.fstat(self._destination.fileno())
+        return self.path.stat()
+
+    def write(self, payload: bytes | bytearray | memoryview) -> int:
+        data = memoryview(payload)
+        if not data:
+            return 0
+        with self._io_lock:
+            if not self._active or self._destination is None:
+                raise ValueError("upload reservation is closed")
+            try:
+                self._store._reserve_chunk(self, len(data))
+                written = self._destination.write(data)
+                if written != len(data):
+                    raise OSError("short staging-file write")
+                return written
+            except OSError as exc:
+                self.abort()
+                raise StoreError(
+                    507,
+                    "insufficient_storage",
+                    "cannot write upload staging",
+                ) from exc
+            except BaseException:
+                self.abort()
+                raise
+
+    def write_bytes(self, payload: bytes) -> int:
+        """Path-compatible one-shot helper that retains reservation ownership."""
+
+        return self.write(payload)
+
+    def seal(self) -> None:
+        """Durably close the staging inode without releasing its reservation."""
+
+        with self._io_lock:
+            if not self._active or self._destination is None:
+                return
+            destination = self._destination
+            try:
+                destination.flush()
+                os.fsync(destination.fileno())
+            finally:
+                destination.close()
+                self._destination = None
+
+    def _close_noexcept(self) -> None:
+        with self._io_lock:
+            if self._destination is not None:
+                with contextlib.suppress(OSError):
+                    self._destination.close()
+                self._destination = None
+
+    def _finish(self) -> None:
+        self._close_noexcept()
+        self._active = False
+
+    def abort(self) -> None:
+        """Delete staging and release every byte/file reservation, idempotently."""
+
+        with self._io_lock:
+            if not self._active:
+                return
+            self._close_noexcept()
+            self._store._abort_reservation(self)
+
+    def unlink(self, missing_ok: bool = False) -> None:
+        existed = self.path.exists() or self.path.is_symlink()
+        self.abort()
+        if not existed and not missing_ok:
+            raise FileNotFoundError(self.path)
+
+
 @dataclass(frozen=True)
 class InstalledRig:
     name: str
@@ -93,6 +499,16 @@ class StoredMedia:
     path: str
 
 
+def is_rig_directory(path: str | Path) -> bool:
+    """Return whether ``path`` is a real directory, never a symlink."""
+
+    try:
+        metadata = Path(path).expanduser().lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode)
+
+
 def resolve_rig_selector(selector: str, rigs_dir: str | Path) -> str:
     """Map ``appearance.rig`` to something :func:`create_rig` understands.
 
@@ -103,11 +519,12 @@ def resolve_rig_selector(selector: str, rigs_dir: str | Path) -> str:
     if selector == "builtin":
         return selector
     candidate = Path(selector).expanduser()
-    if candidate.is_dir():
+    if is_rig_directory(candidate):
         return str(candidate)
     if RIG_NAME_RE.fullmatch(selector):
-        installed = Path(rigs_dir).expanduser() / selector
-        if installed.is_dir():
+        root = Path(rigs_dir).expanduser()
+        installed = root / selector
+        if is_rig_directory(root) and is_rig_directory(installed):
             return str(installed)
     return selector
 
@@ -146,12 +563,22 @@ def render_avatar_thumbnail(
     style: str = "cartoon",
     framing: str = "bust",
     size: tuple[int, int] = THUMBNAIL_SIZE,
+    rig_layer_max_pixels: int = DEFAULT_RIG_LAYER_MAX_PIXELS,
+    rig_total_max_pixels: int = DEFAULT_RIG_TOTAL_MAX_PIXELS,
+    rig_manifest_max_bytes: int = DEFAULT_RIG_MANIFEST_MAX_BYTES,
 ) -> bytes:
     """Render one avatar tile as JPEG bytes (raises RigError on bad rigs)."""
     if cv2 is None:
         raise RuntimeError("opencv-python is required for thumbnails")
     width, height = size
-    rig = create_rig(selector, avatar=avatar, style=style)
+    rig = create_rig(
+        selector,
+        avatar=avatar,
+        style=style,
+        rig_layer_max_pixels=rig_layer_max_pixels,
+        rig_total_max_pixels=rig_total_max_pixels,
+        rig_manifest_max_bytes=rig_manifest_max_bytes,
+    )
     try:
         sprite = rig.render(_neutral_face_state(), frozenset(AVATAR_PARTS))
         backdrop = np.full(
@@ -236,7 +663,11 @@ class RigStore:
     def __init__(self, cfg: StorageConfig):
         self.directory = Path(cfg.rigs_dir).expanduser()
         self._cfg = cfg
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._reserved_bytes = 0
+        self._reserved_rigs = 0
+        self._active_uploads: dict[Path, UploadReservation] = {}
+        self._active_extractions: set[Path] = set()
 
     def rig_path(self, name: str) -> Path:
         if not RIG_NAME_RE.fullmatch(name):
@@ -249,31 +680,162 @@ class RigStore:
         return self.directory / name
 
     def _describe(self, path: Path) -> InstalledRig:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise _unsafe_storage(path, "installed rig is not a regular directory")
+        if not _owned_by_current_user(metadata):
+            raise _unsafe_storage(path, "installed rig is not owned by this user")
+        files: dict[str, os.stat_result] = {}
+        for entry in path.iterdir():
+            child = entry.lstat()
+            if stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode):
+                raise _unsafe_storage(
+                    entry, "installed rig contains a non-regular asset"
+                )
+            if not _owned_by_current_user(child):
+                raise _unsafe_storage(
+                    entry, "installed rig asset is not owned by this user"
+                )
+            files[entry.name] = child
         parts = tuple(
-            part for part in AVATAR_PARTS if (path / f"{part}.png").is_file()
+            part for part in AVATAR_PARTS if f"{part}.png" in files
         )
-        size = sum(
-            entry.stat().st_size for entry in path.iterdir() if entry.is_file()
-        )
+        size = sum(metadata.st_size for metadata in files.values())
         return InstalledRig(
             name=path.name,
             parts=parts,
-            has_manifest=(path / "rig.yaml").is_file(),
+            has_manifest="rig.yaml" in files,
             size_bytes=size,
         )
 
     def list(self) -> list[InstalledRig]:
-        if not self.directory.is_dir():
+        if not _managed_directory_exists(self.directory):
             return []
         rigs = []
         for entry in sorted(self.directory.iterdir()):
-            if (
-                entry.is_dir()
-                and not entry.is_symlink()
-                and RIG_NAME_RE.fullmatch(entry.name)
-            ):
+            try:
+                metadata = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(metadata.st_mode) and RIG_NAME_RE.fullmatch(entry.name):
                 rigs.append(self._describe(entry))
         return rigs
+
+    def stored_path(self, name: str) -> Path:
+        """Return an installed rig directory after a complete no-follow check."""
+
+        path = self.rig_path(name)
+        if not _managed_directory_exists(self.directory):
+            raise StoreError(404, "rig_not_found", f"no installed rig {name!r}")
+        try:
+            self._describe(path)
+        except FileNotFoundError as exc:
+            raise StoreError(
+                404, "rig_not_found", f"no installed rig {name!r}"
+            ) from exc
+        return path
+
+    def _usage_locked(self) -> tuple[int, int]:
+        """Return on-disk bytes and rig slots not represented by reservations."""
+
+        if not _managed_directory_exists(self.directory):
+            return 0, 0
+        total = count = 0
+        active = set(self._active_uploads) | self._active_extractions
+        for entry in self.directory.iterdir():
+            if entry in active:
+                continue
+            try:
+                total += _tree_size(entry)
+                metadata = entry.lstat()
+            except FileNotFoundError:
+                continue
+            # Installed rigs consume one slot. Crash-left hidden directories
+            # also consume a conservative slot until repaired/reclaimed.
+            if stat.S_ISDIR(metadata.st_mode):
+                count += 1
+        return total, count
+
+    def _reserve_chunk(self, reservation: UploadReservation, amount: int) -> None:
+        with self._lock:
+            if self._active_uploads.get(reservation.path) is not reservation:
+                raise ValueError("upload reservation does not belong to this rig store")
+            if reservation.reserved_bytes + amount > reservation.max_bytes:
+                raise StoreError(
+                    413,
+                    "rig_too_large",
+                    f"rig archive exceeds {reservation.max_bytes} bytes",
+                )
+            used, _count = self._usage_locked()
+            if used + self._reserved_bytes + amount > self._cfg.rig_storage_max_bytes:
+                raise StoreError(
+                    507,
+                    "storage_full",
+                    "rig upload does not fit within rig_storage_max_bytes",
+                )
+            self._reserved_bytes += amount
+            reservation.reserved_bytes += amount
+
+    def _release_upload_locked(
+        self, reservation: UploadReservation, *, remove: bool
+    ) -> None:
+        if self._active_uploads.get(reservation.path) is not reservation:
+            reservation._finish()
+            return
+        if remove:
+            try:
+                reservation.path.unlink()
+            except FileNotFoundError:
+                pass
+            # Any other unlink failure deliberately leaves the reservation,
+            # byte charge, and rig slot owned so abort() can be retried.
+        self._active_uploads.pop(reservation.path, None)
+        self._reserved_bytes = max(
+            0, self._reserved_bytes - reservation.reserved_bytes
+        )
+        self._reserved_rigs = max(0, self._reserved_rigs - 1)
+        reservation.reserved_bytes = 0
+        reservation._finish()
+
+    def _abort_reservation(self, reservation: UploadReservation) -> None:
+        with self._lock:
+            self._release_upload_locked(reservation, remove=True)
+
+    def open_staging(self) -> UploadReservation:
+        """Create a private, quota-owned staging file for one rig archive."""
+
+        try:
+            _ensure_private_directory(self.directory)
+            with self._lock:
+                _used, count = self._usage_locked()
+                if count + self._reserved_rigs >= self._cfg.max_rigs:
+                    raise StoreError(
+                        507,
+                        "storage_full",
+                        f"the rig store already holds {self._cfg.max_rigs} rigs",
+                    )
+                while True:
+                    path = self.directory / f".upload-{secrets.token_hex(16)}.zip"
+                    try:
+                        destination = _open_private_file(path)
+                        break
+                    except FileExistsError:
+                        continue
+                reservation = UploadReservation(
+                    self,
+                    path,
+                    destination,
+                    max_bytes=self._cfg.rig_zip_max_bytes,
+                )
+                self._active_uploads[path] = reservation
+                self._reserved_rigs += 1
+                return reservation
+        except StoreError:
+            raise
+        except OSError as exc:
+            raise StoreError(
+                507, "insufficient_storage", "cannot create rig upload staging"
+            ) from exc
 
     @staticmethod
     def _member_basenames(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
@@ -309,7 +871,40 @@ class RigStore:
             members[name] = info
         return members
 
-    def _extract(self, archive: zipfile.ZipFile, destination: Path) -> None:
+    def _reserve_extracted_locked(self, amount: int) -> None:
+        used, _count = self._usage_locked()
+        if used + self._reserved_bytes + amount > self._cfg.rig_storage_max_bytes:
+            raise StoreError(
+                507,
+                "storage_full",
+                "compressed and extracted rig staging exceeds "
+                "rig_storage_max_bytes",
+            )
+        self._reserved_bytes += amount
+
+    def _extract(
+        self,
+        archive: zipfile.ZipFile,
+        destination: Path,
+        extracted: list[int],
+    ) -> None:
+        # Bound the complete central-directory inventory, not just extracted
+        # files. One optional explicit top-level directory record is tolerated
+        # for archives that also place every layer beneath that shared root.
+        inventory = archive.infolist()
+        if len(inventory) > self._cfg.rig_max_entries + 1:
+            raise StoreError(
+                413,
+                "rig_too_large",
+                "rig archive central directory exceeds the configured entry limit",
+            )
+        directory_entries = [info for info in inventory if info.is_dir()]
+        if len(directory_entries) > 1:
+            raise StoreError(
+                422,
+                "invalid_rig",
+                "rig archive may contain at most one top-level directory entry",
+            )
         members = self._member_basenames(archive)
         if len(members) > self._cfg.rig_max_entries:
             raise StoreError(
@@ -319,12 +914,20 @@ class RigStore:
             )
         remaining = self._cfg.rig_max_bytes
         for name, info in members.items():
-            with archive.open(info) as source, open(destination / name, "wb") as out:
+            member_size = 0
+            try:
+                source = archive.open(info)
+            except (RuntimeError, zipfile.BadZipFile) as exc:
+                raise StoreError(
+                    422, "invalid_rig", f"cannot read archive entry {name!r}"
+                ) from exc
+            with source, _open_private_file(destination / name) as out:
                 while True:
                     chunk = source.read(min(_ZIP_READ_CHUNK, remaining + 1))
                     if not chunk:
                         break
                     remaining -= len(chunk)
+                    member_size += len(chunk)
                     if remaining < 0:
                         raise StoreError(
                             413,
@@ -332,44 +935,315 @@ class RigStore:
                             "uncompressed rig exceeds "
                             f"{self._cfg.rig_max_bytes} bytes",
                         )
+                    if (
+                        name == "rig.yaml"
+                        and member_size > self._cfg.rig_manifest_max_bytes
+                    ):
+                        raise StoreError(
+                            413,
+                            "rig_too_large",
+                            "rig.yaml exceeds "
+                            f"{self._cfg.rig_manifest_max_bytes} bytes",
+                        )
+                    self._reserve_extracted_locked(len(chunk))
+                    extracted[0] += len(chunk)
                     out.write(chunk)
 
-    def install_zip(self, name: str, zip_path: Path) -> InstalledRig:
+    @staticmethod
+    def _has_alpha(image: Any) -> bool:
+        return "A" in image.getbands() or "transparency" in image.info
+
+    def _validate_layer_headers(self, destination: Path) -> None:
+        """Fully validate PNG layers with Pillow before OpenCV sees a path."""
+
+        if Image is None:
+            raise StoreError(
+                503, "decoder_unavailable", "Pillow is required to validate rigs"
+            )
+        expected_size: tuple[int, int] | None = None
+        total_pixels = 0
+        layers = sorted(destination.glob("*.png"))
+        for path in layers:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    with Image.open(path) as image:
+                        if image.format != "PNG":
+                            raise ValueError("layer header is not PNG")
+                        width, height = image.size
+                        if width <= 0 or height <= 0:
+                            raise ValueError("invalid layer dimensions")
+                        pixels = width * height
+                        if pixels > self._cfg.rig_layer_max_pixels:
+                            raise StoreError(
+                                413,
+                                "rig_too_large",
+                                f"rig layer {path.name} exceeds "
+                                f"{self._cfg.rig_layer_max_pixels} pixels",
+                            )
+                        total_pixels += pixels
+                        if total_pixels > self._cfg.rig_total_max_pixels:
+                            raise StoreError(
+                                413,
+                                "rig_too_large",
+                                "rig decoded layers exceed "
+                                f"{self._cfg.rig_total_max_pixels} pixels",
+                            )
+                        if expected_size is None:
+                            expected_size = (width, height)
+                        elif (width, height) != expected_size:
+                            raise StoreError(
+                                422,
+                                "invalid_rig",
+                                f"rig layer {path.name} size {width}x{height} "
+                                f"does not match {expected_size[0]}x{expected_size[1]}",
+                            )
+                        if not self._has_alpha(image):
+                            raise StoreError(
+                                422,
+                                "invalid_rig",
+                                f"rig layer must be a PNG with alpha: {path.name}",
+                            )
+                        image.verify()
+                    # ``verify`` checks structure/CRC; ``load`` then forces a
+                    # complete decompression before cv2.imread can allocate.
+                    with Image.open(path) as decoded:
+                        decoded.load()
+            except StoreError:
+                raise
+            except (
+                Image.DecompressionBombError,
+                Image.DecompressionBombWarning,
+                UnidentifiedImageError,
+                OSError,
+                ValueError,
+                Warning,
+            ) as exc:
+                raise StoreError(
+                    422, "invalid_rig", f"invalid PNG rig layer: {path.name}"
+                ) from exc
+
+    def _validate_manifest(self, destination: Path) -> None:
+        manifest = destination / "rig.yaml"
+        if not manifest.is_file():
+            return
+        if manifest.stat().st_size > self._cfg.rig_manifest_max_bytes:
+            raise StoreError(
+                413,
+                "rig_too_large",
+                f"rig.yaml exceeds {self._cfg.rig_manifest_max_bytes} bytes",
+            )
+        try:
+            raw = yaml.load(
+                manifest.read_text(encoding="utf-8"),
+                Loader=_RigManifestLoader,
+            )
+        except (OSError, UnicodeError, yaml.YAMLError, RecursionError) as exc:
+            raise StoreError(422, "invalid_rig", "rig.yaml is invalid") from exc
+
+        visited: set[int] = set()
+        node_count = 0
+
+        def has_non_finite(value: Any, depth: int = 0) -> bool:
+            nonlocal node_count
+            node_count += 1
+            if depth > 32 or node_count > 2048:
+                raise StoreError(
+                    422, "invalid_rig", "rig.yaml structure is too complex"
+                )
+            if isinstance(value, bool) or value is None:
+                return False
+            if isinstance(value, (int, float)):
+                try:
+                    return not math.isfinite(float(value))
+                except (OverflowError, ValueError):
+                    return True
+            if isinstance(value, dict):
+                identity = id(value)
+                if identity in visited:
+                    raise StoreError(
+                        422, "invalid_rig", "rig.yaml contains a recursive value"
+                    )
+                visited.add(identity)
+                return any(
+                    has_non_finite(key, depth + 1)
+                    or has_non_finite(item, depth + 1)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                identity = id(value)
+                if identity in visited:
+                    raise StoreError(
+                        422, "invalid_rig", "rig.yaml contains a recursive value"
+                    )
+                visited.add(identity)
+                return any(has_non_finite(item, depth + 1) for item in value)
+            return False
+
+        if has_non_finite(raw):
+            raise StoreError(
+                422, "invalid_rig", "rig.yaml geometry must be finite"
+            )
+
+    def _secure_installed_rig(self, path: Path) -> None:
+        _secure_existing(path, _PRIVATE_DIRECTORY_MODE, directory=True)
+        for child in path.iterdir():
+            _secure_existing(child, _PRIVATE_FILE_MODE, directory=False)
+
+    def install_zip(
+        self, name: str, zip_path: Path | UploadReservation
+    ) -> InstalledRig:
         """Validate and atomically install an uploaded rig archive."""
         final = self.rig_path(name)
-        with self._lock:
-            if final.exists():
+        reservation = (
+            zip_path if isinstance(zip_path, UploadReservation) else None
+        )
+        archive_path = reservation.path if reservation is not None else Path(zip_path)
+        archive_file: BinaryIO | None = None
+        external_reserved = 0
+        external_reserved_slot = False
+        extracted = [0]
+        staging: Path | None = None
+        published = False
+        installed: InstalledRig | None = None
+        try:
+            if reservation is not None:
+                if reservation._store is not self:
+                    raise ValueError("rig upload reservation belongs to another store")
+                reservation.seal()
+            archive_file = _open_regular_file(archive_path)
+            archive_size = os.fstat(archive_file.fileno()).st_size
+            if (
+                reservation is not None
+                and archive_size != reservation.reserved_bytes
+            ):
                 raise StoreError(
                     409,
-                    "rig_exists",
-                    f"rig {name!r} already exists; delete it first to replace it",
+                    "invalid_reservation",
+                    "rig staging size does not match its quota reservation",
                 )
-            self.directory.mkdir(parents=True, exist_ok=True)
-            staging = self.directory / f".staged-{secrets.token_hex(8)}"
-            staging.mkdir()
-            try:
+            if archive_size > self._cfg.rig_zip_max_bytes:
+                raise StoreError(
+                    413,
+                    "rig_too_large",
+                    f"rig archive exceeds {self._cfg.rig_zip_max_bytes} bytes",
+                )
+            _ensure_private_directory(self.directory)
+            with self._lock:
+                used, count = self._usage_locked()
+                if reservation is not None:
+                    if self._active_uploads.get(reservation.path) is not reservation:
+                        raise ValueError("rig upload reservation is no longer active")
+                    if count + self._reserved_rigs > self._cfg.max_rigs:
+                        raise StoreError(
+                            507,
+                            "storage_full",
+                            f"the rig store already holds {self._cfg.max_rigs} rigs",
+                        )
+                else:
+                    if count + self._reserved_rigs >= self._cfg.max_rigs:
+                        raise StoreError(
+                            507,
+                            "storage_full",
+                            f"the rig store already holds {self._cfg.max_rigs} rigs",
+                        )
+                    if (
+                        used + self._reserved_bytes + archive_size
+                        > self._cfg.rig_storage_max_bytes
+                    ):
+                        raise StoreError(
+                            507,
+                            "storage_full",
+                            "rig archive does not fit within rig_storage_max_bytes",
+                        )
+                    self._reserved_bytes += archive_size
+                    external_reserved = archive_size
+                    self._reserved_rigs += 1
+                    external_reserved_slot = True
+                if final.exists() or final.is_symlink():
+                    raise StoreError(
+                        409,
+                        "rig_exists",
+                        f"rig {name!r} already exists; delete it first to replace it",
+                    )
+                while True:
+                    staging = self.directory / f".staged-{secrets.token_hex(8)}"
+                    try:
+                        _make_private_directory(staging)
+                        break
+                    except FileExistsError:
+                        continue
+                self._active_extractions.add(staging)
                 try:
-                    with zipfile.ZipFile(zip_path) as archive:
-                        self._extract(archive, staging)
-                except zipfile.BadZipFile as exc:
+                    with zipfile.ZipFile(archive_file) as archive:
+                        self._extract(archive, staging, extracted)
+                except (
+                    zipfile.BadZipFile,
+                    zipfile.LargeZipFile,
+                    RuntimeError,
+                    EOFError,
+                    NotImplementedError,
+                    zlib.error,
+                ) as exc:
                     raise StoreError(
                         422, "invalid_rig", "rig upload is not a valid zip archive"
                     ) from exc
+                self._validate_layer_headers(staging)
+                self._validate_manifest(staging)
                 try:
-                    create_rig(str(staging)).close()
+                    create_rig(
+                        str(staging),
+                        rig_layer_max_pixels=self._cfg.rig_layer_max_pixels,
+                        rig_total_max_pixels=self._cfg.rig_total_max_pixels,
+                        rig_manifest_max_bytes=self._cfg.rig_manifest_max_bytes,
+                    ).close()
                 except RigError as exc:
                     raise StoreError(422, "invalid_rig", str(exc)) from exc
                 os.replace(staging, final)
-            except BaseException:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
-        return self._describe(final)
+                self._active_extractions.discard(staging)
+                staging = None
+                published = True
+                self._secure_installed_rig(final)
+                # The atomic rename made these bytes committed. Release their
+                # extraction reservation while holding the same quota lock.
+                self._reserved_bytes = max(
+                    0, self._reserved_bytes - extracted[0]
+                )
+                extracted[0] = 0
+                installed = self._describe(final)
+        except StoreError:
+            raise
+        except OSError as exc:
+            raise StoreError(
+                507, "insufficient_storage", "cannot install rig archive"
+            ) from exc
+        finally:
+            if archive_file is not None:
+                archive_file.close()
+            with self._lock:
+                if staging is not None:
+                    self._active_extractions.discard(staging)
+                    shutil.rmtree(staging, ignore_errors=True)
+                if extracted[0]:
+                    self._reserved_bytes = max(
+                        0, self._reserved_bytes - extracted[0]
+                    )
+                if external_reserved:
+                    self._reserved_bytes = max(
+                        0, self._reserved_bytes - external_reserved
+                    )
+                if external_reserved_slot:
+                    self._reserved_rigs = max(0, self._reserved_rigs - 1)
+                if reservation is not None:
+                    self._release_upload_locked(reservation, remove=True)
+                if published and installed is None:
+                    shutil.rmtree(final, ignore_errors=True)
+        assert installed is not None
+        return installed
 
     def remove(self, name: str, active_selector: str) -> None:
-        path = self.rig_path(name)
         with self._lock:
-            if not path.is_dir() or path.is_symlink():
-                raise StoreError(404, "rig_not_found", f"no installed rig {name!r}")
+            path = self.stored_path(name)
             active = resolve_rig_selector(active_selector, self.directory)
             if active != "builtin" and Path(active) == path:
                 raise StoreError(
@@ -386,7 +1260,10 @@ class MediaStore:
     def __init__(self, cfg: StorageConfig):
         self.directory = Path(cfg.backgrounds_dir).expanduser()
         self._cfg = cfg
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._reserved_bytes = 0
+        self._reserved_files = 0
+        self._active_uploads: dict[Path, UploadReservation] = {}
 
     @staticmethod
     def kind_of(path: Path) -> str | None:
@@ -398,39 +1275,144 @@ class MediaStore:
         return None
 
     def max_bytes(self, kind: str) -> int:
+        if kind not in ("image", "video"):
+            raise ValueError("media kind must be 'image' or 'video'")
         return (
             self._cfg.image_max_bytes
             if kind == "image"
             else self._cfg.video_max_bytes
         )
 
-    def open_staging(self) -> Path:
-        """Reserve a staging file inside the store (same filesystem)."""
-        self.directory.mkdir(parents=True, exist_ok=True)
-        return self.directory / f".upload-{secrets.token_hex(16)}.part"
+    def _usage_locked(self) -> tuple[int, int]:
+        """Count committed and crash-left data not represented in memory."""
+
+        if not _managed_directory_exists(self.directory):
+            return 0, 0
+        total = count = 0
+        for entry in self.directory.iterdir():
+            if entry in self._active_uploads:
+                continue
+            try:
+                total += _tree_size(entry)
+            except FileNotFoundError:
+                continue
+            count += 1
+        return total, count
+
+    def _reserve_chunk(self, reservation: UploadReservation, amount: int) -> None:
+        with self._lock:
+            if self._active_uploads.get(reservation.path) is not reservation:
+                raise ValueError(
+                    "upload reservation does not belong to this media store"
+                )
+            if reservation.reserved_bytes + amount > reservation.max_bytes:
+                raise StoreError(
+                    413,
+                    "upload_too_large",
+                    f"media upload exceeds {reservation.max_bytes} bytes",
+                )
+            used, _count = self._usage_locked()
+            if used + self._reserved_bytes + amount > self._cfg.storage_max_bytes:
+                raise StoreError(
+                    507,
+                    "storage_full",
+                    "media upload does not fit within storage_max_bytes",
+                )
+            self._reserved_bytes += amount
+            reservation.reserved_bytes += amount
+
+    def _release_upload_locked(
+        self, reservation: UploadReservation, *, remove: bool
+    ) -> None:
+        if self._active_uploads.get(reservation.path) is not reservation:
+            reservation._finish()
+            return
+        if remove:
+            try:
+                reservation.path.unlink()
+            except FileNotFoundError:
+                pass
+            # Keep failed cleanup fully charged and retryable.
+        self._active_uploads.pop(reservation.path, None)
+        self._reserved_files = max(0, self._reserved_files - 1)
+        self._reserved_bytes = max(
+            0, self._reserved_bytes - reservation.reserved_bytes
+        )
+        reservation.reserved_bytes = 0
+        reservation._finish()
+
+    def _abort_reservation(self, reservation: UploadReservation) -> None:
+        with self._lock:
+            self._release_upload_locked(reservation, remove=True)
+
+    def open_staging(self, kind: str | None = None) -> UploadReservation:
+        """Reserve one private file slot and account every subsequent chunk."""
+
+        if kind not in (None, "image", "video"):
+            raise ValueError("media staging kind must be 'image' or 'video'")
+        maximum = self.max_bytes(kind) if kind is not None else max(
+            self._cfg.image_max_bytes, self._cfg.video_max_bytes
+        )
+        try:
+            _ensure_private_directory(self.directory)
+            with self._lock:
+                _used, count = self._usage_locked()
+                if count + self._reserved_files >= self._cfg.max_files:
+                    raise StoreError(
+                        507,
+                        "storage_full",
+                        f"the store already holds {self._cfg.max_files} files",
+                    )
+                while True:
+                    path = self.directory / f".upload-{secrets.token_hex(16)}.part"
+                    try:
+                        destination = _open_private_file(path)
+                        break
+                    except FileExistsError:
+                        continue
+                reservation = UploadReservation(
+                    self, path, destination, max_bytes=maximum
+                )
+                self._active_uploads[path] = reservation
+                self._reserved_files += 1
+                return reservation
+        except StoreError:
+            raise
+        except OSError as exc:
+            raise StoreError(
+                507, "insufficient_storage", "cannot create media upload staging"
+            ) from exc
 
     def _entries(self) -> list[Path]:
-        if not self.directory.is_dir():
+        if not _managed_directory_exists(self.directory):
             return []
-        return [
-            entry
-            for entry in sorted(self.directory.iterdir())
-            if entry.is_file()
-            and not entry.is_symlink()
-            and not entry.name.startswith(".")
-            and self.kind_of(entry) is not None
-        ]
+        entries: list[Path] = []
+        for entry in sorted(self.directory.iterdir()):
+            try:
+                metadata = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISREG(metadata.st_mode)
+                and not entry.name.startswith(".")
+                and self.kind_of(entry) is not None
+            ):
+                entries.append(entry)
+        return entries
 
     def list(self) -> list[StoredMedia]:
         described = []
         for entry in self._entries():
+            metadata = entry.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                continue
             kind = self.kind_of(entry)
             assert kind is not None
             described.append(
                 StoredMedia(
                     name=entry.name,
                     kind=kind,
-                    size=entry.stat().st_size,
+                    size=metadata.st_size,
                     path=str(entry),
                 )
             )
@@ -444,85 +1426,239 @@ class MediaStore:
             or os.path.basename(name.replace("\\", "/")) != name
         ):
             raise StoreError(404, "media_not_found", "no such stored file")
-        path = self.directory / name
-        if not path.is_file() or path.is_symlink() or self.kind_of(path) is None:
+        if not _managed_directory_exists(self.directory):
             raise StoreError(404, "media_not_found", "no such stored file")
+        path = self.directory / name
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as exc:
+            raise StoreError(404, "media_not_found", "no such stored file") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or self.kind_of(path) is None
+        ):
+            raise StoreError(404, "media_not_found", "no such stored file")
+        if not _owned_by_current_user(metadata):
+            raise _unsafe_storage(path, "stored media is not owned by this user")
         return path
 
-    def _validate_image(self, path: Path) -> None:
-        if Image is not None:
-            try:
+    def _validate_image(self, path: Path, suffix: str) -> None:
+        if Image is None:
+            raise StoreError(
+                503, "decoder_unavailable", "Pillow is required to validate images"
+            )
+        expected_format = _IMAGE_FORMATS.get(suffix)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
                 with Image.open(path) as image:
+                    if image.format != expected_format:
+                        raise ValueError("image header does not match its filename")
                     width, height = image.size
-            except (UnidentifiedImageError, OSError) as exc:
+                    if width <= 0 or height <= 0:
+                        raise ValueError("invalid image dimensions")
+                    if width * height > self._cfg.image_max_pixels:
+                        raise StoreError(
+                            413,
+                            "media_too_large",
+                            f"image exceeds {self._cfg.image_max_pixels} pixels",
+                        )
+                    image.verify()
+                with Image.open(path) as decoded:
+                    decoded.load()
+        except StoreError:
+            raise
+        except (
+            Image.DecompressionBombError,
+            Image.DecompressionBombWarning,
+            UnidentifiedImageError,
+            OSError,
+            ValueError,
+            Warning,
+        ) as exc:
+            raise StoreError(
+                422, "invalid_media", "image upload cannot be decoded"
+            ) from exc
+        if cv2 is not None:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if (
+                frame is None
+                or frame.dtype != np.uint8
+                or frame.ndim != 3
+                or frame.shape[2] != 3
+            ):
                 raise StoreError(
                     422, "invalid_media", "image upload cannot be decoded"
-                ) from exc
-            if width * height > self._cfg.image_max_pixels:
-                raise StoreError(
-                    413,
-                    "media_too_large",
-                    f"image exceeds {self._cfg.image_max_pixels} pixels",
                 )
-        if cv2 is not None and cv2.imread(str(path), cv2.IMREAD_COLOR) is None:
-            raise StoreError(422, "invalid_media", "image upload cannot be decoded")
+            actual_height, actual_width = frame.shape[:2]
+            if (actual_width, actual_height) != (width, height):
+                raise StoreError(
+                    422, "invalid_media", "image decoders disagree on dimensions"
+                )
 
-    def _validate_video(self, path: Path) -> None:
+    def _validate_video(self, path: Path, suffix: str) -> None:
         if cv2 is None:  # pragma: no cover - required by the package
             return
-        capture = cv2.VideoCapture(str(path))
-        try:
-            ok, frame = capture.read()
-        finally:
-            capture.release()
-        if not ok or frame is None:
-            raise StoreError(422, "invalid_media", "video upload cannot be decoded")
-        height, width = frame.shape[:2]
-        if width > self._cfg.video_max_width or height > self._cfg.video_max_height:
+        with _open_regular_file(path) as media_file:
+            header = media_file.read(16)
+        header_matches = {
+            ".mp4": len(header) >= 8 and header[4:8] == b"ftyp",
+            ".mov": len(header) >= 8 and header[4:8] == b"ftyp",
+            ".webm": header.startswith(b"\x1aE\xdf\xa3"),
+            ".mkv": header.startswith(b"\x1aE\xdf\xa3"),
+            ".gif": header.startswith((b"GIF87a", b"GIF89a")),
+            ".avi": header.startswith(b"RIFF") and header[8:12] == b"AVI ",
+        }.get(suffix, False)
+        if not header_matches:
             raise StoreError(
-                413,
-                "media_too_large",
-                f"video frames exceed {self._cfg.video_max_width}"
-                f"x{self._cfg.video_max_height}",
+                422,
+                "invalid_media",
+                "video container header does not match its filename",
             )
+        try:
+            capture = cv2.VideoCapture(str(path))
+        except Exception as exc:
+            raise StoreError(
+                422, "invalid_media", "video upload cannot be decoded"
+            ) from exc
+        try:
+            try:
+                if not capture.isOpened():
+                    raise StoreError(
+                        422, "invalid_media", "video upload cannot be decoded"
+                    )
+                metadata_width = float(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                metadata_height = float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if (
+                    not math.isfinite(metadata_width)
+                    or not math.isfinite(metadata_height)
+                    or metadata_width < 1
+                    or metadata_height < 1
+                ):
+                    raise StoreError(
+                        422, "invalid_media", "video dimensions are missing"
+                    )
+                if (
+                    metadata_width > self._cfg.video_max_width
+                    or metadata_height > self._cfg.video_max_height
+                ):
+                    raise StoreError(
+                        413,
+                        "media_too_large",
+                        f"video frames exceed {self._cfg.video_max_width}"
+                        f"x{self._cfg.video_max_height}",
+                    )
+                decoded = 0
+                while True:
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        break
+                    if (
+                        not isinstance(frame, np.ndarray)
+                        or frame.dtype != np.uint8
+                        or frame.ndim != 3
+                        or frame.shape[2] != 3
+                        or frame.shape[0] < 1
+                        or frame.shape[1] < 1
+                    ):
+                        raise StoreError(
+                            422,
+                            "invalid_media",
+                            "video contains an invalid frame",
+                        )
+                    height, width = frame.shape[:2]
+                    if (
+                        width > self._cfg.video_max_width
+                        or height > self._cfg.video_max_height
+                    ):
+                        raise StoreError(
+                            413,
+                            "media_too_large",
+                            f"video frames exceed {self._cfg.video_max_width}"
+                            f"x{self._cfg.video_max_height}",
+                        )
+                    decoded += 1
+                if decoded == 0:
+                    raise StoreError(
+                        422, "invalid_media", "video upload cannot be decoded"
+                    )
+            except StoreError:
+                raise
+            except Exception as exc:
+                raise StoreError(
+                    422, "invalid_media", "video upload cannot be decoded"
+                ) from exc
+        finally:
+            with contextlib.suppress(Exception):
+                capture.release()
 
-    def commit(self, staging: Path, name: str, kind: str) -> StoredMedia:
+    def commit(
+        self, staging: UploadReservation, name: str, kind: str
+    ) -> StoredMedia:
         """Validate a fully-written staging file and publish it."""
-        safe_name = sanitize_media_name(name, kind)
-        size = staging.stat().st_size
-        if size == 0:
-            raise StoreError(422, "invalid_media", "upload is empty")
-        if kind == "image":
-            self._validate_image(staging)
-        else:
-            self._validate_video(staging)
-        with self._lock:
-            entries = self._entries()
-            if len(entries) + 1 > self._cfg.max_files:
+        if not isinstance(staging, UploadReservation) or staging._store is not self:
+            raise ValueError("media commit requires this store's reservation")
+        final: Path | None = None
+        published = False
+        committed = False
+        try:
+            maximum = self.max_bytes(kind)
+            safe_name = sanitize_media_name(name, kind)
+            staging.seal()
+            size = staging.stat().st_size
+            if size != staging.reserved_bytes:
                 raise StoreError(
-                    507,
-                    "storage_full",
-                    f"the store already holds {self._cfg.max_files} files",
+                    409,
+                    "invalid_reservation",
+                    "media staging size does not match its quota reservation",
                 )
-            used = sum(entry.stat().st_size for entry in entries)
-            if used + size > self._cfg.storage_max_bytes:
+            if size == 0:
+                raise StoreError(422, "invalid_media", "upload is empty")
+            if size > maximum:
                 raise StoreError(
-                    507,
-                    "storage_full",
-                    "the upload does not fit within storage_max_bytes",
+                    413,
+                    "upload_too_large",
+                    f"{kind} exceeds {maximum} bytes",
                 )
-            final = self.directory / safe_name
-            stem, suffix = os.path.splitext(safe_name)
-            attempt = 2
-            while final.exists() or final.is_symlink():
-                final = self.directory / f"{stem}-{attempt}{suffix}"
-                attempt += 1
-            os.replace(staging, final)
-        kind_checked = self.kind_of(final)
-        assert kind_checked == kind
-        return StoredMedia(
-            name=final.name, kind=kind, size=size, path=str(final)
-        )
+            suffix = Path(safe_name).suffix
+            if kind == "image":
+                self._validate_image(staging.path, suffix)
+            else:
+                self._validate_video(staging.path, suffix)
+            with self._lock:
+                if self._active_uploads.get(staging.path) is not staging:
+                    raise ValueError("media upload reservation is no longer active")
+                final = self.directory / safe_name
+                stem, suffix = os.path.splitext(safe_name)
+                attempt = 2
+                while final.exists() or final.is_symlink():
+                    final = self.directory / f"{stem}-{attempt}{suffix}"
+                    attempt += 1
+                os.replace(staging.path, final)
+                published = True
+                # Atomic rename preserves the staging inode's mode, but the
+                # final descriptor is explicitly re-secured as part of commit.
+                _secure_existing(final, _PRIVATE_FILE_MODE, directory=False)
+                self._release_upload_locked(staging, remove=False)
+                committed = True
+            kind_checked = self.kind_of(final)
+            assert kind_checked == kind
+            return StoredMedia(
+                name=final.name, kind=kind, size=size, path=str(final)
+            )
+        except StoreError:
+            raise
+        except OSError as exc:
+            raise StoreError(
+                507, "insufficient_storage", "cannot publish media upload"
+            ) from exc
+        finally:
+            if staging.active:
+                staging.abort()
+            if published and not committed and final is not None:
+                with contextlib.suppress(OSError):
+                    final.unlink()
 
     def remove(self, name: str, background_cfg) -> None:
         with self._lock:

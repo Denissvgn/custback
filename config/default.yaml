@@ -66,6 +66,7 @@ api:
   tls_certfile: ""         # both TLS paths are mandatory for non-loopback
   tls_keyfile: ""
   ws_max_bytes: 16777216
+  max_stream_connections: 16 # shared cap for authenticated MJPEG/WebSocket clients
   uploads:
     image_max_bytes: 20971520
     video_max_bytes: 268435456

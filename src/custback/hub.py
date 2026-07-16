@@ -10,6 +10,7 @@ Three flows meet here:
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
@@ -81,6 +82,7 @@ class _Slot:
         self._value: np.ndarray | None = None
         self._seq = 0
         self._ts = 0.0
+        self._subscribers: set[_AsyncSlotSubscription] = set()
 
     def put(self, value: np.ndarray) -> None:
         with self._cond:
@@ -88,6 +90,9 @@ class _Slot:
             self._seq += 1
             self._ts = time.monotonic()
             self._cond.notify_all()
+            subscribers = tuple(self._subscribers)
+        for subscriber in subscribers:
+            subscriber._notify()
 
     def get(self, last_seq: int = -1, timeout: float | None = None):
         """Return (frame, seq) newer than last_seq, or (None, last_seq)."""
@@ -107,10 +112,89 @@ class _Slot:
             self._ts = 0.0
             self._seq += 1
             self._cond.notify_all()
+            subscribers = tuple(self._subscribers)
+        for subscriber in subscribers:
+            subscriber._notify()
 
     def latest(self) -> tuple[np.ndarray | None, float]:
         with self._cond:
             return self._value, self._ts
+
+    def subscribe(self) -> "_AsyncSlotSubscription":
+        """Subscribe the current event loop to latest-only frame updates."""
+
+        subscription = _AsyncSlotSubscription(self, asyncio.get_running_loop())
+        with self._cond:
+            self._subscribers.add(subscription)
+        return subscription
+
+    def _unsubscribe(self, subscription: "_AsyncSlotSubscription") -> None:
+        with self._cond:
+            self._subscribers.discard(subscription)
+
+
+class _AsyncSlotSubscription:
+    """Event-loop-native view of a thread-published latest-value slot."""
+
+    def __init__(self, slot: _Slot, loop: asyncio.AbstractEventLoop) -> None:
+        self._slot = slot
+        self._loop = loop
+        self._event = asyncio.Event()
+        self._closed = False
+
+    def _notify(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._event.set)
+        except RuntimeError:
+            # A loop can disappear during process/test teardown. Do not retain
+            # a dead subscriber indefinitely in a long-lived frame hub.
+            self.close()
+
+    async def get(
+        self, last_seq: int = -1, timeout: float | None = None
+    ) -> tuple[np.ndarray | None, int]:
+        """Return the newest frame after ``last_seq`` without a worker thread."""
+
+        deadline = None if timeout is None else self._loop.time() + timeout
+        while not self._closed:
+            with self._slot._cond:
+                if (
+                    self._slot._value is not None
+                    and self._slot._seq != last_seq
+                ):
+                    return self._slot._value, self._slot._seq
+                # Clear while holding the publisher's lock so an update cannot
+                # land in the gap between checking the sequence and waiting.
+                self._event.clear()
+
+            remaining = (
+                None if deadline is None else max(0.0, deadline - self._loop.time())
+            )
+            if remaining == 0.0:
+                return None, last_seq
+            try:
+                if remaining is None:
+                    await self._event.wait()
+                else:
+                    await asyncio.wait_for(self._event.wait(), remaining)
+            except asyncio.TimeoutError:
+                return None, last_seq
+        return None, last_seq
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._slot._unsubscribe(self)
+        self._event.set()
+
+    async def __aenter__(self) -> "_AsyncSlotSubscription":
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        self.close()
 
 
 class FrameHub:

@@ -236,6 +236,38 @@ def test_auto_preacquires_every_installed_fallback(monkeypatch):
     assert preparation.ready_backends == frozenset({"rvm", "mediapipe"})
 
 
+@pytest.mark.parametrize(
+    ("suffix", "backend", "module"),
+    [
+        (".onnx", "rvm", "onnxruntime"),
+        (".tflite", "mediapipe", "mediapipe"),
+    ],
+)
+def test_auto_custom_model_preparation_routes_only_by_suffix(
+    monkeypatch, tmp_path, suffix, backend, module
+):
+    model = tmp_path / f"custom{suffix}"
+    model.write_bytes(b"custom-model")
+    imported = []
+    monkeypatch.setattr(
+        segmentation_mod.importlib,
+        "import_module",
+        lambda name: imported.append(name) or object(),
+    )
+    monkeypatch.setattr(
+        segmentation_mod,
+        "acquire_builtin_model",
+        lambda selected: pytest.fail(f"unexpected built-in acquisition: {selected}"),
+    )
+
+    preparation = preacquire_segmenter_model(
+        SegmentationConfig(backend="auto", model_path=str(model))
+    )
+
+    assert imported == [module]
+    assert preparation.ready_backends == frozenset({backend})
+
+
 def test_preparation_prevents_retry_of_an_unavailable_higher_backend(monkeypatch):
     class PreparedMediaPipe:
         device = "cpu"

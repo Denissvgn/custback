@@ -235,6 +235,71 @@ class TestBackdrops:
         assert out.shape == (72, 128, 3)
         assert (out == 42).all()
 
+    def test_image_backdrop_rejects_pixel_bomb_before_opencv(
+        self, tmp_path, monkeypatch
+    ):
+        cv2 = pytest.importorskip("cv2")
+        path = tmp_path / "oversized.png"
+        assert cv2.imwrite(str(path), frame(h=9, w=9, value=42))
+        monkeypatch.setattr(
+            backgrounds_mod.cv2,
+            "imread",
+            lambda *_args, **_kwargs: pytest.fail(
+                "OpenCV must not see an image over the configured pixel cap"
+            ),
+        )
+
+        with pytest.raises(ValueError, match="exceeds 64 pixels"):
+            create_backdrop(
+                BackgroundConfig(mode="image", image_path=str(path)),
+                image_max_pixels=64,
+            )
+
+    def test_image_backdrop_fully_decodes_with_pillow_before_opencv(
+        self, monkeypatch
+    ):
+        pytest.importorskip("cv2")
+        open_calls = []
+
+        class FakeImage:
+            format = "PNG"
+            size = (8, 8)
+
+            def __init__(self, decode):
+                self.decode = decode
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def verify(self):
+                return None
+
+            def load(self):
+                if self.decode:
+                    raise OSError("corrupt compressed pixels")
+
+        def fake_open(_path):
+            open_calls.append(len(open_calls))
+            return FakeImage(decode=len(open_calls) == 2)
+
+        monkeypatch.setattr(backgrounds_mod.Image, "open", fake_open)
+        monkeypatch.setattr(
+            backgrounds_mod.cv2,
+            "imread",
+            lambda *_args, **_kwargs: pytest.fail(
+                "OpenCV must not see a Pillow decode failure"
+            ),
+        )
+
+        with pytest.raises(ValueError, match="invalid background image"):
+            create_backdrop(
+                BackgroundConfig(mode="image", image_path="corrupt.png")
+            )
+        assert len(open_calls) == 2
+
     def test_video_backdrop_loops(self, tmp_path):
         cv2 = pytest.importorskip("cv2")
         path = tmp_path / "bg.avi"

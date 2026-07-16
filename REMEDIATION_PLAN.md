@@ -1,10 +1,10 @@
 # Custback remediation plan
 
-Status: **Phase 1 complete — release blocked; Phase 2 is next**
+Status: **Phase 3 complete — release blocked; Phase 4 is next**
 
 This plan converts the findings from the July 2026 repository review into an
-implementation sequence. The Phase 1 security/privacy gates are satisfied,
-but the tree remains stop-ship while 21 later-phase blockers remain open,
+implementation sequence. The Phase 1–3 gates are satisfied, but the tree
+remains stop-ship while 8 Phase 4 blockers remain open,
 including the Audio2Face dependency/protocol gate.
 
 ## Target invariants
@@ -203,6 +203,26 @@ status reports version N while version N-1 resources render.
 Acceptance: blocked fake render/gRPC calls cannot overlap reconnect, observe
 closed resources, or survive the shutdown deadline.
 
+### Phase 2 completion record (2026-07-16)
+
+- `CFG-01`, `LIFE-01`, and `LIFE-02` are resolved and their strict
+  expected-failure markers are now permanent passing regressions. The registry
+  has 18 open blockers remaining.
+- Avatar PATCH now pre-acquires driver assets away from a dedicated
+  single-worker render/activation lane. That lane constructs changed resources
+  under rollback ownership, trials a complete config-bearing generation, swaps
+  it at a frame boundary, and publishes the matching version through one CAS.
+- Candidate failure or conflict preserves the published config, version, and
+  every live resource identity. Replaced resources close only after the
+  successful acknowledgement; active rig/background deletion is serialized
+  with activation and cannot leave a committed path missing.
+- Session cancellation shields and drains the authoritative render future
+  before reconnect or teardown, so no abandoned shared-executor render can use
+  a replaced or closed generation.
+- Audio2Face now owns its source, RPC, channel, and worker under one lifecycle
+  lock. Close is ordered and idempotent (stop, source interrupt, RPC cancel,
+  channel close, worker join), and reconnect/pacing waits are interruptible.
+
 ## Phase 3 — storage and runtime correctness
 
 ### Private, quota-owned storage
@@ -244,6 +264,31 @@ before `cv2.imread`.
 Acceptance includes analytical alpha cases, pose behavior, NaN/Inf masks,
 custom-model routing, non-blocking model acquisition, executor saturation, and
 concise CLI errors.
+
+### Phase 3 completion record (2026-07-16)
+
+- `CFG-02`, `STOR-01`, `STOR-02`, `SEG-01`, `SEG-02`, `RENDER-01`,
+  `RENDER-02`, `API-01`, `MISC-01`, and `MISC-02` are resolved and their
+  strict expected-failure markers are permanent passing regressions. Together
+  with the earlier `SEG-03` resolution, the registry now has 8 open Phase 4
+  blockers.
+- Core and avatar storage now use exact private modes, no-follow inode checks,
+  chunk-owned reservations, concurrent aggregate quotas, decoded-pixel and
+  manifest limits, complete Pillow decoding before OpenCV, and retryable
+  cleanup ownership. Avatar storage also provides permission audit/repair CLI
+  paths for existing user-owned assets.
+- Core and avatar configuration share recursive merge-patch semantics and
+  validate combined CLI overrides once. YAML/port/startup errors are concise;
+  custom model suffixes select their authoritative backend; candidate
+  acquisition and abandoned cleanup remain on bounded, deadline-owned lanes;
+  and masks are validated before every compositing boundary.
+- Rendering consistently uses straight alpha with premultiplied transforms,
+  preserves transparent-color isolation, and honors `follow_pose` in both rig
+  implementations. MJPEG/WebSocket delivery is event-loop-native, shares one
+  bounded latest-only JPEG scheduler, enforces authenticated connection caps,
+  and releases leases/upstream responses across the full ASGI lifecycle.
+- Final verification passed 689 Python tests and all four npm test files. The
+  release verifier remains fail-closed on the 8 unresolved Phase 4 entries.
 
 ## Phase 4 — Audio2Face, npm, release, and compliance
 

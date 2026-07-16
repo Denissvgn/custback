@@ -5,6 +5,8 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
+import custback.avatar.rig as rig_mod
+import custback.backgrounds as backgrounds_mod
 from custback.avatar.config import (
     AVATAR_PARTS,
     BUILTIN_AVATARS,
@@ -17,7 +19,10 @@ from custback.avatar.rig import (
     BuiltinRig,
     LayeredRig,
     RigError,
+    alpha_over,
+    apply_head_pose,
     create_rig,
+    sketch_filter,
 )
 from custback.avatar.state import FaceState
 
@@ -29,6 +34,82 @@ def neutral(**channels):
     for name, value in channels.items():
         state.set_channel(name, value)
     return state
+
+
+def test_alpha_over_retains_straight_color_on_transparent_base():
+    base = np.zeros((1, 1, 4), dtype=np.uint8)
+    layer = np.array([[[200, 100, 50, 128]]], dtype=np.uint8)
+
+    alpha_over(base, layer)
+
+    np.testing.assert_array_equal(base[0, 0], layer[0, 0])
+
+
+def test_alpha_over_matches_porter_duff_for_two_translucent_layers():
+    base = np.array([[[100, 20, 10, 128]]], dtype=np.uint8)
+    layer = np.array([[[20, 40, 200, 128]]], dtype=np.uint8)
+    source_alpha = 128.0 / 255.0
+    destination_alpha = 128.0 / 255.0
+    expected_alpha = source_alpha + destination_alpha * (1.0 - source_alpha)
+    expected_rgb = (
+        layer[0, 0, :3] * source_alpha
+        + base[0, 0, :3] * destination_alpha * (1.0 - source_alpha)
+    ) / expected_alpha
+
+    alpha_over(base, layer)
+
+    np.testing.assert_allclose(base[0, 0, :3], expected_rgb, atol=1.0)
+    assert base[0, 0, 3] == pytest.approx(expected_alpha * 255.0, abs=1.0)
+
+
+def test_layer_alpha_is_applied_once_at_final_avatar_composition():
+    sprite = np.zeros((10, 10, 4), dtype=np.uint8)
+    layer = np.full((10, 10, 4), (200, 100, 50, 128), dtype=np.uint8)
+    alpha_over(sprite, layer)
+
+    rendered = compose_avatar(
+        sprite,
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        AppearanceConfig(scale=0.5),
+    )
+
+    covered = rendered[np.any(rendered > 0, axis=2)]
+    assert covered.size > 0
+    np.testing.assert_allclose(covered.max(axis=0), (100, 50, 25), atol=2)
+
+
+def test_head_pose_transform_preserves_straight_color_at_soft_edges():
+    layer = np.zeros((41, 41, 4), dtype=np.uint8)
+    authored = np.array([30, 120, 220], dtype=np.uint8)
+    layer[10:31, 10:31, :3] = authored
+    layer[10:31, 10:31, 3] = 255
+
+    transformed = apply_head_pose(
+        layer,
+        yaw=0.2,
+        pitch=0.1,
+        roll=0.23,
+        pivot=(20.0, 20.0),
+        sway_px=(4.0, 3.0),
+    )
+
+    soft_edge = (transformed[..., 3] > 8) & (transformed[..., 3] < 247)
+    assert soft_edge.any()
+    expected = np.broadcast_to(authored, transformed[..., :3][soft_edge].shape)
+    np.testing.assert_allclose(transformed[..., :3][soft_edge], expected, atol=2)
+
+
+def test_sketch_filter_ignores_rgb_hidden_by_zero_alpha():
+    first = np.zeros((41, 41, 4), dtype=np.uint8)
+    first[10:31, 10:31] = (40, 120, 220, 255)
+    second = first.copy()
+    transparent = second[..., 3] == 0
+    second[transparent, :3] = (255, 15, 190)
+
+    sketch_filter(first)
+    sketch_filter(second)
+
+    np.testing.assert_array_equal(first, second)
 
 
 def test_builtin_rig_renders_bgra_sprite():
@@ -73,6 +154,30 @@ def test_builtin_head_pose_moves_head_but_not_torso():
     assert not np.array_equal(base, posed)
     torso_only = frozenset({"torso"})
     assert np.array_equal(rig.render(state, torso_only), rig.render(FaceState.neutral(), torso_only))
+
+
+def _assert_follow_pose_switch_preserves_expression(rig):
+    state = neutral(jawOpen=0.8, eyeBlinkLeft=1.0, eyeBlinkRight=1.0)
+    state.yaw = 0.4
+    state.pitch = 0.15
+    state.roll = 0.2
+    expression_only = FaceState(
+        present=True,
+        blendshapes=dict(state.blendshapes),
+    )
+
+    fixed = rig.render(state, ALL_PARTS, follow_pose=False)
+    expected_fixed = rig.render(expression_only, ALL_PARTS, follow_pose=True)
+    following = rig.render(state, ALL_PARTS, follow_pose=True)
+    neutral_fixed = rig.render(FaceState.neutral(), ALL_PARTS, follow_pose=False)
+
+    assert np.array_equal(fixed, expected_fixed)
+    assert not np.array_equal(fixed, following)
+    assert not np.array_equal(fixed, neutral_fixed)
+
+
+def test_builtin_follow_pose_switch_keeps_expression_channels_active():
+    _assert_follow_pose_switch_preserves_expression(BuiltinRig())
 
 
 def test_create_rig_builtin_and_missing_directory(tmp_path):
@@ -174,6 +279,10 @@ def test_layered_rig_expression_variants(rig_dir):
     assert not np.array_equal(base, talk)
 
 
+def test_layered_follow_pose_switch_keeps_expression_variants_active(rig_dir):
+    _assert_follow_pose_switch_preserves_expression(LayeredRig(rig_dir))
+
+
 def test_layered_rig_manifest_controls_head_parts(rig_dir):
     (rig_dir / "rig.yaml").write_text(
         "pivot: [50, 120]\nsway: [10, 5]\nhead_parts: [eyes, mouth]\n"
@@ -212,12 +321,146 @@ def test_layered_rig_rejects_bad_manifests_and_layers(rig_dir, tmp_path):
         LayeredRig(rig_dir)
 
 
+@pytest.mark.parametrize(
+    ("manifest", "field"),
+    [
+        ("pivot: [.nan, 120]\n", "pivot"),
+        ("pivot: [" + "9" * 1000 + ", 120]\n", "pivot"),
+        ("sway: [10, .inf]\n", "sway"),
+        ("framing:\n  bust: [0.1, .nan]\n", "framing"),
+        (
+            "framing:\n  bust: [0.1, " + "9" * 1000 + "]\n",
+            "framing",
+        ),
+    ],
+)
+def test_layered_rig_rejects_non_finite_geometry(rig_dir, manifest, field):
+    (rig_dir / "rig.yaml").write_text(manifest)
+    with pytest.raises(RigError, match=field):
+        LayeredRig(rig_dir)
+
+
 def test_layered_rig_rejects_opaque_layers(tmp_path):
     directory = tmp_path / "rig"
     directory.mkdir()
     solid = np.zeros((10, 10, 3), dtype=np.uint8)
     assert cv2.imwrite(str(directory / "head.png"), solid)
     with pytest.raises(RigError, match="alpha"):
+        LayeredRig(directory)
+
+
+def test_direct_rig_rejects_invalid_png_before_opencv(monkeypatch, tmp_path):
+    directory = tmp_path / "rig"
+    directory.mkdir()
+    (directory / "head.png").write_bytes(b"not a png")
+    monkeypatch.setattr(
+        rig_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: pytest.fail("OpenCV saw an invalid layer"),
+    )
+
+    with pytest.raises(RigError, match="invalid PNG"):
+        LayeredRig(directory)
+
+
+def test_direct_rig_rejects_layer_pixel_bomb_before_opencv(
+    monkeypatch, tmp_path
+):
+    directory = tmp_path / "rig"
+    directory.mkdir()
+    _write_layer(
+        directory / "head.png",
+        (9, 9),
+        (1, 2, 3),
+        (slice(0, 9), slice(0, 9)),
+    )
+    monkeypatch.setattr(
+        rig_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: pytest.fail("OpenCV saw an oversized layer"),
+    )
+
+    with pytest.raises(RigError, match="exceeds 64 pixels"):
+        LayeredRig(directory, rig_layer_max_pixels=64)
+
+
+def test_direct_rig_rejects_total_pixels_before_opencv(monkeypatch, tmp_path):
+    directory = tmp_path / "rig"
+    directory.mkdir()
+    for name in ("head", "torso"):
+        _write_layer(
+            directory / f"{name}.png",
+            (9, 9),
+            (1, 2, 3),
+            (slice(0, 9), slice(0, 9)),
+        )
+    monkeypatch.setattr(
+        rig_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: pytest.fail("OpenCV saw an oversized rig"),
+    )
+
+    with pytest.raises(RigError, match="decoded layers exceed 100 pixels"):
+        LayeredRig(
+            directory,
+            rig_layer_max_pixels=100,
+            rig_total_max_pixels=100,
+        )
+
+
+def test_direct_rig_rejects_non_uint8_opencv_decode(monkeypatch, tmp_path):
+    directory = tmp_path / "rig"
+    directory.mkdir()
+    _write_layer(
+        directory / "head.png",
+        (4, 4),
+        (1, 2, 3),
+        (slice(0, 4), slice(0, 4)),
+    )
+    monkeypatch.setattr(
+        rig_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: np.zeros((4, 4, 4), dtype=np.uint16),
+    )
+
+    with pytest.raises(RigError, match="PNG with alpha"):
+        LayeredRig(directory)
+
+
+def test_direct_rig_rejects_oversized_manifest_before_opencv(
+    monkeypatch, tmp_path
+):
+    directory = tmp_path / "rig"
+    directory.mkdir()
+    _write_layer(
+        directory / "head.png",
+        (4, 4),
+        (1, 2, 3),
+        (slice(0, 4), slice(0, 4)),
+    )
+    (directory / "rig.yaml").write_text("#" * 17)
+    monkeypatch.setattr(
+        rig_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: pytest.fail("OpenCV ran before manifest cap"),
+    )
+
+    with pytest.raises(RigError, match="rig.yaml exceeds 16 bytes"):
+        LayeredRig(directory, rig_manifest_max_bytes=16)
+
+
+def test_direct_rig_maps_recursive_manifest_failure_to_rig_error(tmp_path):
+    directory = tmp_path / "rig"
+    directory.mkdir()
+    _write_layer(
+        directory / "head.png",
+        (4, 4),
+        (1, 2, 3),
+        (slice(0, 4), slice(0, 4)),
+    )
+    (directory / "rig.yaml").write_text("[" * 2_000 + "]" * 2_000)
+
+    with pytest.raises(RigError, match="invalid rig.yaml"):
         LayeredRig(directory)
 
 
@@ -313,6 +556,28 @@ def test_create_avatar_backdrop_modes(tmp_path):
         AvatarBackgroundConfig(mode="image", image_path=str(image_path))
     )
     assert image.frame(32, 16).shape == (16, 32, 3)
+
+
+def test_avatar_image_backdrop_uses_configured_pixel_cap_before_opencv(
+    tmp_path, monkeypatch
+):
+    image_path = tmp_path / "oversized.png"
+    assert cv2.imwrite(
+        str(image_path), np.full((9, 9, 3), 9, dtype=np.uint8)
+    )
+    monkeypatch.setattr(
+        backgrounds_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: pytest.fail(
+            "OpenCV must not see an avatar backdrop over its configured cap"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exceeds 64 pixels"):
+        create_avatar_backdrop(
+            AvatarBackgroundConfig(mode="image", image_path=str(image_path)),
+            image_max_pixels=64,
+        )
 
 
 def test_blurred_room_preserves_geometry():

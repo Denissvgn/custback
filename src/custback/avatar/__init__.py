@@ -10,13 +10,19 @@ It runs either on the same machine as custback (``custback-avatar``) or on a
 separate GPU host, pointing ``source.url`` at custback's TLS-protected API.
 """
 
-from .config import AVATAR_PARTS, AvatarConfig, AvatarRuntime
+from .config import (
+    AVATAR_PARTS,
+    AvatarConfig,
+    AvatarConfigVersionConflictError,
+    AvatarRuntime,
+)
 from .state import ARKIT_BLENDSHAPES, FaceState
 
 __all__ = [
     "ARKIT_BLENDSHAPES",
     "AVATAR_PARTS",
     "AvatarConfig",
+    "AvatarConfigVersionConflictError",
     "AvatarRuntime",
     "FaceState",
 ]

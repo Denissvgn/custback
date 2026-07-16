@@ -28,7 +28,6 @@ from typing import Any, Callable
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
 
 from .security import (
     MAX_TOKEN_FILE_BYTES,
@@ -39,6 +38,22 @@ from .security import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the upstream response across the complete ASGI lifecycle."""
+
+    def __init__(self, *args, close: Callable[[], Any], **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._close_upstream = close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette background tasks are not run when sending response
+            # headers raises.  The upstream connection is still ours then.
+            await self._close_upstream()
 
 _STATIC_ROUTES = frozenset(
     {
@@ -358,9 +373,9 @@ def register_avatar_proxy(
             for name in _FORWARD_RESPONSE_HEADERS
             if name in upstream.headers
         }
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             upstream.aiter_raw(),
             status_code=upstream.status_code,
             headers=response_headers,
-            background=BackgroundTask(upstream.aclose),
+            close=upstream.aclose,
         )

@@ -115,6 +115,442 @@ def test_hot_mode_switch():
         pipeline.stop()
 
 
+def test_timed_out_candidate_build_does_not_block_frames_or_leak(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, hub = run_pipeline(runtime)
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    construction_threads = []
+    errors = []
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+        def close(self):
+            closed.set()
+
+    def build(_cfg, **_kwargs):
+        construction_threads.append(threading.current_thread().name)
+        entered.set()
+        release.wait(1.0)
+        return CandidateSegmenter()
+
+    monkeypatch.setattr(pipeline_mod, "create_segmenter", build)
+
+    def apply():
+        try:
+            pipeline.apply_config_patch(
+                {"segmentation": {"threshold": 0.61}}, timeout=0.15
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=apply)
+    try:
+        _, sequence = wait_for_frame(hub)
+        worker.start()
+        assert entered.wait(1.0)
+        # Candidate construction is blocked, but the latest frame lane keeps
+        # publishing rather than waiting behind model acquisition.
+        _, next_sequence = wait_for_frame(hub, sequence, timeout=0.5)
+        assert next_sequence != sequence
+        worker.join(1.0)
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ReconfigurationUnavailable)
+        assert runtime.version == 0
+
+        release.set()
+        assert closed.wait(1.0)
+        assert construction_threads[0].startswith("custback-segmentation-prepare")
+        assert runtime.version == 0
+    finally:
+        release.set()
+        worker.join(1.0)
+        pipeline.stop()
+
+
+def test_stop_owns_timed_out_candidate_preparation(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+        def close(self):
+            closed.set()
+
+    def build(_cfg, **_kwargs):
+        entered.set()
+        release.wait(1.0)
+        return CandidateSegmenter()
+
+    monkeypatch.setattr(pipeline_mod, "create_segmenter", build)
+    try:
+        with pytest.raises(
+            ReconfigurationUnavailable, match="candidate preparation exceeded"
+        ):
+            pipeline.apply_config_patch(
+                {"segmentation": {"threshold": 0.61}}, timeout=0.05
+            )
+        assert entered.is_set()
+        with pytest.raises(
+            ReconfigurationUnavailable,
+            match="candidate preparation worker did not stop",
+        ):
+            pipeline.stop(timeout=0.02)
+
+        release.set()
+        assert closed.wait(1.0)
+        pipeline.stop(timeout=1.0)
+        assert pipeline._preparation_executor is None
+        assert runtime.version == 0
+    finally:
+        release.set()
+        if pipeline._preparation_executor is not None:
+            pipeline.stop(timeout=1.0)
+
+
+def test_stop_deadline_bounds_abandoned_candidate_close(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    construction_entered = threading.Event()
+    release_construction = threading.Event()
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    close_done = threading.Event()
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+        def close(self):
+            close_entered.set()
+            release_close.wait()
+            close_done.set()
+
+    def build(_cfg, **_kwargs):
+        construction_entered.set()
+        release_construction.wait()
+        return CandidateSegmenter()
+
+    monkeypatch.setattr(pipeline_mod, "create_segmenter", build)
+    safety_release = threading.Timer(1.0, release_close.set)
+    try:
+        with pytest.raises(
+            ReconfigurationUnavailable, match="candidate preparation exceeded"
+        ):
+            pipeline.apply_config_patch(
+                {"segmentation": {"threshold": 0.61}}, timeout=0.03
+            )
+        assert construction_entered.is_set()
+
+        # The timed-out Future owns its eventual result. Its completion
+        # callback starts deterministic cleanup, whose backend close blocks.
+        release_construction.set()
+        assert close_entered.wait(1.0)
+        safety_release.start()
+
+        started = time.monotonic()
+        with pytest.raises(
+            ReconfigurationUnavailable,
+            match="candidate preparation worker did not stop",
+        ):
+            pipeline.stop(timeout=0.05)
+        assert time.monotonic() - started < 0.5
+        assert pipeline._preparation_executor is not None
+
+        release_close.set()
+        assert close_done.wait(1.0)
+        pipeline.stop(timeout=1.0)
+        assert pipeline._preparation_executor is None
+        assert pipeline._preparation_futures == set()
+        assert runtime.version == 0
+    finally:
+        release_construction.set()
+        release_close.set()
+        safety_release.cancel()
+        if pipeline._preparation_executor is not None:
+            pipeline.stop(timeout=1.0)
+
+
+def test_expired_deadline_before_future_wait_still_owns_candidate(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+        def close(self):
+            closed.set()
+
+    def build(_cfg, **_kwargs):
+        entered.set()
+        release.wait(1.0)
+        return CandidateSegmenter()
+
+    monkeypatch.setattr(pipeline_mod, "create_segmenter", build)
+    original_track = pipeline._track_preparation_future
+
+    def track_after_constructor_starts(future):
+        original_track(future)
+        assert entered.wait(1.0)
+
+    monkeypatch.setattr(
+        pipeline, "_track_preparation_future", track_after_constructor_starts
+    )
+    current = runtime.read().config
+    candidate = current.patched({"segmentation": {"threshold": 0.61}})
+    request = pipeline_mod._PatchRequest(candidate, runtime.version)
+    try:
+        with pytest.raises(
+            ReconfigurationUnavailable, match="preparation exceeded"
+        ):
+            pipeline._prepare_patch_request(
+                request,
+                current,
+                time.monotonic() - 1.0,
+            )
+        assert request.prepared_activation is None
+
+        release.set()
+        assert closed.wait(1.0)
+        assert runtime.version == 0
+    finally:
+        release.set()
+        pipeline.stop()
+
+
+def test_expired_deadline_after_successful_prep_discards_before_enqueue(
+    monkeypatch,
+):
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    closed = threading.Event()
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+        def close(self):
+            closed.set()
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_segmenter",
+        lambda _cfg, **_kwargs: CandidateSegmenter(),
+    )
+    remaining_calls = 0
+
+    def cross_deadline(_deadline):
+        nonlocal remaining_calls
+        remaining_calls += 1
+        if remaining_calls == 1:
+            return 1.0  # preparation future receives ownership and completes
+        raise ReconfigurationUnavailable(
+            "pipeline candidate preparation exceeded the reconfiguration deadline"
+        )
+
+    monkeypatch.setattr(pipeline, "_remaining", cross_deadline)
+    try:
+        with pytest.raises(
+            ReconfigurationUnavailable, match="preparation exceeded"
+        ):
+            pipeline.apply_config_patch(
+                {"segmentation": {"threshold": 0.61}}, timeout=1.0
+            )
+
+        assert remaining_calls == 2
+        assert closed.wait(1.0)
+        assert pipeline._requests.empty()
+        assert runtime.version == 0
+    finally:
+        pipeline.stop()
+
+
+def test_stop_between_preparation_and_enqueue_discards_candidate(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    prepared = threading.Event()
+    allow_enqueue = threading.Event()
+    closed = threading.Event()
+    errors = []
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+        def close(self):
+            closed.set()
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_segmenter",
+        lambda _cfg, **_kwargs: CandidateSegmenter(),
+    )
+    original_prepare = pipeline._prepare_patch_request
+
+    def pause_after_prepare(*args, **kwargs):
+        original_prepare(*args, **kwargs)
+        prepared.set()
+        assert allow_enqueue.wait(1.0)
+
+    monkeypatch.setattr(pipeline, "_prepare_patch_request", pause_after_prepare)
+
+    def apply():
+        try:
+            pipeline.apply_config_patch({"segmentation": {"threshold": 0.61}})
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=apply)
+    try:
+        worker.start()
+        assert prepared.wait(1.0)
+        pipeline.stop()
+        allow_enqueue.set()
+        worker.join(1.0)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ReconfigurationUnavailable)
+        assert closed.is_set()
+        assert pipeline._requests.empty()
+        assert runtime.version == 0
+    finally:
+        allow_enqueue.set()
+        worker.join(1.0)
+        if pipeline._preparation_executor is not None:
+            pipeline.stop()
+
+
+def test_storage_mutation_rejects_enqueue_after_stop(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    enqueue_entered = threading.Event()
+    allow_enqueue = threading.Event()
+    mutated = threading.Event()
+    errors = []
+    original_enqueue = pipeline._enqueue_request
+
+    def pause_before_enqueue(request):
+        enqueue_entered.set()
+        assert allow_enqueue.wait(1.0)
+        return original_enqueue(request)
+
+    monkeypatch.setattr(pipeline, "_enqueue_request", pause_before_enqueue)
+
+    def mutate():
+        try:
+            pipeline.apply_storage_mutation(lambda _cfg: mutated.set())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=mutate)
+    try:
+        worker.start()
+        assert enqueue_entered.wait(1.0)
+        pipeline.stop()
+        allow_enqueue.set()
+        worker.join(1.0)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ReconfigurationUnavailable)
+        assert not mutated.is_set()
+        assert pipeline._requests.empty()
+    finally:
+        allow_enqueue.set()
+        worker.join(1.0)
+
+
+def test_storage_mutation_invalidates_off_lane_candidate(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    prepared = threading.Event()
+    allow_enqueue = threading.Event()
+    closed = threading.Event()
+    errors = []
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+        def close(self):
+            closed.set()
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_segmenter",
+        lambda _cfg, **_kwargs: CandidateSegmenter(),
+    )
+    original_prepare = pipeline._prepare_patch_request
+
+    def pause_after_prepare(*args, **kwargs):
+        original_prepare(*args, **kwargs)
+        prepared.set()
+        assert allow_enqueue.wait(1.0)
+
+    monkeypatch.setattr(pipeline, "_prepare_patch_request", pause_after_prepare)
+
+    def apply():
+        try:
+            pipeline.apply_config_patch({"segmentation": {"threshold": 0.61}})
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=apply)
+    try:
+        worker.start()
+        assert prepared.wait(1.0)
+        mutation = pipeline.apply_storage_mutation(lambda _cfg: None)
+        assert mutation.version == 0
+        allow_enqueue.set()
+        worker.join(2.0)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ActivationError)
+        assert "assets changed" in str(errors[0])
+        assert closed.wait(1.0)
+        assert runtime.version == 0
+    finally:
+        allow_enqueue.set()
+        worker.join(1.0)
+        pipeline.stop()
+
+
 def test_config_change_audit_has_origin_version_fields_and_safe_summary(caplog):
     runtime = make_runtime(mode="passthrough")
     pipeline, hub = run_pipeline(runtime)
@@ -398,6 +834,31 @@ def test_remote_mask_validation_rejects_unsafe_masks(bad_mask):
         Pipeline._validate_mask(bad_mask, raw, privacy_safe=True)
 
 
+@pytest.mark.parametrize(
+    "refined",
+    [
+        pytest.param(np.zeros((24, 32), np.float64), id="wrong-dtype"),
+        pytest.param(np.full((24, 32), np.nan, np.float32), id="nan"),
+        pytest.param(np.full((24, 32), -0.1, np.float32), id="out-of-range"),
+    ],
+)
+def test_refined_mask_is_revalidated_before_composition(refined):
+    raw = np.zeros((24, 32, 3), np.uint8)
+
+    class Segmenter:
+        def segment(self, frame):
+            return np.zeros(frame.shape[:2], np.float32)
+
+    class Refiner:
+        def refine(self, _mask, _frame):
+            return refined
+
+    with pytest.raises(ValueError):
+        Pipeline._segment_and_refine_mask(
+            Segmenter(), Refiner(), raw, privacy_safe=False
+        )
+
+
 def test_runtime_privacy_gate_protects_vcam_and_preview(monkeypatch):
     raw = np.arange(72 * 128 * 3, dtype=np.uint32).reshape(72, 128, 3)
     raw = (raw % 251).astype(np.uint8)
@@ -668,6 +1129,48 @@ def test_every_restart_only_field_is_classified(patch, expected):
     assert _restart_only_changes(current, candidate) == expected
 
 
+def test_backdrop_preparation_key_includes_decode_limits(monkeypatch):
+    cfg = AppConfig.from_dict(
+        {
+            "background": {"mode": "color"},
+            "segmentation": {"backend": "heuristic"},
+            "output": {"backend": "null"},
+        }
+    )
+    candidate = cfg.patched(
+        {"api": {"uploads": {"image_max_pixels": 1_024}}}
+    )
+    observed = []
+
+    class Backdrop:
+        def close(self):
+            pass
+
+    staged_backdrop = Backdrop()
+
+    def record_create(_cfg, **kwargs):
+        observed.append(dict(kwargs))
+        return staged_backdrop
+
+    monkeypatch.setattr(pipeline_mod, "create_backdrop", record_create)
+    prepared = Pipeline._prepare_activation_off_lane(cfg, candidate)
+    resources = pipeline_mod._Resources(
+        cfg, 0, None, None, object(), object(), None
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    staged = pipeline._stage_activation(resources, candidate, prepared)
+
+    assert staged.replace_backdrop is True
+    assert staged.backdrop is staged_backdrop
+    assert observed == [
+        {
+            "image_max_pixels": 1_024,
+            "video_max_width": cfg.api.uploads.video_max_width,
+            "video_max_height": cfg.api.uploads.video_max_height,
+        }
+    ]
+
+
 def test_concurrent_patches_are_serialized_and_one_conflicts():
     class SynchronizedRuntime(RuntimeConfig):
         def __init__(self, config):
@@ -832,7 +1335,11 @@ def test_success_ack_precedes_exactly_once_old_resource_close(monkeypatch):
         hub, "update_stats", lambda **_kw: (_ for _ in ()).throw(RuntimeError("stats"))
     )
     candidate = cfg.patched({"background": {"mode": "blur"}})
-    request = pipeline_mod._PatchRequest(candidate, 0)
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        0,
+        prepared_activation=pipeline._prepare_activation_off_lane(cfg, candidate),
+    )
     handler = threading.Thread(
         target=pipeline._handle_patch_request,
         args=(resources, request, np.zeros((72, 128, 3), np.uint8)),
@@ -906,7 +1413,8 @@ def test_failed_background_trial_preserves_working_processing_state(monkeypatch)
         pipeline_mod, "create_backdrop", lambda _cfg, **_kwargs: bad
     )
     candidate = cfg.patched({"background": {"color": [2, 2, 2]}})
-    activation = pipeline._stage_activation(resources, candidate)
+    prepared = pipeline._prepare_activation_off_lane(cfg, candidate)
+    activation = pipeline._stage_activation(resources, candidate, prepared)
     with pytest.raises(ActivationError):
         pipeline._trial_activation(
             resources, activation, np.zeros((72, 128, 3), np.uint8)

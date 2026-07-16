@@ -22,13 +22,18 @@ test('remediation registry tracks resolved work and keeps the release frozen', (
   assert.equal(blockers.length, 26);
   assert.deepEqual(
     blockers.filter((entry) => entry.status === 'resolved').map((entry) => entry.id),
-    ['SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01', 'SEG-03'],
+    [
+      'SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01',
+      'CFG-01', 'CFG-02', 'LIFE-01', 'LIFE-02',
+      'STOR-01', 'STOR-02', 'SEG-01', 'SEG-02', 'SEG-03',
+      'RENDER-01', 'RENDER-02', 'API-01', 'MISC-01', 'MISC-02',
+    ],
   );
-  assert.equal(blockers.filter((entry) => entry.status === 'open').length, 21);
+  assert.equal(blockers.filter((entry) => entry.status === 'open').length, 8);
   assert.doesNotThrow(() => release.verifyBlockerRegressionCoverage(root));
   assert.throws(
     () => release.verifyNoReleaseBlockers(root),
-    /release blocked by 21 open remediation blocker.*A2F-01.*HYGIENE-01/,
+    /release blocked by 8 open remediation blocker.*A2F-01.*HYGIENE-01/,
   );
 });
 

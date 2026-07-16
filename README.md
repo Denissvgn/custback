@@ -417,9 +417,18 @@ and `DELETE /rigs/{name}` refuses the active one. `POST
 /backgrounds/image|video?name=<file>` (raw body) stores scene media for
 `background.image_path`/`video_path`, listed and deleted via
 `GET`/`DELETE /backgrounds…`. The `storage:` config section sets both
-directories and all quotas. Through custback's `/avatar/*` proxy the web UI
-reaches all of this with the browser session alone — uploads land on
-whichever machine renders the avatar.
+directories and all quotas, including compressed plus extracted rig staging,
+aggregate rig count/bytes, and per-layer/total decoded pixels. Managed
+directories/files are kept at exact `0700`/`0600` modes. Audit or repair a
+pre-existing store before startup with:
+
+```bash
+custback-avatar -c config/avatar.yaml --check-storage-permissions
+custback-avatar -c config/avatar.yaml --fix-storage-permissions
+```
+
+Through custback's `/avatar/*` proxy the web UI reaches all of this with the
+browser session alone — uploads land on whichever machine renders the avatar.
 
 ### Running the avatar service on another host
 

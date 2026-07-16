@@ -13,6 +13,7 @@ import math
 import os
 import queue
 import re
+import stat
 import threading
 import uuid
 import warnings
@@ -46,6 +47,7 @@ from ..config import (
 )
 from ..hub import FrameHub
 from .security import SESSION_COOKIE, SecurityPolicy
+from .streaming import ConnectionLimiter, JpegBroadcaster, LeasedStreamingResponse
 
 try:
     import cv2
@@ -262,6 +264,7 @@ class PublicApiConfig(BaseModel):
     session_ttl_s: int
     tls_certfile: str
     ws_max_bytes: int
+    max_stream_connections: int
     uploads: UploadLimits
 
 
@@ -492,6 +495,55 @@ class _UploadStore:
         self._reserved_bytes = 0
         self._reserved_files = 0
         self._active_temps: set[Path] = set()
+        self._cleanup_pending: dict[
+            Path, tuple[tuple[Path, ...], int, bool]
+        ] = {}
+        self._cleanup_retry_lock = threading.Lock()
+
+    def ensure_directory(self) -> None:
+        """Create or repair the user-owned managed directory as mode 0700."""
+
+        with self._lock:
+            self.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            before = os.lstat(self.directory)
+            if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                raise OSError(errno.ENOTDIR, "upload storage is not a directory")
+            effective_uid = getattr(os, "geteuid", lambda: before.st_uid)()
+            if before.st_uid != effective_uid:
+                raise PermissionError(
+                    errno.EPERM,
+                    "upload storage must be owned by the current user",
+                    self.directory,
+                )
+            # chmod by name first so a restrictive umask cannot leave a newly
+            # created directory unopenable. Verify the inode did not change,
+            # then bind the final mode to an O_NOFOLLOW directory descriptor.
+            os.chmod(self.directory, 0o700, follow_symlinks=False)
+            after = os.lstat(self.directory)
+            if (
+                not stat.S_ISDIR(after.st_mode)
+                or stat.S_ISLNK(after.st_mode)
+                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise OSError(errno.EAGAIN, "upload storage changed while securing it")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.directory, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (after.st_dev, after.st_ino)
+                ):
+                    raise OSError(
+                        errno.EAGAIN,
+                        "upload storage changed while securing it",
+                    )
+                os.fchmod(descriptor, 0o700)
+            finally:
+                os.close(descriptor)
 
     def _usage(self) -> tuple[int, int]:
         total = count = 0
@@ -531,15 +583,20 @@ class _UploadStore:
         self, temporary: Path, reserved_bytes: int, reserved_file: bool
     ) -> None:
         with self._lock:
-            self._active_temps.discard(temporary)
-            if reserved_file:
-                self._reserved_files = max(0, self._reserved_files - 1)
-            self._reserved_bytes = max(0, self._reserved_bytes - reserved_bytes)
+            self._release_locked(temporary, reserved_bytes, reserved_file)
+
+    def _release_locked(
+        self, temporary: Path, reserved_bytes: int, reserved_file: bool
+    ) -> None:
+        self._active_temps.discard(temporary)
+        if reserved_file:
+            self._reserved_files = max(0, self._reserved_files - 1)
+        self._reserved_bytes = max(0, self._reserved_bytes - reserved_bytes)
 
     def _commit(self, temporary: Path, staged: Path, reserved_bytes: int) -> None:
         """Publish only a hidden staged file and release its reservation."""
         with self._lock:
-            os.replace(temporary, staged)
+            self._replace_private(temporary, staged)
             self._active_temps.discard(temporary)
             self._reserved_files = max(0, self._reserved_files - 1)
             self._reserved_bytes = max(0, self._reserved_bytes - reserved_bytes)
@@ -549,7 +606,13 @@ class _UploadStore:
         descriptor: int | None = None
         try:
             descriptor = os.open(
-                path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
             )
             # A restrictive umask may remove owner bits; the final contract is
             # an exact private mode on the inode bound to this descriptor.
@@ -561,6 +624,41 @@ class _UploadStore:
             if descriptor is not None:
                 with contextlib.suppress(OSError):
                     os.close(descriptor)
+
+    @staticmethod
+    def _secure_private_file(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            effective_uid = getattr(os, "geteuid", lambda: opened.st_uid)()
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError(errno.EINVAL, "upload is not a regular file", path)
+            if opened.st_uid != effective_uid:
+                raise PermissionError(
+                    errno.EPERM,
+                    "upload must be owned by the current user",
+                    path,
+                )
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _replace_private(cls, source: Path, destination: Path) -> None:
+        """Rename one owned file and explicitly reassert mode 0600."""
+
+        os.replace(source, destination)
+        try:
+            cls._secure_private_file(destination)
+        except BaseException:
+            # Restore the caller's ownership state when post-rename hardening
+            # fails; transaction cleanup can then remove the original path.
+            with contextlib.suppress(OSError):
+                os.replace(destination, source)
+            raise
 
     @staticmethod
     def _sync_and_close(destination: Any) -> None:
@@ -580,18 +678,71 @@ class _UploadStore:
     ) -> None:
         """Release all pre-handoff upload ownership in one blocking worker."""
 
-        try:
-            if destination is not None:
-                with contextlib.suppress(OSError):
-                    destination.close()
-            for path in (temporary, staged):
-                if path is not None:
-                    with contextlib.suppress(OSError):
-                        path.unlink()
-        finally:
+        if destination is not None:
+            with contextlib.suppress(OSError):
+                destination.close()
+        paths = tuple(path for path in (temporary, staged) if path is not None)
+        with self._cleanup_retry_lock:
+            remaining = self._unlink_cleanup_paths(paths)
+            if remaining:
+                # Keep the reservation/active-file ownership until a later
+                # upload retries deletion. This prevents a transient unlink
+                # failure from turning into an unowned hidden staging inode.
+                with self._lock:
+                    self._cleanup_pending[temporary] = (
+                        remaining,
+                        reserved_bytes,
+                        reserved_file,
+                    )
+                log.warning(
+                    "cannot remove failed upload staging file(s): %s",
+                    ", ".join(path.name for path in remaining),
+                )
+                return
             # This takes the store lock and can wait behind a quota scan, so it
             # belongs in the same worker rather than on the ASGI event loop.
             self._release(temporary, reserved_bytes, reserved_file)
+
+    @staticmethod
+    def _unlink_cleanup_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+        """Retry transient unlinks and return paths still owned by the store."""
+
+        remaining: list[Path] = []
+        for path in paths:
+            for attempt in range(3):
+                try:
+                    path.unlink()
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    if attempt == 2:
+                        remaining.append(path)
+        return tuple(remaining)
+
+    def _retry_pending_cleanup(self) -> None:
+        """Retry failed staging deletion without dropping quota ownership."""
+
+        with self._cleanup_retry_lock:
+            with self._lock:
+                pending = tuple(self._cleanup_pending.items())
+            for temporary, record in pending:
+                paths, reserved_bytes, reserved_file = record
+                remaining = self._unlink_cleanup_paths(paths)
+                with self._lock:
+                    if self._cleanup_pending.get(temporary) != record:
+                        continue
+                    if remaining:
+                        self._cleanup_pending[temporary] = (
+                            remaining,
+                            reserved_bytes,
+                            reserved_file,
+                        )
+                    else:
+                        self._cleanup_pending.pop(temporary, None)
+                        self._release_locked(
+                            temporary, reserved_bytes, reserved_file
+                        )
 
     @staticmethod
     def _active_background_path(config: Any) -> str:
@@ -653,7 +804,7 @@ class _UploadStore:
                 raise FileNotFoundError(f"staged upload is unavailable: {staged.name}")
             if final.exists() or final.is_symlink():
                 raise FileExistsError(f"upload destination already exists: {final.name}")
-            os.replace(staged, final)
+            self._replace_private(staged, final)
 
     def rollback_promotion(self, staged: Path, final: Path) -> None:
         with self._lock:
@@ -661,12 +812,15 @@ class _UploadStore:
                 raise FileNotFoundError(f"promoted upload is unavailable: {final.name}")
             if staged.exists() or staged.is_symlink():
                 raise FileExistsError(f"upload staging path already exists: {staged.name}")
-            os.replace(final, staged)
+            self._replace_private(final, staged)
 
     def cleanup_staged(self, config: Any) -> None:
         """Reclaim crash-left hidden files unless effective config references one."""
-        if not self.directory.is_dir():
+        try:
+            os.lstat(self.directory)
+        except FileNotFoundError:
             return
+        self.ensure_directory()
         with self._lock:
             for path in self.directory.iterdir():
                 if (
@@ -714,15 +868,16 @@ class _UploadStore:
                 raise _error(400, "invalid_content_length", "invalid Content-Length") from exc
 
         try:
-            mkdir_result = await _to_thread_terminal(
-                self.directory.mkdir, parents=True, exist_ok=True
-            )
+            mkdir_result = await _to_thread_terminal(self.ensure_directory)
         except OSError as exc:
             raise _error(
                 507, "insufficient_storage", "cannot create upload storage"
             ) from exc
         if mkdir_result.cancellation is not None:
             raise mkdir_result.cancellation
+        retry_result = await _to_thread_terminal(self._retry_pending_cleanup)
+        if retry_result.cancellation is not None:
+            raise retry_result.cancellation
         upload_id = uuid.uuid4().hex
         temporary = self.directory / f".upload-{upload_id}.part"
         reserved_file = False
@@ -938,6 +1093,16 @@ class _UploadStore:
                                 limit=self.limits.image_max_pixels,
                             )
                         image.verify()
+                    # ``verify`` validates headers and container integrity but
+                    # does not fully decompress pixel data. Reopen and load so
+                    # corrupt compressed payloads never reach OpenCV.
+                    with Image.open(path) as decoded:
+                        if (
+                            decoded.format != _IMAGE_FORMATS.get(suffix)
+                            or decoded.size != (width, height)
+                        ):
+                            raise ValueError("image changed during validation")
+                        decoded.load()
             except HTTPException:
                 raise
             except (
@@ -1187,6 +1352,12 @@ def create_app(
         docs_url=None,
         redoc_url=None,
     )
+    startup_api = _state(runtime).config.api
+    stream_connections = ConnectionLimiter(startup_api.max_stream_connections)
+    output_jpegs = JpegBroadcaster(hub.output, _encode_jpeg)
+    raw_jpegs = JpegBroadcaster(hub.raw, _encode_jpeg)
+    # Exposed for lifecycle diagnostics and deterministic admission tests.
+    app.state.stream_connections = stream_connections
     store = _UploadStore(upload_dir or UPLOAD_DIR, _upload_limits(runtime))
     store.cleanup_staged(_state(runtime).config)
     cleanup_queue = _StagedCleanupQueue(runtime, coordinator, store)
@@ -1384,7 +1555,7 @@ def create_app(
 
     @app.get("/backgrounds", response_model=_BackgroundListResponse)
     async def list_backgrounds() -> dict:
-        await asyncio.to_thread(store.directory.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(store.ensure_directory)
         files = await asyncio.to_thread(
             lambda: sorted(
                 p.name
@@ -1593,21 +1764,35 @@ def create_app(
     )
     async def mjpeg() -> StreamingResponse:
         boundary = "custbackframe"
+        lease = stream_connections.try_acquire()
+        if lease is None:
+            raise _error(
+                429,
+                "stream_limit",
+                "authenticated stream connection limit reached",
+            )
 
         async def gen():
-            seq = -1
-            while True:
-                frame, seq = await asyncio.to_thread(hub.output.get, seq, 1.0)
-                if frame is None:
-                    continue
-                jpeg = await asyncio.to_thread(_encode_jpeg, frame)
-                yield (
-                    f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(jpeg)}\r\n\r\n"
-                ).encode() + jpeg + b"\r\n"
+            try:
+                async with output_jpegs.subscribe() as subscription:
+                    seq = -1
+                    while True:
+                        jpeg, seq = await subscription.get(seq, 1.0)
+                        if jpeg is None:
+                            continue
+                        yield (
+                            f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
+                            f"Content-Length: {len(jpeg)}\r\n\r\n"
+                        ).encode() + jpeg + b"\r\n"
+            finally:
+                # Direct iterator consumers and the response wrapper may both
+                # release; ConnectionLease is deliberately idempotent.
+                lease.release()
 
-        return StreamingResponse(
-            gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}"
+        return LeasedStreamingResponse(
+            gen(),
+            lease=lease,
+            media_type=f"multipart/x-mixed-replace; boundary={boundary}",
         )
 
     @app.websocket("/ws/frames")
@@ -1640,70 +1825,112 @@ def create_app(
             await _deny_ws(ws, 400, 4400, "stream must be raw|output")
             return
 
-        await ws.accept()
-        remote_session = (
-            hub.remote_client_connected() if stream == "raw" else None
-        )
-        slot = hub.raw if stream == "raw" else hub.output
-        stop = asyncio.Event()
-        ws_limit = int(getattr(_state(runtime).config.api, "ws_max_bytes", 16 * 1024**2))
+        lease = stream_connections.try_acquire()
+        if lease is None:
+            await _deny_ws(
+                ws,
+                429,
+                4429,
+                "authenticated stream connection limit reached",
+            )
+            return
 
-        async def sender() -> None:
-            seq = -1
-            while not stop.is_set():
-                frame, seq = await asyncio.to_thread(slot.get, seq, 0.5)
-                if frame is not None:
-                    await ws.send_bytes(await asyncio.to_thread(_encode_jpeg, frame))
+        remote_session = None
+        try:
+            await ws.accept()
+            remote_session = (
+                hub.remote_client_connected() if stream == "raw" else None
+            )
+            jpegs = raw_jpegs if stream == "raw" else output_jpegs
+            stop = asyncio.Event()
+            ws_limit = int(
+                getattr(
+                    _state(runtime).config.api,
+                    "ws_max_bytes",
+                    16 * 1024**2,
+                )
+            )
 
-        async def receiver() -> None:
-            if stream == "output":
+            async def sender() -> None:
+                async with jpegs.subscribe() as subscription:
+                    seq = -1
+                    while not stop.is_set():
+                        jpeg, seq = await subscription.get(seq, 0.5)
+                        if jpeg is not None:
+                            await ws.send_bytes(jpeg)
+
+            async def receiver() -> None:
+                if stream == "output":
+                    while True:
+                        message = await ws.receive()
+                        if message.get("type") == "websocket.disconnect":
+                            return
+                        await ws.close(
+                            code=1008,
+                            reason="output stream is read-only",
+                        )
+                        return
+                expected = _state(runtime).config.camera
+                expected_size = (expected.width, expected.height)
                 while True:
                     message = await ws.receive()
-                    if message.get("type") == "websocket.disconnect":
+                    kind = message.get("type")
+                    if kind == "websocket.disconnect":
                         return
-                    await ws.close(code=1008, reason="output stream is read-only")
-                    return
-            expected = _state(runtime).config.camera
-            expected_size = (expected.width, expected.height)
-            while True:
-                message = await ws.receive()
-                kind = message.get("type")
-                if kind == "websocket.disconnect":
-                    return
-                data = message.get("bytes")
-                if data is None:
-                    await ws.close(code=1003, reason="binary JPEG frames required")
-                    return
-                if len(data) > ws_limit:
-                    await ws.close(code=1009, reason="frame exceeds configured byte limit")
-                    return
-                frame = await asyncio.to_thread(_decode_jpeg, data, expected_size)
-                if frame is None:
-                    await ws.close(code=1007, reason="invalid JPEG or frame dimensions")
-                    return
-                assert remote_session is not None
-                hub.push_remote_frame(frame, remote_session)
+                    data = message.get("bytes")
+                    if data is None:
+                        await ws.close(
+                            code=1003,
+                            reason="binary JPEG frames required",
+                        )
+                        return
+                    if len(data) > ws_limit:
+                        await ws.close(
+                            code=1009,
+                            reason="frame exceeds configured byte limit",
+                        )
+                        return
+                    frame = await asyncio.to_thread(
+                        _decode_jpeg,
+                        data,
+                        expected_size,
+                    )
+                    if frame is None:
+                        await ws.close(
+                            code=1007,
+                            reason="invalid JPEG or frame dimensions",
+                        )
+                        return
+                    assert remote_session is not None
+                    hub.push_remote_frame(frame, remote_session)
 
-        send_task = asyncio.create_task(sender())
-        receive_task = asyncio.create_task(receiver())
-        try:
-            done, _pending = await asyncio.wait(
-                {send_task, receive_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in done:
-                try:
-                    task.result()
-                except Exception:
-                    log.debug("WebSocket frame task stopped", exc_info=True)
+            send_task = asyncio.create_task(sender())
+            receive_task = asyncio.create_task(receiver())
+            try:
+                done, _pending = await asyncio.wait(
+                    {send_task, receive_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    try:
+                        task.result()
+                    except Exception:
+                        log.debug(
+                            "WebSocket frame task stopped",
+                            exc_info=True,
+                        )
+            finally:
+                stop.set()
+                for task in (send_task, receive_task):
+                    task.cancel()
+                await asyncio.gather(
+                    send_task,
+                    receive_task,
+                    return_exceptions=True,
+                )
         finally:
-            stop.set()
-            for task in (send_task, receive_task):
-                task.cancel()
-            await asyncio.gather(
-                send_task, receive_task, return_exceptions=True
-            )
             if remote_session is not None:
                 hub.remote_client_disconnected(remote_session)
+            lease.release()
 
     return app

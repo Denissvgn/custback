@@ -1,6 +1,7 @@
 """Avatar control-plane API: authentication boundary and config PATCH."""
 
 import asyncio
+import contextlib
 import io
 import ssl
 import zipfile
@@ -20,6 +21,7 @@ if int(starlette.__version__.split(".", 1)[0]) >= 1:
 else:  # Starlette < 1 uses the original httpx client contract.
     from httpx import ASGITransport, AsyncClient
 
+import custback.avatar.api as avatar_api_mod
 from custback.api.security import SecurityPolicy
 from custback.avatar.api import create_avatar_app, resolve_avatar_api_token
 from custback.avatar.config import AvatarConfig, AvatarRuntime
@@ -30,12 +32,31 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 ORIGIN = "http://testserver"
 
 
+async def _with_event_loop_heartbeat(awaitable):
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        return await awaitable
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 def run_async(awaitable):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(awaitable)
+        return loop.run_until_complete(_with_event_loop_heartbeat(awaitable))
     finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
         asyncio.set_event_loop(None)
 
@@ -117,7 +138,11 @@ def stack(tmp_path):
         extra_hosts=["testserver"],
     )
     app = create_avatar_app(runtime, service, security=security)
-    return Stack(app, runtime, service)
+    stack = Stack(app, runtime, service)
+    try:
+        yield stack
+    finally:
+        service.close()
 
 
 def test_all_routes_require_bearer_auth(stack):
@@ -236,6 +261,38 @@ def test_patch_invalid_values_return_422(stack):
     assert response.status_code in (415, 422)
 
 
+def test_noop_patch_activates_startup_generation_or_reports_failure(tmp_path):
+    runtime = AvatarRuntime(
+        AvatarConfig.from_dict(
+            {
+                "driver": {"backend": "idle"},
+                "background": {
+                    "mode": "image",
+                    "image_path": str(tmp_path / "missing.png"),
+                },
+            }
+        )
+    )
+    service = AvatarService(runtime)
+    security = SecurityPolicy.for_bind(
+        TOKEN,
+        "testserver",
+        80,
+        allowed_origins=[ORIGIN],
+        extra_hosts=["testserver"],
+    )
+    app = create_avatar_app(runtime, service, security=security)
+    try:
+        response = Stack(app, runtime, service).patch(
+            "/config", headers=AUTH, json={}
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "activation_failed"
+        assert runtime.version == 0
+    finally:
+        service.close()
+
+
 def test_hot_patch_validation_does_not_disclose_operator_tls_paths(tmp_path):
     system_ca = ssl.get_default_verify_paths().cafile
     if not system_ca:
@@ -265,15 +322,18 @@ def test_hot_patch_validation_does_not_disclose_operator_tls_paths(tmp_path):
     app = create_avatar_app(runtime, service, security=security)
     ca_file.unlink()
 
-    response = Stack(app, runtime, service).patch(
-        "/config",
-        headers=AUTH,
-        json={"appearance": {"scale": 0.9}},
-    )
+    try:
+        response = Stack(app, runtime, service).patch(
+            "/config",
+            headers=AUTH,
+            json={"appearance": {"scale": 0.9}},
+        )
 
-    assert response.status_code == 422
-    assert "does not exist" in response.text
-    assert str(ca_file) not in response.text
+        assert response.status_code == 422
+        assert "does not exist" in response.text
+        assert str(ca_file) not in response.text
+    finally:
+        service.close()
 
 
 def test_snapshot_unavailable_then_served(stack):
@@ -285,6 +345,44 @@ def test_snapshot_unavailable_then_served(stack):
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/jpeg"
     assert response.content.startswith(b"\xff\xd8")
+
+
+def test_mjpeg_stream_connection_limit_returns_429(stack):
+    limiter = stack.app.state.stream_connections
+    leases = [limiter.try_acquire() for _ in range(limiter.maximum)]
+    assert all(lease is not None for lease in leases)
+    try:
+        response = stack.get("/video/mjpeg", headers=AUTH)
+        assert response.status_code == 429
+        assert response.json()["detail"]["code"] == "stream_limit"
+    finally:
+        for lease in leases:
+            lease.release()
+    assert limiter.active == 0
+
+
+def test_mjpeg_stream_encodes_async_frame_and_releases_lease(stack):
+    route = next(
+        route for route in stack.app.routes if route.path == "/video/mjpeg"
+    )
+    limiter = stack.app.state.stream_connections
+
+    async def scenario():
+        response = await route.endpoint()
+        assert limiter.active == 1
+        try:
+            stack.service.output.put(np.full((12, 16, 3), 123, dtype=np.uint8))
+            chunk = await asyncio.wait_for(
+                response.body_iterator.__anext__(),
+                1.0,
+            )
+            assert b"Content-Type: image/jpeg" in chunk
+            assert b"\xff\xd8" in chunk
+        finally:
+            await response.body_iterator.aclose()
+        assert limiter.active == 0
+
+    run_async(scenario())
 
 
 def test_avatar_token_env_is_distinct(tmp_path, monkeypatch):
@@ -362,6 +460,41 @@ def test_rig_upload_select_and_delete_lifecycle(stack):
     stack.patch("/config", headers=AUTH, json={"appearance": {"rig": "builtin"}})
     assert stack.delete("/rigs/myrig", headers=AUTH).status_code == 204
     assert stack.get("/rigs", headers=AUTH).json()["rigs"] == []
+
+
+def test_rig_thumbnail_forwards_configured_decode_limits(monkeypatch, stack):
+    response = stack.post(
+        "/rigs",
+        params={"name": "thumbnail-limits"},
+        content=rig_zip(),
+        headers={**AUTH, "content-type": "application/zip"},
+    )
+    assert response.status_code == 201, response.text
+    observed = []
+    original = avatar_api_mod.render_avatar_thumbnail
+
+    def recording_thumbnail(selector, **kwargs):
+        observed.append(dict(kwargs))
+        return original(selector, **kwargs)
+
+    monkeypatch.setattr(
+        avatar_api_mod,
+        "render_avatar_thumbnail",
+        recording_thumbnail,
+    )
+
+    response = stack.get("/rigs/thumbnail-limits/thumbnail.jpg", headers=AUTH)
+
+    assert response.status_code == 200
+    storage = stack.runtime.read().config.storage
+    assert observed == [
+        {
+            "style": "cartoon",
+            "rig_layer_max_pixels": storage.rig_layer_max_pixels,
+            "rig_total_max_pixels": storage.rig_total_max_pixels,
+            "rig_manifest_max_bytes": storage.rig_manifest_max_bytes,
+        }
+    ]
 
 
 def test_rig_upload_rejections(stack):

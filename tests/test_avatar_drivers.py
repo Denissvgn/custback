@@ -2,6 +2,8 @@
 
 import math
 import ssl
+import threading
+import time
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import custback.avatar.drivers as drivers_mod
 from custback.avatar.audio2face import (
     Audio2FaceDriver,
     WavAudioSource,
@@ -19,11 +22,13 @@ from custback.avatar.config import Audio2FaceConfig, DriverConfig
 from custback.api.security import SecurityConfigurationError
 from custback.avatar.drivers import (
     FACE_LANDMARKER_MODEL,
+    DriverStartupError,
     DriverUnavailableError,
     IdleDriver,
     ThreadSafeLatestState,
     create_driver,
     idle_blink,
+    prepare_driver,
 )
 from custback.avatar.state import ARKIT_BLENDSHAPES, FaceState, StateSmoother
 
@@ -98,6 +103,163 @@ def test_face_landmarker_model_is_pinned():
     assert FACE_LANDMARKER_MODEL.filename == "face_landmarker.task"
     assert FACE_LANDMARKER_MODEL.size > 0
     assert len(FACE_LANDMARKER_MODEL.sha256) == 64
+
+
+def _fake_vision_bindings():
+    captured = {}
+
+    class BaseOptions:
+        def __init__(self, *, model_asset_path):
+            captured["model_asset_path"] = model_asset_path
+
+    class FaceLandmarkerOptions:
+        def __init__(self, **kwargs):
+            captured["options"] = kwargs
+
+    class Landmarker:
+        def close(self):
+            captured["closed"] = True
+
+    class FaceLandmarker:
+        @staticmethod
+        def create_from_options(options):
+            captured["created_with"] = options
+            return Landmarker()
+
+    bindings = drivers_mod._VisionBindings(
+        mediapipe=SimpleNamespace(),
+        tasks=SimpleNamespace(BaseOptions=BaseOptions),
+        vision=SimpleNamespace(
+            FaceLandmarkerOptions=FaceLandmarkerOptions,
+            FaceLandmarker=FaceLandmarker,
+            RunningMode=SimpleNamespace(VIDEO="video"),
+        ),
+    )
+    return bindings, captured
+
+
+def test_prepared_managed_model_is_acquired_once_and_reused(
+    monkeypatch, tmp_path
+):
+    model = tmp_path / "managed.task"
+    model.write_bytes(b"model")
+    bindings, captured = _fake_vision_bindings()
+    acquisitions = []
+
+    def acquire(spec, *, allow_download):
+        acquisitions.append((spec, allow_download))
+        return model
+
+    monkeypatch.setattr(drivers_mod, "_load_vision_bindings", lambda: bindings)
+    monkeypatch.setattr(drivers_mod, "acquire_model", acquire)
+    cfg = DriverConfig(backend="vision")
+
+    preparation = prepare_driver(cfg, allow_model_download=False)
+    assert preparation.vision_model_path == model
+    assert acquisitions == [(FACE_LANDMARKER_MODEL, False)]
+
+    monkeypatch.setattr(
+        drivers_mod,
+        "acquire_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("prepared construction must not reacquire the model")
+        ),
+    )
+    driver = create_driver(cfg, preparation=preparation)
+    assert captured["model_asset_path"] == str(model)
+    driver.close()
+    assert captured["closed"] is True
+
+
+def test_prepared_custom_model_is_not_revalidated_on_render_lane(
+    monkeypatch, tmp_path
+):
+    model = tmp_path / "custom.task"
+    model.write_bytes(b"custom")
+    bindings, captured = _fake_vision_bindings()
+    monkeypatch.setattr(drivers_mod, "_load_vision_bindings", lambda: bindings)
+    monkeypatch.setattr(
+        drivers_mod,
+        "acquire_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a custom model must not use managed acquisition")
+        ),
+    )
+    cfg = DriverConfig(
+        backend="vision", vision={"model_path": str(model)}
+    )
+
+    preparation = prepare_driver(cfg)
+    model.unlink()  # construction consumes the prepared result without stat I/O
+    driver = create_driver(cfg, preparation=preparation)
+    assert captured["model_asset_path"] == str(model)
+    driver.close()
+
+
+def test_prepare_driver_preserves_auto_fallback_for_missing_custom_model(
+    monkeypatch, tmp_path
+):
+    missing = tmp_path / "missing.task"
+    monkeypatch.setattr(
+        drivers_mod,
+        "_load_vision_bindings",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("custom path validation must happen before imports")
+        ),
+    )
+    auto = DriverConfig(
+        backend="auto", vision={"model_path": str(missing)}
+    )
+    preparation = prepare_driver(auto)
+    assert create_driver(auto, preparation=preparation).name == "idle"
+
+    vision = DriverConfig(
+        backend="vision", vision={"model_path": str(missing)}
+    )
+    with pytest.raises(DriverUnavailableError, match="does not exist"):
+        prepare_driver(vision)
+
+
+def test_prepare_auto_does_not_acquire_managed_model_without_bindings(monkeypatch):
+    monkeypatch.setattr(
+        drivers_mod,
+        "_load_vision_bindings",
+        lambda: (_ for _ in ()).throw(
+            DriverUnavailableError("mediapipe unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        drivers_mod,
+        "acquire_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unusable backends must not trigger a model download")
+        ),
+    )
+    cfg = DriverConfig(backend="auto")
+
+    preparation = prepare_driver(cfg)
+    assert create_driver(cfg, preparation=preparation).name == "idle"
+
+
+def test_create_driver_rejects_preparation_for_a_different_candidate(
+    monkeypatch, tmp_path
+):
+    first = tmp_path / "first.task"
+    second = tmp_path / "second.task"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    bindings, _captured = _fake_vision_bindings()
+    monkeypatch.setattr(drivers_mod, "_load_vision_bindings", lambda: bindings)
+    original = DriverConfig(
+        backend="vision", vision={"model_path": str(first)}
+    )
+    preparation = prepare_driver(original)
+    changed = DriverConfig(
+        backend="vision", vision={"model_path": str(second)}
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        create_driver(changed, preparation=preparation)
 
 
 def test_arkit_channel_name_normalizes_audio2face_names():
@@ -175,6 +337,413 @@ def test_audio2face_driver_requires_bindings(tmp_path):
     )
     with pytest.raises(DriverUnavailableError, match="nvidia-ace"):
         driver.start()
+
+
+def test_audio2face_start_failure_closes_the_prepared_source(monkeypatch):
+    import custback.avatar.audio2face as a2f
+
+    class Source:
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+
+    source = Source()
+
+    class FailedThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread quota exhausted")
+
+    monkeypatch.setattr(a2f, "_load_protocol", lambda: object())
+    monkeypatch.setattr(a2f, "create_audio_source", lambda _cfg: source)
+    monkeypatch.setattr(a2f.threading, "Thread", FailedThread)
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
+
+    with pytest.raises(RuntimeError, match="thread quota"):
+        driver.start()
+
+    assert source.closes == 1
+    assert driver._source is None
+    assert driver._worker is None
+    driver.close()
+    assert source.closes == 1
+
+
+def test_audio2face_thread_construction_failure_closes_source(monkeypatch):
+    import custback.avatar.audio2face as a2f
+
+    class Source:
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+
+    source = Source()
+
+    class FailedThread:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("cannot allocate worker")
+
+    monkeypatch.setattr(a2f, "_load_protocol", lambda: object())
+    monkeypatch.setattr(a2f, "create_audio_source", lambda _cfg: source)
+    monkeypatch.setattr(a2f.threading, "Thread", FailedThread)
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
+
+    with pytest.raises(RuntimeError, match="allocate worker"):
+        driver.start()
+    assert source.closes == 1
+    driver.close()
+    assert source.closes == 1
+
+
+def test_audio2face_factory_transfers_failed_start_cleanup_ownership(monkeypatch):
+    import custback.avatar.audio2face as a2f
+
+    allow_close = threading.Event()
+
+    class Source:
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+            if not allow_close.is_set():
+                raise RuntimeError("capture device still owns native state")
+
+    source = Source()
+
+    class FailedThread:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("cannot allocate worker")
+
+    monkeypatch.setattr(a2f, "_load_protocol", lambda: object())
+    monkeypatch.setattr(a2f, "create_audio_source", lambda _cfg: source)
+    monkeypatch.setattr(a2f.threading, "Thread", FailedThread)
+    cfg = DriverConfig(
+        backend="audio2face",
+        audio2face=Audio2FaceConfig(url="grpc://127.0.0.1:52000"),
+    )
+
+    with pytest.raises(DriverStartupError) as caught:
+        create_driver(cfg)
+
+    # start() and the factory both tried; the concrete failed driver remains
+    # available to the transactional caller until native teardown succeeds.
+    assert source.closes == 2
+    failed_driver = caught.value.driver
+    with pytest.raises(DriverUnavailableError, match="interruption failed"):
+        failed_driver.close()
+    allow_close.set()
+    failed_driver.close()
+    assert source.closes == 4
+    assert failed_driver._survivors == []
+
+
+def test_audio2face_concurrent_close_waits_for_one_terminal_operation():
+    entered = threading.Event()
+    release = threading.Event()
+    returns = []
+
+    class Source:
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+            entered.set()
+            release.wait()
+
+    source = Source()
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
+    driver._source = source
+
+    def close(label):
+        driver.close()
+        returns.append(label)
+
+    first = threading.Thread(target=close, args=("first",))
+    second = threading.Thread(target=close, args=("second",))
+    try:
+        first.start()
+        assert entered.wait(1.0)
+        second.start()
+        time.sleep(0.03)
+        assert returns == []
+        release.set()
+        first.join(1.0)
+        second.join(1.0)
+        assert not first.is_alive() and not second.is_alive()
+        assert returns == ["first", "second"]
+        assert source.closes == 1
+    finally:
+        release.set()
+        first.join(1.0)
+        second.join(1.0)
+
+
+def test_audio2face_close_bounds_and_retains_blocked_native_interrupt(monkeypatch):
+    import custback.avatar.audio2face as a2f
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Source:
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+            entered.set()
+            release.wait()
+
+    source = Source()
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
+    driver._source = source
+    monkeypatch.setattr(a2f, "_CLOSE_TIMEOUT_S", 0.05)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(DriverUnavailableError, match="did not stop"):
+            driver.close()
+        assert entered.is_set()
+        assert time.monotonic() - started < 0.5
+        assert len(driver._interruptions) == 1
+        assert driver._interruptions[0].resource is source
+
+        release.set()
+        driver.close()
+        assert source.closes == 1
+        assert driver._interruptions == []
+    finally:
+        release.set()
+
+
+def test_audio2face_interruption_completion_race_retains_identity():
+    import custback.avatar.audio2face as audio2face_mod
+
+    pending = audio2face_mod._PendingInterruption("source", object())
+
+    class CompletingEvent:
+        def __init__(self):
+            self.calls = 0
+            self.completed = False
+
+        def is_set(self):
+            self.calls += 1
+            if self.calls == 2:
+                # Completion lands immediately after the classifier's state
+                # observation. A second read would see True and could drop it.
+                pending.error = RuntimeError("native close failed")
+                self.completed = True
+                return False
+            return self.completed
+
+        def wait(self, _timeout=None):
+            return self.completed
+
+    pending.done = CompletingEvent()
+
+    failures, active = Audio2FaceDriver._settle_interruptions(
+        [pending], time.monotonic()
+    )
+
+    assert failures == []
+    assert active == [pending]
+
+
+def test_audio2face_close_interrupts_pacing_wait():
+    entered = threading.Event()
+    finished = threading.Event()
+
+    class AudioHeader:
+        AUDIO_FORMAT_PCM = 1
+
+        def __init__(self, **_kwargs):
+            pass
+
+    protocol = SimpleNamespace(
+        audio_header=AudioHeader,
+        audio_stream_header=lambda **kwargs: kwargs,
+        audio_stream=lambda **kwargs: kwargs,
+        audio_with_emotion=lambda **kwargs: kwargs,
+    )
+
+    class EmptySource:
+        def read(self, _frames):
+            entered.set()
+            return b""
+
+    driver = Audio2FaceDriver(
+        Audio2FaceConfig(url="grpc://127.0.0.1:52000", chunk_ms=1000)
+    )
+    requests = driver._requests(protocol, EmptySource())
+    next(requests)  # protocol header
+
+    def request_audio():
+        try:
+            next(requests)
+        except StopIteration:
+            pass
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=request_audio)
+    worker.start()
+    assert entered.wait(1.0)
+    started = time.monotonic()
+    driver.close()
+    worker.join(0.75)
+
+    assert finished.is_set()
+    assert time.monotonic() - started < 0.75
+
+
+def test_audio2face_close_interrupts_source_before_rpc_registration(monkeypatch):
+    import custback.avatar.audio2face as a2f
+
+    read_entered = threading.Event()
+    read_released = threading.Event()
+    requests_stopped = threading.Event()
+    events = []
+
+    class Source:
+        def read(self, _frames):
+            read_entered.set()
+            read_released.wait()
+            return b""
+
+        def close(self):
+            events.append("source.close")
+            read_released.set()
+
+    source = Source()
+
+    class AudioHeader:
+        AUDIO_FORMAT_PCM = 1
+
+        def __init__(self, **_kwargs):
+            pass
+
+    class Channel:
+        def close(self):
+            events.append("channel.close")
+
+    class Stub:
+        def __init__(self, _channel):
+            pass
+
+        def ProcessAudioStream(self, requests):
+            next(requests)  # protocol header
+            try:
+                next(requests)  # blocked source read, interrupted by close()
+            except StopIteration:
+                requests_stopped.set()
+            return ()
+
+    protocol = SimpleNamespace(
+        grpc=SimpleNamespace(
+            insecure_channel=lambda _url, **_kwargs: Channel()
+        ),
+        stub_class=Stub,
+        audio_header=AudioHeader,
+        audio_stream_header=lambda **kwargs: kwargs,
+        audio_stream=lambda **kwargs: kwargs,
+        audio_with_emotion=lambda **kwargs: kwargs,
+    )
+    monkeypatch.setattr(a2f, "_load_protocol", lambda: protocol)
+    monkeypatch.setattr(a2f, "create_audio_source", lambda _cfg: source)
+    driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
+    driver.start()
+    assert read_entered.wait(1.0)
+    assert driver._worker is not None
+    worker = driver._worker
+
+    driver.close()
+
+    assert not worker.is_alive()
+    assert requests_stopped.is_set()
+    assert events == ["source.close", "channel.close"]
+    driver.close()
+    assert events == ["source.close", "channel.close"]
+
+
+def test_audio2face_release_failure_is_terminal_and_retryable():
+    class Channel:
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+            if self.closes == 1:
+                raise RuntimeError("native channel survived")
+
+    channel = Channel()
+    driver = Audio2FaceDriver(
+        Audio2FaceConfig(url="grpc://127.0.0.1:52000")
+    )
+    driver._channel = channel
+
+    driver._release_channel(channel)
+
+    assert driver._stop.is_set()  # reconnect is terminal after teardown failure
+    assert driver._channel is None
+    assert [(kind, resource) for kind, resource, _error in driver._survivors] == [
+        ("channel", channel)
+    ]
+    driver.close()  # retries the retained native identity
+    assert channel.closes == 2
+    assert driver._survivors == []
+    driver.close()
+    assert channel.closes == 2
+
+
+def test_audio2face_rejected_call_cancel_failure_is_reclaimed_on_close():
+    class Channel:
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+
+    channel = Channel()
+
+    class Call:
+        cancels = 0
+
+        def cancel(self):
+            self.cancels += 1
+            if self.cancels == 1:
+                raise RuntimeError("native call survived")
+
+    call = Call()
+    driver = Audio2FaceDriver(
+        Audio2FaceConfig(url="grpc://127.0.0.1:52000")
+    )
+
+    class Stub:
+        def __init__(self, _channel):
+            pass
+
+        def ProcessAudioStream(self, _requests):
+            # Force the registration rejection after the native call exists.
+            driver._stop.set()
+            return call
+
+    protocol = SimpleNamespace(
+        grpc=SimpleNamespace(
+            insecure_channel=lambda _url, **_kwargs: channel
+        ),
+        stub_class=Stub,
+    )
+
+    driver._run_session(protocol, object())
+
+    assert call.cancels == 1
+    assert channel.closes == 1
+    assert [(kind, resource) for kind, resource, _error in driver._survivors] == [
+        ("call", call)
+    ]
+    driver.close()
+    assert call.cancels == 2
+    assert driver._survivors == []
 
 
 def test_audio2face_driver_renders_fresh_weights_and_idles_when_stale(monkeypatch):

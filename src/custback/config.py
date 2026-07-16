@@ -13,9 +13,12 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     field_validator,
     model_validator,
 )
+
+from .config_merge import merge_patch
 
 # Output / compositing modes. Kept as a tuple for CLI/API compatibility.
 MODES = ("passthrough", "blur", "image", "video", "color", "camera", "remote")
@@ -45,6 +48,27 @@ AVATAR_PROXY_RESTART_ONLY_FIELDS = frozenset(
         "avatar.tls_keyfile",
     }
 )
+
+
+def format_config_error(exc: BaseException) -> str:
+    """Return one value-free line suitable for a CLI configuration error."""
+
+    if isinstance(exc, ValidationError):
+        errors = exc.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+        if errors:
+            first = errors[0]
+            location = ".".join(str(part) for part in first.get("loc", ()))
+            message = str(first.get("msg", "invalid value")).splitlines()[0]
+            prefix = f"{location}: " if location else ""
+            remaining = len(errors) - 1
+            suffix = f" (+{remaining} more error(s))" if remaining else ""
+            return f"{prefix}{message}{suffix}"
+    text = str(exc).splitlines()
+    return text[0] if text else type(exc).__name__
 
 
 def _clean_config_string(value: str, *, allow_empty: bool = True) -> str:
@@ -281,6 +305,7 @@ class ApiConfig(_StrictModel):
     tls_certfile: str = ""
     tls_keyfile: str = ""
     ws_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=2**31)
+    max_stream_connections: int = Field(default=16, ge=1, le=10_000)
     uploads: UploadLimits = Field(default_factory=UploadLimits)
 
     @field_validator("host")
@@ -425,7 +450,19 @@ class AppConfig(_StrictModel):
     def load(cls, path: str | Path | None) -> "AppConfig":
         if path is None:
             return cls()
-        raw = yaml.safe_load(Path(path).read_text())
+        try:
+            raw = yaml.safe_load(Path(path).read_text())
+        except (yaml.YAMLError, RecursionError) as exc:
+            mark = getattr(exc, "problem_mark", None)
+            location = (
+                f" at line {mark.line + 1}, column {mark.column + 1}"
+                if mark is not None
+                else ""
+            )
+            problem = str(getattr(exc, "problem", "malformed YAML")).splitlines()[0]
+            raise ValueError(
+                f"invalid YAML configuration{location}: {problem}"
+            ) from None
         if raw is None:
             raw = {}
         if not isinstance(raw, dict):
@@ -440,23 +477,10 @@ class AppConfig(_StrictModel):
         type(self).model_validate(self.to_dict())
 
     def patched(self, patch: dict[str, Any]) -> "AppConfig":
-        """Validate a one-level partial section patch without mutating self."""
+        """Validate an RFC 7396 merge patch without mutating this config."""
         if not isinstance(patch, dict):
             raise TypeError("config patch must be a mapping")
-        merged = self.to_dict()
-        for section, values in patch.items():
-            if section not in merged:
-                # Preserve the unknown key so Pydantic reports it as forbidden.
-                merged[section] = values
-            elif not isinstance(values, dict):
-                merged[section] = values
-            else:
-                current = merged[section]
-                if not isinstance(current, dict):  # defensive; sections are models
-                    merged[section] = values
-                else:
-                    current.update(values)
-        return type(self).from_dict(merged)
+        return type(self).from_dict(merge_patch(self.to_dict(), patch))
 
 
 @dataclass(frozen=True)

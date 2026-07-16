@@ -16,7 +16,9 @@ import logging
 import math
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -47,6 +49,116 @@ FACE_LANDMARKER_MODEL = ModelSpec(
 
 class DriverUnavailableError(RuntimeError):
     """The requested driver backend cannot run in this environment."""
+
+
+class DriverStartupError(DriverUnavailableError):
+    """A driver failed during startup and still requires lifecycle ownership."""
+
+    def __init__(self, driver: Any, startup_error: BaseException):
+        self.driver = driver
+        self.startup_error = startup_error
+        super().__init__(f"driver startup failed: {startup_error}")
+
+
+@dataclass(frozen=True)
+class _VisionBindings:
+    """Imported MediaPipe surfaces needed to construct a vision driver."""
+
+    mediapipe: Any
+    tasks: Any
+    vision: Any
+
+
+@dataclass(frozen=True)
+class DriverPreparation:
+    """Assets prepared before entering the render/activation lane.
+
+    The backend and configured model spelling bind the preparation to the
+    candidate that produced it.  ``_vision_error`` is retained for ``auto`` so
+    the eventual factory call preserves its historical idle fallback without
+    repeating dependency probes, path checks, or model acquisition.
+    """
+
+    backend: str
+    vision_model_setting: str
+    vision_model_path: Path | None = None
+    _vision_bindings: _VisionBindings | None = field(default=None, repr=False)
+    _vision_error: DriverUnavailableError | ModelAcquisitionError | None = field(
+        default=None, repr=False
+    )
+
+
+def _load_vision_bindings() -> _VisionBindings:
+    try:
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_tasks
+        from mediapipe.tasks.python import vision as mp_vision
+    except ImportError as exc:
+        raise DriverUnavailableError(
+            "mediapipe is not installed; install the [mediapipe] extra "
+            "for the vision avatar driver"
+        ) from exc
+    return _VisionBindings(mp, mp_tasks, mp_vision)
+
+
+def _prepare_vision_model(
+    cfg: VisionConfig, *, allow_model_download: bool
+) -> Path:
+    if cfg.model_path:
+        model_path = Path(cfg.model_path).expanduser()
+        if not model_path.is_file():
+            raise DriverUnavailableError(
+                f"vision model_path does not exist: {model_path}"
+            )
+        return model_path
+    return acquire_model(
+        FACE_LANDMARKER_MODEL, allow_download=allow_model_download
+    )
+
+
+def prepare_driver(
+    cfg: DriverConfig, *, allow_model_download: bool = True
+) -> DriverPreparation:
+    """Prepare driver assets without constructing render-thread resources.
+
+    Existing callers may continue to call :func:`create_driver` directly.  A
+    transactional caller can instead run this function on an acquisition
+    worker, then pass the result to ``create_driver(..., preparation=...)`` on
+    its owned render lane.  Managed downloads and custom-path validation occur
+    exactly once in the preparation step.
+    """
+
+    preparation = DriverPreparation(cfg.backend, cfg.vision.model_path)
+    if cfg.backend not in ("auto", "vision"):
+        return preparation
+    try:
+        if cfg.vision.model_path:
+            # Custom paths are cheap to validate and should fail before any
+            # optional backend import. Managed acquisition, by contrast, must
+            # not download a model on hosts that cannot import MediaPipe.
+            model_path = _prepare_vision_model(
+                cfg.vision, allow_model_download=allow_model_download
+            )
+            bindings = _load_vision_bindings()
+        else:
+            bindings = _load_vision_bindings()
+            model_path = _prepare_vision_model(
+                cfg.vision, allow_model_download=allow_model_download
+            )
+    except (DriverUnavailableError, ModelAcquisitionError) as exc:
+        if cfg.backend == "vision":
+            raise
+        return DriverPreparation(
+            cfg.backend,
+            cfg.vision.model_path,
+            _vision_error=exc,
+        )
+    return DriverPreparation(
+        cfg.backend,
+        cfg.vision.model_path,
+        vision_model_path=model_path,
+        _vision_bindings=bindings,
+    )
 
 
 class FaceDriver(ABC):
@@ -118,38 +230,43 @@ class VisionDriver(FaceDriver):
 
     name = "vision"
 
-    def __init__(self, cfg: VisionConfig, *, allow_model_download: bool = True):
+    def __init__(
+        self,
+        cfg: VisionConfig,
+        *,
+        allow_model_download: bool = True,
+        preparation: DriverPreparation | None = None,
+    ):
         if cv2 is None:
             raise DriverUnavailableError("opencv-python is required for vision tracking")
-        try:
-            import mediapipe as mp
-            from mediapipe.tasks import python as mp_tasks
-            from mediapipe.tasks.python import vision as mp_vision
-        except ImportError as exc:
-            raise DriverUnavailableError(
-                "mediapipe is not installed; install the [mediapipe] extra "
-                "for the vision avatar driver"
-            ) from exc
-        self._mp = mp
-        if cfg.model_path:
-            model_path = Path(cfg.model_path).expanduser()
-            if not model_path.is_file():
-                raise DriverUnavailableError(
-                    f"vision model_path does not exist: {model_path}"
+        if preparation is not None:
+            if preparation.vision_model_setting != cfg.model_path:
+                raise ValueError(
+                    "driver preparation does not match the vision configuration"
                 )
+            if preparation._vision_error is not None:
+                raise preparation._vision_error
+            if preparation.vision_model_path is None:
+                raise ValueError("driver preparation contains no vision model")
+            bindings = preparation._vision_bindings or _load_vision_bindings()
+            model_path = preparation.vision_model_path
         else:
-            model_path = acquire_model(
-                FACE_LANDMARKER_MODEL, allow_download=allow_model_download
+            bindings = _load_vision_bindings()
+            model_path = _prepare_vision_model(
+                cfg, allow_model_download=allow_model_download
             )
-        options = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_tasks.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=mp_vision.RunningMode.VIDEO,
+        self._mp = bindings.mediapipe
+        options = bindings.vision.FaceLandmarkerOptions(
+            base_options=bindings.tasks.BaseOptions(model_asset_path=str(model_path)),
+            running_mode=bindings.vision.RunningMode.VIDEO,
             output_face_blendshapes=True,
             output_facial_transformation_matrixes=True,
             num_faces=1,
         )
         try:
-            self._landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+            self._landmarker = bindings.vision.FaceLandmarker.create_from_options(
+                options
+            )
         except Exception as exc:  # mediapipe raises framework-specific types
             raise DriverUnavailableError(f"face landmarker failed to start: {exc}") from exc
         self._last_timestamp_ms = -1
@@ -192,12 +309,31 @@ class VisionDriver(FaceDriver):
 
 
 def create_driver(
-    cfg: DriverConfig, *, allow_model_download: bool = True
+    cfg: DriverConfig,
+    *,
+    allow_model_download: bool = True,
+    preparation: DriverPreparation | None = None,
 ) -> FaceDriver:
-    """Build the configured driver; ``auto`` degrades to the idle animator."""
+    """Build the configured driver; ``auto`` degrades to the idle animator.
+
+    ``preparation`` is optional for backward compatibility.  When supplied it
+    must match the candidate configuration, and vision construction performs
+    no model acquisition or path validation.
+    """
+    if preparation is not None and (
+        preparation.backend != cfg.backend
+        or preparation.vision_model_setting != cfg.vision.model_path
+    ):
+        raise ValueError("driver preparation does not match the driver configuration")
     if cfg.backend in ("auto", "vision"):
         try:
-            return VisionDriver(cfg.vision, allow_model_download=allow_model_download)
+            if preparation is not None and preparation._vision_error is not None:
+                raise preparation._vision_error
+            return VisionDriver(
+                cfg.vision,
+                allow_model_download=allow_model_download,
+                preparation=preparation,
+            )
         except (DriverUnavailableError, ModelAcquisitionError) as exc:
             if cfg.backend == "vision":
                 raise
@@ -207,7 +343,17 @@ def create_driver(
         from .audio2face import Audio2FaceDriver
 
         driver = Audio2FaceDriver(cfg.audio2face)
-        driver.start()
+        try:
+            driver.start()
+        except BaseException as startup_error:
+            # A source can exist even when worker construction/start fails.
+            # Retry its teardown here; if it still survives, transfer the
+            # concrete driver identity to the transactional owner.
+            try:
+                driver.close()
+            except BaseException as cleanup_error:
+                raise DriverStartupError(driver, startup_error) from cleanup_error
+            raise
         return driver
     return IdleDriver()
 

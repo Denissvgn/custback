@@ -15,6 +15,7 @@ import pytest
 cv2 = pytest.importorskip("cv2")
 websockets = pytest.importorskip("websockets")
 
+import custback.avatar.service as avatar_service_mod
 from custback.avatar.config import AvatarConfig, AvatarRuntime
 from custback.avatar.service import AvatarService
 
@@ -22,11 +23,98 @@ TOKEN = "avatar-service-test-token-0123456789abcdef"
 WIDTH, HEIGHT = 160, 120
 
 
+def test_service_forwards_configured_rig_validation_limits(monkeypatch):
+    observed = []
+    original = avatar_service_mod.create_rig
+
+    def recording_create_rig(selector, **kwargs):
+        observed.append((selector, dict(kwargs)))
+        return original(selector, **kwargs)
+
+    monkeypatch.setattr(avatar_service_mod, "create_rig", recording_create_rig)
+    runtime = AvatarRuntime(
+        AvatarConfig.from_dict(
+            {
+                "driver": {"backend": "idle"},
+                "storage": {
+                    "rig_layer_max_pixels": 1_024,
+                    "rig_total_max_pixels": 2_048,
+                    "rig_manifest_max_bytes": 512,
+                },
+            }
+        )
+    )
+    service = AvatarService(runtime)
+    try:
+        service.activate_initial()
+    finally:
+        service.close()
+
+    assert len(observed) == 1
+    selector, kwargs = observed[0]
+    assert selector == "builtin"
+    assert kwargs["rig_layer_max_pixels"] == 1_024
+    assert kwargs["rig_total_max_pixels"] == 2_048
+    assert kwargs["rig_manifest_max_bytes"] == 512
+
+
+def test_service_forwards_configured_backdrop_decode_limits(monkeypatch):
+    observed = []
+    original = avatar_service_mod.create_avatar_backdrop
+
+    def recording_create_backdrop(cfg, **kwargs):
+        observed.append(dict(kwargs))
+        return original(cfg, **kwargs)
+
+    monkeypatch.setattr(
+        avatar_service_mod, "create_avatar_backdrop", recording_create_backdrop
+    )
+    runtime = AvatarRuntime(
+        AvatarConfig.from_dict(
+            {
+                "driver": {"backend": "idle"},
+                "storage": {
+                    "image_max_pixels": 1_024,
+                    "video_max_width": 640,
+                    "video_max_height": 480,
+                },
+            }
+        )
+    )
+    service = AvatarService(runtime)
+    try:
+        service.activate_initial()
+    finally:
+        service.close()
+
+    assert observed == [
+        {
+            "image_max_pixels": 1_024,
+            "video_max_width": 640,
+            "video_max_height": 480,
+        }
+    ]
+
+
+async def _with_event_loop_heartbeat(awaitable):
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        return await awaitable
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 def run_async(awaitable):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(awaitable)
+        return loop.run_until_complete(_with_event_loop_heartbeat(awaitable))
     finally:
         pending = asyncio.all_tasks(loop)
         for task in pending:
@@ -259,6 +347,24 @@ def test_service_passes_verified_ssl_context_to_wss(monkeypatch, token_file):
     assert context.verify_mode.name == "CERT_REQUIRED"
     assert captured["proxy"] is None
     assert captured["url"].startswith("wss://renderer.example:8710/")
+
+
+def test_auto_driver_keeps_idle_fallback_for_missing_custom_model(tmp_path):
+    cfg = AvatarConfig.from_dict(
+        {
+            "driver": {
+                "backend": "auto",
+                "vision": {"model_path": str(tmp_path / "missing.task")},
+            }
+        }
+    )
+    service = AvatarService(AvatarRuntime(cfg))
+    try:
+        state = service.activate_initial()
+        assert state.version == 0
+        assert service._components.driver.name == "idle"
+    finally:
+        service.close()
 
 
 def test_service_switches_avatar_style_and_framing_live(token_file):

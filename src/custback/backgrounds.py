@@ -7,9 +7,11 @@ the most recent available frame.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import time
+import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Callable
@@ -24,10 +26,24 @@ try:
 except ImportError:  # pragma: no cover
     cv2 = None
 
+try:
+    from PIL import Image, UnidentifiedImageError
+except ImportError:  # pragma: no cover - Pillow is a required dependency
+    Image = None
+    UnidentifiedImageError = OSError
+
 log = logging.getLogger(__name__)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".gif", ".avi"}
+DEFAULT_IMAGE_MAX_PIXELS = 16_777_216
+_IMAGE_FORMATS = {
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".png": "PNG",
+    ".bmp": "BMP",
+    ".webp": "WEBP",
+}
 # Shared by the API's upload endpoints and the preview window's n/p file
 # cycling, so files uploaded through one show up in the other.
 DEFAULT_BACKGROUNDS_DIR = Path.home() / ".local" / "share" / "custback" / "backgrounds"
@@ -104,13 +120,80 @@ class ColorBackdrop(BackdropProvider):
 class ImageBackdrop(BackdropProvider):
     """Static image backdrop."""
 
-    def __init__(self, path: str):
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS,
+    ):
         if cv2 is None:
             raise RuntimeError("opencv-python is required for image backdrops")
-        image = cv2.imread(path, cv2.IMREAD_COLOR)
-        if image is None:
+        if Image is None:
+            raise RuntimeError("Pillow is required for image backdrops")
+        if max_pixels <= 0:
+            raise ValueError("image backdrop pixel limit must be positive")
+
+        expected_format = _IMAGE_FORMATS.get(Path(path).suffix.lower())
+        if expected_format is None:
+            raise ValueError(
+                f"unsupported background image format: {sanitized_source(path)}"
+            )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                with Image.open(path) as candidate:
+                    if candidate.format != expected_format:
+                        raise ValueError(
+                            "background image header does not match its filename"
+                        )
+                    width, height = candidate.size
+                    if width <= 0 or height <= 0:
+                        raise ValueError("invalid background image dimensions")
+                    if width * height > max_pixels:
+                        raise ValueError(
+                            f"background image exceeds {max_pixels} pixels"
+                        )
+                    candidate.verify()
+
+                # verify() validates the container without decoding pixels.
+                # Reopen and force decompression before OpenCV sees the path.
+                with Image.open(path) as decoded:
+                    if (
+                        decoded.format != expected_format
+                        or decoded.size != (width, height)
+                    ):
+                        raise ValueError("background image changed during validation")
+                    decoded.load()
+        except FileNotFoundError as exc:
             raise FileNotFoundError(
                 f"cannot read background image: {sanitized_source(path)}"
+            ) from exc
+        except (
+            Image.DecompressionBombError,
+            Image.DecompressionBombWarning,
+            UnidentifiedImageError,
+            OSError,
+            ValueError,
+            Warning,
+        ) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith(
+                "background image exceeds "
+            ):
+                raise
+            raise ValueError(
+                f"invalid background image: {sanitized_source(path)}"
+            ) from exc
+
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if (
+            image is None
+            or image.dtype != np.uint8
+            or image.ndim != 3
+            or image.shape[2] != 3
+            or image.shape[:2] != (height, width)
+        ):
+            raise ValueError(
+                f"invalid background image: {sanitized_source(path)}"
             )
         self._image = image
         self._cache: np.ndarray | None = None
@@ -752,7 +835,15 @@ class CameraBackdrop(BackdropProvider):
         if isinstance(device, str) and device.isdigit():
             device = int(device)
         self.cap = cv2.VideoCapture(device)
-        if not self.cap.isOpened():
+        try:
+            opened = self.cap.isOpened()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self.cap.release()
+            raise
+        if not opened:
+            with contextlib.suppress(Exception):
+                self.cap.release()
             raise RuntimeError(
                 f"cannot open backdrop source: {sanitized_source(device)!r}"
             )
@@ -826,6 +917,7 @@ class BlurBackdrop(BackdropProvider):
 def create_backdrop(
     cfg: BackgroundConfig,
     *,
+    image_max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS,
     video_max_width: int = 3840,
     video_max_height: int = 2160,
 ) -> BackdropProvider | None:
@@ -840,7 +932,7 @@ def create_backdrop(
     if mode == "color":
         return ColorBackdrop(cfg.color)
     if mode == "image":
-        return ImageBackdrop(cfg.image_path)
+        return ImageBackdrop(cfg.image_path, max_pixels=image_max_pixels)
     if mode == "video":
         return VideoBackdrop(
             cfg.video_path,

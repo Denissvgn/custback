@@ -1,11 +1,17 @@
 """Avatar-service configuration: strict validation and patch semantics."""
 
+import threading
+import time
+from pathlib import Path
+
 import pytest
 
+from custback.avatar.__main__ import EXIT_CONFIG, _storage_permission_command
 from custback.avatar.config import (
     AVATAR_PARTS,
     BUILTIN_AVATARS,
     AvatarConfig,
+    AvatarConfigVersionConflictError,
     AvatarRuntime,
     RestartRequiredError,
 )
@@ -234,3 +240,121 @@ def test_runtime_invalid_patch_changes_nothing():
     with pytest.raises(ValueError):
         runtime.apply_patch({"appearance": {"scale": 99}})
     assert runtime.version == 0
+
+
+def test_runtime_prepare_patch_returns_cas_base_and_marks_noop():
+    runtime = AvatarRuntime(AvatarConfig())
+    base, candidate = runtime.prepare_patch({"appearance": {"scale": 0.5}})
+    assert base.version == 0
+    assert candidate is not None
+    assert candidate.appearance.scale == 0.5
+    assert runtime.version == 0
+
+    unchanged, noop = runtime.prepare_patch({"appearance": {"scale": 1.0}})
+    assert unchanged.version == 0
+    assert noop is None
+
+
+def test_runtime_coordinator_commit_is_cas_and_activation_atomic():
+    runtime = AvatarRuntime(AvatarConfig())
+    writer = runtime._coordinator_writer()
+    base, candidate = runtime.prepare_patch({"appearance": {"scale": 0.5}})
+    assert candidate is not None
+    entered = threading.Event()
+    release = threading.Event()
+    effective = {"scale": 1.0}
+    result = []
+
+    def activate(_version):
+        entered.set()
+        assert release.wait(1.0)
+        effective["scale"] = 0.5
+
+    committer = threading.Thread(
+        target=lambda: result.append(
+            writer.commit_with_activation(candidate, base.version, activate)
+        )
+    )
+    committer.start()
+    assert entered.wait(1.0)
+
+    observed = []
+    reader = threading.Thread(target=lambda: observed.append(runtime.read()))
+    reader.start()
+    time.sleep(0.03)
+    assert reader.is_alive()
+    assert effective["scale"] == 1.0
+
+    release.set()
+    committer.join(1.0)
+    reader.join(1.0)
+    assert not committer.is_alive()
+    assert not reader.is_alive()
+    assert result[0].version == 1
+    assert observed[0].version == 1
+    assert observed[0].config.appearance.scale == 0.5
+    assert effective["scale"] == 0.5
+
+    with pytest.raises(AvatarConfigVersionConflictError) as excinfo:
+        writer.commit_with_activation(candidate, base.version, lambda _version: None)
+    assert excinfo.value.expected_version == 0
+    assert excinfo.value.current_version == 1
+
+
+def test_runtime_failed_activation_does_not_publish_candidate():
+    runtime = AvatarRuntime(AvatarConfig())
+    writer = runtime._coordinator_writer()
+    base, candidate = runtime.prepare_patch({"appearance": {"scale": 0.5}})
+    assert candidate is not None
+
+    def fail(_version):
+        raise RuntimeError("candidate failed")
+
+    with pytest.raises(RuntimeError, match="candidate failed"):
+        writer.commit_with_activation(candidate, base.version, fail)
+    assert runtime.read() == base
+
+
+def test_bound_runtime_apply_patch_delegates_to_service_coordinator():
+    runtime = AvatarRuntime(AvatarConfig())
+    writer = runtime._coordinator_writer()
+    calls = []
+
+    def coordinate(patch):
+        calls.append(patch)
+        base, candidate = runtime.prepare_patch(patch)
+        if candidate is None:
+            return base
+        return writer.commit_with_activation(
+            candidate, base.version, lambda _version: None
+        )
+
+    runtime.bind_coordinator(coordinate)
+    state = runtime.apply_patch({"appearance": {"scale": 0.5}})
+    assert calls == [{"appearance": {"scale": 0.5}}]
+    assert state.version == 1
+    assert state.config.appearance.scale == 0.5
+    with pytest.raises(RuntimeError, match="already bound"):
+        runtime.bind_coordinator(coordinate)
+
+
+def test_storage_permission_cli_check_and_fix(tmp_path, capsys):
+    rigs = tmp_path / "rigs"
+    media = tmp_path / "media"
+    rigs.mkdir(mode=0o755)
+    media.mkdir(mode=0o755)
+    cfg = AvatarConfig.from_dict(
+        {
+            "storage": {
+                "rigs_dir": str(rigs),
+                "backgrounds_dir": str(media),
+            }
+        }
+    )
+
+    assert _storage_permission_command(cfg, fix=False) == EXIT_CONFIG
+    assert "--fix-storage-permissions" in capsys.readouterr().err
+    assert _storage_permission_command(cfg, fix=True) == 0
+    assert "storage permissions repaired" in capsys.readouterr().out
+    assert (Path(rigs).stat().st_mode & 0o777) == 0o700
+    assert (Path(media).stat().st_mode & 0o777) == 0o700

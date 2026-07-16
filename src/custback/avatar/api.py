@@ -15,7 +15,6 @@ import asyncio
 import importlib.util
 import logging
 import os
-import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, get_args
@@ -27,7 +26,17 @@ from pydantic import BaseModel, ValidationError
 
 from .. import __version__
 from ..api.security import SecurityPolicy, resolve_api_token
-from ..api.server import _encode_jpeg, _error, _limited_json
+from ..api.server import (
+    _encode_jpeg,
+    _error,
+    _limited_json,
+    _to_thread_terminal,
+)
+from ..api.streaming import (
+    ConnectionLimiter,
+    JpegBroadcaster,
+    LeasedStreamingResponse,
+)
 from .config import (
     AVATAR_PARTS,
     BUILTIN_AVATARS,
@@ -43,12 +52,19 @@ from .config import (
     VisionConfig,
 )
 from .rig import RigError
-from .service import AvatarService
+from .service import (
+    ActivationError,
+    AvatarService,
+    ConfigConflictError,
+    ReconfigurationUnavailable,
+)
 from .store import (
     MediaStore,
     RigStore,
     StoreError,
     ThumbnailCache,
+    UploadReservation,
+    is_rig_directory,
     render_avatar_thumbnail,
     render_media_thumbnail,
     resolve_rig_selector,
@@ -137,7 +153,7 @@ def driver_modes(cfg: AvatarConfig) -> list[dict]:
 
 async def _receive_body_to(
     request: Request,
-    destination: Path,
+    destination: UploadReservation,
     *,
     max_bytes: int,
     media_types: frozenset[str],
@@ -163,17 +179,15 @@ async def _receive_body_to(
     if declared is not None and declared.isdigit() and int(declared) > max_bytes:
         raise _error(413, "upload_too_large", f"{kind} exceeds {max_bytes} bytes")
     total = 0
-    handle = await asyncio.to_thread(open, destination, "wb")
-    try:
-        async for chunk in request.stream():
-            total += len(chunk)
-            if total > max_bytes:
-                raise _error(
-                    413, "upload_too_large", f"{kind} exceeds {max_bytes} bytes"
-                )
-            await asyncio.to_thread(handle.write, chunk)
-    finally:
-        await asyncio.to_thread(handle.close)
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise _error(
+                413, "upload_too_large", f"{kind} exceeds {max_bytes} bytes"
+            )
+        result = await _to_thread_terminal(destination.write, chunk)
+        if result.cancellation is not None:
+            raise result.cancellation
     return total
 
 
@@ -218,6 +232,7 @@ class PublicAvatarApiConfig(BaseModel):
     allowed_origins: tuple[str, ...]
     session_ttl_s: int
     ws_max_bytes: int
+    max_stream_connections: int
 
 
 class PublicAvatarConfig(BaseModel):
@@ -255,6 +270,10 @@ def create_avatar_app(
         docs_url=None,
         redoc_url=None,
     )
+    startup_api = runtime.read().config.api
+    stream_connections = ConnectionLimiter(startup_api.max_stream_connections)
+    output_jpegs = JpegBroadcaster(service.output, _encode_jpeg)
+    app.state.stream_connections = stream_connections
     # Storage is a restart-required section, so the startup snapshot is
     # authoritative for the process lifetime.
     storage_cfg = runtime.read().config.storage
@@ -399,28 +418,42 @@ def create_avatar_app(
     async def install_rig(request: Request, name: str) -> JSONResponse:
         # Fails fast on a bad name before the body is consumed.
         rig_store.rig_path(name)
-        handle, staged = tempfile.mkstemp(suffix=".zip", prefix="custback-rig-")
-        os.close(handle)
-        staged_path = Path(staged)
+        opened = await _to_thread_terminal(rig_store.open_staging)
+        staging = opened.value
+        if opened.cancellation is not None:
+            await _to_thread_terminal(staging.abort)
+            raise opened.cancellation
         try:
             await _receive_body_to(
                 request,
-                staged_path,
+                staging,
                 max_bytes=storage_cfg.rig_zip_max_bytes,
                 media_types=_ZIP_MEDIA_TYPES,
                 kind="rig archive",
             )
-            installed = await asyncio.to_thread(
-                rig_store.install_zip, name, staged_path
+            result = await _to_thread_terminal(
+                rig_store.install_zip, name, staging
             )
+            installed = result.value
+            if result.cancellation is not None:
+                raise result.cancellation
         finally:
-            await asyncio.to_thread(staged_path.unlink, True)
+            cleanup = await _to_thread_terminal(staging.abort)
+            if cleanup.cancellation is not None:
+                raise cleanup.cancellation
         return JSONResponse(asdict(installed), status_code=201)
 
     @app.delete("/rigs/{name}", status_code=204)
     async def delete_rig(name: str) -> Response:
-        cfg = runtime.read().config
-        await asyncio.to_thread(rig_store.remove, name, cfg.appearance.rig)
+        try:
+            await asyncio.to_thread(
+                service.apply_storage_mutation,
+                lambda cfg: rig_store.remove(name, cfg.appearance.rig),
+            )
+        except ConfigConflictError as exc:
+            raise _error(409, "config_conflict", str(exc)) from exc
+        except (ReconfigurationUnavailable, TimeoutError) as exc:
+            raise _error(503, "reconfiguration_unavailable", str(exc)) from exc
         return Response(status_code=204)
 
     @app.get(
@@ -429,11 +462,17 @@ def create_avatar_app(
         responses={200: {"content": {"image/jpeg": {}}}},
     )
     async def rig_thumbnail(name: str) -> Response:
-        directory = rig_store.rig_path(name)
-        if not directory.is_dir():
-            raise _error(404, "rig_not_found", f"no installed rig {name!r}")
+        directory = rig_store.stored_path(name)
         cfg = runtime.read().config
-        key = ("rig", name, cfg.appearance.style, directory.stat().st_mtime_ns)
+        key = (
+            "rig",
+            name,
+            cfg.appearance.style,
+            cfg.storage.rig_layer_max_pixels,
+            cfg.storage.rig_total_max_pixels,
+            cfg.storage.rig_manifest_max_bytes,
+            directory.stat().st_mtime_ns,
+        )
         cached = thumbnails.get(key)
         if cached is None:
             try:
@@ -441,6 +480,9 @@ def create_avatar_app(
                     render_avatar_thumbnail,
                     str(directory),
                     style=cfg.appearance.style,
+                    rig_layer_max_pixels=cfg.storage.rig_layer_max_pixels,
+                    rig_total_max_pixels=cfg.storage.rig_total_max_pixels,
+                    rig_manifest_max_bytes=cfg.storage.rig_manifest_max_bytes,
                 )
             except RigError as exc:
                 raise _error(422, "invalid_rig", str(exc)) from exc
@@ -469,7 +511,11 @@ def create_avatar_app(
             if kind == "image"
             else frozenset({"video/", "image/gif", "application/octet-stream"})
         )
-        staging = await asyncio.to_thread(media_store.open_staging)
+        opened = await _to_thread_terminal(media_store.open_staging, kind)
+        staging = opened.value
+        if opened.cancellation is not None:
+            await _to_thread_terminal(staging.abort)
+            raise opened.cancellation
         try:
             await _receive_body_to(
                 request,
@@ -478,9 +524,16 @@ def create_avatar_app(
                 media_types=media_types,
                 kind=kind,
             )
-            saved = await asyncio.to_thread(media_store.commit, staging, name, kind)
+            result = await _to_thread_terminal(
+                media_store.commit, staging, name, kind
+            )
+            saved = result.value
+            if result.cancellation is not None:
+                raise result.cancellation
         finally:
-            await asyncio.to_thread(staging.unlink, True)
+            cleanup = await _to_thread_terminal(staging.abort)
+            if cleanup.cancellation is not None:
+                raise cleanup.cancellation
         return JSONResponse(asdict(saved), status_code=201)
 
     upload_openapi = {
@@ -504,8 +557,15 @@ def create_avatar_app(
 
     @app.delete("/backgrounds/{name}", status_code=204)
     async def delete_background(name: str) -> Response:
-        cfg = runtime.read().config
-        await asyncio.to_thread(media_store.remove, name, cfg.background)
+        try:
+            await asyncio.to_thread(
+                service.apply_storage_mutation,
+                lambda cfg: media_store.remove(name, cfg.background),
+            )
+        except ConfigConflictError as exc:
+            raise _error(409, "config_conflict", str(exc)) from exc
+        except (ReconfigurationUnavailable, TimeoutError) as exc:
+            raise _error(503, "reconfiguration_unavailable", str(exc)) from exc
         return Response(status_code=204)
 
     @app.get(
@@ -549,7 +609,7 @@ def create_avatar_app(
             resolved = await asyncio.to_thread(
                 resolve_rig_selector, selector, storage_cfg.rigs_dir
             )
-            if resolved != "builtin" and not Path(resolved).expanduser().is_dir():
+            if resolved != "builtin" and not is_rig_directory(resolved):
                 raise _error(
                     422,
                     "invalid_config",
@@ -557,7 +617,7 @@ def create_avatar_app(
                     "an existing directory of PNG layers",
                 )
         try:
-            state = await asyncio.to_thread(runtime.apply_patch, patch)
+            state = await asyncio.to_thread(service.apply_config_patch, patch)
         except RestartRequiredError as exc:
             raise _error(
                 409,
@@ -566,6 +626,18 @@ def create_avatar_app(
                 fields=list(exc.fields),
                 current_version=exc.current_version,
             ) from exc
+        except ConfigConflictError as exc:
+            raise _error(
+                409,
+                "config_conflict",
+                str(exc),
+                expected_version=exc.expected_version,
+                current_version=exc.current_version,
+            ) from exc
+        except ActivationError as exc:
+            raise _error(422, "activation_failed", str(exc)) from exc
+        except (ReconfigurationUnavailable, TimeoutError) as exc:
+            raise _error(503, "reconfiguration_unavailable", str(exc)) from exc
         except ValidationError as exc:
             errors = [
                 {
@@ -624,21 +696,33 @@ def create_avatar_app(
     )
     async def mjpeg() -> StreamingResponse:
         boundary = "custbackavatarframe"
+        lease = stream_connections.try_acquire()
+        if lease is None:
+            raise _error(
+                429,
+                "stream_limit",
+                "authenticated stream connection limit reached",
+            )
 
         async def gen():
-            seq = -1
-            while True:
-                frame, seq = await asyncio.to_thread(service.output.get, seq, 1.0)
-                if frame is None:
-                    continue
-                jpeg = await asyncio.to_thread(_encode_jpeg, frame)
-                yield (
-                    f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(jpeg)}\r\n\r\n"
-                ).encode() + jpeg + b"\r\n"
+            try:
+                async with output_jpegs.subscribe() as subscription:
+                    seq = -1
+                    while True:
+                        jpeg, seq = await subscription.get(seq, 1.0)
+                        if jpeg is None:
+                            continue
+                        yield (
+                            f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
+                            f"Content-Length: {len(jpeg)}\r\n\r\n"
+                        ).encode() + jpeg + b"\r\n"
+            finally:
+                lease.release()
 
-        return StreamingResponse(
-            gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}"
+        return LeasedStreamingResponse(
+            gen(),
+            lease=lease,
+            media_type=f"multipart/x-mixed-replace; boundary={boundary}",
         )
 
     return app

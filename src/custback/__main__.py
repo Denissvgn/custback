@@ -15,7 +15,7 @@ from types import FrameType
 from typing import Any
 
 from .backgrounds import IMAGE_EXTS, VIDEO_EXTS
-from .config import MODES, AppConfig, RuntimeConfig
+from .config import MODES, AppConfig, RuntimeConfig, format_config_error
 from .hub import FrameHub
 from .pipeline import Pipeline
 
@@ -118,77 +118,79 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> AppConfig:
-    cfg = AppConfig.load(args.config)
-    cam, bg, api = cfg.camera, cfg.background, cfg.api
+    # Apply every CLI override to plain data and validate the resulting
+    # configuration once.  Valid combinations must not depend on assignment
+    # order when two overrides jointly satisfy a cross-field invariant.
+    values = AppConfig.load(args.config).to_dict()
+    cam = values["camera"]
+    bg = values["background"]
+    api = values["api"]
+    output = values["output"]
     if args.camera is not None:
-        cam.device = args.camera
+        cam["device"] = args.camera
     if args.width is not None:
-        cam.width = args.width
+        cam["width"] = args.width
     if args.height is not None:
-        cam.height = args.height
+        cam["height"] = args.height
     if args.fps is not None:
-        cam.fps = args.fps
-        cfg.output.fps = args.fps
+        cam["fps"] = args.fps
+        output["fps"] = args.fps
     if args.camera_pixel_format is not None:
-        cam.pixel_format = args.camera_pixel_format
+        cam["pixel_format"] = args.camera_pixel_format
     if args.camera_mode_mismatch is not None:
-        cam.mode_mismatch = args.camera_mode_mismatch
+        cam["mode_mismatch"] = args.camera_mode_mismatch
     if args.camera_recovery_timeout is not None:
-        cam.recovery_timeout_s = args.camera_recovery_timeout
+        cam["recovery_timeout_s"] = args.camera_recovery_timeout
     if args.mirror:
-        cam.mirror = True
+        cam["mirror"] = True
     if args.synthetic:
-        cam.synthetic = True
+        cam["synthetic"] = True
     if args.image:
         # Route by extension rather than trusting the flag name: users
         # commonly reach for whichever flag they remember, and preview.py's
         # n/p file cycling already auto-detects the same way.
         if Path(args.image).suffix.lower() in VIDEO_EXTS:
-            bg.video_path = args.image
-            bg.mode = "video"
+            bg["video_path"] = args.image
+            bg["mode"] = "video"
         else:
-            bg.image_path = args.image
-            bg.mode = "image"
+            bg["image_path"] = args.image
+            bg["mode"] = "image"
     if args.video:
         if Path(args.video).suffix.lower() in IMAGE_EXTS:
-            bg.image_path = args.video
-            bg.mode = "image"
+            bg["image_path"] = args.video
+            bg["mode"] = "image"
         else:
-            bg.video_path = args.video
-            bg.mode = "video"
+            bg["video_path"] = args.video
+            bg["mode"] = "video"
     if args.bg_camera:
-        bg.camera_device = args.bg_camera
-        bg.mode = "camera"
+        bg["camera_device"] = args.bg_camera
+        bg["mode"] = "camera"
     if args.blur is not None:
-        bg.blur_strength = args.blur
-        bg.mode = "blur"
+        bg["blur_strength"] = args.blur
+        bg["mode"] = "blur"
     if args.mode:
-        bg.mode = args.mode
+        bg["mode"] = args.mode
     if args.no_api:
-        api.enabled = False
+        api["enabled"] = False
     if args.api_host:
-        api.host = args.api_host
+        api["host"] = args.api_host
     if args.api_port is not None:
-        api.port = args.api_port
+        api["port"] = args.api_port
     if args.api_token_file:
-        api.token_file = args.api_token_file
+        api["token_file"] = args.api_token_file
     if args.renderer_token_file:
-        api.renderer_token_file = args.renderer_token_file
+        api["renderer_token_file"] = args.renderer_token_file
     if args.allow_non_loopback_api:
-        api.allow_non_loopback = True
-    if args.api_tls_cert or args.api_tls_key:
-        api_values = api.model_dump(mode="python")
-        if args.api_tls_cert:
-            api_values["tls_certfile"] = args.api_tls_cert
-        if args.api_tls_key:
-            api_values["tls_keyfile"] = args.api_tls_key
-        cfg.api = type(api).model_validate(api_values)
+        api["allow_non_loopback"] = True
+    if args.api_tls_cert:
+        api["tls_certfile"] = args.api_tls_cert
+    if args.api_tls_key:
+        api["tls_keyfile"] = args.api_tls_key
     if args.no_vcam:
-        cfg.output.backend = "null"
+        output["backend"] = "null"
     if args.preview:
-        cfg.output.preview = True
-    cfg.validate()
-    return cfg
+        output["preview"] = True
+    return AppConfig.from_dict(values)
 
 
 class ApiStartupError(RuntimeError):
@@ -590,7 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             cfg = config_from_args(args)
         except (OSError, ValueError) as exc:
-            log.error("invalid configuration: %s", exc)
+            log.error("invalid configuration: %s", format_config_error(exc))
             return EXIT_CONFIG
         if args.dump_config:
             cfg.save(args.dump_config)
@@ -603,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(resolve_api_token(cfg.api.token_file).value)
                 return 0
             except (OSError, ValueError) as exc:
-                log.error("cannot resolve API token: %s", exc)
+                log.error("cannot resolve API token: %s", format_config_error(exc))
                 return EXIT_CONFIG
         if args.show_renderer_token:
             try:
@@ -617,12 +619,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             except (OSError, ValueError) as exc:
-                log.error("cannot resolve renderer token: %s", exc)
+                log.error(
+                    "cannot resolve renderer token: %s",
+                    format_config_error(exc),
+                )
                 return EXIT_CONFIG
         try:
             return run(cfg, run_id=logging_session.run_id)
         except (OSError, ValueError) as exc:
-            log.error("startup configuration error: %s", exc)
+            log.error(
+                "startup configuration error: %s",
+                format_config_error(exc),
+            )
             return EXIT_CONFIG
     finally:
         logging_session.close()

@@ -1,7 +1,7 @@
 """Strict avatar-service configuration and its versioned runtime state.
 
 The models mirror :mod:`custback.config`: strict validation, transactional
-assignment, YAML loading, and one-level section patches. ``AvatarRuntime``
+assignment, YAML loading, and recursive JSON Merge Patch. ``AvatarRuntime``
 is a simplified counterpart of ``RuntimeConfig`` — the avatar service has no
 hardware to stage, so hot sections activate on the next rendered frame and
 everything else requires a restart.
@@ -12,12 +12,13 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 import yaml
 from pydantic import Field, field_validator, model_validator
 
 from ..config import _clean_config_string, _StrictModel
+from ..config_merge import merge_patch
 from .state import ARKIT_BLENDSHAPES  # noqa: F401  (re-exported contract)
 
 DriverBackend = Literal["auto", "vision", "audio2face", "idle"]
@@ -326,6 +327,24 @@ class StorageConfig(_StrictModel):
     rig_zip_max_bytes: int = Field(default=64 * 1024 * 1024, ge=1024, le=2**31)
     rig_max_bytes: int = Field(default=128 * 1024 * 1024, ge=1024, le=2**31)
     rig_max_entries: int = Field(default=16, ge=1, le=64)
+    # Aggregate installed-rig limits are separate from scene-media storage.
+    # Upload archives and extracted staging bytes count against this ceiling
+    # while an installation is in flight.
+    rig_storage_max_bytes: int = Field(
+        default=1024 * 1024 * 1024, ge=1024, le=2**40
+    )
+    max_rigs: int = Field(default=100, ge=1, le=100_000)
+    # Pillow checks these limits before any rig layer reaches OpenCV.  The
+    # total cap accounts every base/expression layer in the archive.
+    rig_layer_max_pixels: int = Field(
+        default=16_777_216, ge=256, le=89_478_485
+    )
+    rig_total_max_pixels: int = Field(
+        default=134_217_728, ge=256, le=1_431_655_760
+    )
+    rig_manifest_max_bytes: int = Field(
+        default=64 * 1024, ge=256, le=16 * 1024 * 1024
+    )
     storage_max_bytes: int = Field(
         default=1024 * 1024 * 1024, ge=1024, le=2**40
     )
@@ -342,6 +361,10 @@ class StorageConfig(_StrictModel):
         if self.storage_max_bytes < largest:
             raise ValueError(
                 "storage_max_bytes must be at least the largest per-file limit"
+            )
+        if self.rig_total_max_pixels < self.rig_layer_max_pixels:
+            raise ValueError(
+                "rig_total_max_pixels must be at least rig_layer_max_pixels"
             )
         return self
 
@@ -360,6 +383,7 @@ class AvatarApiConfig(_StrictModel):
     tls_keyfile: str = ""
     # No WebSocket routes yet; kept for uvicorn parity with custback's API.
     ws_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=2**31)
+    max_stream_connections: int = Field(default=16, ge=1, le=10_000)
 
     @field_validator("host")
     @classmethod
@@ -431,7 +455,19 @@ class AvatarConfig(_StrictModel):
     def load(cls, path: str | Path | None) -> "AvatarConfig":
         if path is None:
             return cls()
-        raw = yaml.safe_load(Path(path).read_text())
+        try:
+            raw = yaml.safe_load(Path(path).read_text())
+        except (yaml.YAMLError, RecursionError) as exc:
+            mark = getattr(exc, "problem_mark", None)
+            location = (
+                f" at line {mark.line + 1}, column {mark.column + 1}"
+                if mark is not None
+                else ""
+            )
+            problem = str(getattr(exc, "problem", "malformed YAML")).splitlines()[0]
+            raise ValueError(
+                f"invalid YAML configuration{location}: {problem}"
+            ) from None
         if raw is None:
             raw = {}
         if not isinstance(raw, dict):
@@ -442,21 +478,10 @@ class AvatarConfig(_StrictModel):
         Path(path).write_text(yaml.safe_dump(self.to_dict(), sort_keys=False))
 
     def patched(self, patch: dict[str, Any]) -> "AvatarConfig":
-        """Validate a one-level partial section patch without mutating self."""
+        """Validate an RFC 7396 merge patch without mutating this config."""
         if not isinstance(patch, dict):
             raise TypeError("config patch must be a mapping")
-        merged = self.to_dict()
-        for section, values in patch.items():
-            if section not in merged or not isinstance(values, dict):
-                # Preserve the unknown key so Pydantic reports it as forbidden.
-                merged[section] = values
-            else:
-                current = merged[section]
-                if not isinstance(current, dict):  # defensive; sections are models
-                    merged[section] = values
-                else:
-                    current.update(values)
-        return type(self).from_dict(merged)
+        return type(self).from_dict(merge_patch(self.to_dict(), patch))
 
 
 @dataclass(frozen=True)
@@ -479,6 +504,56 @@ def _changed_fields(
     return changed
 
 
+def _validate_hot_changes(
+    before: AvatarConfig,
+    after: AvatarConfig,
+    current_version: int,
+) -> tuple[str, ...]:
+    """Return changed fields, rejecting changes that require a restart."""
+
+    changed = tuple(_changed_fields(before.to_dict(), after.to_dict()))
+    restart = tuple(
+        field
+        for field in changed
+        if field.split(".", 1)[0] not in HOT_SECTIONS
+        or field in RESTART_FIELDS
+    )
+    if restart:
+        raise RestartRequiredError(restart, current_version)
+    return changed
+
+
+class AvatarConfigVersionConflictError(RuntimeError):
+    """A candidate was prepared from an avatar generation that is now stale."""
+
+    def __init__(self, expected_version: int, current_version: int):
+        self.expected_version = expected_version
+        self.current_version = current_version
+        super().__init__(
+            f"configuration changed concurrently: expected version "
+            f"{expected_version}, current version is {current_version}"
+        )
+
+
+class _AvatarRuntimeCoordinator:
+    """Private mutation capability held by the live avatar service."""
+
+    __slots__ = ("__runtime",)
+
+    def __init__(self, runtime: "AvatarRuntime"):
+        self.__runtime = runtime
+
+    def commit_with_activation(
+        self,
+        candidate: AvatarConfig,
+        expected_version: int,
+        activate: Callable[[int], None],
+    ) -> AvatarConfigState:
+        return self.__runtime._commit_with_activation(
+            candidate, expected_version, activate
+        )
+
+
 class AvatarRuntime:
     """Atomic, versioned avatar configuration.
 
@@ -491,6 +566,9 @@ class AvatarRuntime:
         self._config = AvatarConfig.from_dict(config.to_dict())
         self._lock = threading.Lock()
         self._version = 0
+        self._patch_coordinator: (
+            Callable[[dict[str, Any]], AvatarConfigState] | None
+        ) = None
 
     @property
     def version(self) -> int:
@@ -501,21 +579,101 @@ class AvatarRuntime:
         with self._lock:
             return AvatarConfigState(self._config.model_copy(deep=True), self._version)
 
-    def apply_patch(self, patch: dict[str, Any]) -> AvatarConfigState:
+    def prepare_patch(
+        self, patch: dict[str, Any]
+    ) -> tuple[AvatarConfigState, AvatarConfig | None]:
+        """Validate a patch against one snapshot without publishing it.
+
+        The returned base version is the compare-and-swap token for the private
+        coordinator writer. ``None`` denotes a no-op, which must preserve the
+        current version and must not run an activation callback.
+        """
+
+        base = self.read()
+        candidate = base.config.patched(patch)
+        changed = _validate_hot_changes(base.config, candidate, base.version)
+        return base, candidate if changed else None
+
+    def _coordinator_writer(self) -> _AvatarRuntimeCoordinator:
+        """Return the private write capability used by :class:`AvatarService`."""
+
+        return _AvatarRuntimeCoordinator(self)
+
+    def bind_coordinator(
+        self,
+        coordinator: Callable[[dict[str, Any]], AvatarConfigState],
+    ) -> None:
+        """Permanently route compatibility PATCH calls through the live service.
+
+        Binding is intentionally one-shot. Falling back to config-only writes
+        after a service has taken ownership would let configuration diverge
+        from the generation that is actually rendering it.
+        """
+
+        if not callable(coordinator):
+            raise TypeError("avatar runtime coordinator must be callable")
         with self._lock:
-            candidate = self._config.patched(patch)
-            before = self._config.to_dict()
-            after = candidate.to_dict()
-            changed = _changed_fields(before, after)
-            if not changed:
-                return AvatarConfigState(self._config.model_copy(deep=True), self._version)
-            restart = tuple(
-                field for field in changed
-                if field.split(".", 1)[0] not in HOT_SECTIONS
-                or field in RESTART_FIELDS
+            if self._patch_coordinator is not None:
+                raise RuntimeError("avatar runtime coordinator is already bound")
+            self._patch_coordinator = coordinator
+
+    def _commit_with_activation(
+        self,
+        candidate: AvatarConfig,
+        expected_version: int,
+        activate: Callable[[int], None],
+    ) -> AvatarConfigState:
+        """Atomically swap prepared resources and publish their configuration.
+
+        ``activate`` runs while readers are excluded and receives the version
+        that will be published. It must perform only a prepared, non-blocking
+        pointer swap. Construction, trials, and teardown belong outside this
+        critical section. If it raises, configuration and version are unchanged.
+        """
+
+        validated = AvatarConfig.from_dict(candidate.to_dict())
+        published = validated.model_copy(deep=True)
+        with self._lock:
+            if self._version != expected_version:
+                raise AvatarConfigVersionConflictError(
+                    expected_version, self._version
+                )
+            changed = _validate_hot_changes(
+                self._config, validated, self._version
             )
-            if restart:
-                raise RestartRequiredError(restart, self._version)
-            self._config = candidate
-            self._version += 1
-            return AvatarConfigState(self._config.model_copy(deep=True), self._version)
+            if not changed:
+                return AvatarConfigState(
+                    self._config.model_copy(deep=True), self._version
+                )
+            next_version = self._version + 1
+            activate(next_version)
+            self._config = validated
+            self._version = next_version
+            return AvatarConfigState(published, next_version)
+
+    def apply_patch(self, patch: dict[str, Any]) -> AvatarConfigState:
+        """Apply directly when standalone, or delegate to the bound service.
+
+        Direct mutation remains for callers that use ``AvatarRuntime`` without
+        a live service. A bound runtime never takes this compatibility path.
+        """
+
+        with self._lock:
+            coordinator = self._patch_coordinator
+            if coordinator is None:
+                candidate = self._config.patched(patch)
+                changed = _validate_hot_changes(
+                    self._config, candidate, self._version
+                )
+                if not changed:
+                    return AvatarConfigState(
+                        self._config.model_copy(deep=True), self._version
+                    )
+                self._config = candidate
+                self._version += 1
+                return AvatarConfigState(
+                    self._config.model_copy(deep=True), self._version
+                )
+        # The service coordinator needs to read and later CAS this runtime,
+        # so never invoke it while holding the runtime lock.
+        return coordinator(patch)

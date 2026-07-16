@@ -1,6 +1,7 @@
 """The /avatar/* reverse proxy: auth boundary, forwarding, and failures."""
 
 import asyncio
+import contextlib
 import io
 import ssl
 import zipfile
@@ -38,12 +39,31 @@ AUTH = {"Authorization": f"Bearer {CORE_TOKEN}"}
 ORIGIN = "http://testserver"
 
 
+async def _with_event_loop_heartbeat(awaitable):
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        return await awaitable
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 def run_async(awaitable):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(awaitable)
+        return loop.run_until_complete(_with_event_loop_heartbeat(awaitable))
     finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
         asyncio.set_event_loop(None)
 
@@ -70,6 +90,7 @@ class Stack:
     runtime: RuntimeConfig
     pipeline: Pipeline
     avatar_runtime: AvatarRuntime
+    avatar_service: AvatarService
 
     async def arequest(self, method: str, path: str, **kwargs):
         transport = ASGITransport(app=self.app)
@@ -151,14 +172,17 @@ def make_stack(tmp_path, monkeypatch, avatar_url="https://avatar-host:8711"):
         upload_dir=tmp_path / "uploads",
         avatar_client_factory=avatar_client_factory,
     )
-    return Stack(app, runtime, pipeline, avatar_runtime)
+    return Stack(app, runtime, pipeline, avatar_runtime, avatar_service)
 
 
 @pytest.fixture()
 def stack(tmp_path, monkeypatch):
     built = make_stack(tmp_path, monkeypatch)
     yield built
-    built.pipeline.stop()
+    try:
+        built.pipeline.stop()
+    finally:
+        built.avatar_service.close()
 
 
 def test_proxy_requires_core_auth(stack):
@@ -666,3 +690,42 @@ def test_proxy_never_follows_upstream_redirects(monkeypatch):
     assert response.status_code == 302
     assert calls == ["https://trusted-avatar.example:8711/status"]
     assert "location" not in response.headers
+
+
+def test_proxy_stream_closes_upstream_when_sending_headers_fails():
+    closed = False
+    body_entered = False
+
+    async def body():
+        nonlocal body_entered
+        body_entered = True
+        yield b"never sent"
+
+    async def close():
+        nonlocal closed
+        closed = True
+
+    async def scenario():
+        response = avatar_proxy_module._ClosingStreamingResponse(
+            body(), close=close
+        )
+        blocked_receive = asyncio.Event()
+
+        async def receive():
+            await blocked_receive.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            assert message["type"] == "http.response.start"
+            raise RuntimeError("header transport failed")
+
+        with pytest.raises(BaseException):
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.3"}},
+                receive,
+                send,
+            )
+
+    asyncio.run(scenario())
+    assert body_entered is False
+    assert closed is True

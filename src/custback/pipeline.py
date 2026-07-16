@@ -7,6 +7,11 @@ import queue
 import threading
 import time
 from collections import deque
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeout,
+)
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -61,6 +66,18 @@ _RAW_ECHO_HASH_DISTANCE = 16
 _RAW_ECHO_MEAN_COLOR_DELTA = 24.0
 _RAW_ECHO_LOWRES_MEAN_DELTA = 20.0
 _RAW_ECHO_LOWRES_CORRELATION = 0.93
+
+
+def _backdrop_key(cfg: AppConfig) -> tuple[object, int, int, int]:
+    """Inputs whose changes require a fresh backdrop preflight."""
+
+    uploads = cfg.api.uploads
+    return (
+        cfg.background,
+        uploads.image_max_pixels,
+        uploads.video_max_width,
+        uploads.video_max_height,
+    )
 
 
 def _ewma(previous: float | None, sample: float, alpha: float = 0.1) -> float:
@@ -177,14 +194,19 @@ class _PatchRequest:
     cancelled: bool = False
     result: ConfigState | None = None
     error: BaseException | None = None
+    storage_epoch: int = 0
+    prepared_activation: _Activation | None = None
 
-    def cancel(self) -> bool:
-        """Cancel unless completion already won the request lock."""
+    def cancel_and_take_activation(self) -> tuple[bool, _Activation | None]:
+        """Cancel and reclaim an activation not yet claimed by the frame lane."""
+
         with self.lock:
             if self.result is not None or self.error is not None:
-                return False
+                return False, None
             self.cancelled = True
-            return True
+            activation = self.prepared_activation
+            self.prepared_activation = None
+            return True, activation
 
     def fail(self, error: BaseException) -> None:
         with self.lock:
@@ -262,6 +284,19 @@ class Pipeline:
         self._thread: threading.Thread | None = None
         self._error: BaseException | None = None
         self._requests: queue.Queue[_PatchRequest | _MutationRequest] = queue.Queue()
+        self._request_enqueue_lock = threading.Lock()
+        # A preparation stays registered until its result has either moved to
+        # request ownership or all abandoned-result cleanup has finished.  The
+        # condition lets stop() enforce its deadline without calling an
+        # unbounded executor join while a backend's close() is still running in
+        # a Future callback.  RLock is intentional: cancelling queued futures
+        # during executor.shutdown() can invoke their callbacks synchronously.
+        self._preparation_lock = threading.RLock()
+        self._preparation_condition = threading.Condition(self._preparation_lock)
+        self._preparation_executor: ThreadPoolExecutor | None = None
+        self._preparation_futures: set[Future[_Activation]] = set()
+        self._storage_epoch_lock = threading.Lock()
+        self._storage_epoch = 0
         self._lifecycle_lock = threading.Lock()
         self._active_state: ConfigState | None = None
         self._teardown_lock = threading.Lock()
@@ -292,6 +327,15 @@ class Pipeline:
             self._fallback_log_states.clear()
             self._recent_raw_fingerprints.clear()
             self._latest_raw_frame = None
+            with self._preparation_lock:
+                if self._preparation_executor is not None:
+                    raise ReconfigurationUnavailable(
+                        "pipeline candidate preparation is still shutting down"
+                    )
+                self._preparation_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="custback-segmentation-prepare",
+                )
             self._thread = threading.Thread(
                 target=self._run, name="pipeline", daemon=True
             )
@@ -324,25 +368,37 @@ class Pipeline:
     def stop(self, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
         self._stop.set()
-        self._fail_pending(ReconfigurationUnavailable("pipeline is stopping"))
+        with self._request_enqueue_lock:
+            self._fail_pending(ReconfigurationUnavailable("pipeline is stopping"))
         thread = self._thread
         if thread is not None:
             thread.join(max(0.0, deadline - time.monotonic()))
-            if thread.is_alive():
-                raise ReconfigurationUnavailable(
-                    f"pipeline worker did not stop within {timeout:.1f}s"
-                )
+        frame_survived = thread is not None and thread.is_alive()
         with self._teardown_lock:
             teardown_threads = tuple(self._teardown_threads)
         for teardown in teardown_threads:
             teardown.join(max(0.0, deadline - time.monotonic()))
         with self._teardown_lock:
             survivors = [worker for worker in self._teardown_threads if worker.is_alive()]
+        preparation_error: ReconfigurationUnavailable | None = None
+        try:
+            # Always initiate executor shutdown, even if another worker has
+            # survived its deadline. A later stop() can finish joining any
+            # model constructor that could not be interrupted on this pass.
+            self._shutdown_preparation_executor(deadline, timeout)
+        except ReconfigurationUnavailable as exc:
+            preparation_error = exc
+        if frame_survived:
+            raise ReconfigurationUnavailable(
+                f"pipeline worker did not stop within {timeout:.1f}s"
+            )
         if survivors:
             raise ReconfigurationUnavailable(
                 f"{len(survivors)} resource teardown worker(s) did not stop "
                 f"within {timeout:.1f}s"
             )
+        if preparation_error is not None:
+            raise preparation_error
         if self._error is not None:
             raise self._error
 
@@ -389,8 +445,15 @@ class Pipeline:
                 "cannot synchronously reconfigure from the pipeline worker"
             )
 
-        request = _PatchRequest(candidate, base.version, origin=origin)
-        return self._submit_patch(request, timeout)
+        deadline = time.monotonic() + timeout
+        request = _PatchRequest(
+            candidate,
+            base.version,
+            origin=origin,
+            storage_epoch=self._read_storage_epoch(),
+        )
+        self._prepare_patch_request(request, base.config, deadline)
+        return self._submit_prepared_patch(request, deadline)
 
     def apply_staged_config_patch(
         self,
@@ -447,15 +510,170 @@ class Pipeline:
             activation_candidate=staging_candidate,
             before_activate=before_activate,
             rollback_activate=rollback_activate,
+            storage_epoch=self._read_storage_epoch(),
         )
-        return self._submit_patch(request, timeout)
+        deadline = time.monotonic() + timeout
+        self._prepare_patch_request(request, base.config, deadline)
+        return self._submit_prepared_patch(request, deadline)
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise ReconfigurationUnavailable(
+                "pipeline candidate preparation exceeded the reconfiguration deadline"
+            )
+        return remaining
+
+    def _read_storage_epoch(self) -> int:
+        with self._storage_epoch_lock:
+            return self._storage_epoch
+
+    def _track_preparation_future(self, future: Future[_Activation]) -> None:
+        with self._preparation_condition:
+            self._preparation_futures.add(future)
+
+    def _untrack_preparation_future(self, future: Future[_Activation]) -> None:
+        with self._preparation_condition:
+            self._preparation_futures.discard(future)
+            self._preparation_condition.notify_all()
+
+    def _discard_preparation_result(self, future: Future[_Activation]) -> None:
+        """Close an abandoned result before releasing its lifecycle token."""
+
+        try:
+            if future.cancelled():
+                return
+            activation = future.result()
+        except BaseException:
+            return
+        else:
+            activation.discard()
+        finally:
+            # Future.result() becomes observable before its callbacks finish.
+            # Removing this token only here prevents stop() from mistaking a
+            # blocked candidate close for a terminal preparation worker.
+            self._untrack_preparation_future(future)
+
+    def _abandon_preparation_future(self, future: Future[_Activation]) -> None:
+        """Transfer a not-yet-returned future to deterministic cleanup."""
+
+        if future.cancel():
+            self._untrack_preparation_future(future)
+            return
+        # The constructor is already running or completed concurrently.
+        # add_done_callback also runs immediately for a completed future.
+        future.add_done_callback(self._discard_preparation_result)
+
+    def _prepare_patch_request(
+        self,
+        request: _PatchRequest,
+        current: AppConfig,
+        deadline: float,
+    ) -> None:
+        """Build fallible candidate resources on the dedicated executor."""
+
+        candidate = request.activation_candidate or request.candidate
+        with self._preparation_lock:
+            executor = self._preparation_executor
+            if executor is None:
+                raise ReconfigurationUnavailable(
+                    "pipeline candidate preparation is unavailable"
+                )
+            try:
+                future = executor.submit(
+                    self._prepare_activation_off_lane,
+                    current.model_copy(deep=True),
+                    candidate.model_copy(deep=True),
+                )
+                # Register under the same lock as submit so shutdown cannot
+                # snapshot the executor in the handoff gap between the two.
+                self._track_preparation_future(future)
+            except RuntimeError as exc:
+                raise ReconfigurationUnavailable(
+                    "pipeline candidate preparation is shutting down"
+                ) from exc
+        cleanup_deferred = False
+        try:
+            try:
+                remaining = self._remaining(deadline)
+            except BaseException:
+                cleanup_deferred = True
+                self._abandon_preparation_future(future)
+                raise
+            try:
+                activation = future.result(timeout=remaining)
+            except FutureTimeout as exc:
+                cleanup_deferred = True
+                self._abandon_preparation_future(future)
+                raise ReconfigurationUnavailable(
+                    "pipeline candidate preparation exceeded the reconfiguration deadline"
+                ) from exc
+            except ActivationError:
+                raise
+            except BaseException as exc:
+                raise ActivationError(str(exc)) from exc
+            if not self.running or not self._startup_done.is_set():
+                activation.discard()
+                raise ReconfigurationUnavailable("pipeline stopped during preparation")
+            request.prepared_activation = activation
+        finally:
+            if not cleanup_deferred:
+                self._untrack_preparation_future(future)
+
+    def _submit_prepared_patch(
+        self, request: _PatchRequest, deadline: float
+    ) -> ConfigState:
+        """Transfer a prepared activation to the frame queue or discard it."""
+
+        try:
+            remaining = self._remaining(deadline)
+        except BaseException:
+            activation = request.prepared_activation
+            request.prepared_activation = None
+            self._schedule_discard_activation(activation)
+            raise
+        return self._submit_patch(request, remaining)
+
+    def _shutdown_preparation_executor(
+        self, deadline: float, timeout: float
+    ) -> None:
+        with self._preparation_condition:
+            executor = self._preparation_executor
+            if executor is None:
+                return
+            executor.shutdown(wait=False, cancel_futures=True)
+            while self._preparation_futures:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise ReconfigurationUnavailable(
+                        "pipeline candidate preparation worker did not stop "
+                        f"within {timeout:.1f}s"
+                    )
+                self._preparation_condition.wait(remaining)
+        # All running callbacks have reached terminal state, so this wait is
+        # now bounded to executor bookkeeping and worker exit.
+        executor.shutdown(wait=True, cancel_futures=True)
+        with self._preparation_condition:
+            if self._preparation_executor is executor:
+                self._preparation_executor = None
 
     def _submit_patch(
         self, request: _PatchRequest, timeout: float
     ) -> ConfigState:
-        self._requests.put(request)
+        try:
+            self._enqueue_request(request)
+        except BaseException:
+            _cancelled, activation = request.cancel_and_take_activation()
+            # The request never entered the owned frame queue, so the caller
+            # remains the sole owner and closes it before returning.
+            if activation is not None:
+                activation.discard()
+            raise
         if not request.done.wait(timeout):
-            if request.cancel():
+            cancelled, activation = request.cancel_and_take_activation()
+            if cancelled:
+                self._schedule_discard_activation(activation)
                 raise ReconfigurationUnavailable(
                     f"pipeline did not acknowledge reconfiguration within {timeout:.1f}s"
                 )
@@ -466,6 +684,20 @@ class Pipeline:
         if request.result is None:  # defensive invariant
             raise ReconfigurationUnavailable("pipeline returned no configuration result")
         return request.result
+
+    def _enqueue_request(
+        self, request: _PatchRequest | _MutationRequest
+    ) -> None:
+        """Atomically enqueue only while the frame worker still accepts work."""
+
+        with self._request_enqueue_lock:
+            if (
+                self._stop.is_set()
+                or not self.running
+                or not self._startup_done.is_set()
+            ):
+                raise ReconfigurationUnavailable("pipeline is not accepting requests")
+            self._requests.put(request)
 
     def apply_storage_mutation(
         self,
@@ -486,7 +718,7 @@ class Pipeline:
                 "cannot synchronously mutate storage from the pipeline worker"
             )
         request = _MutationRequest(mutate)
-        self._requests.put(request)
+        self._enqueue_request(request)
         if not request.done.wait(timeout):
             if request.cancel():
                 raise ReconfigurationUnavailable(
@@ -518,6 +750,7 @@ class Pipeline:
             refiner = refiner_for(cfg.segmentation, segmenter)
             backdrop = create_backdrop(
                 cfg.background,
+                image_max_pixels=cfg.api.uploads.image_max_pixels,
                 video_max_width=cfg.api.uploads.video_max_width,
                 video_max_height=cfg.api.uploads.video_max_height,
             )
@@ -549,7 +782,11 @@ class Pipeline:
             log.exception("pipeline crashed")
             self._error = exc
         finally:
-            self._fail_pending(ReconfigurationUnavailable("pipeline worker stopped"))
+            self._stop.set()
+            with self._request_enqueue_lock:
+                self._fail_pending(
+                    ReconfigurationUnavailable("pipeline worker stopped")
+                )
             if resources is not None:
                 resources.close()
             self._drain_deferred_closes()
@@ -564,39 +801,69 @@ class Pipeline:
                 request = self._requests.get_nowait()
             except queue.Empty:
                 return
-            request.fail(error)
+            if isinstance(request, _PatchRequest):
+                with request.lock:
+                    activation = request.prepared_activation
+                    request.prepared_activation = None
+                    if request.result is None and request.error is None:
+                        request.error = error
+                request.done.set()
+                self._schedule_discard_activation(activation)
+            else:
+                request.fail(error)
 
     # -- reconfiguration ----------------------------------------------
-    def _stage_activation(
-        self, resources: _Resources, candidate: AppConfig
+    @staticmethod
+    def _prepare_activation_off_lane(
+        current: AppConfig,
+        candidate: AppConfig,
     ) -> _Activation:
+        """Construct changed resources without occupying the frame worker."""
+
         activation = _Activation(candidate=candidate)
-        old_cfg = resources.cfg
         try:
-            # Every segmentation patch receives an isolated backend/refiner.
-            # Candidate trials therefore cannot advance the working backend's
-            # recurrent state or temporal mask on failure.
-            if candidate.segmentation != old_cfg.segmentation:
+            if candidate.segmentation != current.segmentation:
                 activation.segmenter = create_segmenter(candidate.segmentation)
                 activation.replace_segmenter = True
                 activation.refiner = refiner_for(
                     candidate.segmentation, activation.segmenter
                 )
-            else:
-                activation.refiner = resources.refiner
-
-            if candidate.background != old_cfg.background:
+            if _backdrop_key(candidate) != _backdrop_key(current):
                 activation.backdrop = create_backdrop(
                     candidate.background,
+                    image_max_pixels=candidate.api.uploads.image_max_pixels,
                     video_max_width=candidate.api.uploads.video_max_width,
                     video_max_height=candidate.api.uploads.video_max_height,
                 )
                 activation.replace_backdrop = True
-            else:
-                activation.backdrop = resources.backdrop
         except Exception as exc:
             activation.discard()
             raise ActivationError(str(exc)) from exc
+        return activation
+
+    def _stage_activation(
+        self,
+        resources: _Resources,
+        candidate: AppConfig,
+        prepared: _Activation | None,
+    ) -> _Activation:
+        """Attach reused live pointers to an already constructed candidate."""
+
+        old_cfg = resources.cfg
+        if prepared is None:
+            raise ActivationError("candidate resources were not prepared off-lane")
+        activation = prepared
+        activation.candidate = candidate
+        segmentation_changed = candidate.segmentation != old_cfg.segmentation
+        background_changed = _backdrop_key(candidate) != _backdrop_key(old_cfg)
+        if segmentation_changed != activation.replace_segmenter:
+            raise ActivationError("prepared segmentation candidate is stale")
+        if background_changed != activation.replace_backdrop:
+            raise ActivationError("prepared background candidate is stale")
+        if not segmentation_changed:
+            activation.refiner = resources.refiner
+        if not background_changed:
+            activation.backdrop = resources.backdrop
         return activation
 
     def _trial_activation(
@@ -613,16 +880,17 @@ class Pipeline:
         """
         old_cfg = resources.cfg
         segmentation_changed = activation.candidate.segmentation != old_cfg.segmentation
-        background_changed = activation.candidate.background != old_cfg.background
+        background_changed = _backdrop_key(activation.candidate) != _backdrop_key(
+            old_cfg
+        )
         compositing_changed = activation.candidate.compositing != old_cfg.compositing
         if not (segmentation_changed or background_changed or compositing_changed):
             return
         try:
             if segmentation_changed:
-                mask = self._validate_mask(
-                    activation.refiner.refine(
-                        activation.segmenter.segment(frame), frame
-                    ),
+                mask = self._segment_and_refine_mask(
+                    activation.segmenter,
+                    activation.refiner,
                     frame,
                     privacy_safe=activation.candidate.background.mode == "remote",
                 )
@@ -720,15 +988,36 @@ class Pipeline:
     ) -> None:
         with request.lock:
             if request.cancelled:
+                activation = request.prepared_activation
+                request.prepared_activation = None
                 request.done.set()
+                self._schedule_discard_activation(activation)
                 return
+            # Ownership leaves the request before any fallible trial work.
+            # A concurrent timeout can only reclaim an activation that the
+            # frame lane has not claimed yet.
+            activation = request.prepared_activation
+            request.prepared_activation = None
         current = self.runtime.read()
-        if current.version != request.expected_version or resources.version != request.expected_version:
+        storage_epoch = self._read_storage_epoch()
+        if (
+            current.version != request.expected_version
+            or resources.version != request.expected_version
+        ):
+            self._schedule_discard_activation(activation)
             request.fail(ConfigConflictError(request.expected_version, current.version))
+            return
+        if storage_epoch != request.storage_epoch:
+            self._schedule_discard_activation(activation)
+            request.fail(
+                ActivationError("candidate assets changed during preparation")
+            )
             return
         try:
             activation = self._stage_activation(
-                resources, request.activation_candidate or request.candidate
+                resources,
+                request.activation_candidate or request.candidate,
+                activation,
             )
             self._trial_activation(resources, activation, trial_frame)
             if activation.replace_backdrop and hasattr(
@@ -744,8 +1033,7 @@ class Pipeline:
             # promoted final path.
             activation.candidate = request.candidate
         except BaseException as exc:
-            if "activation" in locals():
-                activation.discard()
+            self._schedule_discard_activation(activation)
             request.fail(exc)
             return
 
@@ -753,7 +1041,7 @@ class Pipeline:
         old_cfg: AppConfig | None = None
         with request.lock:
             if request.cancelled:
-                activation.discard()
+                self._schedule_discard_activation(activation)
                 request.done.set()
                 return
             try:
@@ -776,12 +1064,12 @@ class Pipeline:
                     request.candidate, request.expected_version, activate
                 )
             except ConfigVersionConflictError as exc:
-                activation.discard()
+                self._schedule_discard_activation(activation)
                 request.error = ConfigConflictError(
                     exc.expected_version, exc.current_version
                 )
             except BaseException as exc:
-                activation.discard()
+                self._schedule_discard_activation(activation)
                 request.error = exc
             else:
                 if old_cfg is not None:
@@ -801,6 +1089,22 @@ class Pipeline:
         self._schedule_close(old_backdrop, "replaced backdrop")
         self._schedule_close(old_segmenter, "replaced segmenter")
 
+    def _schedule_discard_activation(
+        self, activation: _Activation | None
+    ) -> None:
+        if activation is None:
+            return
+        if activation.replace_backdrop:
+            backdrop = activation.backdrop
+            activation.backdrop = None
+            activation.replace_backdrop = False
+            self._schedule_close(backdrop, "discarded staged backdrop")
+        if activation.replace_segmenter:
+            segmenter = activation.segmenter
+            activation.segmenter = None
+            activation.replace_segmenter = False
+            self._schedule_close(segmenter, "discarded staged segmenter")
+
     def _handle_mutation_request(
         self, resources: _Resources, request: _MutationRequest
     ) -> None:
@@ -817,6 +1121,8 @@ class Pipeline:
                     raise ConfigConflictError(
                         resources.version, request.result.version
                     )
+                with self._storage_epoch_lock:
+                    self._storage_epoch += 1
             except BaseException as exc:
                 request.error = exc
             request.done.set()
@@ -1009,10 +1315,7 @@ class Pipeline:
             not isinstance(mask, np.ndarray)
             or mask.ndim != 2
             or mask.shape != frame.shape[:2]
-            or not (
-                np.issubdtype(mask.dtype, np.integer)
-                or np.issubdtype(mask.dtype, np.floating)
-            )
+            or mask.dtype != np.float32
             or mask.size == 0
         ):
             raise _PrivacyViolation(
@@ -1038,6 +1341,29 @@ class Pipeline:
                 "remote fallback mask exposes the entire camera frame",
             )
         return validated
+
+    @classmethod
+    def _segment_and_refine_mask(
+        cls,
+        segmenter: Any,
+        refiner: Any,
+        frame: np.ndarray,
+        *,
+        privacy_safe: bool,
+    ) -> np.ndarray:
+        """Validate the backend contract both before and after refinement."""
+
+        raw = cls._validate_mask(
+            segmenter.segment(frame),
+            frame,
+            privacy_safe=False,
+        )
+        refined = refiner.refine(raw, frame)
+        return cls._validate_mask(
+            refined,
+            frame,
+            privacy_safe=privacy_safe,
+        )
 
     @staticmethod
     def _raw_fingerprint(frame: np.ndarray) -> _RawFingerprint:
@@ -1225,10 +1551,9 @@ class Pipeline:
                 # is already part of the hot-swappable resource generation.
                 # Exercise it so a later background-only PATCH cannot reveal a
                 # backend failure for the first time.
-                self._validate_mask(
-                    resources.refiner.refine(
-                        resources.segmenter.segment(frame), frame
-                    ),
+                self._segment_and_refine_mask(
+                    resources.segmenter,
+                    resources.refiner,
                     frame,
                     privacy_safe=False,
                 )
@@ -1300,10 +1625,12 @@ class Pipeline:
 
         try:
             started = time.monotonic_ns()
-            mask = resources.refiner.refine(
-                resources.segmenter.segment(frame), frame
+            mask = self._segment_and_refine_mask(
+                resources.segmenter,
+                resources.refiner,
+                frame,
+                privacy_safe=privacy_safe,
             )
-            mask = self._validate_mask(mask, frame, privacy_safe=privacy_safe)
             if timings is not None:
                 timings["segmentation_ms"] = (
                     time.monotonic_ns() - started

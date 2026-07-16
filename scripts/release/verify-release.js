@@ -23,6 +23,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/api/avatar_proxy.py',
   'custback/api/security.py',
   'custback/api/server.py',
+  'custback/api/streaming.py',
   'custback/api/webui.py',
   'custback/avatar/__init__.py',
   'custback/avatar/__main__.py',
@@ -39,6 +40,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/capture.py',
   'custback/compositor.py',
   'custback/config.py',
+  'custback/config_merge.py',
   'custback/diagnostics.py',
   'custback/gpu_probe.py',
   'custback/hub.py',
@@ -60,6 +62,7 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_avatar_store.py',
   'tests/test_capture.py',
   'tests/test_config.py',
+  'tests/test_config_merge.py',
   'tests/test_diagnostics.py',
   'tests/test_gpu_probe.py',
   'tests/test_model_acquisition.py',
@@ -67,6 +70,7 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_preview.py',
   'tests/test_processing.py',
   'tests/test_segmentation_rvm.py',
+  'tests/test_streaming.py',
   'tests/test_webui.py',
 ];
 const REVIEWED_NPM_PAYLOAD = [

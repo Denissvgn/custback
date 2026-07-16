@@ -14,17 +14,20 @@ Two rig kinds share one contract:
   rendered as authored: ``sketch`` applies as a post-filter, ``realistic``
   is builtin-only.
 
-``render`` returns a BGRA uint8 sprite; the renderer scales and places it
-over the selected background, cropped to the rig's window for the
-configured framing (``bust`` keeps head and chest in frame for meeting
-tiles, ``full`` shows everything, ``closeup`` fills the frame with the
-face).
+``render`` returns a straight-alpha BGRA uint8 sprite: RGB retains the
+authored color independently of coverage, and alpha is applied exactly once
+when the renderer places the sprite. OpenCV geometric/filter transforms use a
+temporary premultiplied copy to avoid transparent-edge color bleed, then
+restore straight alpha. The renderer crops the rig's window for the configured
+framing (``bust`` keeps head and chest in frame for meeting tiles, ``full``
+shows everything, ``closeup`` fills the frame with the face).
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +44,11 @@ try:
 except ImportError:  # pragma: no cover - required by the package, defensive
     cv2 = None
 
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - Pillow is a required dependency
+    Image = None
+
 log = logging.getLogger(__name__)
 
 # Parts that ride on the head group and follow the head pose.
@@ -51,6 +59,9 @@ AVATAR_FRAMINGS: tuple[str, ...] = get_args(AvatarFraming)
 
 _BLINK_THRESHOLD = 0.5
 _MOUTH_OPEN_THRESHOLD = 0.25
+DEFAULT_RIG_LAYER_MAX_PIXELS = 16_777_216
+DEFAULT_RIG_TOTAL_MAX_PIXELS = 134_217_728
+DEFAULT_RIG_MANIFEST_MAX_BYTES = 64 * 1024
 
 
 class RigError(ValueError):
@@ -105,24 +116,72 @@ AVATAR_PRESETS: dict[str, AvatarPreset] = {
 def sketch_filter(canvas: np.ndarray) -> None:
     """Pencil-drawing post-process in place; preserves the alpha channel."""
     _require_cv2()
-    gray = cv2.cvtColor(canvas[..., :3], cv2.COLOR_BGR2GRAY)
+    premultiplied = _premultiply_straight_alpha(canvas)
+    gray = cv2.cvtColor(premultiplied[..., :3], cv2.COLOR_BGR2GRAY)
     blurred_inverse = cv2.GaussianBlur(255 - gray, (21, 21), 0)
     pencil = cv2.divide(gray, 255 - blurred_inverse, scale=256)
     # A faint warm paper tint keeps the strokes from looking clinical.
-    canvas[..., 0] = (pencil * 0.96).astype(np.uint8)
-    canvas[..., 1] = (pencil * 0.98).astype(np.uint8)
-    canvas[..., 2] = pencil
+    coverage = premultiplied[..., 3:4] / 255.0
+    styled = np.zeros_like(premultiplied)
+    styled[..., 0] = pencil * 0.96 * coverage[..., 0]
+    styled[..., 1] = pencil * 0.98 * coverage[..., 0]
+    styled[..., 2] = pencil * coverage[..., 0]
+    styled[..., 3:4] = premultiplied[..., 3:4]
+    canvas[:] = _restore_straight_alpha(styled)
 
 
 def alpha_over(base: np.ndarray, layer: np.ndarray) -> None:
-    """Composite BGRA ``layer`` over BGRA ``base`` in place (same shape)."""
-    alpha = layer[..., 3:4].astype(np.float32) / 255.0
-    base_rgb = base[..., :3].astype(np.float32)
-    base_alpha = base[..., 3:4].astype(np.float32) / 255.0
-    out_alpha = alpha + base_alpha * (1.0 - alpha)
-    out_rgb = layer[..., :3].astype(np.float32) * alpha + base_rgb * (1.0 - alpha)
-    base[..., :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
-    base[..., 3:4] = np.clip(out_alpha * 255.0, 0, 255).astype(np.uint8)
+    """Composite straight-alpha BGRA ``layer`` over ``base`` in place."""
+
+    source_alpha = layer[..., 3:4].astype(np.float32) / 255.0
+    destination_alpha = base[..., 3:4].astype(np.float32) / 255.0
+    out_alpha = source_alpha + destination_alpha * (1.0 - source_alpha)
+    numerator = (
+        layer[..., :3].astype(np.float32) * source_alpha
+        + base[..., :3].astype(np.float32)
+        * destination_alpha
+        * (1.0 - source_alpha)
+    )
+    out_rgb = np.zeros_like(numerator)
+    np.divide(numerator, out_alpha, out=out_rgb, where=out_alpha > 0.0)
+    base[..., :3] = np.clip(np.rint(out_rgb), 0, 255).astype(np.uint8)
+    base[..., 3:4] = np.clip(np.rint(out_alpha * 255.0), 0, 255).astype(np.uint8)
+
+
+def _premultiply_straight_alpha(image: np.ndarray) -> np.ndarray:
+    premultiplied = image.astype(np.float32)
+    premultiplied[..., :3] *= premultiplied[..., 3:4] / 255.0
+    return premultiplied
+
+
+def _restore_straight_alpha(premultiplied: np.ndarray) -> np.ndarray:
+    alpha = np.clip(premultiplied[..., 3:4], 0.0, 255.0)
+    straight = np.zeros_like(premultiplied, dtype=np.float32)
+    straight[..., 3:4] = alpha
+    np.divide(
+        premultiplied[..., :3] * 255.0,
+        alpha,
+        out=straight[..., :3],
+        where=alpha > 1e-6,
+    )
+    return np.clip(np.rint(straight), 0, 255).astype(np.uint8)
+
+
+def resize_straight_alpha(
+    image: np.ndarray,
+    size: tuple[int, int],
+    *,
+    interpolation: int,
+) -> np.ndarray:
+    """Resize BGRA while preserving its documented straight-alpha storage."""
+
+    _require_cv2()
+    transformed = cv2.resize(
+        _premultiply_straight_alpha(image),
+        size,
+        interpolation=interpolation,
+    )
+    return _restore_straight_alpha(transformed)
 
 
 def apply_head_pose(
@@ -142,14 +201,15 @@ def apply_head_pose(
     matrix = cv2.getRotationMatrix2D(pivot, math.degrees(roll), 1.0)
     matrix[0, 2] += dx
     matrix[1, 2] += dy
-    return cv2.warpAffine(
-        layer,
+    transformed = cv2.warpAffine(
+        _premultiply_straight_alpha(layer),
         matrix,
         (width, height),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0),
     )
+    return _restore_straight_alpha(transformed)
 
 
 class Rig(ABC):
@@ -164,8 +224,14 @@ class Rig(ABC):
     }
 
     @abstractmethod
-    def render(self, state: FaceState, visible: frozenset[str]) -> np.ndarray:
-        """Return the avatar as a BGRA uint8 sprite."""
+    def render(
+        self,
+        state: FaceState,
+        visible: frozenset[str],
+        *,
+        follow_pose: bool = True,
+    ) -> np.ndarray:
+        """Return the avatar as a straight-alpha BGRA uint8 sprite."""
 
     def framing_window(self, framing: str) -> tuple[float, float]:
         """The sprite rows (as fractions) that the framing keeps in shot."""
@@ -233,7 +299,13 @@ class BuiltinRig(Rig):
         self._lip_open_px = 4 if realistic else 5
         self._lip_closed_px = 5 if realistic else 7
 
-    def render(self, state: FaceState, visible: frozenset[str]) -> np.ndarray:
+    def render(
+        self,
+        state: FaceState,
+        visible: frozenset[str],
+        *,
+        follow_pose: bool = True,
+    ) -> np.ndarray:
         canvas = np.zeros((self.HEIGHT, self.WIDTH, 4), dtype=np.uint8)
         if "torso" in visible:
             self._draw_torso(canvas)
@@ -246,7 +318,11 @@ class BuiltinRig(Rig):
                 getattr(self, f"_draw_{part}")(head, state)
                 drew_head = True
         if drew_head:
-            if state.present and (state.yaw or state.pitch or state.roll):
+            if (
+                follow_pose
+                and state.present
+                and (state.yaw or state.pitch or state.roll)
+            ):
                 head = apply_head_pose(
                     head,
                     yaw=state.yaw,
@@ -426,7 +502,9 @@ class BuiltinRig(Rig):
         cv2.ellipse(overlay, (296, 306), (52, 64), 15, 0, 360, self._SKIN_SHADOW, -1)
         cv2.ellipse(overlay, (240, 486), (140, 70), 0, 0, 180, self._SKIN_SHADOW, -1)
         canvas[..., :3] = cv2.addWeighted(overlay, 0.22, canvas[..., :3], 0.78, 0)
-        canvas[:] = cv2.GaussianBlur(canvas, (3, 3), 0)
+        canvas[:] = _restore_straight_alpha(
+            cv2.GaussianBlur(_premultiply_straight_alpha(canvas), (3, 3), 0)
+        )
 
 
 class LayeredRig(Rig):
@@ -453,7 +531,15 @@ class LayeredRig(Rig):
         "closeup": (0.0, 0.5),
     }
 
-    def __init__(self, directory: str | Path, style: str = "cartoon"):
+    def __init__(
+        self,
+        directory: str | Path,
+        style: str = "cartoon",
+        *,
+        rig_layer_max_pixels: int = DEFAULT_RIG_LAYER_MAX_PIXELS,
+        rig_total_max_pixels: int = DEFAULT_RIG_TOTAL_MAX_PIXELS,
+        rig_manifest_max_bytes: int = DEFAULT_RIG_MANIFEST_MAX_BYTES,
+    ):
         _require_cv2()
         if style not in AVATAR_STYLES:
             raise RigError(
@@ -464,19 +550,40 @@ class LayeredRig(Rig):
         self.directory = Path(directory).expanduser()
         if not self.directory.is_dir():
             raise RigError(f"rig directory does not exist: {self.directory}")
+        for label, value in (
+            ("rig_layer_max_pixels", rig_layer_max_pixels),
+            ("rig_total_max_pixels", rig_total_max_pixels),
+            ("rig_manifest_max_bytes", rig_manifest_max_bytes),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise RigError(f"{label} must be a positive integer")
+        self._rig_layer_max_pixels = rig_layer_max_pixels
+        self._rig_total_max_pixels = rig_total_max_pixels
+        self._rig_manifest_max_bytes = rig_manifest_max_bytes
+        self._validate_manifest_size()
         self._layers: dict[str, np.ndarray] = {}
         self._variants: dict[str, np.ndarray] = {}
-        size: tuple[int, int] | None = None
+        discovered: list[tuple[str, Path]] = []
         for name in (*AVATAR_PARTS, "eyes_closed", "mouth_open"):
             path = self.directory / f"{name}.png"
-            if not path.is_file():
-                continue
+            if path.is_file():
+                discovered.append((name, path))
+        if not any(name in AVATAR_PARTS for name, _path in discovered):
+            raise RigError(
+                f"rig directory {self.directory} contains no part layers "
+                f"({', '.join(part + '.png' for part in AVATAR_PARTS)})"
+            )
+        size = self._preflight_layers([path for _name, path in discovered])
+        for name, path in discovered:
             layer = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-            if layer is None or layer.ndim != 3 or layer.shape[2] != 4:
+            if (
+                layer is None
+                or layer.dtype != np.uint8
+                or layer.ndim != 3
+                or layer.shape[2] != 4
+            ):
                 raise RigError(f"rig layer must be a PNG with alpha: {path.name}")
-            if size is None:
-                size = layer.shape[:2]
-            elif layer.shape[:2] != size:
+            if layer.shape[:2] != size:
                 raise RigError(
                     f"rig layer {path.name} size {layer.shape[1]}x{layer.shape[0]} "
                     f"does not match {size[1]}x{size[0]}"
@@ -485,23 +592,99 @@ class LayeredRig(Rig):
                 self._layers[name] = layer
             else:
                 self._variants[name] = layer
-        if not self._layers:
-            raise RigError(
-                f"rig directory {self.directory} contains no part layers "
-                f"({', '.join(part + '.png' for part in AVATAR_PARTS)})"
-            )
-        height, width = size  # type: ignore[misc]
+        height, width = size
         self.parts = tuple(part for part in AVATAR_PARTS if part in self._layers)
         self._pivot = (width / 2.0, height * 0.6)
         self._sway = (width * 0.08, height * 0.04)
         self._head_parts = frozenset(self._layers) & HEAD_PARTS
         self._load_manifest()
 
+    @staticmethod
+    def _has_alpha(image) -> bool:
+        return "A" in image.getbands() or "transparency" in image.info
+
+    def _validate_manifest_size(self) -> None:
+        manifest = self.directory / "rig.yaml"
+        try:
+            if (
+                manifest.is_file()
+                and manifest.stat().st_size > self._rig_manifest_max_bytes
+            ):
+                raise RigError(
+                    f"rig.yaml exceeds {self._rig_manifest_max_bytes} bytes"
+                )
+        except OSError as exc:
+            raise RigError("cannot inspect rig.yaml") from exc
+
+    def _preflight_layers(self, paths: list[Path]) -> tuple[int, int]:
+        """Fully validate every layer with Pillow before OpenCV sees a path."""
+
+        if Image is None:
+            raise RigError("Pillow is required to validate PNG rig layers")
+        expected_size: tuple[int, int] | None = None
+        total_pixels = 0
+        for path in paths:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    with Image.open(path) as image:
+                        if image.format != "PNG":
+                            raise ValueError("layer header is not PNG")
+                        width, height = image.size
+                        if width <= 0 or height <= 0:
+                            raise ValueError("invalid layer dimensions")
+                        pixels = width * height
+                        if pixels > self._rig_layer_max_pixels:
+                            raise RigError(
+                                f"rig layer {path.name} exceeds "
+                                f"{self._rig_layer_max_pixels} pixels"
+                            )
+                        total_pixels += pixels
+                        if total_pixels > self._rig_total_max_pixels:
+                            raise RigError(
+                                "rig decoded layers exceed "
+                                f"{self._rig_total_max_pixels} pixels"
+                            )
+                        if expected_size is None:
+                            expected_size = (width, height)
+                        elif (width, height) != expected_size:
+                            raise RigError(
+                                f"rig layer {path.name} size {width}x{height} "
+                                f"does not match {expected_size[0]}x"
+                                f"{expected_size[1]}"
+                            )
+                        if not self._has_alpha(image):
+                            raise RigError(
+                                f"rig layer must be a PNG with alpha: {path.name}"
+                            )
+                        image.verify()
+                    # verify() checks structure and CRC; a fresh decoder then
+                    # forces full decompression before OpenCV can allocate.
+                    with Image.open(path) as decoded:
+                        if decoded.format != "PNG" or decoded.size != (width, height):
+                            raise ValueError("layer changed during validation")
+                        if not self._has_alpha(decoded):
+                            raise ValueError("layer alpha changed during validation")
+                        decoded.load()
+            except RigError:
+                raise
+            except Exception as exc:
+                # warnings.simplefilter("error") turns Pillow decompression
+                # warnings into exceptions here; decoder/CRC/truncation and
+                # unidentified-format failures share the same RigError API.
+                raise RigError(f"invalid PNG rig layer: {path.name}") from exc
+        assert expected_size is not None
+        return expected_size[1], expected_size[0]
+
     def _load_manifest(self) -> None:
         manifest = self.directory / "rig.yaml"
         if not manifest.is_file():
             return
-        raw = yaml.safe_load(manifest.read_text())
+        self._validate_manifest_size()
+        try:
+            raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError, RecursionError) as exc:
+            raise RigError("invalid rig.yaml") from exc
         if raw is None:
             return
         if not isinstance(raw, dict):
@@ -512,13 +695,29 @@ class LayeredRig(Rig):
         for key in ("pivot", "sway"):
             if key in raw:
                 value = raw[key]
+                converted: tuple[float, float] | None = None
                 if (
-                    not isinstance(value, list)
-                    or len(value) != 2
-                    or not all(isinstance(item, (int, float)) for item in value)
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and all(
+                        isinstance(item, (int, float))
+                        and not isinstance(item, bool)
+                        for item in value
+                    )
                 ):
-                    raise RigError(f"rig.yaml {key} must be [x, y] numbers")
-                setattr(self, f"_{key}", (float(value[0]), float(value[1])))
+                    try:
+                        candidate = (float(value[0]), float(value[1]))
+                    except (OverflowError, ValueError):
+                        candidate = None
+                    if candidate is not None and all(
+                        math.isfinite(item) for item in candidate
+                    ):
+                        converted = candidate
+                if converted is None:
+                    raise RigError(
+                        f"rig.yaml {key} must be [x, y] finite numbers"
+                    )
+                setattr(self, f"_{key}", converted)
         if "head_parts" in raw:
             value = raw["head_parts"]
             if not isinstance(value, list) or not all(
@@ -539,20 +738,32 @@ class LayeredRig(Rig):
                     raise RigError(
                         f"unknown framing {name!r}; choose from {list(AVATAR_FRAMINGS)}"
                     )
+                converted_window: tuple[float, float] | None = None
                 if (
-                    not isinstance(window, list)
-                    or len(window) != 2
-                    or not all(
-                        isinstance(item, (int, float)) and not isinstance(item, bool)
+                    isinstance(window, list)
+                    and len(window) == 2
+                    and all(
+                        isinstance(item, (int, float))
+                        and not isinstance(item, bool)
                         for item in window
                     )
-                    or not 0.0 <= window[0] < window[1] <= 1.0
                 ):
+                    try:
+                        candidate = (float(window[0]), float(window[1]))
+                    except (OverflowError, ValueError):
+                        candidate = None
+                    if (
+                        candidate is not None
+                        and all(math.isfinite(item) for item in candidate)
+                        and 0.0 <= candidate[0] < candidate[1] <= 1.0
+                    ):
+                        converted_window = candidate
+                if converted_window is None:
                     raise RigError(
                         f"rig.yaml framing {name} must be [top, bottom] fractions "
                         "with 0 <= top < bottom <= 1"
                     )
-                self._framing_windows[name] = (float(window[0]), float(window[1]))
+                self._framing_windows[name] = converted_window
 
     def framing_window(self, framing: str) -> tuple[float, float]:
         return self._framing_windows.get(framing, (0.0, 1.0))
@@ -567,7 +778,13 @@ class LayeredRig(Rig):
                 return self._variants["mouth_open"]
         return self._layers[part]
 
-    def render(self, state: FaceState, visible: frozenset[str]) -> np.ndarray:
+    def render(
+        self,
+        state: FaceState,
+        visible: frozenset[str],
+        *,
+        follow_pose: bool = True,
+    ) -> np.ndarray:
         sample = next(iter(self._layers.values()))
         canvas = np.zeros_like(sample)
         head = np.zeros_like(sample)
@@ -582,7 +799,11 @@ class LayeredRig(Rig):
             else:
                 alpha_over(canvas, layer)
         if drew_head:
-            if state.present and (state.yaw or state.pitch or state.roll):
+            if (
+                follow_pose
+                and state.present
+                and (state.yaw or state.pitch or state.roll)
+            ):
                 head = apply_head_pose(
                     head,
                     yaw=state.yaw,
@@ -597,8 +818,22 @@ class LayeredRig(Rig):
         return canvas
 
 
-def create_rig(selector: str, *, avatar: str = "casey", style: str = "cartoon") -> Rig:
+def create_rig(
+    selector: str,
+    *,
+    avatar: str = "casey",
+    style: str = "cartoon",
+    rig_layer_max_pixels: int = DEFAULT_RIG_LAYER_MAX_PIXELS,
+    rig_total_max_pixels: int = DEFAULT_RIG_TOTAL_MAX_PIXELS,
+    rig_manifest_max_bytes: int = DEFAULT_RIG_MANIFEST_MAX_BYTES,
+) -> Rig:
     """Build a rig from the ``appearance`` selectors."""
     if selector == "builtin":
         return BuiltinRig(avatar=avatar, style=style)
-    return LayeredRig(selector, style=style)
+    return LayeredRig(
+        selector,
+        style=style,
+        rig_layer_max_pixels=rig_layer_max_pixels,
+        rig_total_max_pixels=rig_total_max_pixels,
+        rig_manifest_max_bytes=rig_manifest_max_bytes,
+    )

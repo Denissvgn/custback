@@ -82,6 +82,11 @@ storage:
   rig_zip_max_bytes: 67108864    # compressed rig upload cap (64 MiB)
   rig_max_bytes: 134217728       # extracted rig cap (128 MiB)
   rig_max_entries: 16            # files per rig archive
+  rig_storage_max_bytes: 1073741824 # installed + in-flight rigs (1 GiB)
+  max_rigs: 100
+  rig_layer_max_pixels: 16777216
+  rig_total_max_pixels: 134217728
+  rig_manifest_max_bytes: 65536
   storage_max_bytes: 1073741824  # scene media store cap (1 GiB)
   max_files: 100
 
@@ -98,3 +103,4 @@ api:
   tls_certfile: ""
   tls_keyfile: ""
   ws_max_bytes: 16777216
+  max_stream_connections: 16 # authenticated MJPEG preview clients

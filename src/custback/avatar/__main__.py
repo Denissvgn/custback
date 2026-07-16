@@ -11,6 +11,7 @@ import sys
 
 from typing import get_args
 
+from ..config import format_config_error
 from .config import (
     AVATAR_PARTS,
     BUILTIN_AVATARS,
@@ -104,6 +105,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-api-token", action="store_true",
         help="print the resolved avatar control API token and exit",
     )
+    storage_permissions = parser.add_mutually_exclusive_group()
+    storage_permissions.add_argument(
+        "--check-storage-permissions",
+        action="store_true",
+        help="audit existing rig/background store ownership and modes, then exit",
+    )
+    storage_permissions.add_argument(
+        "--fix-storage-permissions",
+        action="store_true",
+        help="repair user-owned rig/background store modes, then exit",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument(
@@ -117,61 +129,102 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> AvatarConfig:
-    cfg = AvatarConfig.load(args.config)
+    # Assemble one candidate so related overrides are validated atomically.
+    values = AvatarConfig.load(args.config).to_dict()
+    source = values["source"]
+    driver = values["driver"]
+    audio2face = driver["audio2face"]
+    appearance = values["appearance"]
+    background = values["background"]
+    api = values["api"]
     if args.source:
-        cfg.source.url = args.source
+        source["url"] = args.source
     if args.source_token_file:
-        cfg.source.token_file = args.source_token_file
+        source["token_file"] = args.source_token_file
     if args.a2f_url:
-        # Assignment order matters: the backend validator requires the URL.
-        cfg.driver.audio2face.url = args.a2f_url
-        cfg.driver.backend = "audio2face"
+        audio2face["url"] = args.a2f_url
+        driver["backend"] = "audio2face"
     if args.driver:
-        cfg.driver.backend = args.driver
+        driver["backend"] = args.driver
     if args.rig:
-        cfg.appearance.rig = args.rig
+        appearance["rig"] = args.rig
     if args.avatar:
-        cfg.appearance.avatar = args.avatar
+        appearance["avatar"] = args.avatar
     if args.style:
-        cfg.appearance.style = args.style
+        appearance["style"] = args.style
     if args.framing:
-        cfg.appearance.framing = args.framing
+        appearance["framing"] = args.framing
     if args.parts:
-        cfg.appearance.parts = tuple(
+        appearance["parts"] = tuple(
             part.strip() for part in args.parts.split(",") if part.strip()
         )
     if args.scale is not None:
-        cfg.appearance.scale = args.scale
+        appearance["scale"] = args.scale
     if args.offset_x is not None:
-        cfg.appearance.offset_x = args.offset_x
+        appearance["offset_x"] = args.offset_x
     if args.offset_y is not None:
-        cfg.appearance.offset_y = args.offset_y
+        appearance["offset_y"] = args.offset_y
     if args.bg_image:
-        cfg.background.image_path = args.bg_image
-        cfg.background.mode = "image"
+        background["image_path"] = args.bg_image
+        background["mode"] = "image"
     if args.bg_video:
-        cfg.background.video_path = args.bg_video
-        cfg.background.mode = "video"
+        background["video_path"] = args.bg_video
+        background["mode"] = "video"
     if args.bg_mode:
-        cfg.background.mode = args.bg_mode
+        background["mode"] = args.bg_mode
     if args.no_api:
-        cfg.api.enabled = False
+        api["enabled"] = False
     if args.api_host:
-        cfg.api.host = args.api_host
+        api["host"] = args.api_host
     if args.api_port is not None:
-        cfg.api.port = args.api_port
+        api["port"] = args.api_port
     if args.api_token_file:
-        cfg.api.token_file = args.api_token_file
+        api["token_file"] = args.api_token_file
     if args.allow_non_loopback_api:
-        cfg.api.allow_non_loopback = True
-    if args.api_tls_cert or args.api_tls_key:
-        api_values = cfg.api.model_dump(mode="python")
-        if args.api_tls_cert:
-            api_values["tls_certfile"] = args.api_tls_cert
-        if args.api_tls_key:
-            api_values["tls_keyfile"] = args.api_tls_key
-        cfg.api = type(cfg.api).model_validate(api_values)
-    return AvatarConfig.from_dict(cfg.to_dict())
+        api["allow_non_loopback"] = True
+    if args.api_tls_cert:
+        api["tls_certfile"] = args.api_tls_cert
+    if args.api_tls_key:
+        api["tls_keyfile"] = args.api_tls_key
+    return AvatarConfig.from_dict(values)
+
+
+def _storage_permission_command(cfg: AvatarConfig, *, fix: bool) -> int:
+    """Run the operator-facing storage permission doctor/fix command."""
+
+    from .store import (
+        StoreError,
+        audit_storage_permissions,
+        repair_storage_permissions,
+    )
+
+    try:
+        repaired = repair_storage_permissions(cfg.storage) if fix else ()
+        remaining = audit_storage_permissions(cfg.storage)
+    except (OSError, StoreError) as exc:
+        print(
+            f"custback-avatar: storage permission check failed: {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    if remaining:
+        for issue in remaining:
+            print(
+                f"{issue.reason}: {issue.path} "
+                f"mode={issue.actual_mode:04o} expected={issue.expected_mode:04o}",
+                file=sys.stderr,
+            )
+        print(
+            "custback-avatar: storage permissions need repair; "
+            "run with --fix-storage-permissions",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    if fix:
+        print(f"storage permissions repaired: {len(repaired)} path(s)")
+    else:
+        print("storage permissions ok")
+    return 0
 
 
 def _security_policy(cfg: AvatarConfig):
@@ -240,6 +293,10 @@ def run(cfg: AvatarConfig) -> int:
     api_runner = None
     exit_code = 0
     try:
+        # Do not publish the control plane until version zero has a complete,
+        # trialed resource generation behind it. ``service.run`` observes this
+        # generation and treats the call as an idempotent startup check.
+        service.activate_initial()
         if cfg.api.enabled:
             assert security is not None
             app = create_avatar_app(runtime, service, security=security)
@@ -275,6 +332,11 @@ def run(cfg: AvatarConfig) -> int:
         if api_runner is not None and not api_runner.stop():
             log.error("avatar control API did not stop cleanly")
             exit_code = exit_code or EXIT_API
+        try:
+            service.close()
+        except Exception:
+            log.exception("avatar service resource teardown failed")
+            exit_code = exit_code or EXIT_RUNTIME
     return exit_code
 
 
@@ -297,8 +359,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             cfg = config_from_args(args)
         except (OSError, ValueError) as exc:
-            log.error("invalid configuration: %s", exc)
+            log.error("invalid configuration: %s", format_config_error(exc))
             return EXIT_CONFIG
+        if args.check_storage_permissions or args.fix_storage_permissions:
+            return _storage_permission_command(
+                cfg,
+                fix=args.fix_storage_permissions,
+            )
         if args.dump_config:
             cfg.save(args.dump_config)
             print(f"config written to {args.dump_config}")
@@ -310,12 +377,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(resolve_avatar_api_token(cfg.api.token_file).value)
                 return 0
             except (OSError, ValueError) as exc:
-                log.error("cannot resolve avatar API token: %s", exc)
+                log.error(
+                    "cannot resolve avatar API token: %s",
+                    format_config_error(exc),
+                )
                 return EXIT_CONFIG
         try:
             return run(cfg)
         except (OSError, ValueError) as exc:
-            log.error("startup configuration error: %s", exc)
+            log.error(
+                "startup configuration error: %s",
+                format_config_error(exc),
+            )
             return EXIT_CONFIG
     finally:
         logging_session.close()

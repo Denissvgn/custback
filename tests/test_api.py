@@ -738,6 +738,38 @@ def test_websocket_requires_auth_and_origin(stack):
     run_async(scenario())
 
 
+def test_websocket_stream_limit_is_enforced_after_authentication(stack):
+    limiter = stack.app.state.stream_connections
+    leases = [limiter.try_acquire() for _ in range(limiter.maximum)]
+    assert all(lease is not None for lease in leases)
+    try:
+        response = stack.get("/video/mjpeg", headers=AUTH)
+        assert response.status_code == 429
+        assert response.json()["detail"]["code"] == "stream_limit"
+
+        async def scenario():
+            with pytest.raises(WebSocketClosed) as unauthenticated:
+                await ASGIWebSocket(
+                    stack.app,
+                    "/ws/frames?stream=raw",
+                ).connect()
+            assert unauthenticated.value.code == 4401
+
+            with pytest.raises(WebSocketClosed) as saturated:
+                await ASGIWebSocket(
+                    stack.app,
+                    "/ws/frames?stream=raw",
+                    headers={**AUTH, "Origin": ORIGIN},
+                ).connect()
+            assert saturated.value.code == 4429
+
+        run_async(scenario())
+    finally:
+        for lease in leases:
+            lease.release()
+    assert limiter.active == 0
+
+
 def test_renderer_credential_is_scoped_to_raw_frame_websocket(stack):
     assert stack.get("/status", headers=RENDERER_AUTH).status_code == 401
 
@@ -968,6 +1000,7 @@ def test_upload_store_enforces_exact_byte_limit_and_private_mode(tmp_path):
     store = _UploadStore(tmp_path / "exact", limits)
     saved = run_async(store.save(_multipart_request(payload), "image"))
     assert saved.size == len(payload)
+    assert stat.S_IMODE(store.directory.stat().st_mode) == 0o700
     assert stat.S_IMODE(saved.path.stat().st_mode) == 0o600
 
     too_small = _UploadStore(
@@ -1006,6 +1039,44 @@ def test_upload_store_establishes_mode_0600_with_restrictive_umask(tmp_path):
     finally:
         os.umask(previous)
     assert stat.S_IMODE(saved.path.stat().st_mode) == 0o600
+
+
+def test_upload_store_establishes_exact_private_modes_with_permissive_umask(
+    tmp_path,
+):
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    payload = encoded.tobytes()
+    store = _UploadStore(
+        tmp_path / "permissive-mode",
+        _UploadLimits(
+            image_max_bytes=len(payload),
+            storage_max_bytes=len(payload),
+            max_files=1,
+        ),
+    )
+    previous = os.umask(0)
+    try:
+        saved = run_async(store.save(_multipart_request(payload), "image"))
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(store.directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(saved.path.stat().st_mode) == 0o600
+
+
+def test_upload_store_revalidates_managed_directory_after_path_swap(tmp_path):
+    directory = tmp_path / "managed"
+    store = _UploadStore(directory, _UploadLimits())
+    store.ensure_directory()
+    original = tmp_path / "original"
+    directory.rename(original)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir(mode=0o755)
+    directory.symlink_to(replacement, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        store.ensure_directory()
+    assert stat.S_IMODE(replacement.stat().st_mode) == 0o755
 
 
 def test_upload_store_accounts_actual_bytes_and_rejects_quota(tmp_path):
@@ -1265,6 +1336,42 @@ def test_upload_cancellation_waits_for_mutating_worker_and_cleans_ownership(
     assert list(directory.iterdir()) == []
 
 
+def test_failed_upload_unlink_keeps_ownership_until_retry(tmp_path, monkeypatch):
+    directory = tmp_path / "cleanup-retry"
+    store = _UploadStore(directory, _UploadLimits())
+    store.ensure_directory()
+    temporary = directory / ".upload-retry.part"
+    store._reserve_file(temporary)
+    temporary.write_bytes(b"owned staging bytes")
+    store._reserve_bytes(temporary.stat().st_size)
+    size = temporary.stat().st_size
+    original_unlink = Path.unlink
+    failures = 3
+
+    def fail_first_cleanup_attempts(path, *args, **kwargs):
+        nonlocal failures
+        if path == temporary and failures:
+            failures -= 1
+            raise PermissionError(errno.EACCES, "temporary unlink failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_cleanup_attempts)
+    store._cleanup_save(None, temporary, None, size, True)
+
+    assert temporary.exists()
+    assert temporary in store._cleanup_pending
+    assert temporary in store._active_temps
+    assert store._reserved_files == 1
+    assert store._reserved_bytes == size
+
+    store._retry_pending_cleanup()
+    assert not temporary.exists()
+    assert store._cleanup_pending == {}
+    assert store._active_temps == set()
+    assert store._reserved_files == 0
+    assert store._reserved_bytes == 0
+
+
 def test_image_header_rejection_happens_before_opencv_decode(tmp_path, monkeypatch):
     path = tmp_path / "forged.png"
     path.write_bytes(b"not a real image")
@@ -1279,6 +1386,53 @@ def test_image_header_rejection_happens_before_opencv_decode(tmp_path, monkeypat
     with pytest.raises(HTTPException) as caught:
         store._validate(path, "image")
     assert caught.value.status_code == 422
+
+
+def test_image_full_pillow_decode_happens_before_opencv(tmp_path, monkeypatch):
+    path = tmp_path / "corrupt-compressed.png"
+    path.write_bytes(b"container accepted by the test decoder")
+    calls = 0
+
+    class PillowImage:
+        format = "PNG"
+        size = (2, 2)
+
+        def __init__(self, fail_load):
+            self.fail_load = fail_load
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc_info):
+            return False
+
+        def verify(self):
+            return None
+
+        def load(self):
+            if self.fail_load:
+                raise OSError("corrupt compressed pixels")
+
+    def open_image(_path):
+        nonlocal calls
+        calls += 1
+        return PillowImage(fail_load=calls == 2)
+
+    store = _UploadStore(tmp_path, _UploadLimits(image_max_pixels=100))
+    monkeypatch.setattr(server_mod.Image, "open", open_image)
+    monkeypatch.setattr(
+        server_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("OpenCV must not see corrupt compressed pixels")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        store._validate(path, "image")
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "invalid_media"
+    assert calls == 2
 
 
 def test_image_dimension_limit_is_checked_before_opencv_decode(tmp_path, monkeypatch):

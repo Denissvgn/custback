@@ -341,31 +341,49 @@ def acquire_builtin_model(backend: str, model_dir: Path | None = None) -> Path:
     return acquire_model(spec, model_dir)
 
 
+def _custom_model_backend(cfg: SegmentationConfig) -> str | None:
+    """Return the backend selected by a custom model's file format.
+
+    Model formats are backend-specific, so the suffix is authoritative when
+    ``backend: auto`` is used: an ONNX model is never offered to MediaPipe and
+    a TFLite model is never preceded by an unrelated RVM probe/download.
+    Configuration validation rejects incompatible explicit backend/suffix
+    combinations before this helper is called.
+    """
+
+    if not cfg.model_path:
+        return None
+    suffix = Path(cfg.model_path).suffix.lower()
+    if suffix == ".onnx":
+        return "rvm"
+    if suffix == ".tflite":
+        return "mediapipe"
+    return None
+
+
 def preacquire_segmenter_model(cfg: SegmentationConfig) -> SegmenterPreparation:
     """Resolve every viable startup fallback before camera resources open.
 
-    Automatic selection prepares both installed ML backends.  This avoids a
-    second network attempt after capture starts when RVM activation fails and
-    MediaPipe becomes the next candidate.  Custom paths remain user-owned and
-    unpinned; they receive only an existence/readability preflight.
+    Without a custom path, automatic selection prepares both installed ML
+    backends. This avoids a second network attempt after capture starts when
+    RVM activation fails and MediaPipe becomes the next candidate. A custom
+    path selects exactly the backend matching its suffix; custom bytes remain
+    user-owned and unpinned and receive only an existence/readability preflight.
     """
 
     module_names = {"rvm": "onnxruntime", "mediapipe": "mediapipe"}
-    candidates = (
-        ("rvm", module_names["rvm"]),
-        ("mediapipe", module_names["mediapipe"]),
-    ) if cfg.backend == "auto" else (
-        (cfg.backend, module_names.get(cfg.backend, cfg.backend)),
-    )
+    custom_backend = _custom_model_backend(cfg)
+    if cfg.backend == "auto" and custom_backend is not None:
+        candidates = ((custom_backend, module_names[custom_backend]),)
+    elif cfg.backend == "auto":
+        candidates = (
+            ("rvm", module_names["rvm"]),
+            ("mediapipe", module_names["mediapipe"]),
+        )
+    else:
+        candidates = ((cfg.backend, module_names.get(cfg.backend, cfg.backend)),)
     ready: set[str] = set()
     custom_path = Path(cfg.model_path) if cfg.model_path else None
-    custom_backend = (
-        "rvm"
-        if custom_path is not None and custom_path.suffix.lower() == ".onnx"
-        else "mediapipe"
-        if custom_path is not None and custom_path.suffix.lower() == ".tflite"
-        else None
-    )
     for backend, module in candidates:
         if backend not in BUILTIN_MODELS:
             continue
@@ -449,7 +467,7 @@ class MediaPipeSegmenter(Segmenter):
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision as mp_vision
 
-        if cfg.model_path and cfg.model_path.endswith(".tflite"):
+        if cfg.model_path and Path(cfg.model_path).suffix.lower() == ".tflite":
             model_path = Path(cfg.model_path)
         else:
             model_path = acquire_model(
@@ -509,7 +527,7 @@ class RVMSegmenter(Segmenter):
     ):
         import onnxruntime as ort
 
-        if cfg.model_path and cfg.model_path.endswith(".onnx"):
+        if cfg.model_path and Path(cfg.model_path).suffix.lower() == ".onnx":
             model_path = Path(cfg.model_path)
         else:
             model_path = acquire_model(
@@ -778,7 +796,17 @@ def create_segmenter(
     *,
     preparation: SegmenterPreparation | None = None,
 ) -> Segmenter:
-    backend = cfg.backend
+    requested_backend = cfg.backend
+    backend = (
+        _custom_model_backend(cfg)
+        if requested_backend == "auto" and cfg.model_path
+        else requested_backend
+    )
+    # SegmentationConfig validates custom suffixes, but retain the automatic
+    # behavior defensively if a caller supplies a non-standard path through a
+    # model constructed without normal validation.
+    if backend is None:
+        backend = requested_backend
     prepared = preparation.ready_backends if preparation is not None else None
     if backend == "none":
         return NullSegmenter()
@@ -788,7 +816,7 @@ def create_segmenter(
         and backend not in prepared
     ):
         raise ModelAcquisitionError(
-            f"explicit {backend} backend did not pass model pre-acquisition"
+            f"selected {backend} backend did not pass model pre-acquisition"
         )
     if backend in ("auto", "rvm") and (prepared is None or "rvm" in prepared):
         try:
@@ -798,7 +826,7 @@ def create_segmenter(
             log.info("using rvm matting backend on %s", seg.device)
             return seg
         except Exception as exc:
-            if backend == "rvm":
+            if requested_backend == "rvm":
                 raise
             log.info("rvm backend unavailable (%s)", exc)
     if backend in ("auto", "mediapipe") and (
@@ -811,7 +839,7 @@ def create_segmenter(
             log.info("using mediapipe segmentation backend on %s", seg.device)
             return seg
         except Exception as exc:
-            if backend == "mediapipe":
+            if requested_backend == "mediapipe":
                 raise
             log.info("mediapipe unavailable (%s); falling back to heuristic", exc)
     log.info("using heuristic segmentation backend")

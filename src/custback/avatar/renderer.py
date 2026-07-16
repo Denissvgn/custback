@@ -11,8 +11,15 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..backgrounds import BackdropProvider, ColorBackdrop, ImageBackdrop, VideoBackdrop
+from ..backgrounds import (
+    DEFAULT_IMAGE_MAX_PIXELS,
+    BackdropProvider,
+    ColorBackdrop,
+    ImageBackdrop,
+    VideoBackdrop,
+)
 from .config import AppearanceConfig, AvatarBackgroundConfig
+from .rig import resize_straight_alpha
 
 try:
     import cv2
@@ -20,14 +27,24 @@ except ImportError:  # pragma: no cover - required by the package, defensive
     cv2 = None
 
 
-def create_avatar_backdrop(cfg: AvatarBackgroundConfig) -> BackdropProvider | None:
+def create_avatar_backdrop(
+    cfg: AvatarBackgroundConfig,
+    *,
+    image_max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS,
+    video_max_width: int = 3840,
+    video_max_height: int = 2160,
+) -> BackdropProvider | None:
     """Build the static/scene provider; ``blur`` is handled per frame."""
     if cfg.mode == "color":
         return ColorBackdrop(cfg.color)
     if cfg.mode == "image":
-        return ImageBackdrop(cfg.image_path)
+        return ImageBackdrop(cfg.image_path, max_pixels=image_max_pixels)
     if cfg.mode == "video":
-        return VideoBackdrop(cfg.video_path)
+        return VideoBackdrop(
+            cfg.video_path,
+            max_width=video_max_width,
+            max_height=video_max_height,
+        )
     return None  # blur uses the raw frame
 
 
@@ -69,7 +86,11 @@ def compose_avatar(
     target_h = max(1, int(round(height * appearance.scale)))
     target_w = max(1, int(round(sprite_w * target_h / sprite_h)))
     interpolation = cv2.INTER_AREA if target_h < sprite_h else cv2.INTER_LINEAR
-    sprite = cv2.resize(sprite_bgra, (target_w, target_h), interpolation=interpolation)
+    sprite = resize_straight_alpha(
+        sprite_bgra,
+        (target_w, target_h),
+        interpolation=interpolation,
+    )
 
     anchor_x = width / 2.0 + appearance.offset_x * width / 2.0
     anchor_y = float(height) + appearance.offset_y * height / 2.0
