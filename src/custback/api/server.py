@@ -35,6 +35,7 @@ except ImportError:  # python-multipart 0.0.9 minimum compatibility
     from multipart.multipart import MultipartParser, parse_options_header
 
 from .. import __version__
+from .. import _platform as platform_fs
 from ..backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, VIDEO_EXTS
 from ..config import (
     MODES,
@@ -553,8 +554,7 @@ class _UploadStore:
             before = os.lstat(self.directory)
             if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
                 raise OSError(errno.ENOTDIR, "upload storage is not a directory")
-            effective_uid = getattr(os, "geteuid", lambda: before.st_uid)()
-            if before.st_uid != effective_uid:
+            if not platform_fs.stat_owner_matches(before):
                 raise PermissionError(
                     errno.EPERM,
                     "upload storage must be owned by the current user",
@@ -562,8 +562,8 @@ class _UploadStore:
                 )
             # chmod by name first so a restrictive umask cannot leave a newly
             # created directory unopenable. Verify the inode did not change,
-            # then bind the final mode to an O_NOFOLLOW directory descriptor.
-            os.chmod(self.directory, 0o700, follow_symlinks=False)
+            # then bind the final mode to a no-follow directory descriptor.
+            platform_fs.chmod_private(self.directory, 0o700)
             after = os.lstat(self.directory)
             if (
                 not stat.S_ISDIR(after.st_mode)
@@ -572,9 +572,7 @@ class _UploadStore:
             ):
                 raise OSError(errno.EAGAIN, "upload storage changed while securing it")
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_DIRECTORY", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(self.directory, flags)
+            descriptor = platform_fs.open_nofollow(self.directory, flags, directory=True)
             try:
                 opened = os.fstat(descriptor)
                 if not stat.S_ISDIR(opened.st_mode) or (
@@ -585,7 +583,14 @@ class _UploadStore:
                         errno.EAGAIN,
                         "upload storage changed while securing it",
                     )
-                os.fchmod(descriptor, 0o700)
+                # Authoritative owner check on the bound descriptor (SID on Windows).
+                if not platform_fs.owner_matches(descriptor):
+                    raise PermissionError(
+                        errno.EPERM,
+                        "upload storage must be owned by the current user",
+                        self.directory,
+                    )
+                platform_fs.set_private_mode(descriptor, 0o700)
             finally:
                 os.close(descriptor)
 
@@ -680,18 +685,14 @@ class _UploadStore:
     def _open_private_file(path: Path):
         descriptor: int | None = None
         try:
-            descriptor = os.open(
+            descriptor = platform_fs.open_nofollow(
                 path,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
                 0o600,
             )
             # A restrictive umask may remove owner bits; the final contract is
             # an exact private mode on the inode bound to this descriptor.
-            os.fchmod(descriptor, 0o600)
+            platform_fs.set_private_mode(descriptor, 0o600)
             destination = os.fdopen(descriptor, "wb")
             descriptor = None
             return destination
@@ -703,21 +704,19 @@ class _UploadStore:
     @staticmethod
     def _secure_private_file(path: Path) -> None:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
-        descriptor = os.open(path, flags)
+        descriptor = platform_fs.open_nofollow(path, flags)
         try:
             opened = os.fstat(descriptor)
-            effective_uid = getattr(os, "geteuid", lambda: opened.st_uid)()
             if not stat.S_ISREG(opened.st_mode):
                 raise OSError(errno.EINVAL, "upload is not a regular file", path)
-            if opened.st_uid != effective_uid:
+            if not platform_fs.owner_matches(descriptor):
                 raise PermissionError(
                     errno.EPERM,
                     "upload must be owned by the current user",
                     path,
                 )
-            os.fchmod(descriptor, 0o600)
+            platform_fs.set_private_mode(descriptor, 0o600)
         finally:
             os.close(descriptor)
 

@@ -29,6 +29,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .. import _platform as platform_fs
+
 from .security import (
     MAX_TOKEN_FILE_BYTES,
     SecurityConfigurationError,
@@ -118,9 +120,9 @@ def _read_avatar_client_token(token_file: str) -> str:
         raise SecurityConfigurationError(
             f"avatar API token path {path} must be a regular non-symlink file"
         )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = platform_fs.open_nofollow(path, flags)
     except OSError as exc:
         raise SecurityConfigurationError(
             f"cannot safely open avatar API token file {path}"
@@ -135,8 +137,8 @@ def _read_avatar_client_token(token_file: str) -> str:
             raise SecurityConfigurationError(
                 f"avatar API token file {path} changed while it was being opened"
             )
-        mode = stat.S_IMODE(opened.st_mode)
-        if mode & 0o077:
+        if not platform_fs.is_private_to_owner(token_stream.fileno()):
+            mode = stat.S_IMODE(opened.st_mode)
             raise SecurityConfigurationError(
                 f"avatar API token file {path} must not be accessible by group "
                 f"or others (current mode {mode:04o}; run chmod 600 {path})"

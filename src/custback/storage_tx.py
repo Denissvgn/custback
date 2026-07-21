@@ -15,88 +15,34 @@ file/tree remover so quota and publication locks remain owned by the caller.
 from __future__ import annotations
 
 import json
-import ctypes
-import errno
 import os
 import re
 import stat
-import sys
 import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - supported hosts are POSIX
-    fcntl = None
+from . import _platform as platform_fs
 
 
 _RECORD_RE = re.compile(r"\.custback-owned-([0-9a-f]{32})\.json\Z")
 _TEMP_RECORD_RE = re.compile(r"\.custback-owned-([0-9a-f]{32})-[0-9a-f]{32}\.tmp\Z")
 _MAX_RECORD_BYTES = 16 * 1024
 _MAX_RECOVERY_RECORDS = 4096
-_AT_FDCWD = -100
-_RENAME_NOREPLACE = 1
-_RENAME_EXCL = 0x4
 
 
 def sync_directory(path: Path) -> None:
     """Durably order namespace changes below a no-follow directory."""
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(Path(path), flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    platform_fs.fsync_dir(Path(path))
 
 
 def rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically rename without ever replacing an unmarked destination."""
 
-    source = Path(source)
-    destination = Path(destination)
-    libc = ctypes.CDLL(None, use_errno=True)
-    result: int | None = None
-    if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
-        renameat2 = libc.renameat2
-        renameat2.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        renameat2.restype = ctypes.c_int
-        result = renameat2(
-            _AT_FDCWD,
-            os.fsencode(source),
-            _AT_FDCWD,
-            os.fsencode(destination),
-            _RENAME_NOREPLACE,
-        )
-    elif sys.platform == "darwin" and hasattr(libc, "renamex_np"):
-        renamex_np = libc.renamex_np
-        renamex_np.argtypes = (
-            ctypes.c_char_p,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        renamex_np.restype = ctypes.c_int
-        result = renamex_np(os.fsencode(source), os.fsencode(destination), _RENAME_EXCL)
-    if result is None:
-        raise OSError(
-            errno.ENOTSUP,
-            "atomic no-replace rename is unavailable on this platform",
-            destination,
-        )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination)
-    sync_directory(source.parent)
+    platform_fs.rename_noreplace(Path(source), Path(destination))
 
 
 def is_ownership_metadata(path: Path) -> bool:
@@ -106,11 +52,10 @@ def is_ownership_metadata(path: Path) -> bool:
 
 
 def _private_open(path: Path) -> int:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    descriptor = platform_fs.open_nofollow(path, flags, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
+        platform_fs.set_private_mode(descriptor, 0o600)
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -224,13 +169,7 @@ class OwnershipLedger:
         }
 
     def _sync_directory(self) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.metadata_root, flags)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        platform_fs.fsync_dir(self.metadata_root)
 
     def _secure_metadata_root(self, *, create: bool) -> os.stat_result | None:
         created = False
@@ -246,17 +185,15 @@ class OwnershipLedger:
             return None
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
             raise OSError("storage ownership metadata is not a directory")
-        effective_uid = getattr(os, "geteuid", lambda: before.st_uid)()
-        if before.st_uid != effective_uid:
+        if not platform_fs.stat_owner_matches(before):
             raise PermissionError("storage ownership metadata has another owner")
         if created:
-            os.chmod(self.metadata_root, 0o700, follow_symlinks=False)
+            platform_fs.chmod_private(self.metadata_root, 0o700)
             before = self.metadata_root.lstat()
         elif stat.S_IMODE(before.st_mode) != 0o700:
             raise PermissionError("storage ownership metadata does not have mode 0700")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.metadata_root, flags)
+        descriptor = platform_fs.open_nofollow(self.metadata_root, flags, directory=True)
         try:
             opened = os.fstat(descriptor)
             if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
@@ -264,7 +201,10 @@ class OwnershipLedger:
                 before.st_ino,
             ):
                 raise OSError("storage ownership metadata changed while opening")
-            os.fchmod(descriptor, 0o700)
+            # Authoritative owner check on the bound descriptor (SID on Windows).
+            if not platform_fs.owner_matches(descriptor):
+                raise PermissionError("storage ownership metadata has another owner")
+            platform_fs.set_private_mode(descriptor, 0o700)
             return opened
         finally:
             os.close(descriptor)
@@ -272,22 +212,20 @@ class OwnershipLedger:
     def _acquire_lease(self, *, create: bool) -> None:
         if self._lease_descriptor is not None:
             return
-        if fcntl is None:
-            raise OSError("storage ownership leases require POSIX flock")
         metadata = self._secure_metadata_root(create=create)
         if metadata is None:
             return
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self._lease_path(), flags, 0o600)
+        descriptor = platform_fs.open_nofollow(self._lease_path(), flags, 0o600)
         try:
             opened = os.fstat(descriptor)
-            effective_uid = getattr(os, "geteuid", lambda: opened.st_uid)()
-            if not stat.S_ISREG(opened.st_mode) or opened.st_uid != effective_uid:
+            if not stat.S_ISREG(opened.st_mode) or not platform_fs.owner_matches(
+                descriptor
+            ):
                 raise OSError("unsafe storage ownership lease")
-            os.fchmod(descriptor, 0o600)
+            platform_fs.set_private_mode(descriptor, 0o600)
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                platform_fs.lock_exclusive(descriptor)
             except BlockingIOError as exc:
                 raise OSError("storage ownership is held by another process") from exc
         except BaseException:
@@ -394,8 +332,7 @@ class OwnershipLedger:
                 or metadata.st_size > _MAX_RECORD_BYTES
             ):
                 raise OSError(f"unsafe storage ownership record: {path}")
-            effective_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
-            if metadata.st_uid != effective_uid:
+            if not platform_fs.stat_owner_matches(metadata):
                 raise PermissionError(
                     f"storage ownership record has another owner: {path}"
                 )
@@ -404,8 +341,8 @@ class OwnershipLedger:
                     f"storage ownership record does not have mode 0600: {path}"
                 )
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-            descriptor = os.open(path, flags)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = platform_fs.open_nofollow(path, flags)
             try:
                 opened = os.fstat(descriptor)
                 if (
@@ -416,6 +353,11 @@ class OwnershipLedger:
                 ):
                     raise OSError(
                         f"storage ownership record changed while opening: {path}"
+                    )
+                # Authoritative owner check on the bound descriptor (SID on Windows).
+                if not platform_fs.owner_matches(descriptor):
+                    raise PermissionError(
+                        f"storage ownership record has another owner: {path}"
                     )
                 with os.fdopen(descriptor, "rb") as source:
                     descriptor = -1

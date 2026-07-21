@@ -14,6 +14,7 @@ from pathlib import Path
 
 from typing import get_args
 
+from .. import _platform as platform_fs
 from ..config import format_config_error
 from .config import (
     AVATAR_PARTS,
@@ -167,9 +168,11 @@ def export_avatar_config(
         return 0
 
     path = Path(destination).expanduser()
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = platform_fs.open_nofollow(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+    )
     try:
-        os.fchmod(descriptor, 0o600)
+        platform_fs.set_private_mode(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
             handle.write(contents)
             handle.flush()

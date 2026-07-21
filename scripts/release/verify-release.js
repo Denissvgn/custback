@@ -27,6 +27,10 @@ const LINUX_MEMORY_BACKED_FILESYSTEM_MAGICS = new Set([
 const REVIEWED_PYTHON_MODULES = [
   'custback/__init__.py',
   'custback/__main__.py',
+  'custback/_platform/__init__.py',
+  'custback/_platform/base.py',
+  'custback/_platform/posix.py',
+  'custback/_platform/windows.py',
   'custback/api/__init__.py',
   'custback/api/avatar_proxy.py',
   'custback/api/security.py',
@@ -79,6 +83,7 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_gpu_probe.py',
   'tests/test_model_acquisition.py',
   'tests/test_pipeline.py',
+  'tests/test_platform_seam.py',
   'tests/test_phase5_lifecycle.py',
   'tests/test_phase5_storage.py',
   'tests/test_phase6_migration.py',
@@ -159,6 +164,9 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
   mediapipe: ['mediapipe>=0.10.14,<0.11'],
   rvm: ['onnxruntime>=1.17,<2'],
   gpu: ['onnxruntime-gpu>=1.17,<1.27'],
+  // Windows filesystem-security backend (custback._platform.windows): LockFileEx,
+  // owner-only DACLs, reparse-point rejection, SID ownership, MoveFileEx.
+  windows: ['pywin32>=306'],
   audio2face: [
     'grpcio>=1.67,<1.67.2',
     'nvidia-ace==1.0.0',

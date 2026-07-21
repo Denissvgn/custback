@@ -37,6 +37,7 @@ import numpy as np
 import yaml
 from yaml.events import AliasEvent
 
+from .. import _platform as platform_fs
 from ..backgrounds import IMAGE_EXTS, VIDEO_EXTS
 from ..storage_tx import (
     OwnedPath,
@@ -117,10 +118,15 @@ class StoreError(Exception):
 
 
 def _owned_by_current_user(metadata: os.stat_result) -> bool:
-    """Return whether ``metadata`` belongs to this process's effective user."""
+    """Advisory pre-open owner check from a stat result.
 
-    getuid = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
-    return getuid is None or metadata.st_uid == getuid()
+    POSIX compares ``st_uid`` to the effective UID.  A Windows stat result
+    carries no usable owner, so this is a pre-filter that defers to the
+    authoritative post-open :func:`platform_fs.owner_matches` SID check in
+    :func:`_secure_existing` (WIN-2.6 / CC-1).
+    """
+
+    return platform_fs.stat_owner_matches(metadata)
 
 
 def _unsafe_storage(path: Path, message: str) -> StoreError:
@@ -128,12 +134,12 @@ def _unsafe_storage(path: Path, message: str) -> StoreError:
 
 
 def _open_flags(*, directory: bool = False, writable: bool = False) -> int:
+    """Base ``open`` flags; :func:`platform_fs.open_nofollow` adds no-follow and,
+    when requested, the directory flag."""
+
     flags = os.O_WRONLY if writable else os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    if directory:
-        flags |= getattr(os, "O_DIRECTORY", 0)
-    elif not writable:
+    if not directory and not writable:
         # Refuse a raced FIFO/device without waiting on it.
         flags |= getattr(os, "O_NONBLOCK", 0)
     return flags
@@ -161,7 +167,7 @@ def _secure_existing(path: Path, mode: int, *, directory: bool) -> None:
     # opening and fchmod'ing the authoritative descriptor.
     required_owner_bits = stat.S_IRUSR | stat.S_IXUSR if directory else stat.S_IRUSR
     if stat.S_IMODE(before.st_mode) & required_owner_bits != required_owner_bits:
-        os.chmod(path, mode, follow_symlinks=False)
+        platform_fs.chmod_private(path, mode)
         after = path.lstat()
         if (
             stat.S_ISLNK(after.st_mode)
@@ -171,16 +177,19 @@ def _secure_existing(path: Path, mode: int, *, directory: bool) -> None:
         ):
             raise _unsafe_storage(path, "managed storage changed while securing")
 
-    descriptor = os.open(path, _open_flags(directory=directory))
+    descriptor = platform_fs.open_nofollow(
+        path, _open_flags(directory=directory), directory=directory
+    )
     try:
         current = os.fstat(descriptor)
         if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
             raise _unsafe_storage(path, "managed storage changed while opening")
         if not expected_type(current.st_mode):
             raise _unsafe_storage(path, "managed storage changed type while opening")
-        if not _owned_by_current_user(current):
+        # Authoritative owner check on the bound descriptor (SID on Windows).
+        if not platform_fs.owner_matches(descriptor):
             raise _unsafe_storage(path, "managed storage is not owned by this user")
-        os.fchmod(descriptor, mode)
+        platform_fs.set_private_mode(descriptor, mode)
     finally:
         os.close(descriptor)
 
@@ -223,16 +232,10 @@ def _open_private_file(path: Path) -> BinaryIO:
 
     descriptor: int | None = None
     try:
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        descriptor = os.open(path, flags, _PRIVATE_FILE_MODE)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        descriptor = platform_fs.open_nofollow(path, flags, _PRIVATE_FILE_MODE)
         # Both permissive and restrictive umasks converge on the exact mode.
-        os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+        platform_fs.set_private_mode(descriptor, _PRIVATE_FILE_MODE)
         destination = os.fdopen(descriptor, "wb")
         descriptor = None
         return destination
@@ -253,7 +256,7 @@ def _open_private_file(path: Path) -> BinaryIO:
 def _open_regular_file(path: Path) -> BinaryIO:
     """Open an existing regular file for reading without following symlinks."""
 
-    descriptor = os.open(path, _open_flags())
+    descriptor = platform_fs.open_nofollow(path, _open_flags())
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):

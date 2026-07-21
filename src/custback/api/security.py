@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Literal, Mapping
 from urllib.parse import urlsplit
 
+from .. import _platform as platform_fs
+
 
 TOKEN_ENV = "CUSTBACK_API_TOKEN"
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "custback" / "api-token"
@@ -104,9 +106,9 @@ def _resolve_token(
             raise SecurityConfigurationError(
                 f"API token path {path} must be a regular non-symlink file"
             )
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         try:
-            descriptor = os.open(path, flags)
+            descriptor = platform_fs.open_nofollow(path, flags)
         except OSError as exc:
             raise SecurityConfigurationError(
                 f"cannot safely open API token file {path}"
@@ -121,8 +123,8 @@ def _resolve_token(
                 raise SecurityConfigurationError(
                     f"API token file {path} changed while it was being opened"
                 )
-            mode = stat.S_IMODE(opened.st_mode)
-            if mode & 0o077:
+            if not platform_fs.is_private_to_owner(token_stream.fileno()):
+                mode = stat.S_IMODE(opened.st_mode)
                 raise SecurityConfigurationError(
                     f"API token file {path} must not be accessible by group or others "
                     f"(current mode {mode:04o}; run chmod 600 {path})"
@@ -147,15 +149,9 @@ def _resolve_token(
 
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     token = secrets.token_urlsafe(32)
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = platform_fs.open_nofollow(path, flags, 0o600)
     except FileExistsError:  # another process won the first-start race
         return _resolve_token(
             path,
@@ -167,7 +163,7 @@ def _resolve_token(
     try:
         # A restrictive process umask may remove owner-write permission.  The
         # token contract is an exact private mode, so establish it explicitly.
-        os.fchmod(fd, 0o600)
+        platform_fs.set_private_mode(fd, 0o600)
         with os.fdopen(fd, "w") as fh:
             fh.write(token + "\n")
     except BaseException:

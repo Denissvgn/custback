@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import _platform as platform_fs
+
 DEFAULT_LOG_BYTES = 5 * 1024 * 1024
 DEFAULT_LOG_BACKUPS = 3
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s [run=%(run_id)s]: %(message)s"
@@ -200,8 +202,7 @@ class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
+        fd = platform_fs.open_nofollow(path, flags)
         try:
             opened = os.fstat(fd)
             if (
@@ -214,7 +215,7 @@ class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
                     "log file changed while permissions were being secured",
                     path,
                 )
-            os.fchmod(fd, 0o600)
+            platform_fs.set_private_mode(fd, 0o600)
         finally:
             os.close(fd)
 
@@ -227,10 +228,9 @@ class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
         flags = os.O_WRONLY | os.O_CREAT
         flags |= os.O_APPEND if self.mode.startswith("a") else os.O_TRUNC
         flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.baseFilename, flags, 0o600)
+        fd = platform_fs.open_nofollow(self.baseFilename, flags, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            platform_fs.set_private_mode(fd, 0o600)
             return os.fdopen(
                 fd,
                 self.mode,

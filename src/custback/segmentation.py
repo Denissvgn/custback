@@ -20,7 +20,6 @@ Backends:
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import importlib
 import logging
@@ -36,6 +35,7 @@ from typing import BinaryIO, Iterator
 
 import numpy as np
 
+from . import _platform as platform_fs
 from .config import SegmentationConfig
 
 try:
@@ -122,13 +122,13 @@ def _valid_cached_model(path: Path, spec: ModelSpec) -> bool:
 def _model_lock(path: Path, timeout_s: float = MODEL_LOCK_TIMEOUT_S) -> Iterator[None]:
     """Serialize model writers without leaving an owned sentinel behind."""
 
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    os.fchmod(descriptor, 0o600)
+    descriptor = platform_fs.open_nofollow(path, os.O_CREAT | os.O_RDWR, 0o600)
+    platform_fs.set_private_mode(descriptor, 0o600)
     deadline = time.monotonic() + timeout_s
     try:
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                platform_fs.lock_exclusive(descriptor)
                 break
             except BlockingIOError as exc:
                 if time.monotonic() >= deadline:
@@ -139,22 +139,16 @@ def _model_lock(path: Path, timeout_s: float = MODEL_LOCK_TIMEOUT_S) -> Iterator
         yield
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            platform_fs.unlock(descriptor)
         finally:
             os.close(descriptor)
 
 
 def _sync_directory(path: Path) -> None:
     try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:  # pragma: no cover - uncommon filesystem limitation
-        return
-    try:
-        os.fsync(descriptor)
+        platform_fs.fsync_dir(path)
     except OSError:  # pragma: no cover - not supported by every filesystem
         pass
-    finally:
-        os.close(descriptor)
 
 
 def _stream_model(

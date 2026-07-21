@@ -35,6 +35,7 @@ from yaml.constructor import ConstructorError
 from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
+from . import _platform as platform_fs
 from .config import AppConfig, format_config_error
 
 MAX_CONFIG_BYTES = 1024 * 1024
@@ -181,11 +182,6 @@ class _MigrationLoader(yaml.SafeLoader):
         return mapping
 
 
-def _effective_uid() -> int | None:
-    getter = getattr(os, "geteuid", None)
-    return getter() if getter is not None else None
-
-
 def _lexical_path(path: str | os.PathLike[str]) -> Path:
     expanded = os.path.expanduser(os.fspath(path))
     return Path(os.path.abspath(expanded))
@@ -232,8 +228,7 @@ def _read_regular_nofollow(
         raise MigrationError(f"refusing to follow symbolic link: {path}")
     if not stat.S_ISREG(before.st_mode):
         raise MigrationError(f"expected a regular file: {path}")
-    uid = _effective_uid()
-    if uid is not None and before.st_uid != uid:
+    if not platform_fs.stat_owner_matches(before):
         raise MigrationError(f"file is not owned by the current user: {path}")
     actual_mode = stat.S_IMODE(before.st_mode)
     if required_mode is not None and actual_mode != required_mode:
@@ -243,10 +238,9 @@ def _read_regular_nofollow(
     if before.st_size > maximum:
         raise MigrationError(f"file exceeds the migration size limit: {path}")
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = platform_fs.open_nofollow(path, flags)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise MigrationError(f"refusing to follow symbolic link: {path}") from exc
@@ -258,6 +252,9 @@ def _read_regular_nofollow(
             before.st_ino,
         ):
             raise MigrationError(f"file changed while opening: {path}")
+        # Authoritative owner check on the bound descriptor (SID on Windows).
+        if not platform_fs.owner_matches(descriptor):
+            raise MigrationError(f"file is not owned by the current user: {path}")
         chunks: list[bytes] = []
         remaining = maximum + 1
         while remaining:
@@ -289,16 +286,12 @@ def _read_regular_nofollow(
 
 
 def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(directory, flags)
     try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISDIR(opened.st_mode):
-            raise MigrationError(f"migration parent is not a directory: {directory}")
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        platform_fs.fsync_dir(directory)
+    except NotADirectoryError as exc:
+        raise MigrationError(
+            f"migration parent is not a directory: {directory}"
+        ) from exc
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -315,13 +308,12 @@ def _atomic_private_write(path: Path, payload: bytes, *, replace: bool) -> None:
 
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
     created = False
     try:
-        descriptor = os.open(temporary, flags, PRIVATE_FILE_MODE)
+        descriptor = platform_fs.open_nofollow(temporary, flags, PRIVATE_FILE_MODE)
         created = True
-        os.fchmod(descriptor, PRIVATE_FILE_MODE)
+        platform_fs.set_private_mode(descriptor, PRIVATE_FILE_MODE)
         _write_all(descriptor, payload)
         os.fsync(descriptor)
         os.close(descriptor)
@@ -340,7 +332,7 @@ def _atomic_private_write(path: Path, payload: bytes, *, replace: bool) -> None:
         else:
             # A hard-link publication supplies rename-like durability without
             # replacing a pre-existing backup or journal of unknown origin.
-            os.link(temporary, path, follow_symlinks=False)
+            platform_fs.hardlink(temporary, path)
             os.unlink(temporary)
             created = False
         _fsync_directory(path.parent)
@@ -806,8 +798,7 @@ def _scan_storage_path(path: Path, issues: list[StorageIssue]) -> None:
     if not (is_directory or is_file):
         issues.append(_storage_issue(path, "type", metadata, expected))
         return
-    uid = _effective_uid()
-    if uid is not None and metadata.st_uid != uid:
+    if not platform_fs.stat_owner_matches(metadata):
         issues.append(_storage_issue(path, "owner", metadata, expected))
         return
     if stat.S_IMODE(metadata.st_mode) != expected:
@@ -816,9 +807,8 @@ def _scan_storage_path(path: Path, issues: list[StorageIssue]) -> None:
         return
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = platform_fs.open_nofollow(path, flags, directory=True)
     except OSError:
         issues.append(_storage_issue(path, "unreadable", metadata, expected))
         return
@@ -831,7 +821,7 @@ def _scan_storage_path(path: Path, issues: list[StorageIssue]) -> None:
             issues.append(_storage_issue(path, "changed", metadata, expected))
             return
         try:
-            names = sorted(os.listdir(descriptor))
+            names = sorted(platform_fs.listdir_secure(descriptor, path))
         except OSError:
             issues.append(_storage_issue(path, "unreadable", metadata, expected))
             return
@@ -865,15 +855,14 @@ def _repair_mode(issue: StorageIssue) -> None:
     if issue.expected_mode is None or issue.device is None or issue.inode is None:
         raise StorageMigrationError(f"cannot repair unsafe storage path: {issue.path}")
     before = issue.path.lstat()
-    uid = _effective_uid()
     if (
         stat.S_ISLNK(before.st_mode)
         or not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode))
         or (before.st_dev, before.st_ino) != (issue.device, issue.inode)
-        or (uid is not None and before.st_uid != uid)
+        or not platform_fs.stat_owner_matches(before)
     ):
         raise StorageMigrationError(f"storage path changed before repair: {issue.path}")
-    os.chmod(issue.path, issue.expected_mode, follow_symlinks=False)
+    platform_fs.chmod_private(issue.path, issue.expected_mode)
     after = issue.path.lstat()
     if stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (
         issue.device,
@@ -881,19 +870,25 @@ def _repair_mode(issue: StorageIssue) -> None:
     ):
         raise StorageMigrationError(f"storage path changed during repair: {issue.path}")
 
+    is_directory = stat.S_ISDIR(after.st_mode)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    if stat.S_ISDIR(after.st_mode):
-        flags |= getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(issue.path, flags)
+    descriptor = platform_fs.open_nofollow(issue.path, flags, directory=is_directory)
     try:
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (issue.device, issue.inode):
             raise StorageMigrationError(
                 f"storage path changed while binding repair: {issue.path}"
             )
-        os.fchmod(descriptor, issue.expected_mode)
-        os.fsync(descriptor)
+        # Authoritative owner check on the bound descriptor (SID on Windows).
+        if not platform_fs.owner_matches(descriptor):
+            raise StorageMigrationError(
+                f"storage path is not owned by the current user: {issue.path}"
+            )
+        platform_fs.set_private_mode(descriptor, issue.expected_mode)
+        if is_directory:
+            platform_fs.fsync_dir(issue.path)
+        else:
+            os.fsync(descriptor)
     finally:
         os.close(descriptor)
 

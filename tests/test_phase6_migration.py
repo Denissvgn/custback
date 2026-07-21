@@ -264,8 +264,13 @@ def test_store_repair_refuses_foreign_owners_before_mutation(tmp_path, monkeypat
     root = tmp_path / "rigs"
     root.mkdir()
     root.chmod(0o755)
-    actual_uid = root.lstat().st_uid
-    monkeypatch.setattr(migration, "_effective_uid", lambda: actual_uid + 1)
+    # Simulate a foreign owner through the platform seam. Ownership now routes
+    # through platform_fs (st_uid == geteuid() on POSIX; an owner-SID comparison
+    # on Windows), so forcing the advisory check to report "not ours" drives the
+    # audit's "owner" issue without a file actually owned by another principal.
+    monkeypatch.setattr(
+        migration.platform_fs, "stat_owner_matches", lambda metadata: False
+    )
 
     audit = migration.audit_storage((root,))
     assert [issue.reason for issue in audit.issues] == ["owner"]

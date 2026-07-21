@@ -35,6 +35,11 @@ rvm = ["onnxruntime>=1.17,<2"]
 # ONNX Runtime 1.27 switched the Python 3.14 Linux wheel to CUDA 13, while
 # custback's supported GPU runtime line remains CUDA 12.
 gpu = ["onnxruntime-gpu>=1.17,<1.27"]
+# Windows filesystem-security backend (custback._platform.windows): the
+# LockFileEx/owner-only-DACL/reparse-rejection/SID/MoveFileEx primitives that
+# replace the POSIX fcntl/fchmod/O_NOFOLLOW/geteuid contract (Phase 2, WIN-2.x).
+# Required whenever custback runs on Windows; bundled by the frozen installer.
+windows = ["pywin32>=306"]
 # Audio-driven avatar animation via an NVIDIA Audio2Face-3D gRPC endpoint.
 # NVIDIA's published protocol wheels have a narrow grpc/protobuf intersection.
 # This extra cannot be combined with mediapipe, which requires protobuf<5.
