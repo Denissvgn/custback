@@ -197,25 +197,26 @@ test('npm artifact LICENSE must be byte-identical to the canonical source', (t) 
   );
 });
 
-test('remediation registry records Phase 5 complete with only REL-01 open', () => {
+test('remediation registry records Phase 5 resolved with REL-01 and WIN-01 open', () => {
   const registry = release.remediationRegistry(root);
   const blockers = release.remediationBlockers(root);
   assert.equal(registry.phase, 6);
   assert.equal(registry.release_blocked, true);
-  assert.equal(blockers.length, 28);
+  assert.equal(blockers.length, 29);
   assert.deepEqual(blockers.map((entry) => entry.id), [
     'SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01', 'A2F-01',
     'CFG-01', 'CFG-02', 'LIFE-01', 'LIFE-02', 'STOR-01', 'STOR-02',
     'SEG-01', 'SEG-02', 'SEG-03', 'RENDER-01', 'RENDER-02', 'API-01',
     'NPM-01', 'PKG-01', 'PKG-02', 'DEPLOY-01', 'MISC-01', 'MISC-02',
-    'LICENSE-01', 'PLATFORM-01', 'HYGIENE-01', 'SEC-02', 'REL-01',
+    'LICENSE-01', 'PLATFORM-01', 'HYGIENE-01', 'SEC-02', 'REL-01', 'WIN-01',
   ]);
   assert.equal(blockers.filter((entry) => entry.status === 'resolved').length, 27);
   assert.deepEqual(
     blockers.filter((entry) => entry.status === 'open').map((entry) => entry.id),
-    ['REL-01'],
+    ['REL-01', 'WIN-01'],
   );
   assert.equal(blockers.find((entry) => entry.id === 'REL-01').phase, 6);
+  assert.equal(blockers.find((entry) => entry.id === 'WIN-01').phase, 6);
   assert.doesNotThrow(() => release.verifyBlockerRegressionCoverage(root));
   assert.throws(() => release.verifyNoReleaseBlockers(root), /REL-01/);
 });

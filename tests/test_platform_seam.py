@@ -31,9 +31,7 @@ WINDOWS = sys.platform == "win32"
 
 
 def _make_private_file(path, data=b"payload"):
-    fd = platform_fs.open_nofollow(
-        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-    )
+    fd = platform_fs.open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         platform_fs.set_private_mode(fd, 0o600)
         os.write(fd, data)
@@ -70,9 +68,7 @@ def test_open_nofollow_excl_refuses_existing(tmp_path):
     target = tmp_path / "excl"
     _make_private_file(target)
     with pytest.raises(FileExistsError):
-        platform_fs.open_nofollow(
-            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
+        platform_fs.open_nofollow(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 
 
 def test_open_nofollow_directory_flag_opens_a_directory(tmp_path):
@@ -157,7 +153,9 @@ def test_is_private_to_owner_false_when_group_or_other_readable(tmp_path):
         os.close(fd)
 
 
-@pytest.mark.skipif(not WINDOWS, reason="NTFS owner-only DACL is protected (no inheritance)")
+@pytest.mark.skipif(
+    not WINDOWS, reason="NTFS owner-only DACL is protected (no inheritance)"
+)
 def test_private_dacl_is_owner_only_and_protected(tmp_path):
     import win32security
 

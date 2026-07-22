@@ -1634,7 +1634,7 @@ def test_passthrough_startup_preflights_segmenter_inference(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        pipeline_mod, "create_segmenter", lambda _cfg: BrokenSegmenter()
+        pipeline_mod, "create_segmenter", lambda _cfg, **_kwargs: BrokenSegmenter()
     )
     with pytest.raises(ActivationError, match="inference is broken"):
         pipeline.start()
@@ -1718,7 +1718,7 @@ def test_slow_processing_counts_deadline_misses_without_send_pacing(monkeypatch)
     monkeypatch.setattr(
         pipeline_mod,
         "create_segmenter",
-        lambda _cfg: SlowSegmenter(),
+        lambda _cfg, **_kwargs: SlowSegmenter(),
     )
     runtime = make_runtime(mode="color")
     pipeline, hub = run_pipeline(runtime)
@@ -1800,7 +1800,7 @@ def test_fallback_logs_only_transitions_and_recovery(monkeypatch, caplog):
     monkeypatch.setattr(
         pipeline_mod,
         "create_segmenter",
-        lambda cfg: pipeline_mod.HeuristicSegmenter(cfg),
+        lambda cfg, **_kwargs: pipeline_mod.HeuristicSegmenter(cfg),
     )
     with caplog.at_level("INFO", logger="custback.pipeline"):
         pipeline, hub = run_pipeline(runtime)

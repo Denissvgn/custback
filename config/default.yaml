@@ -45,6 +45,18 @@ segmentation:
   mask_shift: 0        # grow (>0) / shrink (<0) mask by N px; -1..-2 removes halos
   temporal_smoothing: 0.35  # flicker damping; motion still tracks instantly
 
+# RVM inference acceleration policy (onnxruntime execution provider).
+# Independent of segmentation.delegate above, which only selects MediaPipe's
+# CPU/GPU delegate. GPU registration alone is not trusted: auto mode proves the
+# provider can actually execute RVM before using it, and latches to CPU if not.
+acceleration:
+  mode: auto           # auto | cpu | gpu_required
+                       #   auto         = try GPU, prove it, else fall back to CPU
+                       #   cpu          = CPUExecutionProvider only (never a GPU)
+                       #   gpu_required = fail startup unless GPU execution is proven
+  provider: auto       # auto | cuda | directml — auto tries platform GPU providers
+  device_id: 0         # adapter index when more than one accelerator is present
+
 compositing:
   light_wrap: 0.25     # 0..1, backdrop light bleeding into the person's edge
   use_model_foreground: true  # rvm only: color-spill removal on hair/edges

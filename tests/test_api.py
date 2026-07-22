@@ -31,7 +31,7 @@ if int(starlette.__version__.split(".", 1)[0]) >= 1:
 else:  # Starlette < 1 uses the original httpx client contract.
     from httpx import ASGITransport, AsyncClient
 
-from custback.api.security import SecurityPolicy
+from custback.api.security import SESSION_COOKIE, SecurityPolicy
 import custback.api.server as server_mod
 from custback.api.server import _UploadLimits, _UploadStore, create_app
 from custback.config import AppConfig, ConfigState, RuntimeConfig
@@ -1641,3 +1641,63 @@ def test_video_later_frame_limit_rejects_the_whole_upload(tmp_path, monkeypatch)
     assert caught.value.status_code == 422
     assert caught.value.detail["code"] == "video_dimensions_exceeded"
     assert capture.released
+
+
+def _shutdown_stack(stack, on_shutdown):
+    """A second app over the fixture's live pipeline with a shutdown channel."""
+    security = SecurityPolicy.for_bind(
+        TOKEN,
+        "testserver",
+        80,
+        allowed_origins=[ORIGIN],
+        extra_hosts=["testserver"],
+        renderer_token=RENDERER_TOKEN,
+    )
+    app = create_app(
+        stack.runtime,
+        stack.hub,
+        stack.pipeline,
+        security=security,
+        upload_dir=stack.upload_dir,
+        on_shutdown=on_shutdown,
+    )
+    return Stack(app, stack.runtime, stack.hub, stack.pipeline, stack.upload_dir)
+
+
+def test_lifecycle_shutdown_requires_bearer_and_invokes_handler(stack):
+    # WIN-5.3: the supervising shell's private lifecycle channel.
+    calls = []
+    wired = _shutdown_stack(stack, lambda: calls.append(True))
+
+    unauth = wired.post("/lifecycle/shutdown")
+    assert unauth.status_code == 401
+    assert calls == []
+
+    ok = wired.post("/lifecycle/shutdown", headers=AUTH)
+    assert ok.status_code == 202
+    assert calls == [True]
+
+
+def test_lifecycle_shutdown_rejects_browser_session(stack):
+    # A WebView holds only the HttpOnly session cookie, never the bearer; it
+    # must not be able to stop the engine.
+    calls = []
+    wired = _shutdown_stack(stack, lambda: calls.append(True))
+    issued = wired.post("/auth/session", json={"token": TOKEN})
+    assert issued.status_code == 204
+    session = issued.cookies.get(SESSION_COOKIE)
+    assert session
+    denied = wired.post(
+        "/lifecycle/shutdown", headers={"Cookie": f"{SESSION_COOKIE}={session}"}
+    )
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "forbidden"
+    assert calls == []
+
+
+def test_lifecycle_shutdown_unavailable_without_supervisor(stack):
+    # The default (source/signal-driven) app wires no handler; the route then
+    # reports the channel is unavailable rather than crashing or 404-ing.
+    resp = stack.post("/lifecycle/shutdown", headers=AUTH)
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "shutdown_unavailable"

@@ -36,7 +36,17 @@ from typing import BinaryIO, Iterator
 import numpy as np
 
 from . import _platform as platform_fs
-from .config import SegmentationConfig
+from .acceleration import (
+    CPU_PROVIDER,
+    AccelerationState,
+    GpuRequiredError,
+    preload_acceleration_dlls,
+    provider_label,
+    prove_rvm_provider,
+    resolve_provider_candidates,
+    warm_up_session,
+)
+from .config import AccelerationConfig, SegmentationConfig
 
 try:
     import cv2
@@ -518,7 +528,13 @@ class RVMSegmenter(Segmenter):
 
     produces_matte = True
 
-    def __init__(self, cfg: SegmentationConfig, *, allow_model_download: bool = True):
+    def __init__(
+        self,
+        cfg: SegmentationConfig,
+        *,
+        acceleration: AccelerationConfig | None = None,
+        allow_model_download: bool = True,
+    ):
         import onnxruntime as ort
 
         if cfg.model_path and Path(cfg.model_path).suffix.lower() == ".onnx":
@@ -526,27 +542,124 @@ class RVMSegmenter(Segmenter):
         else:
             model_path = acquire_model(RVM_MODEL, allow_download=allow_model_download)
 
-        available = ort.get_available_providers()
-        preferred = [
-            p
-            for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider")
-            if p in available
-        ]
-        options = ort.SessionOptions()
-        options.log_severity_level = 3  # hide per-node provider assignment noise
-        self._session = ort.InferenceSession(
-            str(model_path),
-            sess_options=options,
-            providers=preferred + ["CPUExecutionProvider"],
+        self._ort = ort
+        self._model_path = str(model_path)
+        self._accel_cfg = (
+            acceleration if acceleration is not None else AccelerationConfig()
         )
-        active = self._session.get_providers()[0]
-        self.device = {
-            "CUDAExecutionProvider": "cuda",
-            "CoreMLExecutionProvider": "coreml",
-        }.get(active, "cpu")
+        #: Truthful, latched acceleration lifecycle (read by /status and doctor).
+        self.accel = AccelerationState(self._accel_cfg)
+        self._session = self._build_session()
         self._downsample = cfg.rvm_downsample
         self._rec: list[np.ndarray] | None = None
         self._size: tuple[int, int] | None = None
+
+    # -- session construction / acceleration policy -------------------
+    def _new_session_options(self):
+        options = self._ort.SessionOptions()
+        options.log_severity_level = 3  # hide per-node provider assignment noise
+        return options
+
+    def _make_session(self, providers: list) -> object:
+        return self._ort.InferenceSession(
+            self._model_path,
+            sess_options=self._new_session_options(),
+            providers=providers,
+        )
+
+    def _build_cpu_session(self) -> object:
+        """Construct a deterministic CPU-only session."""
+
+        return self._make_session([CPU_PROVIDER])
+
+    def _build_session(self) -> object:
+        """Resolve the acceleration policy into a proven production session.
+
+        GPU providers are proven against the real RVM graph before use; a
+        registered-but-unprovable provider is treated as absent.  ``auto`` falls
+        back to CPU (latched) and ``gpu_required`` fails startup, so no code path
+        silently pretends a GPU is active when it is not.
+        """
+
+        available = list(self._ort.get_available_providers())
+        candidates = resolve_provider_candidates(self._accel_cfg, available)
+        gpu_required = self._accel_cfg.mode == "gpu_required"
+
+        if not candidates:
+            if gpu_required:
+                raise GpuRequiredError(
+                    "acceleration.mode is gpu_required but no accelerator "
+                    "execution provider is registered"
+                )
+            session = self._build_cpu_session()
+            self.device = "cpu"
+            self.accel.mark_cpu_active()
+            return session
+
+        self.accel.mark_probing()
+        last_reason = "no accelerator provider could execute RVM"
+        for candidate in candidates:
+            preload_acceleration_dlls(candidate.name)
+            proof = prove_rvm_provider(self._ort, self._model_path, candidate)
+            if not proof.proven:
+                last_reason = proof.error or last_reason
+                log.info(
+                    "RVM acceleration provider %s unavailable (%s)",
+                    candidate.name,
+                    proof.error or "not proven",
+                )
+                continue
+            session = self._make_session([candidate.as_ort_arg(), CPU_PROVIDER])
+            active = session.get_providers()[0]
+            if active != candidate.name:
+                # Production session disagreed with the proof; do not trust it.
+                last_reason = "production session did not bind the proven provider"
+                continue
+            try:
+                warm_up_session(session, 64, 64)
+            except Exception as exc:  # pragma: no cover - defensive warm-up guard
+                last_reason = " ".join(str(exc).split())[:200]
+                log.info("RVM warm-up failed on %s (%s)", candidate.name, exc)
+                continue
+            self.device = provider_label(candidate.name)
+            self.accel.mark_gpu_active(candidate.name)
+            log.info("RVM acceleration active on %s", candidate.name)
+            return session
+
+        if gpu_required:
+            raise GpuRequiredError(
+                f"acceleration.mode is gpu_required but no accelerator could "
+                f"execute RVM: {last_reason}"
+            )
+        session = self._build_cpu_session()
+        self.device = "cpu"
+        self.accel.latch_fallback(last_reason)
+        log.warning("RVM acceleration fell back to CPU: %s", last_reason)
+        return session
+
+    def _recover_to_cpu(self, exc: BaseException) -> None:
+        """Rebuild a CPU-only session after a GPU/DLL/OOM inference failure."""
+
+        log.warning("RVM GPU inference failed (%s); rebuilding a CPU-only session", exc)
+        self._session = self._build_cpu_session()
+        self.device = "cpu"
+        self.accel.latch_fallback(str(exc))
+
+    def _feeds(self, frame_bgr: np.ndarray, ratio: float) -> dict[str, np.ndarray]:
+        assert self._rec is not None
+        if cv2 is not None:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        else:  # pragma: no cover
+            rgb = frame_bgr[..., ::-1]
+        src = rgb.astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+        return {
+            "src": src,
+            "r1i": self._rec[0],
+            "r2i": self._rec[1],
+            "r3i": self._rec[2],
+            "r4i": self._rec[3],
+            "downsample_ratio": np.asarray([ratio], dtype=np.float32),
+        }
 
     def segment(self, frame_bgr: np.ndarray) -> np.ndarray:
         h, w = frame_bgr.shape[:2]
@@ -554,26 +667,26 @@ class RVMSegmenter(Segmenter):
             # Recurrent state is resolution-bound; reset on size changes.
             self._rec = [np.zeros((1, 1, 1, 1), dtype=np.float32)] * 4
             self._size = (h, w)
-        if cv2 is not None:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        else:  # pragma: no cover
-            rgb = frame_bgr[..., ::-1]
-        src = rgb.astype(np.float32).transpose(2, 0, 1)[None] / 255.0
         # Internal inference resolution: the model was trained to matte at a
         # reduced size and refine at full size; ~512 px on the long side is
         # the quality/speed sweet spot for webcam framing.
         ratio = self._downsample or min(1.0, max(0.125, 512.0 / max(h, w)))
-        fgr, pha, *self._rec = self._session.run(
-            None,
-            {
-                "src": src,
-                "r1i": self._rec[0],
-                "r2i": self._rec[1],
-                "r3i": self._rec[2],
-                "r4i": self._rec[3],
-                "downsample_ratio": np.asarray([ratio], dtype=np.float32),
-            },
-        )
+        try:
+            fgr, pha, *self._rec = self._session.run(
+                None, self._feeds(frame_bgr, ratio)
+            )
+        except Exception as exc:
+            # A GPU/DLL/OOM failure is recoverable once: rebuild a CPU session,
+            # clear the recurrent state and foreground so the retry starts clean,
+            # and stay on CPU. A CPU-side failure is not retried (it would loop).
+            if not self.accel.on_gpu:
+                raise
+            self._recover_to_cpu(exc)
+            self._rec = [np.zeros((1, 1, 1, 1), dtype=np.float32)] * 4
+            self.last_foreground = None
+            fgr, pha, *self._rec = self._session.run(
+                None, self._feeds(frame_bgr, ratio)
+            )
         fgr_rgb = np.clip(fgr[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
         self.last_foreground = np.ascontiguousarray(fgr_rgb[..., ::-1])
         return np.ascontiguousarray(pha[0, 0].astype(np.float32))
@@ -788,6 +901,7 @@ def refiner_for(cfg: SegmentationConfig, segmenter: Segmenter) -> MaskRefiner:
 def create_segmenter(
     cfg: SegmentationConfig,
     *,
+    acceleration: AccelerationConfig | None = None,
     preparation: SegmenterPreparation | None = None,
 ) -> Segmenter:
     requested_backend = cfg.backend
@@ -814,9 +928,18 @@ def create_segmenter(
         )
     if backend in ("auto", "rvm") and (prepared is None or "rvm" in prepared):
         try:
-            seg = RVMSegmenter(cfg, allow_model_download=preparation is None)
+            seg = RVMSegmenter(
+                cfg,
+                acceleration=acceleration,
+                allow_model_download=preparation is None,
+            )
             log.info("using rvm matting backend on %s", seg.device)
             return seg
+        except GpuRequiredError:
+            # gpu_required is an explicit operator demand for proven GPU
+            # execution; never satisfy it by silently degrading to another
+            # backend, regardless of backend=auto fallback.
+            raise
         except Exception as exc:
             if requested_backend == "rvm":
                 raise

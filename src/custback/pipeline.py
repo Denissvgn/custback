@@ -53,6 +53,45 @@ _VIDEO_STATS_DEFAULTS: dict[str, object] = {
     "background_video_decode_failures": 0,
 }
 
+_ACCELERATION_STATS_DEFAULTS: dict[str, object] = {
+    "acceleration_mode": "",
+    "acceleration_requested_provider": "",
+    "acceleration_device_id": 0,
+    "acceleration_state": "",
+    "acceleration_active_provider": "",
+    "acceleration_fallback_active": False,
+    "acceleration_fallback_reason": "",
+    "acceleration_fallback_count": 0,
+    "acceleration_last_transition_ms": None,
+}
+
+
+def _acceleration_stats(segmenter: Any) -> dict[str, object]:
+    """Read the segmenter's latched acceleration status, if it has one.
+
+    Only the RVM segmenter runs an ONNX Runtime execution provider; the
+    heuristic/mediapipe/null backends report the neutral defaults.  Reading the
+    latched state each frame is what makes a mid-run GPU->CPU fallback visible
+    in ``/status`` without any extra notification path.
+    """
+
+    accel = getattr(segmenter, "accel", None)
+    if accel is None:
+        return dict(_ACCELERATION_STATS_DEFAULTS)
+    status = accel.status()
+    return {
+        "acceleration_mode": status.requested_mode,
+        "acceleration_requested_provider": status.requested_provider,
+        "acceleration_device_id": status.device_id,
+        "acceleration_state": status.state,
+        "acceleration_active_provider": status.active_provider,
+        "acceleration_fallback_active": status.fallback_active,
+        "acceleration_fallback_reason": status.fallback_reason,
+        "acceleration_fallback_count": status.fallback_count,
+        "acceleration_last_transition_ms": status.last_transition_ms,
+    }
+
+
 # Retain compact downsampled fingerprints for the complete pipeline session.
 # The bound is a fail-closed admission limit, never an eviction policy: once it
 # is reached, the renderer session is invalidated and output remains the slate.
@@ -63,6 +102,20 @@ _RAW_ECHO_CHANGED_FRACTION = 0.02
 _RAW_ECHO_MEAN_DELTA = 4.0
 _RAW_ECHO_LOWRES_MEAN_DELTA = 20.0
 _RAW_ECHO_LOWRES_CORRELATION = 0.93
+
+
+def _segmenter_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Inputs that require rebuilding the segmenter (and its ORT session).
+
+    The acceleration policy is a separate top-level section but is consumed at
+    segmenter construction (provider selection / proof), so a change to it must
+    re-stage the segmenter exactly like a segmentation change would.
+    """
+
+    return (
+        cfg.segmentation.model_dump(mode="python"),
+        cfg.acceleration.model_dump(mode="python"),
+    )
 
 
 def _backdrop_key(cfg: AppConfig) -> tuple[object, ...]:
@@ -871,10 +924,13 @@ class Pipeline:
             if self._model_preparation is not None:
                 segmenter = create_segmenter(
                     cfg.segmentation,
+                    acceleration=cfg.acceleration,
                     preparation=self._model_preparation,
                 )
             else:
-                segmenter = create_segmenter(cfg.segmentation)
+                segmenter = create_segmenter(
+                    cfg.segmentation, acceleration=cfg.acceleration
+                )
             startup.callback(_safe_close, segmenter, "segmenter")
             refiner = refiner_for(cfg.segmentation, segmenter)
             backdrop = _build_backdrop(cfg)
@@ -945,8 +1001,10 @@ class Pipeline:
 
         activation = _Activation(candidate=candidate)
         try:
-            if candidate.segmentation != current.segmentation:
-                activation.segmenter = create_segmenter(candidate.segmentation)
+            if _segmenter_key(candidate) != _segmenter_key(current):
+                activation.segmenter = create_segmenter(
+                    candidate.segmentation, acceleration=candidate.acceleration
+                )
                 activation.replace_segmenter = True
                 activation.refiner = refiner_for(
                     candidate.segmentation, activation.segmenter
@@ -972,7 +1030,7 @@ class Pipeline:
             raise ActivationError("candidate resources were not prepared off-lane")
         activation = prepared
         activation.candidate = candidate
-        segmentation_changed = candidate.segmentation != old_cfg.segmentation
+        segmentation_changed = _segmenter_key(candidate) != _segmenter_key(old_cfg)
         background_changed = _backdrop_key(candidate) != _backdrop_key(old_cfg)
         if segmentation_changed != activation.replace_segmenter:
             raise ActivationError("prepared segmentation candidate is stale")
@@ -1330,6 +1388,7 @@ class Pipeline:
                 "privacy-slate" if cfg.background.mode == "remote" else ""
             ),
             config_version=resources.version,
+            **_acceleration_stats(resources.segmenter),
             **video_stats,
         )
         self._log_fallback_transition(
@@ -2015,6 +2074,7 @@ class Pipeline:
                 output_send_ms=stage_ewma["output_send_ms"],
                 frame_processing_ms=stage_ewma["frame_processing_ms"],
                 config_version=resources.version,
+                **_acceleration_stats(resources.segmenter),
                 **video_stats,
             )
             # Publish only after the matching counters/fallback state are

@@ -31,6 +31,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/_platform/base.py',
   'custback/_platform/posix.py',
   'custback/_platform/windows.py',
+  'custback/acceleration.py',
   'custback/api/__init__.py',
   'custback/api/avatar_proxy.py',
   'custback/api/security.py',
@@ -50,6 +51,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/avatar/state.py',
   'custback/avatar/store.py',
   'custback/backgrounds.py',
+  'custback/camera_devices.py',
   'custback/capture.py',
   'custback/compositor.py',
   'custback/config.py',
@@ -65,6 +67,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/vcam.py',
 ];
 const REVIEWED_PYTHON_TESTS = [
+  'tests/test_acceleration.py',
   'tests/test_api.py',
   'tests/test_api_lifecycle.py',
   'tests/test_api_security.py',
@@ -76,6 +79,7 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_avatar_rig.py',
   'tests/test_avatar_service.py',
   'tests/test_avatar_store.py',
+  'tests/test_camera_devices.py',
   'tests/test_capture.py',
   'tests/test_config.py',
   'tests/test_config_merge.py',
@@ -95,7 +99,9 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_remediation_security.py',
   'tests/test_segmentation_rvm.py',
   'tests/test_streaming.py',
+  'tests/test_vcam.py',
   'tests/test_webui.py',
+  'tests/test_windows_packaging.py',
   'tests/fixtures/migration/expected-0.4.0-local-camera.yaml',
   'tests/fixtures/migration/legacy-0.3.0-default.yaml',
   'tests/fixtures/migration/legacy-0.3.0-local-camera.yaml',
@@ -127,6 +133,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'packaging/npm/test/phase6-migration.test.js',
   'packaging/npm/test/release-check.test.js',
   'packaging/npm/test/release-workflow.test.js',
+  'packaging/npm/test/windows-release-check.test.js',
   'packaging/npm/test/remediation-phase0.test.js',
   'pyproject.toml',
   'scripts/install_linux.sh',
@@ -180,7 +187,10 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
     'pytest-timeout>=2.3,<3',
     'httpx>=0.27,<0.29',
     'httpx2>=2,<3',
-    'ruff>=0.12,<1',
+    // Exact pin: ruff's pre-1.0 formatter style is version-specific, so the
+    // `ruff format --check` gate is only deterministic when the version is
+    // fixed (see pyproject dev extra + [tool.ruff] required-version).
+    'ruff==0.15.22',
   ],
 };
 const REVIEWED_CONSOLE_SCRIPTS = {
@@ -194,7 +204,7 @@ const REVIEWED_ACTIONS = new Set([
 ]);
 const REVIEWED_LICENSE_COPYRIGHT = 'Copyright (c) 2026 Bramen';
 const REVIEWED_REMEDIATION_CONTRACT_SHA256 =
-  'd60119dc48db2a8327348b788da1bef6218f4bf5211dadc74178fdd505042cda';
+  'c64a8907141e5f5c6ad883384936ddd92673a3e1c2e4f290a296125a0ce6446b';
 const REVIEWED_NPM_METADATA = {
   name: 'custback',
   description: 'Virtual camera with background replacement for meeting apps (Ubuntu / Debian / macOS)',

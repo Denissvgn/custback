@@ -27,6 +27,8 @@ DEFAULT_LOG_BACKUPS = 3
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s [run=%(run_id)s]: %(message)s"
 _URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>'\"]+")
 _SAFE_CONFIG_STRINGS = {
+    "acceleration.mode",
+    "acceleration.provider",
     "background.mode",
     "background.remote_fallback_mode",
     "camera.mode_mismatch",

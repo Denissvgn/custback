@@ -121,7 +121,36 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="write the effective config to PATH and exit",
     )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="list detected input cameras (friendly name + stable id) and exit",
+    )
     return parser
+
+
+def list_cameras() -> int:
+    """Print detected input cameras and exit.
+
+    A no-hardware-mutating surface for choosing a stable device identifier
+    instead of a bare index that can change meaning when devices reorder
+    (WIN-3.1).  The project's own / OBS output camera is excluded so it is
+    never selected as an input (WIN-3.4).
+    """
+
+    from .camera_devices import enumerate_cameras
+
+    devices = enumerate_cameras()
+    if not devices:
+        print("no input cameras detected")
+        return 0
+    width = max(len(str(device.index)) for device in devices)
+    for device in devices:
+        print(
+            f"[{device.index:>{width}}] {device.name}  "
+            f"(id={device.stable_id}, backend={device.backend})"
+        )
+    return 0
 
 
 def config_from_args(args: argparse.Namespace) -> AppConfig:
@@ -480,7 +509,24 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
             from .api.server import create_app
 
             assert security is not None
-            app = create_app(runtime, hub, pipeline, security=security)
+
+            def request_lifecycle_shutdown() -> None:
+                # Invoked from the API thread by POST /lifecycle/shutdown
+                # (WIN-5.3). Setting the event unwinds the wait loop below; the
+                # finally block then stops the API and drains the pipeline, so
+                # camera/output cleanup still runs (WIN-5.4).
+                nonlocal shutdown_reason
+                if not stop.is_set():
+                    shutdown_reason = "lifecycle-shutdown"
+                stop.set()
+
+            app = create_app(
+                runtime,
+                hub,
+                pipeline,
+                security=security,
+                on_shutdown=request_lifecycle_shutdown,
+            )
             api_runner = _ApiRunner(app, cfg.api)
             try:
                 api_runner.start()
@@ -616,6 +662,10 @@ def main(argv: list[str] | None = None) -> int:
     except (LoggingConfigurationError, ValueError) as exc:
         print(f"custback: logging configuration error: {exc}", file=sys.stderr)
         return EXIT_CONFIG
+    if args.list_cameras:
+        # Enumeration touches no config and opens no output; keep it ahead of
+        # config load so a broken config file does not block device discovery.
+        return list_cameras()
     try:
         try:
             cfg = config_from_args(args)

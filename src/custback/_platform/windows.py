@@ -76,7 +76,9 @@ def _current_user_sid():
     return _current_user_sid_cache
 
 
-def _oserror(exc: pywintypes.error, path: os.PathLike[str] | str | None = None) -> OSError:
+def _oserror(
+    exc: pywintypes.error, path: os.PathLike[str] | str | None = None
+) -> OSError:
     """Translate a Win32 error into an ``OSError`` with a mapped ``errno``.
 
     Passing ``winerror`` as the fourth argument lets CPython map it onto the
@@ -241,9 +243,7 @@ def open_nofollow(
     try:
         file_attributes = win32file.GetFileInformationByHandle(handle)[0]
         if file_attributes & win32con.FILE_ATTRIBUTE_REPARSE_POINT:
-            raise OSError(
-                errno.ELOOP, "refusing to open a reparse point", str(path)
-            )
+            raise OSError(errno.ELOOP, "refusing to open a reparse point", str(path))
         is_directory = bool(file_attributes & win32con.FILE_ATTRIBUTE_DIRECTORY)
         if directory and not is_directory:
             raise NotADirectoryError(errno.ENOTDIR, "not a directory", str(path))
@@ -369,8 +369,7 @@ def fsync_dir(path: os.PathLike[str] | str) -> None:
             _SHARE_ALL,
             None,
             win32con.OPEN_EXISTING,
-            win32con.FILE_FLAG_BACKUP_SEMANTICS
-            | win32con.FILE_FLAG_OPEN_REPARSE_POINT,
+            win32con.FILE_FLAG_BACKUP_SEMANTICS | win32con.FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
     except pywintypes.error as exc:

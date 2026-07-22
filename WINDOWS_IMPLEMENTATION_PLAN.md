@@ -87,28 +87,36 @@ These are not a phase; they are invariants that gate every merge.
 Win32/NTFS backend; POSIX is byte-for-byte and the full suite is green on Linux;
 the NTFS-specific execution/adversarial assertions run under the still-TODO
 `windows-latest` CI job (WIN-1.8), which is where these flip to `DONE`.
-| WIN-3.1 | Friendly camera enumeration + stable IDs | 3 | M | WIN-1.8 | TODO |
-| WIN-3.2 | Explicit MSMF/DSHOW backend selection | 3 | M | WIN-3.1 | TODO |
-| WIN-3.3 | Camera privacy-denial handling | 3 | S | WIN-3.2 | TODO |
-| WIN-3.4 | Output-camera loop prevention | 3 | S | WIN-3.1 | TODO |
-| WIN-3.5 | Resolution/FPS negotiation verification | 3 | S | WIN-3.2 | TODO |
-| WIN-3.6 | Device lifecycle (replug/suspend/contention) | 3 | M | WIN-3.2 | TODO |
-| WIN-3.7 | OBS Virtual Camera detect + setup | 3 | M | WIN-1.8 | TODO |
-| WIN-4.1 | `acceleration` config model + migration | 4 | M | — | TODO |
-| WIN-4.2 | Real-RVM warm-up probe | 4 | M | WIN-4.1 | TODO |
-| WIN-4.3 | GPU state machine + non-fatal probe + DLL preload | 4 | L | WIN-4.2 | TODO |
-| WIN-4.4 | Inference-time recovery around `session.run` | 4 | M | WIN-4.3 | TODO |
-| WIN-4.5 | Truthful acceleration status/doctor/UI | 4 | M | WIN-4.3 | TODO |
-| WIN-4.6 | CPU-force and gpu_required modes | 4 | S | WIN-4.1 | TODO |
-| WIN-4.7 | DirectML / Windows ML go/no-go spike | 4 | M | WIN-4.2 | TODO |
-| WIN-5.1 | PyInstaller onedir spec + hooks | 5 | L | WIN-2.8, WIN-3.7, WIN-4.4 | TODO |
-| WIN-5.2 | C# WebView2/tray shell | 5 | L | WIN-5.1 | TODO |
-| WIN-5.3 | Secure WebView session bootstrap | 5 | M | WIN-5.2 | TODO |
-| WIN-5.4 | Tray lifecycle / suspend / crash handling | 5 | M | WIN-5.2 | TODO |
-| WIN-5.5 | Supervise avatar second process | 5 | S | WIN-5.2 | TODO |
-| WIN-5.6 | Signed per-user EXE/MSI installer | 5 | L | WIN-5.1 | TODO |
-| WIN-5.7 | Uninstall data-retention policy | 5 | S | WIN-5.6 | TODO |
-| WIN-5.8 | Windows release-evidence pipeline | 5 | M | WIN-5.6, WIN-0.2 | TODO |
+| WIN-3.1 | Friendly camera enumeration + stable IDs | 3 | M | WIN-1.8 | IMPL* |
+| WIN-3.2 | Explicit MSMF/DSHOW backend selection | 3 | M | WIN-3.1 | IMPL* |
+| WIN-3.3 | Camera privacy-denial handling | 3 | S | WIN-3.2 | IMPL* |
+| WIN-3.4 | Output-camera loop prevention | 3 | S | WIN-3.1 | IMPL* |
+| WIN-3.5 | Resolution/FPS negotiation verification | 3 | S | WIN-3.2 | IMPL* |
+| WIN-3.6 | Device lifecycle (replug/suspend/contention) | 3 | M | WIN-3.2 | IMPL* (existing recovery covers replug/suspend/contention; reorder mitigated by stable IDs at selection) |
+| WIN-3.7 | OBS Virtual Camera detect + setup | 3 | M | WIN-1.8 | IMPL* |
+| WIN-4.1 | `acceleration` config model + migration | 4 | M | — | DONE |
+| WIN-4.2 | Real-RVM warm-up probe | 4 | M | WIN-4.1 | IMPL* |
+| WIN-4.3 | GPU state machine + non-fatal probe + DLL preload | 4 | L | WIN-4.2 | IMPL* |
+| WIN-4.4 | Inference-time recovery around `session.run` | 4 | M | WIN-4.3 | IMPL* |
+| WIN-4.5 | Truthful acceleration status/doctor/UI | 4 | M | WIN-4.3 | IMPL* |
+| WIN-4.6 | CPU-force and gpu_required modes | 4 | S | WIN-4.1 | IMPL* |
+| WIN-4.7 | DirectML / Windows ML go/no-go spike | 4 | M | WIN-4.2 | DONE (planning gate) |
+
+`IMPL*` here = implemented behind the acceleration seam
+(`custback/acceleration.py`); the policy, latched state machine, real-RVM
+proof, provider selection, inference-time recovery, and truthful status are
+green on Linux with a fake ORT. The provider-*execution* assertions (a real
+CUDA/DirectML node proven via the ORT profile, and the injected mid-run GPU/OOM
+failure) are the Phase-4/5 hardware gates in the validation matrix, which is
+where these flip to `DONE`.
+| WIN-5.1 | PyInstaller onedir spec + hooks | 5 | L | WIN-2.8, WIN-3.7, WIN-4.4 | IMPL* |
+| WIN-5.2 | C# WebView2/tray shell | 5 | L | WIN-5.1 | IMPL* |
+| WIN-5.3 | Secure WebView session bootstrap | 5 | M | WIN-5.2 | IMPL* (engine contract DONE on Linux) |
+| WIN-5.4 | Tray lifecycle / suspend / crash handling | 5 | M | WIN-5.2 | IMPL* |
+| WIN-5.5 | Supervise avatar second process | 5 | S | WIN-5.2 | IMPL* |
+| WIN-5.6 | Signed per-user EXE/MSI installer | 5 | L | WIN-5.1 | IMPL* |
+| WIN-5.7 | Uninstall data-retention policy | 5 | S | WIN-5.6 | IMPL* |
+| WIN-5.8 | Windows release-evidence pipeline | 5 | M | WIN-5.6, WIN-0.2 | IMPL* (WIN-01 slot applied; job wiring pends WIN-1.8) |
 | WIN-6.1 | Native Win11 Media Foundation virtual camera | 6 | XL | WIN-5.8 | TODO |
 | WIN-6.2 | Generic GPU provider (DirectML/Windows ML) | 6 | XL | WIN-4.7 | TODO |
 | WIN-6.3 | ARM64 support | 6 | L | WIN-5.8 | TODO |
@@ -402,6 +410,40 @@ Virtual Camera. Parallelizable with Phase 2 once Phase 1 lands.
 **Exit gate:** physical camera → Custback → OBS Virtual Camera is visible and
 stable in Teams, Zoom, Chrome/Meet, and a browser test page.
 
+**Implementation notes (landed behind a camera seam):**
+- **Camera seam:** all OS-specific *camera* behavior (enumeration, backend
+  order, output-loop detection, privacy/OBS guidance) lives in the new
+  `src/custback/camera_devices.py`, so `capture.py`/`vcam.py` contain no camera
+  `sys.platform` branch — the CC-4 discipline applied to capture. Added to the
+  release manifest (`verify-release.js`) per CC-2.
+- **Enumeration (WIN-3.1/3.4):** Linux reads sysfs friendly names + `/dev/v4l/by-id`
+  stable IDs deterministically; other platforms probe OpenCV indices with an
+  optional Media Foundation/DirectShow name provider. Virtual *output* cameras
+  (OBS/Custback/v4l2loopback) are filtered from inputs by name. Surfaced through
+  `custback --list-cameras`.
+- **Backend selection (WIN-3.2):** `capture.py` opens with an explicit
+  `apiPreference` in Windows MSMF→DSHOW order, falling through on open failure.
+  Off Windows the candidate list is empty, so the open call is the historical
+  single-arg `cv2.VideoCapture(device)` — **POSIX capture is byte-for-byte
+  unchanged**.
+- **Privacy denial (WIN-3.3):** a total open failure on Windows appends a
+  credential-free hint naming Settings > Privacy & security > Camera.
+- **Negotiation (WIN-3.5):** the existing post-first-frame verification is
+  backend-agnostic and now reports the explicit MSMF/DSHOW backend.
+- **Lifecycle (WIN-3.6):** the existing bounded reader/recovery controller
+  already covers unplug/replug, suspend/resume, and meeting-app contention;
+  stable IDs address reorder at *selection* time (int-index reopen keeps its
+  documented reorder caveat).
+- **OBS output (WIN-3.7):** `vcam.py` gives platform-specific OBS setup guidance,
+  distinguishes the single-instance "in use" case from "not installed" in the
+  fallback reason, and never redistributes OBS components (CC-5).
+- **Validation:** POSIX byte-for-byte (full suite green on Linux);
+  `tests/test_camera_devices.py` and `tests/test_vcam.py` assert the contract on
+  both backends, and `tests/test_capture.py` forces the Windows platform to
+  exercise MSMF→DSHOW selection and the privacy hint. The MSMF/DSHOW *execution*
+  and real Media Foundation enumeration/OBS assertions run under the still-TODO
+  `windows-latest` CI job (WIN-1.8), which is where these flip to `DONE`.
+
 ### WIN-3.1 — Friendly enumeration + stable IDs · M
 - Enumerate device friendly names and stable identifiers (Media Foundation
   enumeration) instead of bare index `0`. Extend `src/custback/capture.py`
@@ -442,6 +484,57 @@ Phases 2–3.
 **Exit gate:** clean CPU-only machine starts and reports CPU; NVIDIA machine
 proves RVM GPU nodes (not mere provider registration); injected startup *and*
 mid-run GPU failures retry once on CPU and latch, without pipeline exit.
+
+**Implementation notes (landed behind the acceleration seam):**
+- **Acceleration seam:** all provider-selection, proof, DLL-preload, and latched
+  lifecycle logic lives in the new `src/custback/acceleration.py`, so
+  `segmentation.py` no longer composes ORT provider lists inline and no code
+  path branches on `sys.platform` for acceleration (CC-4). Added to the release
+  manifest (`verify-release.js`) per CC-2. It imports nothing GPU-specific at
+  load; the segmenter passes in the already-imported `onnxruntime`.
+- **Config (WIN-4.1):** `AccelerationConfig {mode: auto|cpu|gpu_required,
+  provider: auto|cuda|directml, device_id}` is a strict Pydantic model, separate
+  from `segmentation.delegate` (MediaPipe-only). It is purely additive with safe
+  defaults, so `extra="forbid"` still loads a pre-Phase-4 config (no legacy
+  `camera_device`-style rewrite is needed; a backward-compat test asserts a
+  section-less config gains the default policy and an explicit one round-trips).
+  Hot-reconfig re-stages the segmenter when `acceleration` *or* `segmentation`
+  changes (`_segmenter_key` in `pipeline.py`).
+- **Real-RVM proof (WIN-4.2):** `prove_rvm_provider` runs one synthetic frame
+  through the *actual* RVM graph in a short-lived profiling session and confirms
+  a node executed on the candidate provider — registration-without-execution and
+  init fallback both fail the proof. `gpu_probe.py`'s tiny `Add` graph is kept
+  for diagnostics only.
+- **State machine (WIN-4.3):** `AccelerationState` latches
+  `STARTING → GPU_PROBING → GPU_ACTIVE | CPU_FALLBACK`; a proven provider is
+  warmed up before the first real frame; `preload_acceleration_dlls` adds CUDA
+  DLL directories on Windows before the first session (non-fatal). CPU_FALLBACK
+  is the single on-CPU terminal state; `fallback_active` distinguishes an
+  intended CPU landing (`mode: cpu`, or `auto` with no GPU registered) from a
+  degraded one, and `fallback_count` counts each distinct degradation once.
+- **Inference recovery (WIN-4.4):** `RVMSegmenter.segment` wraps `session.run`;
+  a GPU/DLL/OOM failure while `on_gpu` rebuilds a CPU-only session, clears the
+  recurrent state and `last_foreground`, retries the current frame once, and
+  stays latched on CPU. A CPU-side failure is re-raised, never retried (it would
+  loop). GPU is never retried per frame.
+- **Status (WIN-4.5):** the latched status (requested mode/provider, *actual*
+  post-fallback active provider, state, fallback flag/reason/count, transition
+  age) is read each frame into `hub` stats and surfaced in `/status`, the web-UI
+  System-status panel, and the config-change audit whitelist (`diagnostics.py`).
+  The active provider reflects reality, never the requested order.
+- **Modes (WIN-4.6):** `mode: cpu` builds only `CPUExecutionProvider`;
+  `mode: gpu_required` raises `GpuRequiredError` at startup unless real GPU
+  execution is proven, and that error is never swallowed by `backend: auto`
+  segmenter fallback.
+- **DirectML (WIN-4.7):** the `DmlExecutionProvider` path is wired through
+  provider selection and proof; `WINDOWS_ACCELERATION_SPIKE.md` records the
+  benchmark method and go/no-go criteria that gate the WIN-6.2 "all Windows GPUs"
+  claim. Bundling/benchmark on hardware remains open.
+- **Validation:** POSIX byte-for-byte (RVM CPU path unchanged; full suite green
+  on Linux). `tests/test_acceleration.py` and the acceleration cases in
+  `tests/test_segmentation_rvm.py` assert the contract with a fake ORT that
+  writes an ORT-shaped profile; the real CUDA/DirectML execution and injected
+  mid-run failure run under the Phase-4/5 hardware gates.
 
 ### WIN-4.1 — `acceleration` config model + migration · M
 - Add `acceleration: {mode: auto|cpu|gpu_required, provider: auto|cuda|directml,
@@ -498,6 +591,42 @@ stores).
 
 **Exit gate:** a clean VM with no Python/Node/build tools installs, runs,
 upgrades, and uninstalls; no secret appears in process arguments or URLs.
+
+**Implementation notes (landed as reviewable source + an engine contract):**
+- **Packaging tree:** the Windows-built artifacts live under `packaging/windows/`
+  (`pyinstaller/`, `shell/`, `installer/`). That path is matched by no npm
+  `files` glob, so the exact npm-payload gate (CC-2) is unaffected; only the two
+  files that *are* payload-matched — `tests/test_windows_packaging.py` and
+  `packaging/npm/test/windows-release-check.test.js` — were added to the
+  reviewed manifests in `verify-release.js`.
+- **Engine side is real and Linux-verified.** WIN-5.3's contract that the shell
+  depends on — the `/auth/session` bearer→cookie bootstrap and the new
+  bearer-only `POST /lifecycle/shutdown` private lifecycle channel
+  (`api/server.py`, wired from `__main__.py`) — is implemented and asserted on
+  Linux (`tests/test_api.py`): a WebView session (HttpOnly cookie only) is
+  rejected (403), the bearer succeeds (202), and an unwired process reports 503.
+- **Secret hygiene (WIN-5.3).** The bearer never appears in a URL, command line,
+  web storage, or log: the engine writes it to a private-DACL token file
+  (WIN-2.3); the shell passes only the *path*, exchanges the token in a POST
+  body over loopback, and injects only the opaque session cookie into WebView2.
+- **`IMPL*` semantics here:** the PyInstaller spec/hooks (WIN-5.1), the C#
+  shell (WIN-5.2/5.4/5.5), and the WiX installer/retention (WIN-5.6/5.7) are
+  complete, reviewable source whose *byte-static* parts are checked on Linux
+  (`tests/test_windows_packaging.py` syntax-checks the spec/hooks and asserts
+  no bundled weights, onedir, pywin32 hidden imports, no hard-coded version).
+  The freeze, the .NET/WebView2 build, the MSI/bundle build, and the clean-VM
+  install/upgrade/uninstall runs happen on the still-TODO `windows-latest` job
+  (WIN-1.8), which is where these flip to `DONE`.
+- **WIN-5.8 release slot is applied, not bypassed.** The WIN-0.2 Part-B slot is
+  now a real open blocker `WIN-01` in `remediation-blockers.json`
+  (`REVIEWED_REMEDIATION_CONTRACT_SHA256` recomputed in the same edit), with the
+  regression `packaging/npm/test/windows-release-check.test.js`: a `# TODO`
+  acceptance enumerating the target Windows evidence gates and a passing guard
+  proving today's machinery gap. Mutating the *consumed* `required-gates.json`
+  arrays / `release.yml` jobs is correctly deferred to WIN-1.8: the manifest is
+  an exact-match evidence contract with no `windows-latest` evidence source yet,
+  and forcing Windows jobs on a Linux-only release would violate WIN-0.2 item 4.
+  `REL-01` is untouched; release stays blocked (CC-3).
 
 ### WIN-5.1 — PyInstaller onedir spec + hooks · L
 - `onedir` (not `onefile`) spec with explicit hooks for: dynamic segmentation

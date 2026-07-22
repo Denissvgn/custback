@@ -64,6 +64,15 @@ class Stats:
     output_fallback_reason: str = ""
     segmentation_fallback_active: bool = False
     segmentation_fallback_reason: str = ""
+    acceleration_mode: str = ""
+    acceleration_requested_provider: str = ""
+    acceleration_device_id: int = 0
+    acceleration_state: str = ""
+    acceleration_active_provider: str = ""
+    acceleration_fallback_active: bool = False
+    acceleration_fallback_reason: str = ""
+    acceleration_fallback_count: int = 0
+    acceleration_last_transition_ms: float | None = None
     background_video_source_fps: float | None = None
     background_video_timing_mode: str | None = None
     background_video_frames_displayed: int = 0
@@ -373,6 +382,19 @@ class FrameHub:
                 "output_fallback_reason": self.stats.output_fallback_reason,
                 "segmentation_fallback_active": self.stats.segmentation_fallback_active,
                 "segmentation_fallback_reason": self.stats.segmentation_fallback_reason,
+                "acceleration_mode": self.stats.acceleration_mode,
+                "acceleration_requested_provider": (
+                    self.stats.acceleration_requested_provider
+                ),
+                "acceleration_device_id": self.stats.acceleration_device_id,
+                "acceleration_state": self.stats.acceleration_state,
+                "acceleration_active_provider": self.stats.acceleration_active_provider,
+                "acceleration_fallback_active": self.stats.acceleration_fallback_active,
+                "acceleration_fallback_reason": self.stats.acceleration_fallback_reason,
+                "acceleration_fallback_count": self.stats.acceleration_fallback_count,
+                "acceleration_last_transition_ms": self._rounded_optional(
+                    self.stats.acceleration_last_transition_ms, 1
+                ),
                 "background_video_source_fps": self._rounded_optional(
                     self.stats.background_video_source_fps, 2
                 ),

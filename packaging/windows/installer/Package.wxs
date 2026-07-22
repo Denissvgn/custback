@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-user MSI for the Windows desktop product (WIN-5.6 / WIN-5.7).
+
+  Installs the WebView2/tray shell (Custback.exe) plus the frozen engine payload
+  (harvested into an `engine\` subfolder) under the per-user program location.
+  No elevation, no machine-wide state. The Burn bundle (Bundle.wxs) chains the
+  WebView2/VC++ prerequisites and wraps this MSI into the signed
+  `Custback-Setup-<version>.exe`.
+
+  Data-retention policy (WIN-5.7): this MSI installs and removes only the
+  application binaries. The user's data — backgrounds, rigs, config, tokens,
+  logs under %APPDATA%\Custback and %LOCALAPPDATA%\Custback — is created at
+  runtime by the engine and is deliberately NOT tracked by any component, so an
+  ordinary uninstall never deletes it. Removal happens only when the user opts
+  in (REMOVEUSERDATA=1), via the guarded component below.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <?define ProductName = "Custback" ?>
+  <?define Manufacturer = "Bramen" ?>
+  <!-- Stable across versions so upgrades are detected; never regenerate. -->
+  <?define UpgradeCode = "{C0B8A7F2-1E4D-4B7A-9C31-9A0B2D5E7F10}" ?>
+
+  <Package Name="$(ProductName)"
+           Manufacturer="$(Manufacturer)"
+           Version="$(var.Version)"
+           UpgradeCode="$(UpgradeCode)"
+           Scope="perUser"
+           Compressed="yes">
+
+    <!-- Block a same/newer install from being clobbered by an older one, but
+         allow in-place same-version repair (WIN-5.6 upgrade/rollback). -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of $(ProductName) is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- User opt-in to erase data on uninstall. Default 0: keep user data. -->
+    <Property Id="REMOVEUSERDATA" Value="0" Secure="yes" />
+
+    <Feature Id="Main" Title="$(ProductName)" Level="1">
+      <ComponentGroupRef Id="ShellComponents" />
+      <ComponentGroupRef Id="EngineComponents" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="UninstallVirtualCamera" />
+      <ComponentRef Id="OptionalUserDataCleanup" />
+    </Feature>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="$(ProductName)">
+          <!-- The frozen PyInstaller onedir lands here (harvested by build.ps1). -->
+          <Directory Id="EngineFolder" Name="engine" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <!-- Per-user Start Menu shortcut to the shell. -->
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="*">
+      <Shortcut Id="CustbackShortcut"
+                Name="$(ProductName)"
+                Target="[INSTALLFOLDER]Custback.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="CleanupShortcut" On="uninstall" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\$(Manufacturer)\$(ProductName)"
+                     Name="installed"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!--
+      WIN-5.7: if a native Media Foundation virtual camera (WIN-6.1) is ever
+      registered, uninstall must remove that registration. The registration is
+      per-user COM/MF state under HKCU, so removing the key on uninstall is
+      sufficient and is a safe no-op when the native camera was never installed.
+    -->
+    <Component Id="UninstallVirtualCamera" Directory="INSTALLFOLDER" Guid="*">
+      <RegistryValue Root="HKCU"
+                     Key="Software\$(Manufacturer)\$(ProductName)\VirtualCamera"
+                     Name="managed"
+                     Type="integer" Value="1" KeyPath="yes" />
+      <!-- Tears down the COM registration key tree on uninstall if present. -->
+      <util:RemoveRegistryKeyEx Root="HKCU"
+                                Key="Software\Classes\CLSID\{00000000-0000-0000-0000-000000000000}"
+                                Action="removeOnUninstall" />
+    </Component>
+
+    <!--
+      WIN-5.7 opt-in data cleanup. Only when REMOVEUSERDATA=1 does uninstall
+      remove the roaming/local data trees. util:RemoveFolderEx removes the whole
+      subtree recorded at install time; the guarding condition keeps the default
+      (retain) behavior intact.
+    -->
+    <Component Id="OptionalUserDataCleanup" Directory="INSTALLFOLDER" Guid="*"
+               Condition="REMOVEUSERDATA=1">
+      <RegistryValue Root="HKCU"
+                     Key="Software\$(Manufacturer)\$(ProductName)"
+                     Name="userDataRoot"
+                     Type="string"
+                     Value="[LocalAppDataFolder]$(ProductName)"
+                     KeyPath="yes" />
+      <util:RemoveFolderEx On="uninstall" Property="CUSTBACK_LOCAL_DATA" />
+      <util:RemoveFolderEx On="uninstall" Property="CUSTBACK_ROAMING_DATA" />
+    </Component>
+
+    <!-- Resolve the data roots for the opt-in cleanup component above. -->
+    <SetProperty Id="CUSTBACK_LOCAL_DATA"
+                 Value="[LocalAppDataFolder]$(ProductName)"
+                 Before="CostFinalize" Sequence="execute" />
+    <SetProperty Id="CUSTBACK_ROAMING_DATA"
+                 Value="[AppDataFolder]$(ProductName)"
+                 Before="CostFinalize" Sequence="execute" />
+
+    <Icon Id="CustbackIcon" SourceFile="Custback.ico" />
+    <Property Id="ARPPRODUCTICON" Value="CustbackIcon" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/bramen/custback" />
+  </Package>
+</Wix>

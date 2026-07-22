@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from .camera_devices import camera_open_hint, preferred_capture_backends
 from .config import CameraConfig
 from .diagnostics import redact_sensitive_text, sanitized_source
 
@@ -229,13 +230,45 @@ class OpenCVCapture(CaptureSource):
         controller.start()
 
     # -- resource construction ---------------------------------------
+    def _open_candidates(self) -> tuple[list[tuple[str | None, int | None]], bool]:
+        """Ordered ``(name, apiPreference)`` opens plus an "explicit" flag.
+
+        Windows returns an explicit MSMF→DSHOW order (WIN-3.2); every other
+        platform returns a single ``(None, None)`` entry, i.e. the historical
+        ``cv2.VideoCapture(device)`` with OpenCV's default backend — POSIX open
+        behavior is byte-for-byte unchanged.  The flag drives whether a total
+        open failure carries the platform privacy/contention hint (WIN-3.3).
+        """
+
+        backends = preferred_capture_backends(cv2)
+        if not backends:
+            return [(None, None)], False
+        return [(name, api) for name, api in backends], True
+
     def _open_configured_capture(self) -> tuple[Any, str]:
-        cap = cv2.VideoCapture(self._device)
-        try:
+        candidates, explicit = self._open_candidates()
+        for _name, api in candidates:
+            cap = (
+                cv2.VideoCapture(self._device)
+                if api is None
+                else cv2.VideoCapture(self._device, api)
+            )
             if not cap.isOpened():
-                raise CaptureError(
-                    f"cannot open camera {sanitized_source(self.cfg.device)!r}"
-                )
+                # Release and try the next backend; on Windows an MSMF failure
+                # commonly succeeds under DSHOW (and vice versa).
+                try:
+                    cap.release()
+                except Exception:
+                    log.debug("cannot release unopened camera", exc_info=True)
+                continue
+            return self._configure_capture(cap)
+        message = f"cannot open camera {sanitized_source(self.cfg.device)!r}"
+        if explicit:
+            message = f"{message} ({camera_open_hint()})"
+        raise CaptureError(message)
+
+    def _configure_capture(self, cap: Any) -> tuple[Any, str]:
+        try:
             backend = _backend_name(cap)
             request_mjpeg = self.cfg.pixel_format == "mjpeg" or (
                 self.cfg.pixel_format == "auto" and _is_v4l2(backend)

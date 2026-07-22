@@ -17,6 +17,7 @@ import stat
 import threading
 import uuid
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -572,7 +573,9 @@ class _UploadStore:
             ):
                 raise OSError(errno.EAGAIN, "upload storage changed while securing it")
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            descriptor = platform_fs.open_nofollow(self.directory, flags, directory=True)
+            descriptor = platform_fs.open_nofollow(
+                self.directory, flags, directory=True
+            )
             try:
                 opened = os.fstat(descriptor)
                 if not stat.S_ISDIR(opened.st_mode) or (
@@ -1580,8 +1583,16 @@ def create_app(
     security: SecurityPolicy,
     upload_dir: Path | None = None,
     avatar_client_factory: Any = None,
+    on_shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
-    """Create the authenticated API bound to the active pipeline coordinator."""
+    """Create the authenticated API bound to the active pipeline coordinator.
+
+    ``on_shutdown`` wires the private lifecycle channel (WIN-5.3): when supplied,
+    ``POST /lifecycle/shutdown`` invokes it to request a graceful stop.  It is
+    restricted to the management bearer so a browser/WebView session cannot stop
+    the engine, and the route is absent-in-effect (503) when no supervisor wired
+    a handler.
+    """
 
     from ..avatar.store import ThumbnailCache
     from .avatar_proxy import register_avatar_proxy
@@ -1745,6 +1756,29 @@ def create_app(
         response = Response(status_code=204)
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
+
+    @app.post("/lifecycle/shutdown", status_code=202, include_in_schema=False)
+    async def lifecycle_shutdown(request: Request) -> Response:
+        # Private lifecycle channel for the supervising desktop shell (WIN-5.3).
+        # Restricted to the management bearer: a WebView session (HttpOnly cookie
+        # only, no bearer) must never be able to stop the engine.  The
+        # Host/Origin boundary + SameSite=strict already reject cross-site use,
+        # and the bearer is unforgeable from page script, so this cannot be
+        # driven by loaded web content.
+        if not security.bearer_valid(request.headers.get("authorization")):
+            raise _error(
+                403,
+                "forbidden",
+                "lifecycle shutdown requires the management bearer token",
+            )
+        if on_shutdown is None:
+            raise _error(
+                503,
+                "shutdown_unavailable",
+                "no lifecycle shutdown channel is wired to this process",
+            )
+        on_shutdown()
+        return Response(status_code=202)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:

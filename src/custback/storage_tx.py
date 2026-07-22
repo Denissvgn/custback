@@ -193,7 +193,9 @@ class OwnershipLedger:
         elif stat.S_IMODE(before.st_mode) != 0o700:
             raise PermissionError("storage ownership metadata does not have mode 0700")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        descriptor = platform_fs.open_nofollow(self.metadata_root, flags, directory=True)
+        descriptor = platform_fs.open_nofollow(
+            self.metadata_root, flags, directory=True
+        )
         try:
             opened = os.fstat(descriptor)
             if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (

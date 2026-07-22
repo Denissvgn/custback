@@ -175,6 +175,16 @@
         "test": "REL-01: production publish requires exact Phase 6 gate evidence",
         "guard": "REL-01: open registry still blocks the installed Phase 6 publish machinery"
       }
+    },
+    {
+      "id": "WIN-01", "phase": 6, "status": "open",
+      "title": "Windows release can publish without Windows clean-machine, camera, acceleration, and installer evidence",
+      "regression": {
+        "runner": "node",
+        "file": "packaging/npm/test/windows-release-check.test.js",
+        "test": "WIN-01: Windows production publish requires exact Windows release evidence",
+        "guard": "WIN-01: open registry still blocks the installed Windows publish machinery"
+      }
     }
   ]
 }

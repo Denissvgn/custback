@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    C# WebView2 + tray shell for the Windows desktop product (WIN-5.2..5.5).
+
+    A thin, single-instance supervisor around the frozen `custback` engine
+    (../pyinstaller). It reserves a loopback port, launches and supervises the
+    engine (and the optional avatar service), waits for explicit readiness,
+    establishes an HttpOnly browser session without leaking the bearer, and
+    hosts the existing local web UI in WebView2 with a tray lifecycle.
+
+    Built on windows-latest by the release workflow (WIN-5.8); the signed
+    installer (../installer) ships the produced Custback.exe next to the frozen
+    engine payload.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Custback</AssemblyName>
+    <RootNamespace>Custback.Shell</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Self-contained is chosen at publish time by the installer build so a
+         clean VM needs no .NET runtime preinstalled (D5). -->
+    <SelfContained>false</SelfContained>
+    <Version>0.4.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Evergreen WebView2 loader; the runtime itself is a first-class
+         installer prerequisite (WIN-5.6), not bundled here. -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2792.45" />
+  </ItemGroup>
+
+</Project>

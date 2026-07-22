@@ -1774,6 +1774,8 @@ function formatDiagnostic(key, value) {
     "mode", "segmentation_backend", "segmentation_device", "output_backend",
     "capture_backend", "remote_fallback_mode", "background_video_timing_mode",
     "driver_backend", "driver_device",
+    "acceleration_mode", "acceleration_requested_provider",
+    "acceleration_active_provider", "acceleration_state",
   ]);
   return enumKeys.has(key) ? titleCase(value) : String(value);
 }
@@ -1792,6 +1794,11 @@ function diagnosticLabel(key) {
     fps: "Output frame rate", mode: "Output mode", capture_fps: "Capture frame rate",
     capture_frame_age_ms: "Latest frame age", frame_processing_ms: "Frame processing",
     segmentation_backend: "Segmentation backend", segmentation_device: "Segmentation device",
+    acceleration_mode: "Acceleration policy", acceleration_requested_provider: "Requested provider",
+    acceleration_active_provider: "Active provider", acceleration_state: "Acceleration state",
+    acceleration_fallback_active: "GPU fallback active", acceleration_fallback_reason: "GPU fallback reason",
+    acceleration_fallback_count: "GPU fallback count", acceleration_device_id: "Accelerator device",
+    acceleration_last_transition_ms: "Acceleration transition age",
     capture_dropped_frames: "Dropped camera frames", processing_deadline_misses: "Processing deadline misses",
     uptime_s: "Uptime", connected: "Camera feed connected", driver_backend: "Following driver",
     face_present: "Face detected", render_ms: "Avatar render time", render_failures: "Render failures",
@@ -1827,14 +1834,26 @@ function renderDiagnostics() {
   if (status) {
     const dimensions = status.capture_width && status.capture_height
       ? status.capture_width + " × " + status.capture_height : "Negotiating";
-    renderDiagnosticList($("core-diagnostics"), [
+    const coreRows = [
       ["Camera", dimensions + " · " + status.capture_fps.toFixed(1) + " fps", status.capture_stalled ? "bad" : "good"],
       ["Output", status.fps.toFixed(1) + " / " + status.output_target_fps + " fps", status.output_fallback_active ? "warn" : ""],
       ["Subject detection", titleCase(status.segmentation_backend) + " · " + titleCase(status.segmentation_device), status.segmentation_fallback_active ? "warn" : ""],
+    ];
+    // Acceleration is only meaningful for the RVM/ONNX Runtime backend; other
+    // segmenters report an empty active provider. Show the truthful post-
+    // fallback provider, not the requested one.
+    if (status.acceleration_active_provider) {
+      const accelValue = status.acceleration_fallback_active
+        ? titleCase(status.acceleration_active_provider) + " (fell back from GPU)"
+        : titleCase(status.acceleration_active_provider);
+      coreRows.push(["Acceleration", accelValue, status.acceleration_fallback_active ? "warn" : ""]);
+    }
+    coreRows.push(
       ["Frame processing", formatDiagnostic("frame_processing_ms", status.frame_processing_ms), ""],
       ["Dropped camera frames", new Intl.NumberFormat().format(status.capture_dropped_frames), status.capture_dropped_frames ? "bad" : ""],
       ["Uptime", formatDuration(status.uptime_s), ""],
-    ]);
+    );
+    renderDiagnosticList($("core-diagnostics"), coreRows);
   } else {
     renderDiagnosticList($("core-diagnostics"), [["Camera pipeline", "Unavailable", "bad"]]);
   }

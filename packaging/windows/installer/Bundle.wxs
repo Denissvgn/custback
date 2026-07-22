@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Signed per-user installer bundle (WIN-5.6). Produces the SmartScreen-signable
+  `Custback-Setup-<version>.exe` that chains the runtime prerequisites and then
+  the per-user MSI (Package.wxs):
+
+    1. Microsoft Visual C++ runtime  — detected, installed only if missing.
+    2. WebView2 Evergreen runtime    — detected, installed only if missing.
+    3. Custback per-user MSI.
+
+  OBS Virtual Camera (D3) is a user-provided prerequisite: the bundle DETECTS it
+  and records presence for the app to surface (WIN-3.7), but never redistributes
+  OBS components (CC-5). Every executable and the bundle itself are signed and
+  timestamped by build.ps1.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <?define ProductName = "Custback" ?>
+  <?define Manufacturer = "Bramen" ?>
+
+  <Bundle Name="$(ProductName)"
+          Manufacturer="$(Manufacturer)"
+          Version="$(var.Version)"
+          UpgradeCode="{5E2F4A19-9D3B-4C8E-8F27-6B1C0D9E3A42}"
+          IconSourceFile="Custback.ico"
+          Compressed="yes">
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl="https://github.com/bramen/custback/blob/main/LICENSE"
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+
+    <!-- WebView2 Evergreen runtime presence (per-machine or per-user). -->
+    <util:RegistrySearch
+        Id="WebView2Machine"
+        Root="HKLM"
+        Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+        Value="pv"
+        Result="exists"
+        Variable="WebView2RuntimeDetected" />
+    <util:RegistrySearch
+        Id="WebView2User"
+        Root="HKCU"
+        Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+        Value="pv"
+        Result="exists"
+        Variable="WebView2RuntimeDetected"
+        Condition="NOT WebView2RuntimeDetected" />
+
+    <!-- OBS Virtual Camera detection only; never installed by us (CC-5). -->
+    <util:RegistrySearch
+        Id="ObsVirtualCam"
+        Root="HKLM"
+        Key="SOFTWARE\Classes\CLSID\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}"
+        Result="exists"
+        Variable="ObsVirtualCamPresent" />
+
+    <Chain>
+      <!-- VC++ runtime: the pinned redistributable for the ORT/OpenCV natives.
+           InstallCommand is silent; DetectCondition guards re-install. -->
+      <ExePackage
+          Id="VCppRuntime"
+          SourceFile="redist\VC_redist.x64.exe"
+          InstallArguments="/install /quiet /norestart"
+          Permanent="yes"
+          Vital="yes"
+          DetectCondition="VCppRuntimeInstalled" />
+
+      <!-- WebView2 Evergreen bootstrapper (tiny online installer). Skipped when
+           the runtime is already present. Microsoft permits redistribution of
+           this bootstrapper (verified in WINDOWS_LICENSING.md). -->
+      <ExePackage
+          Id="WebView2Runtime"
+          SourceFile="redist\MicrosoftEdgeWebview2Setup.exe"
+          InstallArguments="/silent /install"
+          Permanent="yes"
+          Vital="yes"
+          DetectCondition="WebView2RuntimeDetected" />
+
+      <!-- The per-user application. -->
+      <MsiPackage
+          Id="CustbackMsi"
+          SourceFile="Custback.msi"
+          Vital="yes"
+          Compressed="yes">
+        <MsiProperty Name="OBSVCAMPRESENT" Value="[ObsVirtualCamPresent]" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

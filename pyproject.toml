@@ -56,7 +56,11 @@ dev = [
     "pytest-timeout>=2.3,<3",
     "httpx>=0.27,<0.29",
     "httpx2>=2,<3",
-    "ruff>=0.12,<1",
+    # Exact pin, not a range: ruff's formatter style is only stable within a
+    # single version before 1.0, so `ruff format --check` is a deterministic
+    # gate only when the version is fixed. Bump deliberately (reformat + repin
+    # required-version + the release-gate allowlist in the same commit).
+    "ruff==0.15.22",
 ]
 
 [project.scripts]
@@ -75,7 +79,9 @@ timeout = 30
 timeout_method = "thread"
 
 [tool.ruff]
-required-version = ">=0.12,<1"
+# Exact-match the pinned dev dependency so ruff refuses to run under any other
+# version — the format gate cannot silently drift when a different ruff resolves.
+required-version = "==0.15.22"
 target-version = "py310"
 line-length = 88
 src = ["src", "tests", "examples", "scripts/release"]

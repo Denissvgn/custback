@@ -2,6 +2,8 @@
 
 Linux (Ubuntu): pyvirtualcam -> v4l2loopback device (see scripts/install_linux.sh).
 macOS:          pyvirtualcam -> OBS Virtual Camera extension (see scripts/install_macos.sh).
+Windows:        pyvirtualcam -> OBS Virtual Camera (install OBS Studio and start
+                the virtual camera once; see WIN-3.7 in WINDOWS_IMPLEMENTATION_PLAN.md).
 
 A NullOutput is provided for tests / API-only operation.
 """
@@ -9,6 +11,7 @@ A NullOutput is provided for tests / API-only operation.
 from __future__ import annotations
 
 import logging
+import sys
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -16,6 +19,33 @@ import numpy as np
 from .config import OutputConfig
 
 log = logging.getLogger(__name__)
+
+
+def virtual_camera_setup_hint(platform: str | None = None) -> str:
+    """Platform-specific, credential-free guidance for enabling a virtual camera.
+
+    WIN-3.7: Windows and macOS both drive pyvirtualcam through OBS Virtual
+    Camera, which is a *prerequisite the user installs* — this project must not
+    silently redistribute OBS components (CC-5), so the message points at the
+    install/enable step instead.  Linux keeps the existing v4l2loopback path.
+    """
+
+    plat = platform if platform is not None else sys.platform
+    if plat.startswith("win"):
+        return (
+            "install OBS Studio and click 'Start Virtual Camera' once (or install "
+            "the OBS Virtual Camera prerequisite); if it is already running, "
+            "another application may be holding its single output slot"
+        )
+    if plat == "darwin":
+        return (
+            "install OBS Studio and enable its Virtual Camera extension "
+            "(see scripts/install_macos.sh)"
+        )
+    return (
+        "load the v4l2loopback kernel module and create an output device "
+        "(see scripts/install_linux.sh)"
+    )
 
 
 class VideoOutput(ABC):
@@ -78,21 +108,38 @@ class PyVirtualCamOutput(VideoOutput):
         self.cam.close()
 
 
+def _classify_output_failure(exc: BaseException) -> str:
+    """Map a pyvirtualcam open failure to a bounded, credential-free reason.
+
+    OBS Virtual Camera exposes a *single* output slot; a second producer fails
+    with a "in use"/"busy" style message.  Distinguishing that from "not
+    installed" lets the status surface tell the user to close the other app
+    rather than to (re)install OBS (WIN-3.7).
+    """
+
+    text = str(exc).casefold()
+    if any(marker in text for marker in ("in use", "busy", "already", "in-use")):
+        return "virtual-camera-in-use"
+    return "virtual-camera-unavailable"
+
+
 def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
     if cfg.backend == "null":
         return NullOutput()
     try:
         return PyVirtualCamOutput(cfg, width, height)
     except Exception as exc:
+        hint = virtual_camera_setup_hint()
         if cfg.backend == "pyvirtualcam":
-            raise
-        log.debug(
-            "virtual camera unavailable (%s); frames will only be served via "
-            "the API. On Linux run scripts/install_linux.sh, on macOS run "
-            "scripts/install_macos.sh.",
-            exc,
+            raise RuntimeError(f"virtual camera unavailable: {exc} ({hint})") from exc
+        reason = _classify_output_failure(exc)
+        log.info(
+            "virtual camera unavailable (%s); frames will only be served via the "
+            "API. To enable the virtual camera: %s",
+            reason,
+            hint,
         )
         return NullOutput(
             fallback_active=True,
-            fallback_reason="virtual-camera-unavailable",
+            fallback_reason=reason,
         )

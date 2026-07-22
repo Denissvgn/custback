@@ -31,6 +31,8 @@ BackgroundMode = Literal[
 LocalBackgroundMode = Literal["blur", "image", "video", "color", "camera"]
 SegmentationBackend = Literal["auto", "rvm", "mediapipe", "heuristic", "none"]
 SegmentationDelegate = Literal["cpu", "gpu"]
+AccelerationMode = Literal["auto", "cpu", "gpu_required"]
+AccelerationProvider = Literal["auto", "cuda", "directml"]
 OutputBackend = Literal["auto", "pyvirtualcam", "null"]
 CameraPixelFormat = Literal["auto", "mjpeg", "backend"]
 CameraModeMismatch = Literal["warn", "error"]
@@ -328,6 +330,40 @@ class SegmentationConfig(_StrictModel):
         return self
 
 
+class AccelerationConfig(_StrictModel):
+    """RVM inference acceleration policy for onnxruntime.
+
+    This is deliberately separate from ``segmentation.delegate`` (which only
+    selects MediaPipe's CPU/GPU delegate).  It governs how the RVM ONNX session
+    chooses an execution provider and how it behaves when a GPU provider is
+    registered but cannot actually execute the graph:
+
+    - ``mode: auto`` — prefer a GPU provider, prove it can run RVM, and fall
+      back to CPU (latched) if it cannot.  This is the safe default.
+    - ``mode: cpu`` — construct only ``CPUExecutionProvider``; never touch a GPU.
+    - ``mode: gpu_required`` — fail startup unless real GPU execution is proven.
+
+    ``provider: auto`` tries the platform's GPU providers in priority order;
+    ``cuda`` / ``directml`` pin a specific one.  ``device_id`` selects the
+    adapter when more than one is present.  Provider availability is resolved at
+    runtime, so an unavailable provider is a start-time (or fallback) outcome,
+    not a configuration error.
+    """
+
+    mode: AccelerationMode = "auto"
+    provider: AccelerationProvider = "auto"
+    device_id: int = Field(default=0, ge=0, le=64)
+
+    @model_validator(mode="after")
+    def _cpu_mode_forbids_gpu_provider(self) -> "AccelerationConfig":
+        if self.mode == "cpu" and self.provider != "auto":
+            raise ValueError(
+                "acceleration.provider must be auto when mode is cpu; "
+                "cpu mode never selects a GPU provider"
+            )
+        return self
+
+
 class CompositingConfig(_StrictModel):
     light_wrap: float = Field(default=0.25, ge=0.0, le=1.0)
     use_model_foreground: bool = True
@@ -502,6 +538,7 @@ class AppConfig(_StrictModel):
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
     backdrop_targets: dict[str, BackdropTargetConfig] = Field(default_factory=dict)
     segmentation: SegmentationConfig = Field(default_factory=SegmentationConfig)
+    acceleration: AccelerationConfig = Field(default_factory=AccelerationConfig)
     compositing: CompositingConfig = Field(default_factory=CompositingConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)

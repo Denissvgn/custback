@@ -212,6 +212,29 @@ intact (the Phase 0 exit condition) and honors CC-3 (never bypass `REL-01`).
    must not be publishable without it. WIN-5.8 encodes this as a manifest-driven
    conditional, verified by the new regression test.
 
+### Applied state (WIN-5.8)
+
+The slot's **blocker half is now live**: `WIN-01` (open, phase 6) is appended to
+`remediation-blockers.json` exactly as specified in item 1, and
+`REVIEWED_REMEDIATION_CONTRACT_SHA256` was recomputed in the same edit
+(`c64a8907…`). The regression `packaging/npm/test/windows-release-check.test.js`
+(item 2) is registered in `REVIEWED_NPM_PAYLOAD`; its `# TODO` acceptance
+enumerates the item-3 gates/jobs/artifact and the item-4 scoping rule, and its
+guard proves today's gap. `REL-01` is untouched and release stays blocked
+(CC-3).
+
+The slot's **manifest/workflow half (items 3–4) is intentionally still deferred**
+— now to WIN-1.8, not Phase 0. `required-gates.json` is an *exact-match* evidence
+contract (`phase6-evidence.js` `exactKeys`) with no `windows-latest` evidence
+source until WIN-1.8, and `release.yml`'s aggregate gate requires its `needs` to
+equal `workflow.required_job_ids` exactly. Adding the Windows gates/jobs before a
+real Windows evidence source exists would either break every release (including
+Linux-only, violating item 4) or fabricate machinery with no subject — the same
+reason Phase 0 declined to mutate the registry. When WIN-1.8 lands the
+`windows-latest` job and the conditional evidence plumbing, flipping the
+`WIN-01` guard from passing to failing is the signal to add the gates and move
+the blocker toward resolved.
+
 ### Phase 0 verification (what is checked now)
 
 Because Phase 0 does not touch the registry, the check is that the pinned

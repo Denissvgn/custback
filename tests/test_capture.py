@@ -142,15 +142,17 @@ class FakeCV2:
     CAP_PROP_FOURCC = 6
     CAP_PROP_BACKEND = 42
     CAP_V4L2 = 200
+    CAP_MSMF = 1400
+    CAP_DSHOW = 700
 
     def __init__(self, captures):
         self.captures = list(captures)
         self.opened = []
 
-    def VideoCapture(self, device):
+    def VideoCapture(self, device, apiPreference=None):
         assert self.captures, f"unexpected open for {device!r}"
         cap = self.captures.pop(0)
-        self.opened.append((device, time.monotonic(), cap))
+        self.opened.append((device, time.monotonic(), cap, apiPreference))
         return cap
 
     @staticmethod
@@ -617,6 +619,56 @@ def test_reader_surviving_release_and_join_is_terminal(monkeypatch):
         cap.unblock.set()
         capture.close()
     assert not capture.health_snapshot().worker_alive
+
+
+def _force_windows_platform(monkeypatch):
+    # Drives both the MSMF/DSHOW backend order and the privacy-denial hint,
+    # which read sys.platform through the camera_devices module.
+    import custback.camera_devices as camera_devices_mod
+
+    monkeypatch.setattr(camera_devices_mod.sys, "platform", "win32")
+
+
+def test_windows_capture_selects_msmf_then_dshow(monkeypatch):
+    _force_windows_platform(monkeypatch)
+    msmf_closed = ClosedCap()  # MSMF cannot open
+    dshow_ok = FakeCap(delay=0.002)  # DSHOW opens
+    fake_cv2 = FakeCV2([msmf_closed, dshow_ok])
+    monkeypatch.setattr(capture_mod, "cv2", fake_cv2)
+
+    capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
+    try:
+        frame = wait_for_frame(capture, timeout=0.5)
+        assert frame.shape == (72, 128, 3)
+        assert msmf_closed.released
+        # Both backends were opened explicitly, in order, with apiPreference set.
+        assert fake_cv2.opened[0][3] == FakeCV2.CAP_MSMF
+        assert fake_cv2.opened[1][3] == FakeCV2.CAP_DSHOW
+    finally:
+        capture.close()
+
+
+def test_windows_total_open_failure_logs_privacy_hint(monkeypatch, caplog):
+    _force_windows_platform(monkeypatch)
+
+    class AlwaysClosedCV2(FakeCV2):
+        def VideoCapture(self, device, apiPreference=None):
+            cap = ClosedCap()
+            self.opened.append((device, time.monotonic(), cap, apiPreference))
+            return cap
+
+    monkeypatch.setattr(capture_mod, "cv2", AlwaysClosedCV2([]))
+    monkeypatch.setattr(OpenCVCapture, "_BACKOFFS", (0.01,))
+
+    capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
+    try:
+        with caplog.at_level("WARNING"):
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and "Privacy" not in caplog.text:
+                time.sleep(0.01)
+        assert "Privacy" in caplog.text and "Camera" in caplog.text
+    finally:
+        capture.close()
 
 
 def test_synthetic_capture_exposes_compatible_health_and_mirror():
