@@ -3,9 +3,16 @@
 import asyncio
 import contextlib
 import io
+import json
+import os
+import socket
 import ssl
+import subprocess
+import sys
+import time
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -528,7 +535,7 @@ class _AsyncBody(httpx.AsyncByteStream):
         yield self.content
 
 
-def test_proxy_freezes_destination_and_credential_at_registration(
+def test_proxy_freezes_destination_and_credential_path_at_registration(
     tmp_path, monkeypatch
 ):
     monkeypatch.delenv("CUSTBACK_AVATAR_API_TOKEN", raising=False)
@@ -567,10 +574,6 @@ def test_proxy_freezes_destination_and_credential_at_registration(
         ),
         base.version,
     )
-    # Removing the original file proves requests use the startup credential
-    # snapshot and perform no request-time credential file read.
-    trusted_token.unlink()
-
     response = run_async(_request_proxy_app(app))
 
     assert response.status_code == 200
@@ -606,6 +609,281 @@ def test_proxy_missing_client_token_is_not_created(tmp_path, monkeypatch):
     assert not missing.exists()
     assert not missing.parent.exists()
     assert calls == []
+
+
+def test_proxy_reads_late_supervised_token_and_same_path_rotation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("CUSTBACK_AVATAR_API_TOKEN", raising=False)
+    token_file = tmp_path / "supervised" / "avatar-token"
+    runtime = RuntimeConfig(
+        AppConfig.from_dict(
+            {
+                "avatar": {
+                    "url": "http://127.0.0.1:28711",
+                    "token_file": str(token_file),
+                }
+            }
+        )
+    )
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["authorization"])
+        return httpx.Response(200, stream=_AsyncBody(b'{"ok":true}'))
+
+    # Registering the core proxy must not require the later-supervised avatar
+    # process to have minted its token yet.
+    app = _proxy_only_app(runtime, handler=handler)
+    assert not token_file.exists()
+
+    async def exercise_lifespan_and_rotation():
+        async with app.router.lifespan_context(app):
+            # Enter the real app lifespan with no credential. The avatar
+            # process starts second and atomically provisions it afterwards.
+            assert not token_file.exists()
+            token_file.parent.mkdir()
+            token_file.write_text(AVATAR_TOKEN + "\n")
+            token_file.chmod(0o600)
+
+            async with _async_client(app) as client:
+                first = await client.get("/avatar/status")
+
+                rotated_token = AVATAR_TOKEN[:-1] + "2"
+                replacement = token_file.with_suffix(".new")
+                replacement.write_text(rotated_token + "\n")
+                replacement.chmod(0o600)
+                replacement.replace(token_file)
+                second = await client.get("/avatar/status")
+        return first, second
+
+    first, second = run_async(exercise_lifespan_and_rotation())
+
+    assert first.status_code == second.status_code == 200
+    assert seen == [
+        f"Bearer {AVATAR_TOKEN}",
+        f"Bearer {AVATAR_TOKEN[:-1] + '2'}",
+    ]
+
+
+def _reserve_loopback_port(excluded: int = 0) -> int:
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            candidate = listener.getsockname()[1]
+        if candidate != excluded:
+            return candidate
+
+
+def _wait_for_process_api(
+    client: httpx.Client,
+    process: subprocess.Popen,
+    url: str,
+    token_file: Path,
+    log_file: Path,
+    deadline: float,
+    *,
+    require_connected: bool = False,
+) -> httpx.Response:
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            pytest.fail(
+                f"{cast(list[str], process.args)[2]} exited with {process.returncode}:\n"
+                f"{log_file.read_text(errors='replace')}"
+            )
+        try:
+            token = token_file.read_text().strip()
+            if token:
+                response = client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=1,
+                )
+                if response.status_code == 200 and (
+                    not require_connected or response.json().get("connected") is True
+                ):
+                    return response
+        except (OSError, httpx.HTTPError) as exc:
+            last_error = exc
+        time.sleep(0.1)
+    pytest.fail(
+        f"timed out waiting for {url}: {last_error}\n"
+        f"{log_file.read_text(errors='replace')}"
+    )
+
+
+def _stop_test_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+def test_real_engine_and_avatar_processes_proxy_status_after_token_mint(tmp_path):
+    """D9 acceptance: exercise the actual paired CLIs over loopback."""
+
+    root = Path(__file__).resolve().parents[1]
+    engine_port = _reserve_loopback_port()
+    avatar_port = _reserve_loopback_port(engine_port)
+    engine_token = tmp_path / "config" / "api-token"
+    renderer_token = tmp_path / "config" / "renderer-token"
+    avatar_token = tmp_path / "config" / "avatar-api-token"
+    engine_config = tmp_path / "config.yaml"
+    engine_config.write_text(
+        "camera:\n"
+        "  synthetic: true\n"
+        "  width: 64\n"
+        "  height: 48\n"
+        "  fps: 10\n"
+        "background:\n"
+        "  mode: color\n"
+        "segmentation:\n"
+        "  backend: heuristic\n"
+        "output:\n"
+        '  backend: "null"\n'
+    )
+    avatar_config = tmp_path / "avatar.yaml"
+    avatar_config.write_text(
+        "driver:\n"
+        "  backend: idle\n"
+        "storage:\n"
+        f"  rigs_dir: {json.dumps(str(tmp_path / 'rigs'))}\n"
+        f"  backgrounds_dir: {json.dumps(str(tmp_path / 'backgrounds'))}\n"
+    )
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    environment = os.environ.copy()
+    for variable in (
+        "CUSTBACK_API_TOKEN",
+        "CUSTBACK_RENDERER_TOKEN",
+        "CUSTBACK_AVATAR_API_TOKEN",
+    ):
+        environment.pop(variable, None)
+    environment.update(
+        {
+            "HOME": str(profile),
+            "USERPROFILE": str(profile),
+            "APPDATA": str(profile / "AppData" / "Roaming"),
+            "LOCALAPPDATA": str(profile / "AppData" / "Local"),
+            "XDG_CONFIG_HOME": str(profile / ".config"),
+            "PYTHONPATH": str(root / "src"),
+        }
+    )
+    engine_log = tmp_path / "engine-process.log"
+    avatar_log = tmp_path / "avatar-process.log"
+    engine_log_handle = engine_log.open("w")
+    avatar_log_handle = avatar_log.open("w")
+    engine_process = avatar_process = None
+    startup_deadline = time.monotonic() + 18
+    try:
+        engine_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "custback",
+                "--config",
+                str(engine_config),
+                "--enable-api",
+                "--api-host",
+                "127.0.0.1",
+                "--api-port",
+                str(engine_port),
+                "--api-plaintext",
+                "--api-token-file",
+                str(engine_token),
+                "--renderer-token-file",
+                str(renderer_token),
+                "--avatar-url",
+                f"http://127.0.0.1:{avatar_port}",
+                "--avatar-token-file",
+                str(avatar_token),
+                "--avatar-plaintext",
+                "--no-file-log",
+            ],
+            cwd=root,
+            env=environment,
+            stdout=engine_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        with httpx.Client(trust_env=False) as client:
+            _wait_for_process_api(
+                client,
+                engine_process,
+                f"http://127.0.0.1:{engine_port}/status",
+                engine_token,
+                engine_log,
+                startup_deadline,
+            )
+            assert renderer_token.read_text().strip()
+            assert not avatar_token.exists()
+
+            avatar_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "custback.avatar",
+                    "--config",
+                    str(avatar_config),
+                    "--source",
+                    f"ws://127.0.0.1:{engine_port}",
+                    "--source-token-file",
+                    str(renderer_token),
+                    "--source-plaintext",
+                    "--enable-api",
+                    "--api-host",
+                    "127.0.0.1",
+                    "--api-port",
+                    str(avatar_port),
+                    "--api-token-file",
+                    str(avatar_token),
+                    "--api-plaintext",
+                    "--log-file",
+                    str(tmp_path / "avatar.log"),
+                ],
+                cwd=root,
+                env=environment,
+                stdout=avatar_log_handle,
+                stderr=subprocess.STDOUT,
+            )
+            direct = _wait_for_process_api(
+                client,
+                avatar_process,
+                f"http://127.0.0.1:{avatar_port}/status",
+                avatar_token,
+                avatar_log,
+                startup_deadline,
+                require_connected=True,
+            )
+            proxied = _wait_for_process_api(
+                client,
+                engine_process,
+                f"http://127.0.0.1:{engine_port}/avatar/status",
+                engine_token,
+                engine_log,
+                startup_deadline,
+                require_connected=True,
+            )
+
+            assert proxied.json()["connected"] is True
+            assert direct.json()["driver_backend"] == "idle"
+            assert proxied.json()["driver_backend"] == direct.json()["driver_backend"]
+    finally:
+        with contextlib.suppress(Exception):
+            if avatar_process is not None:
+                _stop_test_process(avatar_process)
+        with contextlib.suppress(Exception):
+            if engine_process is not None:
+                _stop_test_process(engine_process)
+        with contextlib.suppress(Exception):
+            engine_log_handle.close()
+        with contextlib.suppress(Exception):
+            avatar_log_handle.close()
 
 
 @pytest.mark.parametrize("upstream_status", [401, 403])

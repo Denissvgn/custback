@@ -330,6 +330,7 @@ class _StatusResponse(BaseModel):
     segmentation_backend: str
     segmentation_device: str
     output_backend: str
+    native_ring: str
     remote_connected: bool
     remote_frames_used: int
     remote_fallback_active: bool
@@ -1794,7 +1795,10 @@ def create_app(
 
     @app.get("/status", response_model=_StatusResponse)
     async def status() -> JSONResponse:
+        from ..vcam_native import native_ring_status
+
         body = hub.stats_dict()
+        body["native_ring"] = native_ring_status()
         return JSONResponse(
             body, headers={"X-Config-Version": str(body["config_version"])}
         )

@@ -16,6 +16,9 @@ Transport design (latest-frame-wins seqlock, no queue):
   ``seq``, or a ``seq`` that changed across its copy, discards the torn frame
   and retries; the Media Foundation stream serves its own sample clock and
   simply reads the newest complete frame on each ``RequestSample``.
+* CPython's byte-level buffer stores provide the writer-side release ordering
+  this protocol requires.  A future non-CPython writer must add explicit
+  release fences before publishing each ``seq`` transition.
 * There is deliberately no cross-process event: a virtual camera must keep
   producing samples at its negotiated cadence even when the producer stalls,
   so the reader falls back to holding the last frame (or a placeholder when
@@ -23,18 +26,24 @@ Transport design (latest-frame-wins seqlock, no queue):
 
 Nothing here imports pywin32; the Windows mapping uses :mod:`mmap`'s named
 ``tagname`` support, so the ring logic stays testable on any platform against
-a plain buffer.  Everything security-relevant about the section is local to
-the user session (``Local\\`` namespace, per-user Frame Server registration).
+a plain buffer.  The current ``Local\\`` name assumes that the Frame Server
+host can open a section created in the interactive user's session. That
+namespace visibility remains an assumption pending the MIT-C1 clean-machine
+gate evidence; gate builds trace the media source's ``OpenFileMappingW`` error
+code. The namespace choice must not be treated as a validated security
+boundary until that evidence passes.
 """
 
 from __future__ import annotations
 
 import logging
 import mmap
+import os
 import struct
 import sys
 import time
-from typing import TypedDict
+from collections.abc import Callable
+from typing import Any, TypedDict, cast
 
 import numpy as np
 
@@ -46,6 +55,10 @@ log = logging.getLogger(__name__)
 #: literal must match dllmain.cpp, VirtualCameraSession.cs, and Package.wxs;
 #: tests/test_windows_vcam.py cross-checks all of them against this constant.
 VCAM_CLSID = "{7A4C1B2E-9D35-4E6A-8B1F-52C84D9A6E01}"
+
+#: Per-user COM registration written by the Windows installer. The default
+#: value is the absolute path to ``CustbackVCam.dll``.
+VCAM_INPROC_REGISTRY_KEY = rf"Software\Classes\CLSID\{VCAM_CLSID}\InProcServer32"
 
 #: Friendly name the camera registers with; meeting apps show this string.
 #: It intentionally contains "Custback" so camera enumeration classifies it
@@ -75,12 +88,155 @@ _FLAGS_OFFSET = 28
 #: ``flags`` bit 0: the writer is alive and publishing.  Cleared on close so
 #: the media source can show its placeholder instead of a frozen last frame.
 FLAG_ACTIVE = 0x1
+_FILE_MAP_READ = 0x0004
 
 
 def ring_size(width: int, height: int) -> int:
     """Total mapping size for one ``width``×``height`` BGRX frame."""
 
     return HEADER_SIZE + width * height * BYTES_PER_PIXEL
+
+
+def _windows_inproc_server_path(key_path: str) -> str | None:
+    """Read the native camera's per-user in-process COM server path."""
+
+    import winreg as _winreg
+
+    # Pyright analyzes this cross-platform module on Linux, where typeshed
+    # intentionally hides the Windows-only module attributes.
+    winreg = cast(Any, _winreg)
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            key_path,
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            value, value_type = winreg.QueryValueEx(key, "")
+    except OSError:
+        return None
+    if value_type not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+        return None
+    path = value.strip() if isinstance(value, str) else ""
+    if value_type == winreg.REG_EXPAND_SZ:
+        path = os.path.expandvars(path)
+    return path or None
+
+
+def native_camera_component_available(
+    *,
+    platform: str | None = None,
+    read_registration: Callable[[str], str | None] | None = None,
+    file_exists: Callable[[str], bool] | None = None,
+) -> bool:
+    """Return whether the packaged per-user native camera component is installed.
+
+    Availability requires both the HKCU ``InProcServer32`` registration and
+    the DLL it names. The injected reader/file probe keep this Windows contract
+    testable on POSIX without importing :mod:`winreg`. This intentionally does
+    not claim that COM activation works: the WIN-6.1 clean-machine gate remains
+    the authority for that hardware/OS contract, and the auto rung stays off
+    until it passes.
+    """
+
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return False
+    read_path = (
+        _windows_inproc_server_path if read_registration is None else read_registration
+    )
+    path_probe = os.path.isfile if file_exists is None else file_exists
+    try:
+        component_path = read_path(VCAM_INPROC_REGISTRY_KEY)
+        return bool(component_path and path_probe(component_path))
+    except Exception as exc:
+        # A registry or filesystem probe failure must never make the optional
+        # native rung look installed.
+        log.warning(
+            "native virtual camera component probe failed: %s",
+            type(exc).__name__,
+        )
+        return False
+
+
+def require_native_camera_component(
+    *,
+    platform: str | None = None,
+    read_registration: Callable[[str], str | None] | None = None,
+    file_exists: Callable[[str], bool] | None = None,
+) -> None:
+    """Fail loudly unless the Windows native camera DLL is registered."""
+
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        raise RuntimeError("the native virtual camera component requires Windows 11")
+    if not native_camera_component_available(
+        platform=current_platform,
+        read_registration=read_registration,
+        file_exists=file_exists,
+    ):
+        raise RuntimeError(
+            "native virtual camera component is not installed: "
+            f"HKCU\\{VCAM_INPROC_REGISTRY_KEY} must point to an existing DLL"
+        )
+
+
+def _windows_section_present(name: str) -> bool:
+    """Probe an existing named section without creating it."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    open_mapping = kernel32.OpenFileMappingW
+    open_mapping.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    open_mapping.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_mapping(_FILE_MAP_READ, False, name)
+    if not handle:
+        return False
+    try:
+        return True
+    finally:
+        close_handle(handle)
+
+
+def native_ring_status(
+    *,
+    platform: str | None = None,
+    probe: Callable[[str], bool] | None = None,
+) -> str:
+    """Return a bounded diagnostic state for the native frame section.
+
+    The Windows probe uses ``OpenFileMappingW`` rather than :mod:`mmap`, because
+    opening a missing named mmap would create it and turn an absence check into
+    a false positive. Other platforms report ``unsupported`` explicitly.
+    """
+
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return "unsupported"
+    check = _windows_section_present if probe is None else probe
+    try:
+        present = check(SECTION_NAME)
+    except Exception as exc:  # diagnostic only: fail closed to "absent"
+        log.warning("native virtual camera ring probe failed: %s", type(exc).__name__)
+        present = False
+    return "section present" if present else "section absent"
+
+
+def native_ring_diagnostic(
+    *,
+    platform: str | None = None,
+    probe: Callable[[str], bool] | None = None,
+) -> str:
+    """Return the operator-facing diagnostics line."""
+
+    return f"native ring: {native_ring_status(platform=platform, probe=probe)}"
 
 
 def _pack_header(
@@ -174,7 +330,7 @@ class FrameRingWriter:
         self._frame_counter = 0
         # Publish a valid, inactive header immediately so an early reader
         # never parses uninitialized memory.
-        self._write_header(flags=FLAG_ACTIVE, timestamp_100ns=self._now_100ns())
+        self._write_header(flags=0, timestamp_100ns=self._now_100ns())
 
     @staticmethod
     def _now_100ns() -> int:

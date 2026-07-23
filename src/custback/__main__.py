@@ -68,7 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="operator-approved local camera/device as live backdrop (implies --mode camera)",
     )
     parser.add_argument("--blur", type=int, help="blur strength (implies --mode blur)")
-    parser.add_argument("--no-api", action="store_true", help="disable the HTTP API")
+    api_toggle = parser.add_mutually_exclusive_group()
+    api_toggle.add_argument(
+        "--enable-api",
+        action="store_true",
+        help="enable the HTTP API even when the config file disables it",
+    )
+    api_toggle.add_argument(
+        "--no-api", action="store_true", help="disable the HTTP API"
+    )
     parser.add_argument("--api-host", help="API bind host (default 127.0.0.1)")
     parser.add_argument("--api-port", type=int, help="API port (default 8710)")
     parser.add_argument("--api-token-file", help="path to the mode-0600 API token file")
@@ -77,12 +85,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to the mode-0600 renderer-scoped frame token file",
     )
     parser.add_argument(
+        "--avatar-url",
+        help="custback-avatar control API root for the /avatar/* proxy",
+    )
+    parser.add_argument(
+        "--avatar-token-file",
+        help="path to custback-avatar's existing control-token file",
+    )
+    parser.add_argument(
         "--allow-non-loopback-api",
         action="store_true",
         help="allow a TLS-protected API bind outside loopback",
     )
     parser.add_argument("--api-tls-cert", help="TLS certificate for the API")
     parser.add_argument("--api-tls-key", help="TLS private key for the API")
+    parser.add_argument(
+        "--api-plaintext",
+        action="store_true",
+        help="clear configured API TLS credentials (numeric loopback only)",
+    )
+    parser.add_argument(
+        "--avatar-plaintext",
+        action="store_true",
+        help="clear configured avatar-proxy TLS credentials (numeric loopback only)",
+    )
     show_token = parser.add_mutually_exclusive_group()
     show_token.add_argument(
         "--show-api-token",
@@ -161,6 +187,7 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
     cam = values["camera"]
     bg = values["background"]
     api = values["api"]
+    avatar = values["avatar"]
     output = values["output"]
     if args.camera is not None:
         cam["device"] = args.camera
@@ -206,6 +233,8 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
         bg["mode"] = "blur"
     if args.mode:
         bg["mode"] = args.mode
+    if args.enable_api:
+        api["enabled"] = True
     if args.no_api:
         api["enabled"] = False
     if args.api_host:
@@ -216,12 +245,43 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
         api["token_file"] = args.api_token_file
     if args.renderer_token_file:
         api["renderer_token_file"] = args.renderer_token_file
+    if args.avatar_url:
+        avatar["url"] = args.avatar_url
+    if args.avatar_token_file:
+        avatar["token_file"] = args.avatar_token_file
+    if args.avatar_plaintext:
+        from .api.security import validate_outbound_endpoint
+
+        endpoint = validate_outbound_endpoint(
+            avatar["url"],
+            kind="http",
+            label="avatar.url",
+            allow_empty=True,
+        )
+        if endpoint is None or endpoint.secure:
+            raise ValueError(
+                "--avatar-plaintext requires an http:// numeric-loopback --avatar-url"
+            )
+        avatar["tls_ca_file"] = ""
+        avatar["tls_certfile"] = ""
+        avatar["tls_keyfile"] = ""
     if args.allow_non_loopback_api:
         api["allow_non_loopback"] = True
     if args.api_tls_cert:
         api["tls_certfile"] = args.api_tls_cert
     if args.api_tls_key:
         api["tls_keyfile"] = args.api_tls_key
+    if args.api_plaintext:
+        from .api.security import is_numeric_loopback_host
+
+        if args.api_tls_cert or args.api_tls_key:
+            raise ValueError(
+                "--api-plaintext cannot be combined with API TLS arguments"
+            )
+        if not is_numeric_loopback_host(api["host"]):
+            raise ValueError("--api-plaintext requires a numeric-loopback --api-host")
+        api["tls_certfile"] = ""
+        api["tls_keyfile"] = ""
     if args.no_vcam:
         output["backend"] = "null"
     if args.preview:

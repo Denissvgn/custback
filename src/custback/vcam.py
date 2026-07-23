@@ -20,6 +20,11 @@ from .config import OutputConfig
 
 log = logging.getLogger(__name__)
 
+# WIN-6.1 gate flip: once clean-machine evidence passes, changing this one
+# constant enables the already-tested Windows auto ladder
+# (pyvirtualcam -> native -> null).
+_AUTO_NATIVE_ENABLED = False
+
 
 def virtual_camera_setup_hint(platform: str | None = None) -> str:
     """Platform-specific, credential-free guidance for enabling a virtual camera.
@@ -128,11 +133,11 @@ def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
         return NullOutput()
     if cfg.backend == "native":
         # WIN-6.1: the Windows 11 Media Foundation virtual camera.  Explicit
-        # opt-in only — `auto` keeps the OBS/pyvirtualcam path until the native
-        # camera passes its own clean-machine gate (feature-matrix guardrail).
+        # opt-in while the auto-native feature flag remains off.
         # An explicit backend fails loudly rather than silently degrading.
         from . import vcam_native
 
+        vcam_native.require_native_camera_component()
         return vcam_native.NativeVirtualCameraOutput(width, height)
     try:
         return PyVirtualCamOutput(cfg, width, height)
@@ -141,6 +146,26 @@ def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
         if cfg.backend == "pyvirtualcam":
             raise RuntimeError(f"virtual camera unavailable: {exc} ({hint})") from exc
         reason = _classify_output_failure(exc)
+        if _AUTO_NATIVE_ENABLED and sys.platform == "win32":
+            # Latent WIN-6.1 rung. Auto continues down the ladder on native
+            # failure; unlike an explicit `native` selection it never turns a
+            # missing optional camera into a fatal engine startup.
+            from . import vcam_native
+
+            if not vcam_native.native_camera_component_available():
+                log.info(
+                    "native virtual camera component is not installed; "
+                    "continuing to API-only output"
+                )
+            else:
+                try:
+                    return vcam_native.NativeVirtualCameraOutput(width, height)
+                except Exception as native_exc:
+                    log.info(
+                        "native virtual camera unavailable (%s); continuing to "
+                        "API-only output",
+                        type(native_exc).__name__,
+                    )
         log.info(
             "virtual camera unavailable (%s); frames will only be served via the "
             "API. To enable the virtual camera: %s",

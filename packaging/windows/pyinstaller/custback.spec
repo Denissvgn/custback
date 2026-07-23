@@ -35,6 +35,8 @@ tool and are intentionally undefined to a plain interpreter.
 """
 
 import os
+import platform
+import sys
 
 from PyInstaller.utils.hooks import (
     collect_data_files,
@@ -80,7 +82,16 @@ _binaries = []
 _datas = []
 _hiddenimports = []
 
-for _pkg in ("cv2", "onnxruntime", "mediapipe", "pyvirtualcam", "numpy"):
+# pyvirtualcam publishes no Windows ARM64 wheel.  The matching PEP 508 marker
+# in pyproject.toml keeps it out of that environment; mirror the same target
+# predicate here so PyInstaller neither collects nor force-imports an absent
+# package.  build.ps1 verifies that the running interpreter matches -Arch.
+_WINDOWS_ARM64 = sys.platform == "win32" and platform.machine().upper() == "ARM64"
+_native_packages = ["cv2", "onnxruntime", "mediapipe", "numpy"]
+if not _WINDOWS_ARM64:
+    _native_packages.append("pyvirtualcam")
+
+for _pkg in _native_packages:
     try:
         _binaries += collect_dynamic_libs(_pkg)
     except Exception:  # a package absent from this profile is not fatal
@@ -121,7 +132,6 @@ _hiddenimports += [
     "onnxruntime",
     "mediapipe",
     "cv2",
-    "pyvirtualcam",
     # pywin32 modules imported by custback._platform.windows
     "ntsecuritycon",
     "pywintypes",
@@ -131,6 +141,8 @@ _hiddenimports += [
     "win32security",
     "winerror",
 ]
+if not _WINDOWS_ARM64:
+    _hiddenimports.append("pyvirtualcam")
 
 # Trim large, GUI-only, or test-only trees that would otherwise inflate the
 # artifact and drag in unwanted native libraries.  OpenCV HighGUI is off by
@@ -145,6 +157,10 @@ _excludes = [
     "PySide2",
     "PySide6",
 ]
+if _WINDOWS_ARM64:
+    # Keep static analysis of the lazy import in custback.vcam aligned with
+    # dependency resolution: this backend is unavailable in an ARM64 payload.
+    _excludes.append("pyvirtualcam")
 
 # WIN-6.4: exactly one avatar driver stack per payload (see AVATAR_PROFILE).
 if AVATAR_PROFILE == "audio2face":

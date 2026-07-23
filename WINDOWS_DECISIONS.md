@@ -107,6 +107,23 @@ exit condition, not agreement by silence.
   option (WIN-1.6).
 - **Revisit trigger:** a defined support benefit for a native HighGUI window.
 
+### D9 — Packaged avatar control-plane wiring
+- **Decision (2026-07-23):** when the shell supervises an installed avatar, it
+  reserves a second ephemeral loopback port that is distinct from the engine
+  port. It passes `--avatar-url http://127.0.0.1:<avatar-port>` and
+  `--avatar-token-file <avatar-api-token>` to the engine, and passes
+  `--api-port <avatar-port>` to the avatar service. These flags are absent when
+  the avatar is not installed. Command lines carry paths, never token values.
+- **Rationale:** the shell is the only component that already knows whether the
+  avatar is installed, both process ports, and the packaged token path. Explicit
+  CLI wiring avoids mutating a user configuration or coupling the engine to the
+  avatar's source-install default port. Reserving a distinct ephemeral port also
+  removes fixed-port `8711` collisions. The engine freezes the destination and
+  token path at startup but reads the token value per request, so its existing
+  engine-before-avatar startup order remains valid.
+- **Revisit trigger:** avatar supervision moves out of the shell, or a supported
+  deployment needs an externally managed/non-loopback avatar control plane.
+
 ---
 
 ## Part B — Windows release-gate slot design (WIN-0.2)

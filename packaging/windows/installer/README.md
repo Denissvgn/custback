@@ -38,6 +38,33 @@ are Authenticode-signed and RFC-3161 timestamped for SmartScreen.
   (`UninstallVirtualCamera` component); a safe no-op when it was never
   installed.
 
+## Native-camera gate builds (WIN-6.1)
+
+A payload containing `CustbackVCam.dll` still uses the normal configured output
+backend. For gate testing, create `%APPDATA%\Custback\config.yaml` with:
+
+```yaml
+output:
+  backend: native
+```
+
+The setting is an explicit opt-in while `_AUTO_NATIVE_ENABLED = False`. On a
+default `auto` installation, the shell must not expose a placeholder-only
+native camera; it skips camera startup and logs the active-backend mismatch.
+
+The clean-machine installer check therefore has two ordered rows:
+
+1. Install the DLL-bearing payload with the default configuration. Confirm no
+   native camera starts and the shell explains that the active backend is not
+   native.
+2. Apply the gate configuration and restart. Confirm engine diagnostics report
+   `native ring: section present`, then prove live frames in the Windows Camera app
+   before running the Teams/Zoom/Meet/browser matrix.
+
+See `packaging/windows/vcam/README.md` for the full checklist. These rows are
+gate evidence, not a Supported claim; ordinary builds retain the default
+guardrail until WIN-6.1 passes.
+
 ## Build
 
 ```powershell

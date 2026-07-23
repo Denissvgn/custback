@@ -18,6 +18,12 @@
 
 #include <windows.h>
 
+#if defined(CUSTBACK_VCAM_GATE_DIAGNOSTICS)
+#include <strsafe.h>
+#endif
+
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -73,8 +79,15 @@ class FrameRingReader {
         Close();
         m_section = ::OpenFileMappingW(FILE_MAP_READ, FALSE, sectionName);
         if (m_section == nullptr) {
+#if defined(CUSTBACK_VCAM_GATE_DIAGNOSTICS)
+            const DWORD error = ::GetLastError();
+            TraceOpenFailure(sectionName, error);
+#endif
             return false;
         }
+#if defined(CUSTBACK_VCAM_GATE_DIAGNOSTICS)
+        m_reportedOpenFailure = false;
+#endif
         m_view = static_cast<const uint8_t*>(
             ::MapViewOfFile(m_section, FILE_MAP_READ, 0, 0, 0));
         if (m_view == nullptr) {
@@ -114,14 +127,19 @@ class FrameRingReader {
         for (int attempt = 0; attempt < maxAttempts; ++attempt) {
             FrameRingHeader header{};
             std::memcpy(&header, m_view, sizeof(header));
+            const auto& sharedSeq = *reinterpret_cast<const uint32_t*>(
+                m_view + offsetof(FrameRingHeader, seq));
+            const uint32_t seqBefore =
+                std::atomic_ref<const uint32_t>(sharedSeq).load(
+                    std::memory_order_acquire);
+            if (seqBefore != header.seq || (seqBefore & 1u) != 0u) {
+                continue;  // torn header or write in progress
+            }
             if (header.magic != kMagic || header.version != kProtocolVersion) {
                 return false;
             }
             if ((header.flags & kFlagActive) == 0) {
                 return false;
-            }
-            if ((header.seq & 1u) != 0u) {
-                continue;  // write in progress
             }
             const uint64_t payload =
                 uint64_t{header.width} * header.height * kBytesPerPixel;
@@ -132,10 +150,11 @@ class FrameRingReader {
             frame.resize(static_cast<size_t>(payload));
             std::memcpy(frame.data(), m_view + kHeaderSize,
                         static_cast<size_t>(payload));
-            uint32_t seqAfter = 0;
-            std::memcpy(&seqAfter, m_view + offsetof(FrameRingHeader, seq),
-                        sizeof(seqAfter));
-            if (seqAfter != header.seq) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint32_t seqAfter =
+                std::atomic_ref<const uint32_t>(sharedSeq).load(
+                    std::memory_order_acquire);
+            if (seqAfter != seqBefore) {
                 continue;  // torn: the writer moved on mid-copy
             }
             width = header.width;
@@ -146,6 +165,28 @@ class FrameRingReader {
     }
 
  private:
+#if defined(CUSTBACK_VCAM_GATE_DIAGNOSTICS)
+    void TraceOpenFailure(const wchar_t* sectionName, DWORD error) {
+        if (m_reportedOpenFailure && error == m_lastReportedOpenError) {
+            return;
+        }
+        m_reportedOpenFailure = true;
+        m_lastReportedOpenError = error;
+
+        wchar_t message[256]{};
+        if (SUCCEEDED(::StringCchPrintfW(
+                message, ARRAYSIZE(message),
+                L"CustbackVCam MIT-C1: OpenFileMappingW(\"%ls\") failed; "
+                L"GetLastError=%lu\r\n",
+                sectionName, error))) {
+            ::OutputDebugStringW(message);
+        }
+    }
+
+    bool m_reportedOpenFailure = false;
+    DWORD m_lastReportedOpenError = ERROR_SUCCESS;
+#endif
+
     HANDLE m_section = nullptr;
     const uint8_t* m_view = nullptr;
     SIZE_T m_viewSize = 0;

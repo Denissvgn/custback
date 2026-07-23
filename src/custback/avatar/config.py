@@ -17,6 +17,7 @@ from typing import Annotated, Any, Callable, Literal
 import yaml
 from pydantic import Field, field_validator, model_validator
 
+from .. import _platform as platform_fs
 from ..config import _clean_config_string, _StrictModel
 from ..config_merge import merge_patch
 from .state import ARKIT_BLENDSHAPES  # noqa: F401  (re-exported contract)
@@ -383,7 +384,9 @@ class AvatarApiConfig(_StrictModel):
     enabled: bool = True
     host: str = "127.0.0.1"
     port: int = Field(default=8711, ge=1, le=65535)
-    token_file: str = "~/.config/custback/avatar-api-token"
+    token_file: str = Field(
+        default_factory=lambda: str(platform_fs.config_dir() / "avatar-api-token")
+    )
     allow_non_loopback: bool = False
     allowed_origins: tuple[str, ...] = ()
     session_ttl_s: int = Field(default=28_800, ge=60, le=31_536_000)

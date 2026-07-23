@@ -95,8 +95,9 @@ api:
   host: 127.0.0.1
   port: 8711
   # The avatar service's own control token (not custback's);
-  # CUSTBACK_AVATAR_API_TOKEN overrides the file.
-  token_file: ~/.config/custback/avatar-api-token
+  # CUSTBACK_AVATAR_API_TOKEN overrides the file. Omit token_file to use the
+  # platform config directory (~/.config/custback on POSIX,
+  # %APPDATA%\Custback on Windows).
   allow_non_loopback: false
   allowed_origins: []
   session_ttl_s: 28800

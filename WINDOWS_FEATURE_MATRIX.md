@@ -60,7 +60,7 @@ WIN-4):
 | --- | --- | --- |
 | OBS Virtual Camera via `pyvirtualcam` | Planned (WIN-3.7) | Camera → Teams/Zoom/Meet/browser stable |
 | Unity Capture via `pyvirtualcam` | Not planned (secondary compat option) | — |
-| Native Media Foundation virtual camera | Planned (WIN-6.1) — machinery landed (`packaging/windows/vcam/`, `output.backend: native` opt-in; `auto` never selects it) | Own C++/WinRT clean-machine gate: visible + stable in Teams/Zoom/Meet + browser with no OBS installed |
+| Native Media Foundation virtual camera | Planned (WIN-6.1) — machinery landed (`packaging/windows/vcam/`, explicit `output.backend: native` opt-in); the Windows `auto` ladder is encoded as pyvirtualcam → native → null, but `_AUTO_NATIVE_ENABLED = False` keeps the native rung disabled | Own C++/WinRT clean-machine gate: default config suppresses the native camera with a diagnostic; explicit native shows live frames in Camera before Teams/Zoom/Meet/browser checks; only passing evidence permits the one-line auto-flag flip |
 | Legacy DirectShow driver | Not planned | — |
 
 ## 4. Camera input
@@ -99,7 +99,7 @@ state, not a regression.
 | Embedded web UI in WebView2 | Planned (WIN-5.2) | — |
 | Secure WebView session bootstrap (no token in URL/args/log) | Planned (WIN-5.3) | Clean-VM: no secret in process args/URLs |
 | Tray lifecycle / suspend / crash recovery | Planned (WIN-5.4) | — |
-| Avatar second process supervision | Planned (WIN-5.5/WIN-6.4), feature-gated — machinery landed (`custback-avatar.exe` frozen beside the engine, real CLI supervision contract, `-IncludeAvatar` installer gating; vision/audio2face one-per-payload) | Avatar smoke + supervised run on the WIN-1.8 job |
+| Avatar second process supervision + control proxy | Planned (WIN-5.5/WIN-6.4), feature-gated — machinery landed (`custback-avatar.exe` frozen beside the engine, D9 shell-reserved API port and explicit engine proxy flags, `-IncludeAvatar` installer gating; vision/audio2face one-per-payload) | Avatar smoke + supervised run on the WIN-1.8 job, including authenticated `GET /avatar/status` through the engine after the avatar mints its token |
 | Native HighGUI preview | Not planned (decision D8) | — |
 
 ## 7. Distribution

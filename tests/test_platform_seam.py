@@ -19,13 +19,84 @@ from __future__ import annotations
 import os
 import stat
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from custback import _platform as platform_fs
+from custback.avatar.config import AvatarConfig
+from custback.config import AppConfig
 
 WINDOWS = sys.platform == "win32"
+
+
+# --- per-platform configuration paths (MIT-B3 / WIN-1.5 seam) ---------------
+
+
+@pytest.mark.parametrize(
+    ("platform", "environment_key", "directory_name"),
+    [
+        ("linux", "XDG_CONFIG_HOME", "custback"),
+        ("darwin", "XDG_CONFIG_HOME", "custback"),
+        ("win32", "APPDATA", "Custback"),
+    ],
+)
+def test_config_dir_uses_platform_user_directory(
+    tmp_path, platform, environment_key, directory_name
+):
+    base = tmp_path / "platform-config"
+    assert (
+        platform_fs.config_dir(
+            platform=platform,
+            environ={environment_key: str(base)},
+            home=tmp_path / "unused-home",
+        )
+        == base / directory_name
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [
+        ("linux", Path(".config") / "custback"),
+        ("win32", Path("AppData") / "Roaming" / "Custback"),
+    ],
+)
+def test_config_dir_ignores_relative_environment_overrides(
+    tmp_path, platform, expected
+):
+    variable = "APPDATA" if platform == "win32" else "XDG_CONFIG_HOME"
+    assert (
+        platform_fs.config_dir(
+            platform=platform,
+            environ={variable: "relative"},
+            home=tmp_path,
+        )
+        == tmp_path / expected
+    )
+
+
+@pytest.mark.parametrize("directory_name", ["custback", "Custback"])
+def test_avatar_control_token_defaults_share_one_platform_path(
+    tmp_path, monkeypatch, directory_name
+):
+    expected_dir = tmp_path / directory_name
+    monkeypatch.setattr(platform_fs, "config_dir", lambda: expected_dir)
+
+    engine_default = AppConfig().avatar.token_file
+    avatar_default = AvatarConfig().api.token_file
+    assert engine_default == avatar_default == str(expected_dir / "avatar-api-token")
+
+
+def test_shipped_templates_inherit_platform_avatar_token_default():
+    root = Path(__file__).resolve().parents[1]
+    assert AppConfig.load(root / "config" / "default.yaml").avatar.token_file == (
+        AppConfig().avatar.token_file
+    )
+    assert AvatarConfig.load(root / "config" / "avatar.yaml").api.token_file == (
+        AvatarConfig().api.token_file
+    )
 
 
 # --- WIN-2.4: no-follow / reparse-point rejection ----------------------------

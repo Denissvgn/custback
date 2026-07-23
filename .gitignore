@@ -1,4 +1,5 @@
 .venv/
+.hallmark/
 .*.custback-generations/
 __pycache__/
 *.egg-info/

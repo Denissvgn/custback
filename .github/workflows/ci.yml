@@ -23,6 +23,21 @@ jobs:
       - run: python -m ruff check src tests examples scripts/release
       - run: python -m ruff format --check src tests examples scripts/release
 
+  pyright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: python -m venv .venv
+      - run: .venv/bin/python -m pip install --upgrade 'pip>=23,<27'
+      - run: .venv/bin/python -m pip install -e '.[dev]'
+      - run: .venv/bin/python -m pip check
+      - run: .venv/bin/python -m pyright
+
   stress:
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -57,15 +57,17 @@
     <OutDir>$(ProjectDir)dist\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(ProjectDir)build\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>CustbackVCam</TargetName>
+    <CustbackVcamGateDiagnostics Condition="'$(CustbackVcamGateDiagnostics)'==''">false</CustbackVcamGateDiagnostics>
+    <CustbackVcamGateDefine Condition="'$(CustbackVcamGateDiagnostics)'=='true'">CUSTBACK_VCAM_GATE_DIAGNOSTICS;</CustbackVcamGateDefine>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <LanguageStandard>stdcpp17</LanguageStandard>
+      <LanguageStandard>stdcpp20</LanguageStandard>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>$(CustbackVcamGateDefine)WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- winrt::check_hresult / to_hresult need unwinding through C++. -->
       <ExceptionHandling>Sync</ExceptionHandling>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>

@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 
 from .base import PlatformSecurityUnsupported
+from .paths import config_dir
 
 if sys.platform == "win32":  # pragma: no cover - selected only on Windows
     from . import windows as _backend
@@ -50,6 +51,7 @@ listdir_secure = _backend.listdir_secure
 
 __all__ = [
     "PlatformSecurityUnsupported",
+    "config_dir",
     "lock_exclusive",
     "unlock",
     "set_private_mode",

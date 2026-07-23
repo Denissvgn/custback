@@ -57,6 +57,7 @@ for byte, in four places (cross-checked by `tests/test_windows_vcam.py`):
 ```powershell
 pwsh packaging/windows/vcam/build.ps1              # x64
 pwsh packaging/windows/vcam/build.ps1 -Arch arm64  # WIN-6.3
+pwsh packaging/windows/vcam/build.ps1 -GateDiagnostics  # MIT-C1 gate payload
 ```
 
 Requires VS 2022 build tools and Windows 11 SDK 10.0.22000+ (the first SDK
@@ -64,10 +65,67 @@ carrying `MFCreateVirtualCamera`). The produced `CustbackVCam.dll` is placed by
 the installer next to the shell and registered per-user (HKCU only, no
 elevation, matching the per-user install of D5).
 
-## Gate (feature-matrix guardrail)
+`-GateDiagnostics` adds a gate-build-only `OutputDebugStringW` trace. Capture
+Win32 debug output from the Frame Server process while opening the camera. If
+the media source cannot see the engine's ring, it emits one line per distinct
+failure until an open succeeds:
 
-`output.backend: native` is explicit opt-in; `auto` keeps the OBS path until
-this camera passes its own clean-machine gate in the validation matrix
-(visible + stable in Teams, Zoom, Meet, and a browser test page on a machine
-with no OBS installed). Until then the feature stays **Planned (WIN-6.1)** in
-`WINDOWS_FEATURE_MATRIX.md` and is not advertised.
+```text
+CustbackVCam MIT-C1: OpenFileMappingW("Local\CustbackVCamFrame0") failed; GetLastError=<code>
+```
+
+Record the numeric code with the WIN-6.1 evidence. Normal builds omit this
+trace.
+
+## Gate-build operator configuration
+
+Installing `CustbackVCam.dll` does not by itself enable the camera. For a
+WIN-6.1 gate-testing payload, create
+`%APPDATA%\Custback\config.yaml` containing:
+
+```yaml
+output:
+  backend: native
+```
+
+The explicit setting is required until the clean-machine evidence passes.
+Although the Windows `auto` ladder is encoded as pyvirtualcam → native → null,
+`_AUTO_NATIVE_ENABLED = False` keeps its native rung disabled. With `auto` (or
+any other non-native active backend), the shell deliberately does not call
+`MFCreateVirtualCamera` and logs:
+
+```text
+native vcam DLL installed but engine output.backend is '<x>'; native camera not started
+```
+
+With explicit `native`, the engine creates the ring and the shell starts the
+camera after authenticated status confirms the active backend. Windows status
+reports `native_ring: section present` or `native_ring: section absent`; the
+operator-facing diagnostic line is `native ring: section present/absent`.
+Other platforms report `native ring: unsupported`.
+
+## WIN-6.1 clean-machine checklist
+
+Run these rows in order on a machine with no OBS installation:
+
+1. Install a payload built with `-GateDiagnostics`, set
+   `output.backend: native`, restart with the engine publishing, and open the
+   Windows Camera app before any consumer-specific test. Verify that "Custback
+   Camera" shows live processed frames, not the placeholder. An absent ring or
+   placeholder-only camera stops the gate; capture the MIT-C1
+   `OpenFileMappingW` error-code trace before investigating Teams or Zoom.
+2. Verify that engine status reports the native backend, diagnostics say
+   `native ring: section present`, and the shell creates "Custback Camera".
+   In a Debug shell or Release shell published with
+   `-p:CustbackGateBuild=true`, require the
+   `IMFAttributes::GetCount HRESULT=0x00000000` projection-self-check log
+   before the camera-started log. A missing or failing check stops the WIN-1.8
+   shell smoke here.
+3. Verify visibility and stable live frames in Teams, Zoom, Meet, and a browser
+   test page.
+4. Restore the default `output.backend: auto` and restart. Verify that no native
+   camera starts and the shell log contains the backend-mismatch message above.
+
+Until every row passes, the feature remains **Planned (WIN-6.1)** in
+`WINDOWS_FEATURE_MATRIX.md`, `_AUTO_NATIVE_ENABLED` remains `False`, and the
+native camera is not advertised.

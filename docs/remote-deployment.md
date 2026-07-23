@@ -117,20 +117,26 @@ rejected; plaintext is supported only on numeric loopback for same-host use.
 
 ## Rotation
 
-Token files and outbound trust settings are startup authority, so rotation
-requires service restarts. There is no unsafe dual-token grace period.
+Token-file paths and outbound trust settings are startup authority. Token
+values are listener startup authority, except that custback's avatar proxy
+rereads the value at its fixed `avatar.token_file` path for every request.
+There is no unsafe dual-token grace period.
 
 1. Schedule the brief affected-plane outage and generate a new value without
    replacing the other plane's token.
 2. Atomically install mode-`0600` copies on the listener and client hosts.
-3. Restart the listener that validates the token, then restart the client.
+3. Restart the listener that validates the token, then restart clients that
+   snapshot it. Custback itself does not need a restart for a same-path
+   avatar-control-token replacement.
 4. Verify the connection and an intentionally wrong-token rejection. Destroy
    old secret-manager versions according to the site's retention policy.
 
 For renderer-token rotation, custback shows the privacy slate until the avatar
 client reconnects. For avatar-control-token rotation, `/avatar/*` control calls
-fail closed while frame rendering can continue. Restart custback after changing
-its `avatar.token_file` copy because the proxy snapshots that credential.
+fail closed while frame rendering can continue. Restart the avatar listener,
+atomically replace the value at custback's existing `avatar.token_file` path,
+and the next proxy request uses it. Changing that path, the proxy destination,
+or its TLS trust/client identity still requires restarting custback.
 
 Rotate a private CA without a trust gap: first deploy an old-plus-new CA bundle
 to each client and restart it, then replace the listener certificate/key and

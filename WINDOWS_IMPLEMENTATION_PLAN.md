@@ -654,7 +654,9 @@ upgrades, and uninstalls; no secret appears in process arguments or URLs.
 
 ### WIN-5.5 — Supervise avatar second process · S
 - Start/supervise the avatar service process only when that feature is
-  installed. **Deps:** WIN-5.2.
+  installed. Per D9, reserve a second ephemeral loopback port distinct from the
+  engine port, pass its URL and the avatar token path to the engine proxy, and
+  pass the same port to the avatar service. **Deps:** WIN-5.2.
 
 ### WIN-5.6 — Signed per-user EXE/MSI installer · L
 - WiX or Inno Setup, per-user. Include/detect: WebView2 Evergreen runtime,
@@ -705,11 +707,17 @@ matrix, same convention as Phases 2–5):**
   `FrameRing.h` mirrors it, and the reader holds the last frame or a
   placeholder when the engine idles (a camera must never stall its consumer).
   The engine side is `output.backend: native` → `NativeVirtualCameraOutput`
-  (explicit opt-in; `auto` keeps OBS until the WIN-6.1 clean-machine gate
-  passes; POSIX fails closed). Lifecycle: the shell's
-  `VirtualCameraSession.cs` calls `MFCreateVirtualCamera` with **session**
-  lifetime + current-user access after engine readiness, so nothing persists
-  past the process; the MSI owns the per-user COM registration
+  (explicit opt-in; the Windows `auto` ladder is already pyvirtualcam → native
+  → null, but `_AUTO_NATIVE_ENABLED = False` disables the native rung until the
+  WIN-6.1 clean-machine gate passes; POSIX fails closed). Lifecycle: after
+  engine readiness the shell reads the authenticated status and calls
+  `VirtualCameraSession.TryStart` only when the active backend is native.
+  A DLL-bearing build with any other backend starts no placeholder-only camera
+  and logs the mismatch. `VirtualCameraSession.cs` calls
+  `MFCreateVirtualCamera` with **session** lifetime + current-user access, so
+  nothing persists past the process; Windows status reports the named-section
+  ring as present/absent (unsupported off Windows). The MSI owns the per-user
+  COM registration
   (`IncludeNativeVCam` define, staged by `installer/build.ps1 -VCamDll`) and
   its removal — the WIN-5.7 placeholder CLSID is now the real one. Loop
   prevention holds ("Custback Camera" matches the existing `custback`
@@ -720,10 +728,12 @@ matrix, same convention as Phases 2–5):**
   prose: the `directml` extra (`onnxruntime-directml`, mutually exclusive
   with `gpu` — enforced at freeze time and at gate time) plus
   `scripts/release/windows-acceleration-gate.py` — `run` produces per-machine
-  evidence (real-RVM proof via `prove_rvm_provider`, alpha drift vs CPU,
-  720p/1080p timing, adapter identity, wheel-conflict state); `check` is the
-  deterministic validator (both-vendor AMD+Intel coverage, drift ≤
-  0.005 mean / 0.02 max, 720p ≥ target FPS, no co-installation) that becomes
+  schema-2 evidence (real-RVM proof via `prove_rvm_provider`, worst per-frame
+  mean alpha drift vs CPU as `alpha_delta_mean_worst`, 720p/1080p timing,
+  adapter identity, wheel-conflict state); `run --strict` fails a local
+  NO-GO, while CI must use `check` as the deterministic validator (both-vendor
+  AMD+Intel coverage, drift ≤ 0.005 worst per-frame mean / 0.02 max, 720p ≥
+  target FPS, no co-installation) that becomes
   the `windows-acceleration` gate validator when WIN-1.8/WIN-5.8 wire the
   Windows evidence source. Criteria are pinned by
   `tests/test_windows_acceleration_gate.py`; DirectML stays unadvertised
@@ -733,23 +743,34 @@ matrix, same convention as Phases 2–5):**
   extras to the ARM64 profile, refuses CUDA/mediapipe),
   `installer/build.ps1 -Arch` → WiX `-arch` + `VC_redist.$(var.Arch).exe`,
   `CustbackVCam.vcxproj` ARM64 configurations, shell `RuntimeIdentifiers`
-  `win-x64;win-arm64`. `WINDOWS_ARM64.md` records the dependency profile
-  (native MF camera replaces the wheel-less `pyvirtualcam` path), the build
-  commands, and the arm64-* evidence rows required before any Supported
-  claim.
+  `win-x64;win-arm64`. `WINDOWS_ARM64.md` records the dependency profile:
+  a PEP 508 marker and the PyInstaller spec omit wheel-less `pyvirtualcam`;
+  native MF will replace that path only after WIN-6.1 evidence. Today `auto`
+  reaches API-only `NullOutput` and explicit `native` is the manual gate-build
+  opt-in. It also records the build commands and the arm64-* evidence rows
+  required before any Supported claim.
 - **WIN-6.4 (avatar parity).** `custback.spec` now freezes **two console
   executables into one onedir payload** (`custback.exe` +
   `custback-avatar.exe`, shared dependency set), with the avatar driver stack
   selected per payload via `CUSTBACK_AVATAR_PROFILE` (vision/MediaPipe
   default per D7; audio2face flavor swaps stacks — the protobuf conflict
   makes them one-per-payload, mirrored by `build.ps1 -AvatarProfile` guards).
-  The shell's supervision contract is now the *real* avatar CLI (the WIN-5.5
-  `serve` argument was a latent bug): started only after engine readiness
-  with `--source ws://127.0.0.1:<port> --source-token-file <renderer-token>
+  Per D9, the shell reserves an ephemeral avatar API port distinct from the
+  engine port and, only for an installed avatar, starts the engine with
+  `--avatar-url http://127.0.0.1:<avatar-port> --avatar-token-file
+  <avatar-api-token>`. The proxy freezes that destination and token path but
+  reads the service-minted token value per request, preserving the existing
+  engine-before-avatar order. The shell's supervised avatar contract is the
+  *real* CLI (the WIN-5.5 `serve` argument was a latent bug): started only
+  after engine readiness with `--source ws://127.0.0.1:<engine-port>
+  --source-token-file <renderer-token> --api-port <avatar-port>
   --api-token-file <avatar-api-token>` (paths, never secrets), with a bounded
-  3-restart budget; quit gives the avatar a short grace then a tree kill.
-  Storage stays on the Phase-2 seam; explicit token paths keep the packaged
-  product independent of WIN-1.5. The installer ships the avatar only with
+  3-restart budget. Driver selection is intentionally left to the avatar
+  config file; the shell does not pass `--driver`. Quit gives the avatar a
+  short grace then a tree kill. Source-install engine/avatar token defaults
+  share the platform config-directory resolver; the packaged product also
+  passes the same explicit token path to both processes. Storage stays on the
+  Phase-2 seam. The installer ships the avatar only with
   `-IncludeAvatar` (dropped from the staged payload otherwise), and
   `build.ps1` smoke-runs `custback-avatar.exe --smoke` in the scrubbed
   environment.

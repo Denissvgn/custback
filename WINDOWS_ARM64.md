@@ -24,16 +24,23 @@ x64 — architecture is a parameter, not a fork.
 | onnxruntime-directml (`directml` extra) | arm64 wheels available | opt-in; advertising still gated on WIN-6.2 evidence *from ARM64 hardware* |
 | mediapipe (`mediapipe` extra) | **no win_arm64 wheel** | **refused**; segmentation falls back per the existing `backend: auto` ladder |
 | pywin32 (`windows` extra) | arm64 wheels available (306+) | unchanged — the Phase-2 security backend is mandatory |
-| pyvirtualcam | **no win_arm64 wheel; needs local native build** | do not rely on it: the **native MF camera (WIN-6.1) is the ARM64 output path**; OBS ships ARM64 builds for the prerequisite flow |
+| pyvirtualcam | **no win_arm64 wheel; needs local native build** | **excluded** by the core PEP 508 marker and frozen-build spec; the native MF camera **will be the ARM64 output path once WIN-6.1 evidence lands**; until then `auto` produces API-only output (`NullOutput`) and `output.backend: native` is the manual gate-build opt-in |
 | grpcio / nvidia-ace (`audio2face` extra) | grpcio arm64 wheels exist; NVIDIA wheels x86_64-only | **out of ARM64 scope** (WIN-6.4 ships the vision profile) |
 
 Consequences encoded in the build scripts:
 
 - `packaging/windows/pyinstaller/build.ps1 -Arch arm64` defaults the extras to
   `rvm,windows` and hard-fails on `gpu` or `mediapipe`.
-- `output.backend: native` (WIN-6.1) carries the virtual-camera duty; the
-  `pyvirtualcam` import stays lazy inside `PyVirtualCamOutput`, so an ARM64
-  build that never selects the pyvirtualcam backend never imports it.
+- The core dependency marker excludes `pyvirtualcam` only when
+  `sys_platform == 'win32'` and `platform_machine` is either common casing of
+  ARM64; the PyInstaller spec mirrors that predicate for native collection,
+  hidden imports, and analysis exclusions.
+- The intended Windows `auto` ladder is pyvirtualcam → native → null, but its
+  native rung remains disabled by `_AUTO_NATIVE_ENABLED = False` until WIN-6.1
+  evidence lands. Consequently an ARM64 build defaults to API-only
+  `NullOutput` today; `output.backend: native` is the manual gate-build opt-in.
+  The `pyvirtualcam` import stays lazy inside `PyVirtualCamOutput` for other
+  platforms and Windows x64.
 
 ## 2. Build path (all arch-parameterized, no forks)
 

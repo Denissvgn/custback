@@ -1,4 +1,6 @@
 {
+  // Pyright is enforcing in push/PR CI but advisory to the Phase 6 publication
+  // gate: this Linux-hosted basic-mode source check is not artifact evidence.
   "include": [
     "src",
     "tests",

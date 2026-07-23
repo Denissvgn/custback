@@ -520,7 +520,7 @@ test('dependency verification reads runtime tables instead of matching stray tex
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-dependency-test-'));
   t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
   const original = fs.readFileSync(path.join(root, 'pyproject.toml'), 'utf8');
-  const spec = 'pyvirtualcam>=0.11,<1';
+  const spec = "pyvirtualcam>=0.11,<1; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64')";
   fs.writeFileSync(
     path.join(fixture, 'pyproject.toml'),
     `${original.replace(`    "${spec}",\n`, '')}\n# "${spec}"\n`,

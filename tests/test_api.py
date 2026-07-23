@@ -10,6 +10,7 @@ import contextlib
 import errno
 import os
 import stat
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -296,6 +297,10 @@ def test_status_and_config_with_bearer(stack):
     } <= body.keys()
     assert body["capture_backend"] == "synthetic"
     assert body["output_fallback_active"] is False
+    if sys.platform == "win32":
+        assert body["native_ring"] in {"section absent", "section present"}
+    else:
+        assert body["native_ring"] == "unsupported"
     config = stack.get("/config", headers=AUTH)
     assert config.json()["background"]["mode"] == "color"
     assert {

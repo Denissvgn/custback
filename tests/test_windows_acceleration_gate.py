@@ -49,7 +49,7 @@ def _adapter(gate, vendor: str, **overrides) -> dict:
         "proof_error": "",
         "correctness": {
             "frames": 30,
-            "alpha_delta_mean": 0.001,
+            "alpha_delta_mean_worst": 0.001,
             "alpha_delta_max": 0.01,
         },
         "performance": {
@@ -84,6 +84,7 @@ def _evidence(gate, adapters: list[dict]) -> dict:
 
 
 def test_go_requires_amd_and_intel_coverage(gate) -> None:
+    assert gate.SCHEMA_VERSION == 2
     both = _evidence(gate, [_adapter(gate, "AMD"), _adapter(gate, "Intel")])
     go, reasons = gate.evaluate_evidence(both)
     assert go and reasons == []
@@ -115,7 +116,7 @@ def test_alpha_drift_beyond_tolerance_is_no_go(gate) -> None:
     drifted = _adapter(gate, "AMD")
     drifted["correctness"] = {
         "frames": 30,
-        "alpha_delta_mean": 0.02,
+        "alpha_delta_mean_worst": 0.02,
         "alpha_delta_max": 0.2,
     }
     evidence = _evidence(gate, [drifted, _adapter(gate, "Intel")])
@@ -156,6 +157,30 @@ def test_schema_is_exact_match(gate) -> None:
     assert not go
 
 
+def test_schema_1_evidence_is_rejected_before_schema_2_evaluation(gate) -> None:
+    legacy = _evidence(gate, [_adapter(gate, "AMD"), _adapter(gate, "Intel")])
+    legacy["schema_version"] = 1
+    for adapter in legacy["adapters"]:
+        correctness = adapter["correctness"]
+        correctness["alpha_delta_mean"] = correctness.pop("alpha_delta_mean_worst")
+
+    go, reasons = gate.evaluate_evidence(legacy)
+    assert not go
+    assert reasons == ["wrong schema_version/task for the WIN-6.2 gate"]
+
+
+def test_schema_2_rejects_the_old_correctness_field(gate) -> None:
+    evidence = _evidence(gate, [_adapter(gate, "AMD"), _adapter(gate, "Intel")])
+    correctness = evidence["adapters"][0]["correctness"]
+    correctness["alpha_delta_mean"] = correctness.pop("alpha_delta_mean_worst")
+
+    go, reasons = gate.evaluate_evidence(evidence)
+    assert not go
+    assert any(
+        "correctness does not match the exact schema" in reason for reason in reasons
+    )
+
+
 def test_check_cli_exit_codes(gate, tmp_path, capsys) -> None:
     evidence = _evidence(gate, [_adapter(gate, "AMD"), _adapter(gate, "Intel")])
     path = tmp_path / "evidence.json"
@@ -168,6 +193,34 @@ def test_check_cli_exit_codes(gate, tmp_path, capsys) -> None:
     assert gate.main(["check", str(path), "--json"]) == 1
     verdict = json.loads(capsys.readouterr().out)
     assert verdict["go"] is False and verdict["reasons"]
+
+
+def test_run_strict_exit_semantics(gate, capsys) -> None:
+    no_go = _evidence(gate, [_adapter(gate, "AMD")])
+    assert gate._report_local_verdict(no_go, strict=False) == 0
+    captured = capsys.readouterr()
+    assert "NO-GO" in captured.out
+    assert "CI must gate on `check`" in captured.err
+
+    assert gate._report_local_verdict(no_go, strict=True) == 1
+    assert "NO-GO" in capsys.readouterr().out
+
+    go = _evidence(gate, [_adapter(gate, "AMD"), _adapter(gate, "Intel")])
+    assert gate._report_local_verdict(go, strict=True) == 0
+    assert "GO" in capsys.readouterr().out
+
+
+def test_run_cli_threads_strict_option(gate, monkeypatch) -> None:
+    seen: list[bool] = []
+
+    def fake_run(args) -> int:
+        seen.append(args.strict)
+        return int(args.strict)
+
+    monkeypatch.setattr(gate, "run", fake_run)
+    assert gate.main(["run", "--model", "model.onnx"]) == 0
+    assert gate.main(["run", "--model", "model.onnx", "--strict"]) == 1
+    assert seen == [False, True]
 
 
 def test_run_mode_refuses_non_windows(gate, monkeypatch, capsys) -> None:

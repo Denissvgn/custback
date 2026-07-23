@@ -90,10 +90,10 @@ _AVATAR_TOKEN_ENV = "CUSTBACK_AVATAR_API_TOKEN"
 
 @dataclass(frozen=True)
 class _AvatarProxyTarget:
-    """Immutable destination and credential selected during app creation."""
+    """Immutable destination, credential path, and TLS trust selected at startup."""
 
     url: str
-    token: str | None
+    token_file: str
     verify: ssl.SSLContext | bool
 
 
@@ -158,10 +158,10 @@ def _read_avatar_client_token(token_file: str) -> str:
 
 
 def _build_proxy_target(cfg: Any) -> _AvatarProxyTarget:
-    """Resolve a validated destination, TLS trust, and credential once."""
+    """Resolve a validated destination, TLS trust, and credential path once."""
 
     if not cfg.url:
-        return _AvatarProxyTarget(url="", token=None, verify=True)
+        return _AvatarProxyTarget(url="", token_file=cfg.token_file, verify=True)
     endpoint = validate_outbound_endpoint(
         cfg.url,
         kind="http",
@@ -175,20 +175,9 @@ def _build_proxy_target(cfg: Any) -> _AvatarProxyTarget:
         keyfile=cfg.tls_keyfile,
         label="avatar",
     )
-    try:
-        token = _read_avatar_client_token(cfg.token_file)
-    except (OSError, ValueError) as exc:
-        # Keep the core API available so operators can diagnose/fix the
-        # client credential, but never retry or read another path until a
-        # process restart reconstructs this immutable target.
-        log.warning(
-            "avatar API client credential unavailable at startup (%s)",
-            type(exc).__name__,
-        )
-        token = None
     return _AvatarProxyTarget(
         url=endpoint.url,
-        token=token,
+        token_file=cfg.token_file,
         verify=ssl_context if ssl_context is not None else True,
     )
 
@@ -285,11 +274,20 @@ def register_avatar_proxy(
             return _proxy_error(
                 404, "unknown_avatar_path", f"no proxied avatar route: /{path}"
             )
-        if target.token is None:
+        try:
+            # The path is the immutable, restart-only startup selection, but
+            # the supervised avatar owns token creation and starts after the
+            # core API. Read its value lazily without ever provisioning it.
+            token = _read_avatar_client_token(target.token_file)
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "avatar API client credential unavailable at request time (%s)",
+                type(exc).__name__,
+            )
             return _proxy_error(
                 502,
                 "avatar_token_unavailable",
-                "the avatar API client credential was unavailable at startup",
+                "the avatar API client credential is unavailable",
             )
         # ``path`` has already passed an ASCII-only route grammar. Preserve
         # the ASGI query as raw query bytes so delimiters decoded by a web
@@ -299,7 +297,7 @@ def register_avatar_proxy(
         if raw_query:
             url = url.copy_with(query=raw_query)
         headers = {
-            "authorization": f"Bearer {target.token}",
+            "authorization": f"Bearer {token}",
             # Keep upstream bodies un-compressed so they stream through 1:1.
             "accept-encoding": "identity",
         }
@@ -307,8 +305,9 @@ def register_avatar_proxy(
             value = request.headers.get(name)
             if value is not None:
                 headers[name] = value
-        # Only harmless timeout values remain hot. Destination, credential,
-        # and TLS trust all come exclusively from the startup target above.
+        # Only harmless timeout values remain hot. Destination, credential
+        # path, and TLS trust all come exclusively from the startup target
+        # above; only the contents at that path are refreshed.
         # The MJPEG stream is intentionally endless; everything else gets the
         # configured read deadline.
         cfg = _avatar_config(runtime)

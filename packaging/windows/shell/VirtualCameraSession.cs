@@ -61,10 +61,24 @@ internal sealed class VirtualCameraSession : IDisposable
                 categoryCount: 0,
                 out IMFVirtualCamera camera);
             Marshal.ThrowExceptionForHR(hr);
+            // Own the RCW before any gated assertion or Start call so the
+            // catch path can deterministically release a partially created
+            // camera before shutting Media Foundation down.
+            _camera = camera;
+
+#if DEBUG || CUSTBACK_GATE_BUILD
+            // MIT-C4: exercise a late inherited IMFAttributes slot before
+            // Start so an incorrect IMFVirtualCamera projection fails at the
+            // gate boundary instead of corrupting a later virtual-camera call.
+            hr = camera.GetCount(out uint attributeCount);
+            log(
+                "native virtual camera COM projection self-check: " +
+                $"IMFAttributes::GetCount HRESULT=0x{hr:X8}, count={attributeCount}");
+            Marshal.ThrowExceptionForHR(hr);
+#endif
 
             // Start(null): no per-app callback; Frame Server owns activation.
             Marshal.ThrowExceptionForHR(camera.Start(IntPtr.Zero));
-            _camera = camera;
             log($"native virtual camera started: {FriendlyName}");
             return true;
         }
@@ -169,7 +183,7 @@ internal interface IMFVirtualCamera
     void SetUnknown(in Guid key, IntPtr obj);
     void LockStore();
     void UnlockStore();
-    void GetCount(out uint count);
+    [PreserveSig] int GetCount(out uint count);
     void GetItemByIndex(uint index, out Guid key, IntPtr value);
     void CopyAllItems(IntPtr destination);
 

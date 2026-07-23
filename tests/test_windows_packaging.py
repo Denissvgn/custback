@@ -18,8 +18,14 @@ import py_compile
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 SPEC_DIR = Path(__file__).resolve().parents[1] / "packaging" / "windows" / "pyinstaller"
+PROJECT_ROOT = SPEC_DIR.parents[2]
+PYVIRTUALCAM_REQUIREMENT = (
+    "pyvirtualcam>=0.11,<1; sys_platform != 'win32' or "
+    "(platform_machine != 'ARM64' and platform_machine != 'arm64')"
+)
 
 pytestmark = pytest.mark.skipif(
     not (SPEC_DIR / "custback.spec").exists(),
@@ -80,6 +86,34 @@ def test_spec_carries_dynamic_custback_imports() -> None:
         assert needed in text, f"spec is missing hidden import {needed!r}"
 
 
+def test_windows_arm64_omits_pyvirtualcam_dependency_and_freeze_inputs() -> None:
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert f'"{PYVIRTUALCAM_REQUIREMENT}"' in pyproject
+
+    marker = Requirement(PYVIRTUALCAM_REQUIREMENT).marker
+    assert marker is not None
+    assert not marker.evaluate(
+        environment={"sys_platform": "win32", "platform_machine": "ARM64"}
+    )
+    assert not marker.evaluate(
+        environment={"sys_platform": "win32", "platform_machine": "arm64"}
+    )
+    assert marker.evaluate(
+        environment={"sys_platform": "win32", "platform_machine": "AMD64"}
+    )
+    assert marker.evaluate(
+        environment={"sys_platform": "linux", "platform_machine": "aarch64"}
+    )
+
+    text = _spec_text()
+    assert 'sys.platform == "win32"' in text
+    assert 'platform.machine().upper() == "ARM64"' in text
+    assert '_native_packages.append("pyvirtualcam")' in text
+    assert '_hiddenimports.append("pyvirtualcam")' in text
+    assert '_excludes.append("pyvirtualcam")' in text
+    assert "if not _WINDOWS_ARM64:" in text
+
+
 def test_spec_does_not_hardcode_pinned_version() -> None:
     text = _spec_text()
     # The version must come from importlib.metadata / custback.__version__, not
@@ -109,6 +143,21 @@ def test_build_smoke_scrubs_toolchain_environment() -> None:
 # -- Phase 6 -----------------------------------------------------------------
 def _build_script() -> str:
     return (SPEC_DIR / "build.ps1").read_text(encoding="utf-8")
+
+
+def _csharp_block_after(text: str, marker: str) -> str:
+    """Return the contents of the braced C# block following *marker*."""
+    marker_index = text.index(marker)
+    block_start = text.index("{", marker_index + len(marker))
+    depth = 0
+    for index in range(block_start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[block_start + 1 : index]
+    raise AssertionError(f"unterminated C# block after {marker!r}")
 
 
 def test_spec_freezes_avatar_second_executable() -> None:
@@ -154,12 +203,70 @@ def test_build_script_guards_acceleration_and_arch_profiles() -> None:
 def test_shell_supervises_avatar_with_real_cli_contract() -> None:
     shell_dir = SPEC_DIR.parents[0] / "shell"
     engine = (shell_dir / "Engine.cs").read_text(encoding="utf-8")
+    start_async = _csharp_block_after(
+        engine, "internal async Task StartAsync(CancellationToken cancellationToken)"
+    )
+    start_avatar = _csharp_block_after(engine, "private void StartAvatar()")
+
     # The avatar CLI has no "serve" subcommand; supervision must pass the
     # real flags: engine WS source, renderer token path, avatar API token path
     # (paths, never secrets, on the command line — WIN-5.3 discipline).
     assert '"serve"' not in engine
-    for flag in ("--source", "--source-token-file", "--api-token-file"):
-        assert flag in engine, f"avatar supervision is missing {flag}"
+    assert "8711" not in engine
+    assert "bool superviseAvatar = _options.SuperviseAvatar;" in start_async
+    assert (
+        "AvatarPort = superviseAvatar ? ReserveLoopbackPort(Port) : 0;" in start_async
+    )
+    for flag in ("--enable-api", "--api-host", "--api-plaintext"):
+        assert start_async.count(f'"{flag}"') == 1
+
+    supervised_marker = "if (superviseAvatar)"
+    assert start_async.count(supervised_marker) == 2
+    proxy_block = _csharp_block_after(start_async, supervised_marker)
+    for flag in ("--avatar-url", "--avatar-token-file", "--avatar-plaintext"):
+        assert proxy_block.count(f'"{flag}"') == 1
+        assert start_async.count(f'"{flag}"') == 1
+    assert '$"http://127.0.0.1:{AvatarPort}"' in proxy_block
+    assert "_options.AvatarTokenFile" in proxy_block
+
+    ready_index = start_async.index("await WaitForReadyAsync")
+    launch_guard_index = start_async.index(supervised_marker, ready_index)
+    launch_block = _csharp_block_after(
+        start_async[launch_guard_index:], supervised_marker
+    )
+    assert "StartAvatar();" in launch_block
+
+    for flag in (
+        "--source",
+        "--source-token-file",
+        "--source-plaintext",
+        "--enable-api",
+        "--api-host",
+        "--api-token-file",
+        "--api-port",
+        "--api-plaintext",
+    ):
+        assert start_avatar.count(f'"{flag}"') == 1
+    assert '"--source", $"ws://127.0.0.1:{Port}"' in start_avatar
+    assert '"--api-port", AvatarPort.ToString()' in start_avatar
+
+    engine_config_block = _csharp_block_after(
+        start_async, "if (File.Exists(_options.EngineConfigFile))"
+    )
+    avatar_config_block = _csharp_block_after(
+        start_avatar, "if (File.Exists(_options.AvatarConfigFile))"
+    )
+    assert (
+        'engineArguments.AddRange(new[] { "--config", _options.EngineConfigFile });'
+        in engine_config_block
+    )
+    assert (
+        'avatarArguments.AddRange(new[] { "--config", _options.AvatarConfigFile });'
+        in avatar_config_block
+    )
+    assert engine.count('"--config"') == 2
+
+    assert "--driver" not in engine
     assert "MaxAvatarRestarts" in engine
     csproj = (shell_dir / "Custback.Shell.csproj").read_text(encoding="utf-8")
     assert "win-arm64" in csproj  # WIN-6.3 publish RID

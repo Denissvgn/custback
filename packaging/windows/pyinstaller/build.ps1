@@ -43,7 +43,9 @@ Set-StrictMode -Version Latest
 if ($Arch -eq "arm64" -and -not $PSBoundParameters.ContainsKey("Extras")) {
     # ARM64 dependency profile (WIN-6.3 / WINDOWS_ARM64.md): mediapipe ships
     # no win_arm64 wheel, so the default trims to RVM CPU + the security
-    # backend. DirectML may be added explicitly once WIN-6.2 evidence exists.
+    # backend. The core PEP 508 marker and PyInstaller spec also omit the
+    # wheel-less pyvirtualcam package. DirectML may be added explicitly once
+    # WIN-6.2 evidence exists.
     $Extras = "rvm,windows"
 }
 if ($AvatarProfile -eq "audio2face" -and -not $PSBoundParameters.ContainsKey("Extras")) {

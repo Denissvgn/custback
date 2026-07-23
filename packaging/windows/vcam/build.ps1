@@ -14,11 +14,16 @@
 
 .PARAMETER Arch
     Target architecture: x64 (default) or arm64 (WIN-6.3).
+
+.PARAMETER GateDiagnostics
+    Enable the MIT-C1 OutputDebugString trace for frame-ring open failures.
+    This is intended only for WIN-6.1 gate payloads.
 #>
 [CmdletBinding()]
 param(
     [ValidateSet("x64", "arm64")][string]$Arch = "x64",
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [switch]$GateDiagnostics
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +31,7 @@ Set-StrictMode -Version Latest
 
 $here = $PSScriptRoot
 $platform = if ($Arch -eq "arm64") { "ARM64" } else { "x64" }
+$gateDiagnosticsValue = if ($GateDiagnostics) { "true" } else { "false" }
 
 $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
     -latest -requires Microsoft.Component.MSBuild `
@@ -35,7 +41,8 @@ if (-not $msbuild) { throw "MSBuild not found (install VS 2022 build tools)" }
 & $msbuild (Join-Path $here "CustbackVCam.vcxproj") `
     /nologo /m `
     /p:Configuration=$Configuration `
-    /p:Platform=$platform
+    /p:Platform=$platform `
+    /p:CustbackVcamGateDiagnostics=$gateDiagnosticsValue
 if ($LASTEXITCODE -ne 0) { throw "msbuild failed ($LASTEXITCODE)" }
 
 $dll = Join-Path $here "dist\$platform\$Configuration\CustbackVCam.dll"

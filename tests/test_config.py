@@ -3,6 +3,7 @@ import time
 
 import pytest
 
+from custback.__main__ import build_parser, config_from_args
 from custback.config import (
     AVATAR_PROXY_RESTART_ONLY_FIELDS,
     AppConfig,
@@ -29,6 +30,93 @@ def test_defaults_valid():
     assert cfg.camera.mode_mismatch == "warn"
     assert cfg.camera.recovery_timeout_s == 10.0
     assert cfg.api.renderer_token_file == "~/.config/custback/renderer-token"
+
+
+def test_avatar_proxy_cli_overrides_map_atomically_into_runtime(tmp_path):
+    token_file = tmp_path / "avatar-api-token"
+    cfg = config_from_args(
+        build_parser().parse_args(
+            [
+                "--avatar-url",
+                "http://127.0.0.1:28711",
+                "--avatar-token-file",
+                str(token_file),
+            ]
+        )
+    )
+    runtime = RuntimeConfig(cfg)
+
+    effective = runtime.snapshot().avatar
+    assert effective.url == "http://127.0.0.1:28711"
+    assert effective.token_file == str(token_file)
+
+
+def test_packaged_cli_overrides_keep_shell_transports_on_plaintext_loopback(
+    tmp_path,
+):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "api:\n"
+        "  enabled: false\n"
+        "  host: remote.example\n"
+        "  tls_certfile: /operator/server.crt\n"
+        "  tls_keyfile: /operator/server.key\n"
+        "avatar:\n"
+        "  url: https://avatar.example:8711\n"
+        "  tls_ca_file: /operator/ca.pem\n"
+        "  tls_certfile: /operator/client.crt\n"
+        "  tls_keyfile: /operator/client.key\n"
+    )
+    cfg = config_from_args(
+        build_parser().parse_args(
+            [
+                "--config",
+                str(config_file),
+                "--enable-api",
+                "--api-host",
+                "127.0.0.1",
+                "--api-port",
+                "28710",
+                "--api-plaintext",
+                "--avatar-url",
+                "http://127.0.0.1:28711",
+                "--avatar-plaintext",
+            ]
+        )
+    )
+
+    assert cfg.api.enabled is True
+    assert (cfg.api.host, cfg.api.port) == ("127.0.0.1", 28710)
+    assert (cfg.api.tls_certfile, cfg.api.tls_keyfile) == ("", "")
+    assert cfg.avatar.url == "http://127.0.0.1:28711"
+    assert (
+        cfg.avatar.tls_ca_file,
+        cfg.avatar.tls_certfile,
+        cfg.avatar.tls_keyfile,
+    ) == ("", "", "")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--avatar-url", "https://avatar.example:8711", "--avatar-plaintext"],
+        [
+            "--api-host",
+            "remote.example",
+            "--api-plaintext",
+        ],
+        [
+            "--api-plaintext",
+            "--api-tls-cert",
+            "/operator/server.crt",
+            "--api-tls-key",
+            "/operator/server.key",
+        ],
+    ],
+)
+def test_plaintext_cli_flags_cannot_silently_weaken_remote_tls(arguments):
+    with pytest.raises(ValueError, match="plaintext"):
+        config_from_args(build_parser().parse_args(arguments))
 
 
 def test_round_trip_yaml(tmp_path):

@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import _platform as platform_fs
 from .config_merge import merge_patch
 
 # Output / compositing modes. Kept as a tuple for CLI/API compatibility.
@@ -44,7 +45,8 @@ _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\\\/]")
 
 # These fields select the avatar proxy's outbound security boundary.  They are
 # consumed when the API application is constructed and cannot safely diverge
-# from the immutable destination/credential snapshot held by the proxy.
+# from the immutable destination, credential-path, and TLS snapshot held by the
+# proxy. The token value at that fixed path is deliberately read per request.
 AVATAR_PROXY_RESTART_ONLY_FIELDS = frozenset(
     {
         "avatar.url",
@@ -476,12 +478,15 @@ class AvatarRemoteConfig(_StrictModel):
     service's own control token (``custback-avatar --show-api-token``); the
     ``CUSTBACK_AVATAR_API_TOKEN`` environment variable overrides the file.
     The destination and credential path are restart-only because the proxy
-    resolves both into an immutable startup snapshot.  Timeout changes remain
-    hot-configurable.
+    resolves both into an immutable startup snapshot. The token value is read
+    securely for each request so a supervised avatar may mint the file after
+    the core API starts. Timeout changes remain hot-configurable.
     """
 
     url: str = ""
-    token_file: str = "~/.config/custback/avatar-api-token"
+    token_file: str = Field(
+        default_factory=lambda: str(platform_fs.config_dir() / "avatar-api-token")
+    )
     tls_ca_file: str = ""
     tls_certfile: str = ""
     tls_keyfile: str = ""

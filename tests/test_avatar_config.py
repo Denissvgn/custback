@@ -1,7 +1,9 @@
 """Avatar-service configuration: strict validation and patch semantics."""
 
 import io
+import json
 import os
+import ssl
 import threading
 import time
 from pathlib import Path
@@ -12,6 +14,8 @@ from custback.avatar.__main__ import (
     EXIT_CONFIG,
     _storage_permission_command,
     avatar_config_bytes,
+    build_parser,
+    config_from_args,
     export_avatar_config,
 )
 from custback.avatar.config import (
@@ -200,6 +204,106 @@ def test_audio2face_backend_requires_url():
         }
     )
     assert cfg.driver.audio2face.url == "grpcs://a2f.example:52000"
+
+
+def test_cli_driver_override_is_optional_and_explicit(tmp_path):
+    config_path = tmp_path / "avatar.yaml"
+    config_path.write_text(
+        "driver:\n"
+        "  backend: audio2face\n"
+        "  audio2face:\n"
+        "    url: grpc://127.0.0.1:52000\n"
+    )
+    parser = build_parser()
+
+    config_args = parser.parse_args(["--config", str(config_path)])
+    assert config_args.driver is None
+    from_config = config_from_args(config_args)
+    assert from_config.driver.backend == "audio2face"
+
+    from_cli = config_from_args(
+        parser.parse_args(["--config", str(config_path), "--driver", "idle"])
+    )
+    assert from_cli.driver.backend == "idle"
+
+
+def test_packaged_cli_preserves_driver_but_owns_plaintext_loopback_transports(
+    tmp_path,
+):
+    ca_file = ssl.get_default_verify_paths().cafile
+    if not ca_file:
+        pytest.skip("the test interpreter has no default CA bundle")
+    config_path = tmp_path / "avatar.yaml"
+    config_path.write_text(
+        "source:\n"
+        "  url: wss://engine.example:8710\n"
+        f"  tls_ca_file: {json.dumps(ca_file)}\n"
+        "driver:\n"
+        "  backend: audio2face\n"
+        "  audio2face:\n"
+        "    url: grpc://127.0.0.1:52000\n"
+        "api:\n"
+        "  enabled: false\n"
+        "  host: remote.example\n"
+        "  tls_certfile: /operator/server.crt\n"
+        "  tls_keyfile: /operator/server.key\n"
+    )
+
+    cfg = config_from_args(
+        build_parser().parse_args(
+            [
+                "--config",
+                str(config_path),
+                "--source",
+                "ws://127.0.0.1:28710",
+                "--source-plaintext",
+                "--enable-api",
+                "--api-host",
+                "127.0.0.1",
+                "--api-port",
+                "28711",
+                "--api-plaintext",
+            ]
+        )
+    )
+
+    assert cfg.driver.backend == "audio2face"
+    assert cfg.source.url == "ws://127.0.0.1:28710"
+    assert (
+        cfg.source.tls_ca_file,
+        cfg.source.tls_certfile,
+        cfg.source.tls_keyfile,
+    ) == ("", "", "")
+    assert cfg.api.enabled is True
+    assert (cfg.api.host, cfg.api.port) == ("127.0.0.1", 28711)
+    assert (cfg.api.tls_certfile, cfg.api.tls_keyfile) == ("", "")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [
+            "--source",
+            "wss://renderer.example:8710",
+            "--source-plaintext",
+        ],
+        [
+            "--api-host",
+            "remote.example",
+            "--api-plaintext",
+        ],
+        [
+            "--api-plaintext",
+            "--api-tls-cert",
+            "/operator/server.crt",
+            "--api-tls-key",
+            "/operator/server.key",
+        ],
+    ],
+)
+def test_plaintext_cli_flags_cannot_silently_weaken_remote_tls(arguments):
+    with pytest.raises(ValueError, match="plaintext"):
+        config_from_args(build_parser().parse_args(arguments))
 
 
 def test_audio2face_url_requires_explicit_secure_remote_transport():

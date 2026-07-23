@@ -10,7 +10,7 @@ installer (`../installer/`, WIN-5.6) wraps the whole `dist/custback/` tree.
 
 | File | Purpose |
 | --- | --- |
-| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects OpenCV/ONNX Runtime/MediaPipe/pyvirtualcam natives, `custback` package data (`avatar.yaml`), and pywin32; excludes model weights and GUI toolkits. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face swaps stacks — protobuf conflict makes them one-per-payload). |
+| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects OpenCV/ONNX Runtime/MediaPipe natives plus pyvirtualcam where supported, `custback` package data (`avatar.yaml`), and pywin32; excludes model weights and GUI toolkits. Windows ARM64 omits pyvirtualcam collection/hidden import to match its PEP 508 dependency marker. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face swaps stacks — protobuf conflict makes them one-per-payload). |
 | `entry_custback.py` | Frozen entry script → `custback.__main__:main` with `multiprocessing.freeze_support()`. |
 | `entry_custback_avatar.py` | Frozen entry script → `custback.avatar.__main__:main` (WIN-6.4). |
 | `hooks/hook-custback.py` | Analysis hook: hidden imports for `custback._platform.*` and segmentation delegates; packaged YAML data. |
@@ -49,6 +49,10 @@ plus their shared onedir payload.
   installer (WIN-5.6) places the exact pinned components; at runtime
   `custback.acceleration.preload_acceleration_dlls` adds them to the DLL search
   path (non-fatal — a clean CPU-only VM still runs and reports CPU).
+* **pyvirtualcam on Windows ARM64.** PyPI publishes no compatible wheel, so the
+  core dependency marker excludes it and the spec omits its collection, hidden
+  import, and static analysis. `WINDOWS_ARM64.md` records the current
+  `NullOutput` default and the explicit native-camera gate-build opt-in.
 * **Both avatar driver stacks at once.** One payload carries either the
   vision (MediaPipe) or the audio2face (gRPC) driver — their protobuf
   requirements conflict (see the `audio2face` extra in `pyproject.toml`), so

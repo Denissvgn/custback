@@ -1,9 +1,9 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
-using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 
 namespace Custback.Shell;
 
@@ -20,6 +20,8 @@ internal sealed record EngineOptions(
     string TokenFile,
     string RendererTokenFile,
     string AvatarTokenFile,
+    string EngineConfigFile,
+    string AvatarConfigFile,
     string LogFile)
 {
     internal bool SuperviseAvatar => AvatarExe is not null && File.Exists(AvatarExe);
@@ -44,6 +46,8 @@ internal sealed record EngineOptions(
             TokenFile: Path.Combine(configDir, "api-token"),
             RendererTokenFile: Path.Combine(configDir, "renderer-token"),
             AvatarTokenFile: Path.Combine(configDir, "avatar-api-token"),
+            EngineConfigFile: Path.Combine(configDir, "config.yaml"),
+            AvatarConfigFile: Path.Combine(configDir, "avatar.yaml"),
             LogFile: Path.Combine(logDir, "shell.log"));
     }
 }
@@ -82,6 +86,8 @@ internal sealed class Engine : IDisposable
 
     internal int Port { get; private set; }
 
+    internal int AvatarPort { get; private set; }
+
     internal string BaseUrl => $"http://127.0.0.1:{Port}";
 
     /// <summary>Raised when the engine exits without a shutdown request.</summary>
@@ -89,20 +95,49 @@ internal sealed class Engine : IDisposable
 
     internal async Task StartAsync(CancellationToken cancellationToken)
     {
+        // Snapshot install state once so an installer/update race cannot
+        // produce half-wiring (proxy configured without an avatar, or vice
+        // versa) during this startup attempt.
+        bool superviseAvatar = _options.SuperviseAvatar;
         Port = ReserveLoopbackPort();
-        _engineProcess = StartProcess(_options.EngineExe, new[]
+        AvatarPort = superviseAvatar ? ReserveLoopbackPort(Port) : 0;
+        var engineArguments = new List<string>
         {
+            // The packaged shell owns its private plaintext-loopback transport.
+            // These flags override a read-only operator config that disables
+            // the API or configures TLS; all other engine settings still apply.
+            "--enable-api",
             "--api-host", "127.0.0.1",
             "--api-port", Port.ToString(),
+            "--api-plaintext",
             // Paths, not secrets: the engine mints these files with owner-only
             // DACLs (WIN-2.3) and writes the token values into them.
             "--api-token-file", _options.TokenFile,
             "--renderer-token-file", _options.RendererTokenFile,
-        });
+        };
+        // Read an operator-provided config without creating or mutating it.
+        // This makes packaged opt-ins (for example output.backend: native) and
+        // restart-only settings usable while preserving a read-only config.
+        if (File.Exists(_options.EngineConfigFile))
+        {
+            engineArguments.AddRange(new[] { "--config", _options.EngineConfigFile });
+        }
+        if (superviseAvatar)
+        {
+            // D9 / MIT-B2: the shell knows the supervised service's reserved
+            // port and token path, so it explicitly enables the engine proxy.
+            engineArguments.AddRange(new[]
+            {
+                "--avatar-url", $"http://127.0.0.1:{AvatarPort}",
+                "--avatar-token-file", _options.AvatarTokenFile,
+                "--avatar-plaintext",
+            });
+        }
+        _engineProcess = StartProcess(_options.EngineExe, engineArguments);
 
         await WaitForReadyAsync(cancellationToken).ConfigureAwait(false);
 
-        if (_options.SuperviseAvatar)
+        if (superviseAvatar)
         {
             // WIN-6.4: the avatar service starts only after the engine is
             // ready — it consumes the engine's raw-frame WebSocket and reads
@@ -116,34 +151,53 @@ internal sealed class Engine : IDisposable
     {
         // The avatar service is a second process with its own storage and
         // drivers; supervise it only when installed (WIN-5.5).
-        _avatarProcess = StartProcess(_options.AvatarExe!, new[]
+        var avatarArguments = new List<string>
         {
+            // As with the core API, packaged supervision owns both plaintext
+            // loopback transports even when the read-only avatar config has
+            // remote/TLS values for a source-run deployment.
             "--source", $"ws://127.0.0.1:{Port}",
             "--source-token-file", _options.RendererTokenFile,
+            "--source-plaintext",
+            "--enable-api",
+            "--api-host", "127.0.0.1",
             "--api-token-file", _options.AvatarTokenFile,
-            "--driver", "auto",
-        });
+            "--api-port", AvatarPort.ToString(),
+            "--api-plaintext",
+        };
+        if (File.Exists(_options.AvatarConfigFile))
+        {
+            avatarArguments.AddRange(new[] { "--config", _options.AvatarConfigFile });
+        }
+        _avatarProcess = StartProcess(_options.AvatarExe!, avatarArguments);
     }
 
-    private static int ReserveLoopbackPort()
+    private static int ReserveLoopbackPort(int excludedPort = 0)
     {
         // Ask the OS for a free ephemeral loopback port, then release it and
         // hand the number to the engine. A benign TOCTOU remains; engine
         // startup fails loudly (EXIT_API) if the port was taken meanwhile, and
         // the shell surfaces that rather than silently continuing.
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        try
+        while (true)
         {
-            return ((IPEndPoint)listener.LocalEndpoint).Port;
-        }
-        finally
-        {
-            listener.Stop();
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            try
+            {
+                int candidate = ((IPEndPoint)listener.LocalEndpoint).Port;
+                if (candidate != excludedPort)
+                {
+                    return candidate;
+                }
+            }
+            finally
+            {
+                listener.Stop();
+            }
         }
     }
 
-    private Process StartProcess(string exe, string[] arguments)
+    private Process StartProcess(string exe, IEnumerable<string> arguments)
     {
         var info = new ProcessStartInfo(exe)
         {
@@ -278,6 +332,31 @@ internal sealed class Engine : IDisposable
 
     /// <summary>The management bearer, available after <see cref="StartAsync"/>.</summary>
     internal string Bearer => _bearer ?? throw new InvalidOperationException("engine not started");
+
+    /// <summary>
+    /// Read the engine's truthful active output implementation from /status.
+    /// The native camera may start only when this reports the ring writer.
+    /// </summary>
+    internal async Task<string> GetOutputBackendAsync(CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{BaseUrl}/status");
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {Bearer}");
+        using var response = await _http.SendAsync(request, cancellationToken)
+            .ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken)
+            .ConfigureAwait(false);
+        using var status = await JsonDocument.ParseAsync(
+            stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+        if (!status.RootElement.TryGetProperty("output_backend", out var outputBackend) ||
+            outputBackend.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(outputBackend.GetString()))
+        {
+            throw new InvalidOperationException(
+                "engine status did not report an active output backend");
+        }
+        return outputBackend.GetString()!;
+    }
 
     /// <summary>
     /// Ask the engine to stop gracefully over the private lifecycle channel

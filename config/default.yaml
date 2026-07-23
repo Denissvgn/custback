@@ -99,9 +99,10 @@ avatar:
   # Empty url disables the proxy. Destination, credential, and TLS trust are
   # immutable startup settings; changes require restarting custback. Plaintext
   # is accepted only on numeric loopback. CUSTBACK_AVATAR_API_TOKEN overrides
-  # the avatar service's existing control-token file.
+  # the avatar service's existing control-token file. Omit token_file to use
+  # the platform config directory (~/.config/custback on POSIX,
+  # %APPDATA%\Custback on Windows).
   url: ""                        # http://127.0.0.1:8711 or https://gb10:8711
-  token_file: ~/.config/custback/avatar-api-token
   tls_ca_file: ""                # optional private CA bundle for HTTPS
   tls_certfile: ""               # optional mTLS client certificate (pair required)
   tls_keyfile: ""                # optional mTLS client private key (never exposed)

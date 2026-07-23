@@ -11,7 +11,9 @@ that evidence reproducible and its evaluation deterministic:
     profiling standard CUDA must meet, via ``custback.acceleration``),
     measures per-pixel alpha drift against the CPU reference on a fixed
     synthetic sequence, times 720p/1080p inference, and writes one evidence
-    JSON per machine.
+    JSON per machine.  Its default exit code reports collection success even
+    for a local NO-GO; ``--strict`` makes that verdict fail the command.  CI
+    must gate on ``check``, never on ``run``'s default exit code.
 
 ``check``
     Runs anywhere (stdlib only): validates an evidence file against the exact
@@ -25,7 +27,8 @@ that evidence reproducible and its evaluation deterministic:
 Go criteria (from the spike, encoded here so they cannot drift in prose):
     * every listed adapter proves real RVM execution on DirectML,
     * at least one AMD *and* one Intel adapter are covered,
-    * alpha drift vs CPU stays within tolerance (mean <= 0.005, max <= 0.02),
+    * alpha drift vs CPU stays within tolerance (worst per-frame mean <=
+      0.005, max <= 0.02),
     * 720p sustains the configured target FPS (median),
     * the CUDA and DirectML wheels are not co-installed (either-or, mirroring
       the CPU/CUDA rule in packaging/npm/install.js).
@@ -44,7 +47,7 @@ import sys
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TASK = "WIN-6.2"
 
 #: Vendors a "generic Windows GPU" claim must cover (lowercase substrings).
@@ -57,6 +60,7 @@ ALPHA_DELTA_MAX_MAX = 0.02
 #: Benchmark geometry: (label, width, height).
 RESOLUTIONS = (("720p", 1280, 720), ("1080p", 1920, 1080))
 
+#: Exact top-level keys for WIN-6.2 evidence schema 2.
 EVIDENCE_KEYS = {
     "schema_version",
     "task",
@@ -77,6 +81,12 @@ ADAPTER_KEYS = {
     "performance",
     "target_fps",
 }
+#: ``alpha_delta_mean_worst`` is the maximum of the per-frame mean deltas.
+CORRECTNESS_KEYS = {
+    "frames",
+    "alpha_delta_mean_worst",
+    "alpha_delta_max",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -89,7 +99,7 @@ def evaluate_evidence(evidence: dict) -> tuple[bool, list[str]]:
     if not isinstance(evidence, dict) or set(evidence) != EVIDENCE_KEYS:
         return False, ["evidence does not match the exact WIN-6.2 schema"]
     if evidence["schema_version"] != SCHEMA_VERSION or evidence["task"] != TASK:
-        reasons.append("wrong schema_version/task for the WIN-6.2 gate")
+        return False, ["wrong schema_version/task for the WIN-6.2 gate"]
 
     conflict = evidence["wheel_conflict"]
     if conflict.get("onnxruntime_gpu_installed") and conflict.get(
@@ -123,10 +133,14 @@ def evaluate_evidence(evidence: dict) -> tuple[bool, list[str]]:
             )
             continue
         correctness = adapter["correctness"]
-        if correctness["alpha_delta_mean"] > ALPHA_DELTA_MEAN_MAX:
+        if not isinstance(correctness, dict) or set(correctness) != CORRECTNESS_KEYS:
+            reasons.append(f"{label}: correctness does not match the exact schema")
+            continue
+        if correctness["alpha_delta_mean_worst"] > ALPHA_DELTA_MEAN_MAX:
             reasons.append(
-                f"{label}: mean alpha drift {correctness['alpha_delta_mean']:.4f} "
-                f"exceeds {ALPHA_DELTA_MEAN_MAX}"
+                f"{label}: worst per-frame mean alpha drift "
+                f"{correctness['alpha_delta_mean_worst']:.4f} exceeds "
+                f"{ALPHA_DELTA_MEAN_MAX}"
             )
         if correctness["alpha_delta_max"] > ALPHA_DELTA_MAX_MAX:
             reasons.append(
@@ -228,6 +242,8 @@ def _measure(session, feeds, frames: int) -> list[float]:
 
 
 def run(args: argparse.Namespace) -> int:
+    """Collect evidence; CI must use ``check`` as the authoritative gate."""
+
     if sys.platform != "win32":
         print(
             "windows-acceleration-gate: `run` needs Windows hardware; "
@@ -267,7 +283,11 @@ def run(args: argparse.Namespace) -> int:
         candidate = ProviderCandidate("DmlExecutionProvider", {"device_id": device_id})
         proof = prove_rvm_provider(ort, str(model), candidate)
 
-        correctness = {"frames": 0, "alpha_delta_mean": 1.0, "alpha_delta_max": 1.0}
+        correctness = {
+            "frames": 0,
+            "alpha_delta_mean_worst": 1.0,
+            "alpha_delta_max": 1.0,
+        }
         performance = {
             label: {"median_ms": 0.0, "p95_ms": 0.0, "fps": 0.0}
             for label, _, _ in RESOLUTIONS
@@ -291,7 +311,7 @@ def run(args: argparse.Namespace) -> int:
                 maxima.append(float(delta.max()))
             correctness = {
                 "frames": args.frames,
-                "alpha_delta_mean": max(deltas),
+                "alpha_delta_mean_worst": max(deltas),
                 "alpha_delta_max": max(maxima),
             }
             for label, width, height in RESOLUTIONS:
@@ -340,11 +360,23 @@ def run(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
     print(f"evidence written to {out}")
+    return _report_local_verdict(evidence, strict=getattr(args, "strict", False))
+
+
+def _report_local_verdict(evidence: dict, *, strict: bool) -> int:
+    """Print the per-run verdict and apply collection versus strict semantics."""
+
     go, reasons = evaluate_evidence(evidence)
     print("verdict on this machine alone: " + ("GO" if go else "NO-GO"))
     for reason in reasons:
         print(f"  - {reason}")
-    return 0
+    if not go and not strict:
+        print(
+            "warning: default `run` status reports evidence collection, not gate "
+            "success; CI must gate on `check`",
+            file=sys.stderr,
+        )
+    return 1 if strict and not go else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -361,6 +393,11 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--target-fps", type=int, default=30)
     runner.add_argument(
         "--adapter-vendor", default="", help="override detected vendor (CI runners)"
+    )
+    runner.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 on a local NO-GO (CI must still gate on `check`)",
     )
 
     checker = commands.add_parser("check", help="evaluate evidence (any OS)")

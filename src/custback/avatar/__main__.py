@@ -101,7 +101,15 @@ def build_parser(*, prog: str = "custback-avatar") -> argparse.ArgumentParser:
     parser.add_argument(
         "--bg-video", help="background video path (implies --bg-mode video)"
     )
-    parser.add_argument("--no-api", action="store_true", help="disable the control API")
+    api_toggle = parser.add_mutually_exclusive_group()
+    api_toggle.add_argument(
+        "--enable-api",
+        action="store_true",
+        help="enable the control API even when the config file disables it",
+    )
+    api_toggle.add_argument(
+        "--no-api", action="store_true", help="disable the control API"
+    )
     parser.add_argument("--api-host", help="control API bind host (default 127.0.0.1)")
     parser.add_argument("--api-port", type=int, help="control API port (default 8711)")
     parser.add_argument(
@@ -114,6 +122,16 @@ def build_parser(*, prog: str = "custback-avatar") -> argparse.ArgumentParser:
     )
     parser.add_argument("--api-tls-cert", help="TLS certificate for the control API")
     parser.add_argument("--api-tls-key", help="TLS private key for the control API")
+    parser.add_argument(
+        "--api-plaintext",
+        action="store_true",
+        help="clear configured control-API TLS credentials (numeric loopback only)",
+    )
+    parser.add_argument(
+        "--source-plaintext",
+        action="store_true",
+        help="clear configured source TLS credentials (numeric loopback only)",
+    )
     parser.add_argument(
         "--show-api-token",
         action="store_true",
@@ -212,6 +230,21 @@ def config_from_args(args: argparse.Namespace) -> AvatarConfig:
         source["url"] = args.source
     if args.source_token_file:
         source["token_file"] = args.source_token_file
+    if args.source_plaintext:
+        from ..api.security import validate_outbound_endpoint
+
+        endpoint = validate_outbound_endpoint(
+            source["url"],
+            kind="websocket",
+            label="source.url",
+        )
+        if endpoint is None or endpoint.secure:
+            raise ValueError(
+                "--source-plaintext requires a ws:// numeric-loopback --source"
+            )
+        source["tls_ca_file"] = ""
+        source["tls_certfile"] = ""
+        source["tls_keyfile"] = ""
     if args.a2f_url:
         audio2face["url"] = args.a2f_url
         driver["backend"] = "audio2face"
@@ -243,6 +276,8 @@ def config_from_args(args: argparse.Namespace) -> AvatarConfig:
         background["mode"] = "video"
     if args.bg_mode:
         background["mode"] = args.bg_mode
+    if args.enable_api:
+        api["enabled"] = True
     if args.no_api:
         api["enabled"] = False
     if args.api_host:
@@ -257,6 +292,17 @@ def config_from_args(args: argparse.Namespace) -> AvatarConfig:
         api["tls_certfile"] = args.api_tls_cert
     if args.api_tls_key:
         api["tls_keyfile"] = args.api_tls_key
+    if args.api_plaintext:
+        from ..api.security import is_numeric_loopback_host
+
+        if args.api_tls_cert or args.api_tls_key:
+            raise ValueError(
+                "--api-plaintext cannot be combined with API TLS arguments"
+            )
+        if not is_numeric_loopback_host(api["host"]):
+            raise ValueError("--api-plaintext requires a numeric-loopback --api-host")
+        api["tls_certfile"] = ""
+        api["tls_keyfile"] = ""
     return AvatarConfig.from_dict(values)
 
 

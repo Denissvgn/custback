@@ -59,12 +59,17 @@ The method below is now executable, not prose:
 - `run` (Windows hardware): proves DirectML RVM execution via
   `custback.acceleration.prove_rvm_provider`, measures alpha drift against the
   CPU reference and 720p/1080p frame times, records adapter identity and the
-  wheel-conflict state, and writes one evidence JSON per machine.
+  wheel-conflict state, and writes one schema-2 evidence JSON per machine.
+  Correctness records `alpha_delta_mean_worst` (the maximum per-frame mean)
+  alongside `alpha_delta_max`. Its default exit code means collection
+  completed even when the local verdict is NO-GO; `run --strict` makes that
+  verdict exit 1.
 - `check` (any OS, stdlib-only): validates the evidence against the exact
   schema and the go/no-go criteria (both-vendor coverage, drift tolerance
-  mean ≤ 0.005 / max ≤ 0.02, 720p ≥ target FPS, no CUDA/DirectML
-  co-installation). Exit 0 = go. `tests/test_windows_acceleration_gate.py`
-  pins these criteria so they cannot drift silently.
+  worst per-frame mean ≤ 0.005 / max ≤ 0.02, 720p ≥ target FPS, no
+  CUDA/DirectML co-installation). Exit 0 = go.
+  `tests/test_windows_acceleration_gate.py` pins these criteria so they cannot
+  drift silently. CI must gate on `check`, never on `run`'s default exit code.
 
 The `directml` pip extra (`onnxruntime-directml`) exists for the harness and
 the opt-in profile; `packaging/windows/pyinstaller/build.ps1` refuses to

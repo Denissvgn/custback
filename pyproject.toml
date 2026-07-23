@@ -15,7 +15,7 @@ dependencies = [
     "opencv-contrib-python>=4.8,<6",
     "pillow>=10,<13",
     "pydantic>=2.7,<3",
-    "pyvirtualcam>=0.11,<1",
+    "pyvirtualcam>=0.11,<1; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64')",
     "fastapi>=0.110,<1",
     "uvicorn>=0.29,<1",
     "pyyaml>=6.0,<7",
@@ -68,6 +68,9 @@ dev = [
     # gate only when the version is fixed. Bump deliberately (reformat + repin
     # required-version + the release-gate allowlist in the same commit).
     "ruff==0.15.22",
+    # Exact pin keeps Pyright's diagnostics stable across CI runs. Bump only
+    # after running the new version across the complete pyrightconfig include.
+    "pyright==1.1.411",
 ]
 
 [project.scripts]

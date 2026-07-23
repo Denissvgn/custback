@@ -22,10 +22,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import custback.vcam as vcam
 from custback import vcam_native
 from custback.camera_devices import is_virtual_output_name
 from custback.config import OutputConfig
-from custback.vcam import open_output
+from custback.vcam import NullOutput, open_output
 
 ROOT = Path(__file__).resolve().parents[1]
 VCAM_DIR = ROOT / "packaging" / "windows" / "vcam"
@@ -36,6 +37,21 @@ pytestmark = pytest.mark.skipif(
     not (VCAM_DIR / "FrameRing.h").exists(),
     reason="native vcam packaging tree is not present in this layout",
 )
+
+
+def _csharp_block_after(text: str, marker: str) -> str:
+    """Return the contents of the braced C# block following *marker*."""
+    marker_index = text.index(marker)
+    block_start = text.index("{", marker_index + len(marker))
+    depth = 0
+    for index in range(block_start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[block_start + 1 : index]
+    raise AssertionError(f"unterminated C# block after {marker!r}")
 
 
 def _ring_buffer(width: int = 8, height: int = 6) -> bytearray:
@@ -107,6 +123,77 @@ def test_reader_rejects_wrong_magic_or_version() -> None:
     assert vcam_native.read_latest_frame(buffer) is None
 
 
+@pytest.mark.parametrize(
+    ("present", "expected"),
+    [(True, "section present"), (False, "section absent")],
+)
+def test_native_ring_diagnostic_probes_without_creating(present, expected) -> None:
+    calls = []
+
+    def probe(name):
+        calls.append(name)
+        return present
+
+    assert vcam_native.native_ring_status(platform="win32", probe=probe) == expected
+    assert calls == [vcam_native.SECTION_NAME]
+
+
+def test_native_ring_diagnostic_is_explicitly_unsupported_off_windows() -> None:
+    assert (
+        vcam_native.native_ring_diagnostic(platform="linux")
+        == "native ring: unsupported"
+    )
+
+
+def test_native_component_probe_requires_registered_existing_dll() -> None:
+    dll_path = r"C:\Program Files\Custback\CustbackVCam.dll"
+    calls = []
+
+    def read_registration(key):
+        calls.append(("registry", key))
+        return dll_path
+
+    def file_exists(path):
+        calls.append(("file", path))
+        return True
+
+    assert vcam_native.native_camera_component_available(
+        platform="win32",
+        read_registration=read_registration,
+        file_exists=file_exists,
+    )
+    assert calls == [
+        ("registry", vcam_native.VCAM_INPROC_REGISTRY_KEY),
+        ("file", dll_path),
+    ]
+
+
+def test_native_component_probe_fails_closed_for_missing_registration_or_dll() -> None:
+    def unexpected_file_probe(_path):
+        pytest.fail("a missing registration must not probe a file")
+
+    assert not vcam_native.native_camera_component_available(
+        platform="win32",
+        read_registration=lambda _key: None,
+        file_exists=unexpected_file_probe,
+    )
+    assert not vcam_native.native_camera_component_available(
+        platform="win32",
+        read_registration=lambda _key: r"C:\missing\CustbackVCam.dll",
+        file_exists=lambda _path: False,
+    )
+
+
+def test_native_component_probe_skips_registry_off_windows() -> None:
+    def unexpected_registry_read(_key):
+        pytest.fail("non-Windows availability must not read the registry")
+
+    assert not vcam_native.native_camera_component_available(
+        platform="linux",
+        read_registration=unexpected_registry_read,
+    )
+
+
 # -- C++ mirror consistency --------------------------------------------------
 def _cpp_constant(text: str, name: str) -> int:
     match = re.search(rf"{name}\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?", text)
@@ -130,6 +217,56 @@ def test_frame_ring_header_mirrors_python_protocol() -> None:
     assert cpp_section.group(1).replace("\\\\", "\\") == vcam_native.SECTION_NAME
     # The C++ struct must be pinned to the same 64-byte layout.
     assert "static_assert(sizeof(FrameRingHeader) == kHeaderSize" in text
+    # The reader must pair CPython's release-ordered publication with acquire
+    # loads/fencing; plain seq loads can admit torn frames on ARM64.
+    assert "#include <atomic>" in text
+    assert text.count("std::atomic_ref<const uint32_t>") == 2
+    assert text.count("std::memory_order_acquire") == 3
+    payload_copy = text.index("std::memcpy(frame.data(), m_view + kHeaderSize,")
+    acquire_fence = text.index("std::atomic_thread_fence(std::memory_order_acquire);")
+    seq_recheck = text.index("const uint32_t seqAfter =", acquire_fence)
+    assert payload_copy < acquire_fence < seq_recheck
+
+
+def test_mit_c1_gate_build_reports_frame_ring_open_error() -> None:
+    frame_ring = (VCAM_DIR / "FrameRing.h").read_text(encoding="utf-8")
+    open_index = frame_ring.index(
+        "::OpenFileMappingW(FILE_MAP_READ, FALSE, sectionName)"
+    )
+    error_index = frame_ring.index("const DWORD error = ::GetLastError()", open_index)
+    trace_index = frame_ring.index("TraceOpenFailure(sectionName, error)", error_index)
+    assert open_index < error_index < trace_index
+    assert "CUSTBACK_VCAM_GATE_DIAGNOSTICS" in frame_ring
+    assert "::OutputDebugStringW(message)" in frame_ring
+    assert 'L"GetLastError=%lu\\r\\n"' in frame_ring
+
+    project = (VCAM_DIR / "CustbackVCam.vcxproj").read_text(encoding="utf-8")
+    assert (
+        "<CustbackVcamGateDiagnostics "
+        """Condition="'$(CustbackVcamGateDiagnostics)'==''">false""" in project
+    )
+    assert "CUSTBACK_VCAM_GATE_DIAGNOSTICS;" in project
+
+    build = (VCAM_DIR / "build.ps1").read_text(encoding="utf-8")
+    assert "[switch]$GateDiagnostics" in build
+    assert "/p:CustbackVcamGateDiagnostics=$gateDiagnosticsValue" in build
+
+
+def test_mit_c1_checklist_starts_with_live_transport_and_softened_assumption() -> None:
+    readme = (VCAM_DIR / "README.md").read_text(encoding="utf-8")
+    checklist = readme.split("## WIN-6.1 clean-machine checklist", 1)[1]
+    first_row = checklist.split("\n1. ", 1)[1].split("\n2. ", 1)[0]
+    assert "engine publishing" in first_row
+    assert "Windows Camera app" in first_row
+    assert "live processed frames" in first_row
+    assert "placeholder" in first_row
+    assert "OpenFileMappingW" in first_row
+    assert checklist.index(first_row) < checklist.index("Teams, Zoom")
+
+    module_doc = " ".join((vcam_native.__doc__ or "").split())
+    assert "namespace visibility remains an assumption" in module_doc
+    assert "pending the MIT-C1 clean-machine gate evidence" in module_doc
+    assert "Everything security-relevant about the section is local" not in module_doc
 
 
 def test_activator_clsid_is_identical_everywhere() -> None:
@@ -166,11 +303,37 @@ def test_native_backend_fails_closed_off_windows() -> None:
         open_output(cfg, 8, 6)
 
 
+def test_explicit_native_backend_fails_when_component_is_not_installed(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(vcam.sys, "platform", "win32")
+    monkeypatch.setattr(
+        vcam_native,
+        "native_camera_component_available",
+        lambda **_kwargs: False,
+    )
+
+    def unexpected_native_open(*_args):
+        pytest.fail("missing native component must fail before opening the ring")
+
+    monkeypatch.setattr(
+        vcam_native,
+        "NativeVirtualCameraOutput",
+        unexpected_native_open,
+    )
+
+    with pytest.raises(RuntimeError, match="component is not installed"):
+        open_output(OutputConfig(backend="native"), 8, 6)
+
+
 def test_native_output_publishes_via_injected_buffer() -> None:
     buffer = _ring_buffer()
     output = vcam_native.NativeVirtualCameraOutput(8, 6, buffer=buffer)
     assert output.paces is False  # the MF source resamples on its own clock
+    assert vcam_native.read_latest_frame(buffer) is None
     output.send(_frame())
+    first = vcam_native.read_latest_frame(buffer)
+    assert first is not None and first[1, 1, 0] == 17
     output.send(_frame(value=42))
     assert output.frames_sent == 2
     read = vcam_native.read_latest_frame(buffer)
@@ -179,12 +342,124 @@ def test_native_output_publishes_via_injected_buffer() -> None:
     assert vcam_native.read_latest_frame(buffer) is None
 
 
-def test_auto_backend_does_not_select_native() -> None:
+def test_auto_backend_does_not_select_native(monkeypatch) -> None:
     # Guardrail: until the WIN-6.1 clean-machine gate passes, `auto` must keep
     # the OBS/pyvirtualcam-then-null behavior; native is explicit opt-in only.
+    def unavailable_pyvirtualcam(*_args):
+        raise RuntimeError("OBS unavailable")
+
+    assert vcam._AUTO_NATIVE_ENABLED is False
+    monkeypatch.setattr(vcam.sys, "platform", "win32")
+    monkeypatch.setattr(vcam, "PyVirtualCamOutput", unavailable_pyvirtualcam)
+    monkeypatch.setattr(
+        vcam_native,
+        "native_camera_component_available",
+        lambda: pytest.fail("disabled native rung must not probe the component"),
+    )
     output = open_output(OutputConfig(backend="auto"), 8, 6)
     try:
-        assert type(output).__name__ != "NativeVirtualCameraOutput"
+        assert isinstance(output, NullOutput)
+    finally:
+        output.close()
+
+
+def test_auto_backend_uses_native_second_when_gate_flag_is_enabled(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def unavailable_pyvirtualcam(*_args):
+        calls.append("pyvirtualcam")
+        raise RuntimeError("OBS unavailable")
+
+    class NativeMarker:
+        def close(self):
+            calls.append("close")
+
+    def open_native(*_args):
+        calls.append("native")
+        return NativeMarker()
+
+    monkeypatch.setattr(vcam, "PyVirtualCamOutput", unavailable_pyvirtualcam)
+    monkeypatch.setattr(vcam, "_AUTO_NATIVE_ENABLED", True)
+    monkeypatch.setattr(vcam.sys, "platform", "win32")
+    monkeypatch.setattr(
+        vcam_native,
+        "native_camera_component_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(vcam_native, "NativeVirtualCameraOutput", open_native)
+
+    output = open_output(OutputConfig(backend="auto"), 8, 6)
+    assert calls == ["pyvirtualcam", "native"]
+    output.close()
+
+
+def test_auto_backend_falls_through_native_to_null_when_both_fail(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def unavailable_pyvirtualcam(*_args):
+        calls.append("pyvirtualcam")
+        raise RuntimeError("OBS unavailable")
+
+    def unavailable_native(*_args):
+        calls.append("native")
+        raise RuntimeError("native unavailable")
+
+    monkeypatch.setattr(vcam, "PyVirtualCamOutput", unavailable_pyvirtualcam)
+    monkeypatch.setattr(vcam, "_AUTO_NATIVE_ENABLED", True)
+    monkeypatch.setattr(vcam.sys, "platform", "win32")
+    monkeypatch.setattr(
+        vcam_native,
+        "native_camera_component_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(vcam_native, "NativeVirtualCameraOutput", unavailable_native)
+
+    output = open_output(OutputConfig(backend="auto"), 8, 6)
+    try:
+        assert isinstance(output, NullOutput)
+        assert calls == ["pyvirtualcam", "native"]
+    finally:
+        output.close()
+
+
+def test_auto_backend_skips_uninstalled_native_component_and_returns_null(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def unavailable_pyvirtualcam(*_args):
+        calls.append("pyvirtualcam")
+        raise RuntimeError("OBS unavailable")
+
+    def component_available():
+        calls.append("component-probe")
+        return False
+
+    def unexpected_native_open(*_args):
+        pytest.fail("auto must not open native output when its DLL is unavailable")
+
+    monkeypatch.setattr(vcam, "PyVirtualCamOutput", unavailable_pyvirtualcam)
+    monkeypatch.setattr(vcam, "_AUTO_NATIVE_ENABLED", True)
+    monkeypatch.setattr(vcam.sys, "platform", "win32")
+    monkeypatch.setattr(
+        vcam_native,
+        "native_camera_component_available",
+        component_available,
+    )
+    monkeypatch.setattr(
+        vcam_native,
+        "NativeVirtualCameraOutput",
+        unexpected_native_open,
+    )
+
+    output = open_output(OutputConfig(backend="auto"), 8, 6)
+    try:
+        assert isinstance(output, NullOutput)
+        assert calls == ["pyvirtualcam", "component-probe"]
     finally:
         output.close()
 
@@ -198,6 +473,7 @@ def test_vcxproj_lists_exactly_the_sources_on_disk() -> None:
     }
     assert listed == on_disk
     assert "CustbackVCam.def" in project
+    assert "<LanguageStandard>stdcpp20</LanguageStandard>" in project
 
 
 def test_def_exports_the_com_surface() -> None:
@@ -223,5 +499,82 @@ def test_shell_owns_camera_lifecycle() -> None:
     assert "MFVirtualCameraLifetime_Session" in session
     assert "MFVirtualCameraAccess_CurrentUser" in session
     assert "MFCreateVirtualCamera" in session
+
+    engine = (SHELL_DIR / "Engine.cs").read_text(encoding="utf-8")
+    status_method = _csharp_block_after(
+        engine,
+        "internal async Task<string> GetOutputBackendAsync("
+        "CancellationToken cancellationToken)",
+    )
+    request_index = status_method.index(
+        'new HttpRequestMessage(HttpMethod.Get, $"{BaseUrl}/status")'
+    )
+    auth_index = status_method.index(
+        'request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {Bearer}")'
+    )
+    send_index = status_method.index("_http.SendAsync(request, cancellationToken)")
+    assert request_index < auth_index < send_index
+    assert '"output_backend"' in status_method
+
     tray = (SHELL_DIR / "TrayApplicationContext.cs").read_text(encoding="utf-8")
-    assert "_vcam.TryStart" in tray and "_vcam.Stop" in tray
+    boot_method = _csharp_block_after(tray, "private async Task BootAsync()")
+    installed_block = _csharp_block_after(
+        boot_method, "if (VirtualCameraSession.IsInstalled)"
+    )
+    assert (
+        "outputBackend = await _engine.GetOutputBackendAsync(_cts.Token)"
+        in installed_block
+    )
+    native_block = _csharp_block_after(
+        installed_block, 'if (outputBackend == "NativeVirtualCameraOutput")'
+    )
+    assert tray.count("_vcam.TryStart(") == 1
+    assert native_block.count("_vcam.TryStart(Log);") == 1
+    assert "_vcam.Stop" in tray
+    assert "native vcam DLL installed but engine output.backend is" in tray
+    assert "native camera not started" in tray
+
+
+def test_shell_gate_build_checks_com_projection_before_start() -> None:
+    session = (SHELL_DIR / "VirtualCameraSession.cs").read_text(encoding="utf-8")
+    try_start = _csharp_block_after(
+        session, "internal bool TryStart(Action<string> log)"
+    )
+
+    create_index = try_start.index("hr = NativeMethods.MFCreateVirtualCamera(")
+    create_check_index = try_start.index(
+        "Marshal.ThrowExceptionForHR(hr);", create_index
+    )
+    ownership_index = try_start.index("_camera = camera;", create_check_index)
+    gate_index = try_start.index("#if DEBUG || CUSTBACK_GATE_BUILD", ownership_index)
+    get_count_index = try_start.index(
+        "hr = camera.GetCount(out uint attributeCount);", gate_index
+    )
+    result_log_index = try_start.index(
+        "IMFAttributes::GetCount HRESULT=0x", get_count_index
+    )
+    projection_check_index = try_start.index(
+        "Marshal.ThrowExceptionForHR(hr);", result_log_index
+    )
+    start_index = try_start.index("camera.Start(IntPtr.Zero)", projection_check_index)
+
+    assert (
+        create_index
+        < create_check_index
+        < ownership_index
+        < gate_index
+        < get_count_index
+        < result_log_index
+        < projection_check_index
+        < start_index
+    )
+    assert "[PreserveSig] int GetCount(out uint count);" in session
+
+    project = (SHELL_DIR / "Custback.Shell.csproj").read_text(encoding="utf-8")
+    assert "$(CustbackGateBuild)" in project
+    assert "CUSTBACK_GATE_BUILD" in project
+
+    shell_readme = (SHELL_DIR / "README.md").read_text(encoding="utf-8")
+    assert "WIN-1.8 shell smoke" in shell_readme
+    assert "-p:CustbackGateBuild=true" in shell_readme
+    assert "IMFAttributes::GetCount HRESULT=0x00000000" in shell_readme

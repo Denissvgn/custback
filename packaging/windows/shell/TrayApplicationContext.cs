@@ -75,10 +75,32 @@ internal sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        // WIN-6.1: bring up the native virtual camera only after the engine is
-        // ready (its frame ring exists from the first output frame). Optional
-        // and best-effort — absence or failure leaves the OBS path in charge.
-        _vcam.TryStart(Log);
+        // MIT-B4 / WIN-6.1: a shipped DLL does not prove the engine is writing
+        // the native ring. Query the authenticated, truthful runtime status and
+        // create the camera only when its active output is the ring writer.
+        if (VirtualCameraSession.IsInstalled)
+        {
+            string? outputBackend = null;
+            try
+            {
+                outputBackend = await _engine.GetOutputBackendAsync(_cts.Token)
+                    .ConfigureAwait(true);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log("native vcam DLL installed but engine output backend status " +
+                    $"is unavailable ({ex.Message}); native camera not started");
+            }
+
+            if (outputBackend == "NativeVirtualCameraOutput")
+            {
+                _vcam.TryStart(Log);
+            }
+            else if (outputBackend is not null)
+            {
+                Log($"native vcam DLL installed but engine output.backend is '{outputBackend}'; native camera not started");
+            }
+        }
 
         await ShowWindowAsync().ConfigureAwait(true);
     }

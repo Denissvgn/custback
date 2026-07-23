@@ -34,6 +34,12 @@
     <Version>0.4.0</Version>
   </PropertyGroup>
 
+  <!-- Release gate payloads opt into the same COM projection assertion as
+       Debug builds without otherwise changing Release compilation. -->
+  <PropertyGroup Condition="'$(CustbackGateBuild)' == 'true'">
+    <DefineConstants>$(DefineConstants);CUSTBACK_GATE_BUILD</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- Evergreen WebView2 loader; the runtime itself is a first-class
          installer prerequisite (WIN-5.6), not bundled here. -->

@@ -29,6 +29,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/__main__.py',
   'custback/_platform/__init__.py',
   'custback/_platform/base.py',
+  'custback/_platform/paths.py',
   'custback/_platform/posix.py',
   'custback/_platform/windows.py',
   'custback/acceleration.py',
@@ -163,7 +164,7 @@ const REVIEWED_CORE_DEPENDENCIES = [
   'opencv-contrib-python>=4.8,<6',
   'pillow>=10,<13',
   'pydantic>=2.7,<3',
-  'pyvirtualcam>=0.11,<1',
+  "pyvirtualcam>=0.11,<1; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64')",
   'fastapi>=0.110,<1',
   'uvicorn>=0.29,<1',
   'pyyaml>=6.0,<7',
@@ -199,6 +200,9 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
     // `ruff format --check` gate is only deterministic when the version is
     // fixed (see pyproject dev extra + [tool.ruff] required-version).
     'ruff==0.15.22',
+    // Exact pin: Pyright diagnostics are versioned CI policy even though this
+    // source-only basic-mode check is advisory to the publication gate.
+    'pyright==1.1.411',
   ],
 };
 const REVIEWED_CONSOLE_SCRIPTS = {
@@ -1018,6 +1022,12 @@ function verifyCiWorkflow(root = ROOT) {
       !workflow.includes('python -m ruff format --check src tests examples scripts/release')) {
     fail('CI must require the reviewed Ruff lint and format gates');
   }
+  if (!/^\s{2}pyright:\s*$/m.test(workflow) ||
+      !workflow.includes('python -m venv .venv') ||
+      !workflow.includes(".venv/bin/python -m pip install -e '.[dev]'") ||
+      !workflow.includes('.venv/bin/python -m pyright')) {
+    fail('CI must require pinned Pyright in the configured project virtualenv');
+  }
   if (!/^\s{2}stress:\s*$/m.test(workflow) ||
       !workflow.includes('tests/test_phase6_stress.py') ||
       !workflow.includes('CUSTBACK_STRESS_ITERATIONS: "100"')) {
@@ -1403,15 +1413,15 @@ def normalize_requirement(value):
     if specifier.startswith("(") and specifier.endswith(")"):
         specifier = specifier[1:-1]
     specs = tuple(sorted(part.replace(" ", "") for part in specifier.split(",") if part.strip()))
-    extra = ""
+    normalized_marker = ""
     if separator:
-        marker_match = re.fullmatch(
-            r"\\s*extra\\s*==\\s*['\\\"]([A-Za-z0-9_.-]+)['\\\"]\\s*",
-            marker,
-        )
-        require(marker_match, value)
-        extra = marker_match.group(1)
-    return name, specs, extra
+        # Setuptools may render PEP 508 marker quotes differently from
+        # pyproject.toml. Preserve the reviewed marker while normalizing only
+        # insignificant whitespace and quote style.
+        normalized_marker = re.sub(
+            r"\\s+", " ", marker.replace("'", '"')
+        ).strip()
+    return name, specs, normalized_marker
 
 expected_requires = {normalize_requirement(item) for item in core_dependencies}
 for extra, dependencies in optional_dependencies.items():
