@@ -7,6 +7,7 @@ import ssl
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -17,9 +18,11 @@ cv2 = pytest.importorskip("cv2")
 import starlette
 
 if int(starlette.__version__.split(".", 1)[0]) >= 1:
-    from httpx2 import ASGITransport, AsyncClient
+    from httpx2 import ASGITransport as _ASGITransport
+    from httpx2 import AsyncClient as _AsyncClient
 else:  # Starlette < 1 uses the original httpx client contract.
-    from httpx import ASGITransport, AsyncClient
+    from httpx import ASGITransport as _ASGITransport
+    from httpx import AsyncClient as _AsyncClient
 
 import custback.avatar.api as avatar_api_mod
 from custback.api.security import SecurityPolicy
@@ -30,6 +33,16 @@ from custback.avatar.service import AvatarService
 TOKEN = "avatar-api-test-token-which-is-long-enough-0123"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 ORIGIN = "http://testserver"
+
+
+def _async_client(app: object) -> Any:
+    """Return a client across the incompatible httpx/httpx2 transport types."""
+
+    transport = cast(Any, _ASGITransport)(app=app)
+    return cast(Any, _AsyncClient)(
+        transport=transport,
+        base_url="http://testserver",
+    )
 
 
 async def _with_event_loop_heartbeat(awaitable):
@@ -68,10 +81,7 @@ class Stack:
     service: AvatarService
 
     async def arequest(self, method: str, path: str, **kwargs):
-        transport = ASGITransport(app=self.app)
-        async with AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with _async_client(self.app) as client:
             return await client.request(method, path, **kwargs)
 
     def request(self, method: str, path: str, **kwargs):

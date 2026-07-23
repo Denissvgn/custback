@@ -117,10 +117,10 @@ where these flip to `DONE`.
 | WIN-5.6 | Signed per-user EXE/MSI installer | 5 | L | WIN-5.1 | IMPL* |
 | WIN-5.7 | Uninstall data-retention policy | 5 | S | WIN-5.6 | IMPL* |
 | WIN-5.8 | Windows release-evidence pipeline | 5 | M | WIN-5.6, WIN-0.2 | IMPL* (WIN-01 slot applied; job wiring pends WIN-1.8) |
-| WIN-6.1 | Native Win11 Media Foundation virtual camera | 6 | XL | WIN-5.8 | TODO |
-| WIN-6.2 | Generic GPU provider (DirectML/Windows ML) | 6 | XL | WIN-4.7 | TODO |
-| WIN-6.3 | ARM64 support | 6 | L | WIN-5.8 | TODO |
-| WIN-6.4 | Avatar + Audio2Face Windows parity | 6 | XL | WIN-5.8 | TODO |
+| WIN-6.1 | Native Win11 Media Foundation virtual camera | 6 | XL | WIN-5.8 | IMPL* |
+| WIN-6.2 | Generic GPU provider (DirectML/Windows ML) | 6 | XL | WIN-4.7 | IMPL* (gate machinery; AMD/Intel hardware evidence pending) |
+| WIN-6.3 | ARM64 support | 6 | L | WIN-5.8 | IMPL* (build/dependency machinery; ARM64 hardware evidence pending) |
+| WIN-6.4 | Avatar + Audio2Face Windows parity | 6 | XL | WIN-5.8 | IMPL* |
 
 **Critical path:** WIN-1.1 → WIN-1.4 → (WIN-2.1..2.7) → WIN-2.8 → WIN-5.1 →
 WIN-5.6 → WIN-5.8. Phase 2 is the long pole; Phases 3 and 4 parallelize against
@@ -691,6 +691,68 @@ packaging/release evidence rather than inheriting the core claim.
   **Deps:** WIN-5.8.
 - **WIN-6.4 — Avatar + Audio2Face Windows parity** (`XL`): packaging, storage,
   and driver work for the second service on Windows. **Deps:** WIN-5.8.
+
+**Implementation notes (landed as reviewable source; `IMPL*` = the
+Windows-execution/hardware halves pend the WIN-1.8 job and the validation
+matrix, same convention as Phases 2–5):**
+
+- **WIN-6.1 (native virtual camera).** `packaging/windows/vcam/` is the
+  C++/WinRT project: `Activator` (IMFActivate, CLSID
+  `{7A4C1B2E-9D35-4E6A-8B1F-52C84D9A6E01}`) → `MediaSource`/`MediaStream`
+  (IMFMediaSourceEx/IMFMediaStream2/IKsControl, one always-selected RGB32
+  stream at 720p/1080p\@30). Frames arrive over a named-section seqlock ring —
+  `src/custback/vcam_native.py` is the layout's source of truth,
+  `FrameRing.h` mirrors it, and the reader holds the last frame or a
+  placeholder when the engine idles (a camera must never stall its consumer).
+  The engine side is `output.backend: native` → `NativeVirtualCameraOutput`
+  (explicit opt-in; `auto` keeps OBS until the WIN-6.1 clean-machine gate
+  passes; POSIX fails closed). Lifecycle: the shell's
+  `VirtualCameraSession.cs` calls `MFCreateVirtualCamera` with **session**
+  lifetime + current-user access after engine readiness, so nothing persists
+  past the process; the MSI owns the per-user COM registration
+  (`IncludeNativeVCam` define, staged by `installer/build.ps1 -VCamDll`) and
+  its removal — the WIN-5.7 placeholder CLSID is now the real one. Loop
+  prevention holds ("Custback Camera" matches the existing `custback`
+  marker). `tests/test_windows_vcam.py` pins the protocol constants, CLSID
+  consistency across all four files, fail-closed POSIX behavior, and the
+  packaging wiring.
+- **WIN-6.2 (generic GPU gate).** The claim is now gated by machinery, not
+  prose: the `directml` extra (`onnxruntime-directml`, mutually exclusive
+  with `gpu` — enforced at freeze time and at gate time) plus
+  `scripts/release/windows-acceleration-gate.py` — `run` produces per-machine
+  evidence (real-RVM proof via `prove_rvm_provider`, alpha drift vs CPU,
+  720p/1080p timing, adapter identity, wheel-conflict state); `check` is the
+  deterministic validator (both-vendor AMD+Intel coverage, drift ≤
+  0.005 mean / 0.02 max, 720p ≥ target FPS, no co-installation) that becomes
+  the `windows-acceleration` gate validator when WIN-1.8/WIN-5.8 wire the
+  Windows evidence source. Criteria are pinned by
+  `tests/test_windows_acceleration_gate.py`; DirectML stays unadvertised
+  until real AMD+Intel evidence passes.
+- **WIN-6.3 (ARM64).** Architecture is a parameter, not a fork:
+  `pyinstaller/build.ps1 -Arch arm64` (verifies `platform.machine()`, trims
+  extras to the ARM64 profile, refuses CUDA/mediapipe),
+  `installer/build.ps1 -Arch` → WiX `-arch` + `VC_redist.$(var.Arch).exe`,
+  `CustbackVCam.vcxproj` ARM64 configurations, shell `RuntimeIdentifiers`
+  `win-x64;win-arm64`. `WINDOWS_ARM64.md` records the dependency profile
+  (native MF camera replaces the wheel-less `pyvirtualcam` path), the build
+  commands, and the arm64-* evidence rows required before any Supported
+  claim.
+- **WIN-6.4 (avatar parity).** `custback.spec` now freezes **two console
+  executables into one onedir payload** (`custback.exe` +
+  `custback-avatar.exe`, shared dependency set), with the avatar driver stack
+  selected per payload via `CUSTBACK_AVATAR_PROFILE` (vision/MediaPipe
+  default per D7; audio2face flavor swaps stacks — the protobuf conflict
+  makes them one-per-payload, mirrored by `build.ps1 -AvatarProfile` guards).
+  The shell's supervision contract is now the *real* avatar CLI (the WIN-5.5
+  `serve` argument was a latent bug): started only after engine readiness
+  with `--source ws://127.0.0.1:<port> --source-token-file <renderer-token>
+  --api-token-file <avatar-api-token>` (paths, never secrets), with a bounded
+  3-restart budget; quit gives the avatar a short grace then a tree kill.
+  Storage stays on the Phase-2 seam; explicit token paths keep the packaged
+  product independent of WIN-1.5. The installer ships the avatar only with
+  `-IncludeAvatar` (dropped from the staged payload otherwise), and
+  `build.ps1` smoke-runs `custback-avatar.exe --smoke` in the scrubbed
+  environment.
 
 ---
 

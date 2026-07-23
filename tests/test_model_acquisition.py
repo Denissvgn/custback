@@ -61,7 +61,7 @@ def test_builtin_model_registry_is_immutable_and_version_pinned():
     assert "/float16/1/" in MEDIAPIPE_MODEL.url
     assert "/latest/" not in MEDIAPIPE_MODEL.url
     with pytest.raises(Exception):
-        RVM_MODEL.size = 1
+        setattr(RVM_MODEL, "size", 1)
 
 
 def test_acquire_model_streams_verifies_and_atomically_promotes(tmp_path):

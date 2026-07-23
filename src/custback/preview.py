@@ -28,12 +28,15 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 # OpenCV's Qt bootstrap mutates these variables during import.  Remember what
 # the user supplied so we can remove only OpenCV's broken defaults while
 # preserving intentional overrides.
 _QT_ENV_BEFORE_CV2 = {
-    key: os.environ.get(key) for key in ("QT_QPA_FONTDIR", "QT_QPA_PLATFORM")
+    key: value
+    for key in ("QT_QPA_FONTDIR", "QT_QPA_PLATFORM")
+    if (value := os.environ.get(key)) is not None
 }
 
 from .backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, list_background_files
@@ -41,9 +44,13 @@ from .config import RuntimeConfig
 from .hub import FrameHub
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover
-    cv2 = None
+    _cv2 = None
+
+# OpenCV is a compiled optional boundary. Keep its runtime ``None`` fallback
+# while treating the dynamically exposed API as opaque to static analysis.
+cv2: Any = _cv2
 
 log = logging.getLogger(__name__)
 
@@ -456,16 +463,17 @@ class _PreviewController:
     def _set_mode(self, mode: str) -> None:
         cfg = self.runtime.snapshot().background
         patch: dict = {"mode": mode}
+        backgrounds_dir = self.backgrounds_dir or DEFAULT_BACKGROUNDS_DIR
         if mode in ("image", "video") and not (
             cfg.image_path if mode == "image" else cfg.video_path
         ):
             files = [
                 f
-                for f in list_background_files(self.backgrounds_dir)
+                for f in list_background_files(backgrounds_dir)
                 if (f.suffix.lower() in IMAGE_EXTS) == (mode == "image")
             ]
             if not files:
-                self.flash(f"no background {mode} files in {self.backgrounds_dir}")
+                self.flash(f"no background {mode} files in {backgrounds_dir}")
                 return
             patch["image_path" if mode == "image" else "video_path"] = str(files[0])
         if mode == "camera" and cfg.camera_device == "" and not cfg.camera_target:
@@ -487,16 +495,18 @@ class _PreviewController:
         cfg = self.runtime.snapshot().background
         if cfg.mode == "color":
             try:
-                idx = COLOR_PRESETS.index(tuple(cfg.color))
+                color = cast(tuple[int, int, int], tuple(cfg.color))
+                idx = COLOR_PRESETS.index(color)
             except ValueError:
                 idx = -1
             idx = (idx + direction) % len(COLOR_PRESETS)
             self._update({"background": {"color": list(COLOR_PRESETS[idx])}})
             self.flash(f"color preset {idx + 1}/{len(COLOR_PRESETS)}")
         elif cfg.mode in ("image", "video"):
-            files = list_background_files(self.backgrounds_dir)
+            backgrounds_dir = self.backgrounds_dir or DEFAULT_BACKGROUNDS_DIR
+            files = list_background_files(backgrounds_dir)
             if not files:
-                self.flash(f"no background files in {self.backgrounds_dir}")
+                self.flash(f"no background files in {backgrounds_dir}")
                 return
             current = Path(cfg.image_path if cfg.mode == "image" else cfg.video_path)
             idx = files.index(current) if current in files else -1
@@ -512,10 +522,17 @@ class _PreviewController:
 
 def _as_float(value: object) -> float | None:
     try:
-        number = float(value)
-    except (TypeError, ValueError):
+        number = float(cast(Any, value))
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if number >= 0 else None
+
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(cast(Any, value))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _fps_text(actual: object, target: object) -> str:
@@ -563,7 +580,7 @@ def _status_overlay_lines(
 
     timing_mode = str(stats.get("background_video_timing_mode") or "")
     source_fps = _as_float(stats.get("background_video_source_fps"))
-    video_frames = int(stats.get("background_video_frames_displayed") or 0)
+    video_frames = _as_int(stats.get("background_video_frames_displayed")) or 0
     if timing_mode or source_fps or video_frames:
         skip_ratio = _as_float(stats.get("background_video_skip_ratio")) or 0.0
         status.append(

@@ -24,18 +24,32 @@ behavior these replace.
 from __future__ import annotations
 
 import errno
-import msvcrt
+import msvcrt as _msvcrt
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
-import ntsecuritycon
-import pywintypes
-import win32api
-import win32con
-import win32file
-import win32security
-import winerror
+import ntsecuritycon as _ntsecuritycon  # pyright: ignore[reportMissingModuleSource]
+import pywintypes as _pywintypes  # pyright: ignore[reportMissingModuleSource]
+import win32api as _win32api  # pyright: ignore[reportMissingModuleSource]
+import win32con as _win32con  # pyright: ignore[reportMissingModuleSource]
+import win32file as _win32file  # pyright: ignore[reportMissingModuleSource]
+import win32security as _win32security  # pyright: ignore[reportMissingModuleSource]
+import winerror as _winerror  # pyright: ignore[reportMissingModuleSource]
+
+# pywin32 exposes a native, version-dependent surface with partial stubs. Keep
+# the concrete imports visible to the Windows packager, but treat the FFI edge
+# as opaque after import so platform-specific stub gaps do not leak into the
+# portable filesystem-security contract.
+msvcrt: Any = _msvcrt
+ntsecuritycon: Any = _ntsecuritycon
+pywintypes: Any = _pywintypes
+win32api: Any = _win32api
+win32con: Any = _win32con
+win32file: Any = _win32file
+win32security: Any = _win32security
+winerror: Any = _winerror
 
 # LockFileEx flags (winbase.h). Defined here rather than pulled from win32con so
 # the lock contract does not depend on a particular pywin32 constant table.
@@ -55,10 +69,10 @@ _SHARE_ALL = (
 # set_private_mode/owner_matches can operate on it after open.
 _SECURITY_ACCESS = win32con.READ_CONTROL | ntsecuritycon.WRITE_DAC
 
-_current_user_sid_cache: object | None = None
+_current_user_sid_cache: Any | None = None
 
 
-def _current_user_sid():
+def _current_user_sid() -> Any:
     """Return (and cache) the current process user's SID."""
 
     global _current_user_sid_cache
@@ -76,9 +90,7 @@ def _current_user_sid():
     return _current_user_sid_cache
 
 
-def _oserror(
-    exc: pywintypes.error, path: os.PathLike[str] | str | None = None
-) -> OSError:
+def _oserror(exc: Any, path: os.PathLike[str] | str | None = None) -> OSError:
     """Translate a Win32 error into an ``OSError`` with a mapped ``errno``.
 
     Passing ``winerror`` as the fourth argument lets CPython map it onto the
@@ -180,7 +192,9 @@ def chmod_private(path: Path, mode: int) -> None:
 def _translate_open_flags(flags: int) -> tuple[int, int, bool]:
     """Map POSIX ``os.open`` flags to (desiredAccess, creationDisposition, append)."""
 
-    accmode = flags & os.O_ACCMODE
+    # ``O_ACCMODE`` isn't present in Windows typeshed even though CPython may
+    # provide it there; 0x3 is the standard POSIX access-mode mask.
+    accmode = flags & getattr(os, "O_ACCMODE", 0x3)
     if accmode == os.O_WRONLY:
         access = win32con.GENERIC_WRITE
     elif accmode == os.O_RDWR:

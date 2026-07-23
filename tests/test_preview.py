@@ -428,7 +428,9 @@ class TestPreviewController:
         ctl = make_controller(runtime)
         ctl.handle_key(ord("1"))  # blur
         assert runtime.snapshot().background.mode == "blur"
-        assert "blur" in ctl.current_message()
+        message = ctl.current_message()
+        assert message is not None
+        assert "blur" in message
 
     def test_blur_keys_adjust_strength_and_clamp(self):
         runtime = make_runtime(mode="blur", blur_strength=145)
@@ -443,7 +445,9 @@ class TestPreviewController:
         runtime = make_runtime(mode="color")
         ctl = make_controller(runtime)
         ctl.handle_key(ord("]"))
-        assert "switch to blur mode" in ctl.current_message()
+        message = ctl.current_message()
+        assert message is not None
+        assert "switch to blur mode" in message
 
     def test_color_cycle_wraps(self):
         runtime = make_runtime(mode="color")
@@ -459,7 +463,9 @@ class TestPreviewController:
         ctl = make_controller(runtime, tmp_path)
         ctl.handle_key(ord("3"))  # image mode
         assert runtime.snapshot().background.mode == "passthrough"  # unchanged
-        assert "no background image files" in ctl.current_message()
+        message = ctl.current_message()
+        assert message is not None
+        assert "no background image files" in message
 
     def test_image_mode_picks_up_directory_file_and_cycles(self, tmp_path):
         (tmp_path / "a.jpg").write_bytes(b"")
@@ -491,7 +497,9 @@ class TestPreviewController:
         ctl = make_controller(runtime)
         ctl.handle_key(ord("5"))
         assert runtime.snapshot().background.mode == "passthrough"
-        assert "camera_target" in ctl.current_message()
+        message = ctl.current_message()
+        assert message is not None
+        assert "camera_target" in message
 
     def test_camera_mode_accepts_integer_zero_device(self):
         runtime = make_runtime(mode="passthrough", camera_device=0)

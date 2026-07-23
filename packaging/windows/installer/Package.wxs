@@ -46,6 +46,9 @@
       <ComponentGroupRef Id="EngineComponents" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="UninstallVirtualCamera" />
+      <?ifdef IncludeNativeVCam ?>
+      <ComponentRef Id="NativeVCamRegistration" />
+      <?endif ?>
       <ComponentRef Id="OptionalUserDataCleanup" />
     </Feature>
 
@@ -74,10 +77,14 @@
     </Component>
 
     <!--
-      WIN-5.7: if a native Media Foundation virtual camera (WIN-6.1) is ever
-      registered, uninstall must remove that registration. The registration is
-      per-user COM/MF state under HKCU, so removing the key on uninstall is
-      sufficient and is a safe no-op when the native camera was never installed.
+      WIN-5.7 / WIN-6.1: the native Media Foundation virtual camera is
+      per-user COM/MF state under HKCU. The camera device itself has *session*
+      lifetime (created by the shell via MFCreateVirtualCamera, gone with the
+      process), so uninstall only has to remove the media-source COM
+      registration. The CLSID literal must match Activator.h /
+      vcam_native.VCAM_CLSID / VirtualCameraSession.cs. Removing the key tree
+      also covers a developer-loop DllRegisterServer registration, and is a
+      safe no-op when the native camera was never installed.
     -->
     <Component Id="UninstallVirtualCamera" Directory="INSTALLFOLDER" Guid="*">
       <RegistryValue Root="HKCU"
@@ -86,9 +93,28 @@
                      Type="integer" Value="1" KeyPath="yes" />
       <!-- Tears down the COM registration key tree on uninstall if present. -->
       <util:RemoveRegistryKeyEx Root="HKCU"
-                                Key="Software\Classes\CLSID\{00000000-0000-0000-0000-000000000000}"
+                                Key="Software\Classes\CLSID\{7A4C1B2E-9D35-4E6A-8B1F-52C84D9A6E01}"
                                 Action="removeOnUninstall" />
     </Component>
+
+    <?ifdef IncludeNativeVCam ?>
+    <!--
+      WIN-6.1: per-user in-proc COM registration of the media-source DLL that
+      build.ps1 staged next to the shell. HKCU only — no elevation, matching
+      the per-user install (D5). MSI component rules remove these keys on
+      uninstall; the RemoveRegistryKeyEx above is the belt-and-braces sweep.
+    -->
+    <Component Id="NativeVCamRegistration" Directory="INSTALLFOLDER" Guid="*">
+      <RegistryKey Root="HKCU"
+                   Key="Software\Classes\CLSID\{7A4C1B2E-9D35-4E6A-8B1F-52C84D9A6E01}">
+        <RegistryValue Type="string" Value="Custback Camera Media Source" KeyPath="yes" />
+        <RegistryKey Key="InProcServer32">
+          <RegistryValue Type="string" Value="[INSTALLFOLDER]CustbackVCam.dll" />
+          <RegistryValue Type="string" Name="ThreadingModel" Value="Both" />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+    <?endif ?>
 
     <!--
       WIN-5.7 opt-in data cleanup. Only when REMOVEUSERDATA=1 does uninstall

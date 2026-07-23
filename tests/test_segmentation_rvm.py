@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import types
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -37,7 +38,7 @@ def fake_ort(
     to simulate a registered-but-not-executing GPU provider.
     """
 
-    mod = types.ModuleType("onnxruntime")
+    mod = cast(Any, types.ModuleType("onnxruntime"))
     mod.get_available_providers = lambda: list(available_providers)
 
     class SessionOptions:

@@ -233,7 +233,9 @@ class TestBackdrops:
         cv2.imwrite(str(path), frame(h=50, w=50, value=42))
         cfg = BackgroundConfig(mode="image", image_path=str(path))
         bd = create_backdrop(cfg)
+        assert bd is not None
         out = bd.frame(128, 72)
+        assert out is not None
         assert out.shape == (72, 128, 3)
         assert (out == 42).all()
 
@@ -309,9 +311,12 @@ class TestBackdrops:
         writer.release()
         cfg = BackgroundConfig(mode="video", video_path=str(path))
         bd = create_backdrop(cfg)
+        assert bd is not None
         # read more frames than the file has -> must loop, not fail
         frames = [bd.frame(64, 48) for _ in range(5)]
-        assert all(f.shape == (48, 64, 3) for f in frames)
+        for rendered in frames:
+            assert rendered is not None
+            assert rendered.shape == (48, 64, 3)
         bd.close()
 
     def test_video_backdrop_uses_source_time_not_call_count(self, tmp_path):
@@ -721,7 +726,20 @@ class TestSegmentation:
         pytest.importorskip("cv2")
         mask = np.zeros((40, 40), np.float32)
         mask[10:30, 10:30] = 1.0
-        base = dict(mask_blur=0, edge_refine=False, temporal_smoothing=0.0)
-        shrunk = MaskRefiner(SegmentationConfig(mask_shift=-2, **base)).refine(mask)
-        grown = MaskRefiner(SegmentationConfig(mask_shift=2, **base)).refine(mask)
+        shrunk = MaskRefiner(
+            SegmentationConfig(
+                mask_shift=-2,
+                mask_blur=0,
+                edge_refine=False,
+                temporal_smoothing=0.0,
+            )
+        ).refine(mask)
+        grown = MaskRefiner(
+            SegmentationConfig(
+                mask_shift=2,
+                mask_blur=0,
+                edge_refine=False,
+                temporal_smoothing=0.0,
+            )
+        ).refine(mask)
         assert shrunk.sum() < mask.sum() < grown.sum()

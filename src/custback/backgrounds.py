@@ -14,7 +14,7 @@ import time
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, TypeGuard
 
 import numpy as np
 
@@ -22,9 +22,13 @@ from .config import BackgroundConfig, ResolvedBackdropTarget
 from .diagnostics import sanitized_source
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover
-    cv2 = None
+    _cv2 = None
+
+# OpenCV is a compiled optional boundary. Keep its runtime ``None`` fallback
+# while treating the dynamically exposed API as opaque to static analysis.
+cv2: Any = _cv2
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -299,7 +303,7 @@ class VideoBackdrop(BackdropProvider):
         self._last_returned_logical_index: int | None = None
         self._skip_warning_emitted = False
 
-    def _valid_decoded_frame(self, frame: np.ndarray | None) -> bool:
+    def _valid_decoded_frame(self, frame: object) -> TypeGuard[np.ndarray]:
         valid = bool(
             isinstance(frame, np.ndarray)
             and frame.dtype == np.uint8
@@ -431,7 +435,7 @@ class VideoBackdrop(BackdropProvider):
             if self._MIN_TIMESTAMP_STEP_S <= step_s <= self._MAX_TIMESTAMP_STEP_S:
                 self._container_timing = True
                 self._last_pts_step_s = step_s
-                if self._frame_count and origin is not None:
+                if self._frame_count and origin is not None and pts_s is not None:
                     # Until EOF is observed, extrapolate the final interval
                     # from the latest real PTS. This is substantially safer
                     # for VFR files than frame_count / nominal_fps.

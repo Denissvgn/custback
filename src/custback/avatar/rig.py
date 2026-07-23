@@ -31,7 +31,7 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import get_args
+from typing import Any, get_args
 
 import numpy as np
 import yaml
@@ -40,9 +40,14 @@ from .config import AVATAR_PARTS, AvatarFraming, AvatarStyle
 from .state import FaceState
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover - required by the package, defensive
-    cv2 = None
+    _cv2 = None
+
+# OpenCV is an optional-at-import-time native boundary: the runtime checks below
+# preserve the graceful error path when it is absent, while its dynamically
+# generated API intentionally remains opaque to static checking.
+cv2: Any = _cv2
 
 try:
     from PIL import Image

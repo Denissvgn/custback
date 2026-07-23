@@ -45,7 +45,8 @@ def _code(body: Any) -> str | None:
     return detail.get("code") if isinstance(detail, dict) else None
 
 
-def _websocket_headers(headers: dict[str, str]) -> dict[str, dict[str, str]]:
+def _websocket_headers(headers: dict[str, str]) -> dict[str, Any]:
+    """Return the version-dependent header argument for ``websockets.connect``."""
     parameters = inspect.signature(websockets.connect).parameters
     name = (
         "additional_headers" if "additional_headers" in parameters else "extra_headers"
@@ -187,7 +188,8 @@ def _assert_expectation(observations: list[dict[str, Any]], expectation: str) ->
 
 async def _output_frame(args: argparse.Namespace) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {_token(args.token_file)}"}
-    async with asyncio.timeout(args.timeout):
+
+    async def receive_frame() -> dict[str, Any]:
         async with websockets.connect(
             args.url,
             ssl=_context(args.ca_file, insecure=args.insecure),
@@ -195,7 +197,9 @@ async def _output_frame(args: argparse.Namespace) -> dict[str, Any]:
             max_size=args.max_bytes,
             **_websocket_headers(headers),
         ) as websocket:
-            observation = _observe_frame(await websocket.recv(), args)
+            return _observe_frame(await websocket.recv(), args)
+
+    observation = await asyncio.wait_for(receive_frame(), timeout=args.timeout)
     _assert_expectation([observation], args.expect)
     return observation
 
@@ -208,7 +212,8 @@ def command_output_frame(args: argparse.Namespace) -> int:
 async def _record_output(args: argparse.Namespace) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {_token(args.token_file)}"}
     observations: list[dict[str, Any]] = []
-    async with asyncio.timeout(args.timeout):
+
+    async def receive_frames() -> None:
         async with websockets.connect(
             args.url,
             ssl=_context(args.ca_file, insecure=args.insecure),
@@ -218,6 +223,8 @@ async def _record_output(args: argparse.Namespace) -> dict[str, Any]:
         ) as websocket:
             for _index in range(args.frames):
                 observations.append(_observe_frame(await websocket.recv(), args))
+
+    await asyncio.wait_for(receive_frames(), timeout=args.timeout)
     _assert_expectation(observations, args.expect)
     return {
         "frames": len(observations),
@@ -235,17 +242,21 @@ def command_record_output(args: argparse.Namespace) -> int:
 
 async def _ws_auth(args: argparse.Namespace) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {_token(args.token_file)}"}
+
+    async def authenticate() -> None:
+        async with websockets.connect(
+            args.url,
+            ssl=_context(args.ca_file, insecure=args.insecure),
+            origin=args.origin,
+            max_size=args.max_bytes,
+            **_websocket_headers(headers),
+        ):
+            return None
+
     try:
-        async with asyncio.timeout(args.timeout):
-            async with websockets.connect(
-                args.url,
-                ssl=_context(args.ca_file, insecure=args.insecure),
-                origin=args.origin,
-                max_size=args.max_bytes,
-                **_websocket_headers(headers),
-            ):
-                accepted = True
-                status = 101
+        await asyncio.wait_for(authenticate(), timeout=args.timeout)
+        accepted = True
+        status = 101
     except Exception as exc:
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)

@@ -13,11 +13,15 @@ if importlib.util.find_spec("nvidia_audio2face_3d") is None:
         allow_module_level=True,
     )
 
-import grpc
-from nvidia_ace import animation_pb2
-from nvidia_audio2face_3d import audio2face_pb2_grpc, messages_pb2
+import grpc  # pyright: ignore[reportMissingModuleSource]
+from nvidia_ace import animation_pb2  # pyright: ignore[reportMissingImports]
+from nvidia_audio2face_3d import (  # pyright: ignore[reportMissingImports]
+    audio2face_pb2_grpc,
+    messages_pb2,
+)
 
 from custback.avatar.audio2face import (
+    AudioSource,
     Audio2FaceDriver,
     _load_protocol,
     protocol_available,
@@ -115,11 +119,11 @@ def test_driver_uses_generated_in_process_audio2face_service():
     assert port > 0
     server.start()
 
-    class FiniteSource:
+    class FiniteSource(AudioSource):
         def __init__(self):
             self.reads = 0
 
-        def read(self, frames):
+        def read(self, frames: int) -> bytes | None:
             self.reads += 1
             if self.reads == 1:
                 return b"\x00\x00" * min(frames, 16)

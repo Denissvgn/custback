@@ -119,8 +119,9 @@ def sanitized_config_summary(
 ) -> str:
     """Summarize acknowledged values using a deliberately narrow whitelist."""
 
-    if hasattr(config, "model_dump"):
-        data = config.model_dump(mode="python")
+    model_dump = getattr(config, "model_dump", None)
+    if callable(model_dump):
+        data = model_dump(mode="python")
     elif isinstance(config, Mapping):
         data = config
     else:

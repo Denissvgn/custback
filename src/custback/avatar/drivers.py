@@ -27,9 +27,13 @@ from .config import DriverConfig, VisionConfig
 from .state import FaceState
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover - required by the package, defensive
-    cv2 = None
+    _cv2 = None
+
+# OpenCV is a compiled optional boundary. Keep its runtime ``None`` fallback
+# while treating the dynamically exposed API as opaque to static analysis.
+cv2: Any = _cv2
 
 log = logging.getLogger(__name__)
 
@@ -90,9 +94,13 @@ class DriverPreparation:
 
 def _load_vision_bindings() -> _VisionBindings:
     try:
-        import mediapipe as mp
-        from mediapipe.tasks import python as mp_tasks
-        from mediapipe.tasks.python import vision as mp_vision
+        import mediapipe as mp  # pyright: ignore[reportMissingImports] - optional extra
+        from mediapipe.tasks import (  # pyright: ignore[reportMissingImports] - optional extra
+            python as mp_tasks,
+        )
+        from mediapipe.tasks.python import (  # pyright: ignore[reportMissingImports] - optional extra
+            vision as mp_vision,
+        )
     except ImportError as exc:
         raise DriverUnavailableError(
             "mediapipe is not installed; install the [mediapipe] extra "

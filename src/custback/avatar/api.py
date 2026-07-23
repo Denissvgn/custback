@@ -578,6 +578,7 @@ def create_avatar_app(
     async def background_thumbnail(name: str) -> Response:
         path = await asyncio.to_thread(media_store.stored_path, name)
         kind = media_store.kind_of(path)
+        assert kind is not None  # stored_path already rejects unknown media types.
         stat = path.stat()
         key = ("media", str(path), stat.st_mtime_ns, stat.st_size)
         cached = thumbnails.get(key)

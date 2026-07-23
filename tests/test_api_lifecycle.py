@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import signal
+from typing import Any
 
 import pytest
 
@@ -10,7 +11,7 @@ from custback.config import AppConfig
 
 class FakePipeline:
     instances = []
-    start_error = None
+    start_error: BaseException | None = None
 
     def __init__(self, runtime, hub, **_kwargs):
         self.running = False
@@ -37,6 +38,12 @@ def _cfg():
             "output": {"backend": "null"},
         }
     )
+
+
+def _uninitialized_api_runner() -> Any:
+    """Build a runner whose lifecycle state is supplied by the test."""
+
+    return object.__new__(main_mod._ApiRunner)
 
 
 def _patch_common(monkeypatch):
@@ -202,7 +209,7 @@ def test_ready_and_shutdown_records_are_ordered_and_complete(monkeypatch, caplog
 
 
 def test_api_runner_failure_latch_survives_shutdown():
-    runner = object.__new__(main_mod._ApiRunner)
+    runner = _uninitialized_api_runner()
     runner.server = SimpleNamespace(should_exit=False, force_exit=False)
     runner._thread = SimpleNamespace(is_alive=lambda: False, join=lambda _timeout: None)
     runner._socket = None
@@ -221,7 +228,7 @@ def test_api_runner_passes_configured_websocket_size_to_uvicorn():
 
 
 def test_api_runner_bind_failure_is_api_startup_error():
-    runner = object.__new__(main_mod._ApiRunner)
+    runner = _uninitialized_api_runner()
     runner.server = SimpleNamespace(
         config=SimpleNamespace(
             bind_socket=lambda: (_ for _ in ()).throw(OSError("occupied"))
@@ -244,7 +251,7 @@ def test_api_runner_thread_start_failure_closes_prebound_socket(monkeypatch):
             self.closed = True
 
     sock = Socket()
-    runner = object.__new__(main_mod._ApiRunner)
+    runner = _uninitialized_api_runner()
     runner.server = SimpleNamespace(
         config=SimpleNamespace(bind_socket=lambda: sock),
         run=lambda **_kwargs: None,

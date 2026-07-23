@@ -64,7 +64,7 @@ def probe_cuda_inference(ort_module=None) -> dict[str, Any]:
     }
     try:
         if ort_module is None:
-            import onnxruntime as ort_module
+            import onnxruntime as ort_module  # pyright: ignore[reportMissingImports] - optional extra
     except Exception as exc:
         result["error"] = _bounded_error(exc)
         return result

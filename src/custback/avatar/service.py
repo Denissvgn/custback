@@ -51,9 +51,13 @@ from .state import FaceState, StateSmoother
 from .store import is_rig_directory, resolve_rig_selector
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover - required by the package, defensive
-    cv2 = None
+    _cv2 = None
+
+# Keep the defensive no-OpenCV path while treating its native API as an opaque
+# boundary; its generated surface is not stable enough to expose internally.
+cv2: Any = _cv2
 
 log = logging.getLogger(__name__)
 
@@ -1258,6 +1262,10 @@ class AvatarService:
             await self.aclose()
             raise
         connect_parameters = inspect.signature(websockets.connect).parameters
+        # Header and proxy keyword names differ between supported websockets
+        # releases. Runtime inspection selects the compatible spelling, which
+        # cannot be represented by one installed-version-specific signature.
+        websocket_connect = cast(Callable[..., Any], websockets.connect)
         header_arg = (
             "additional_headers"
             if "additional_headers" in connect_parameters
@@ -1279,7 +1287,7 @@ class AvatarService:
                         if self._source_ssl is not None
                         else {}
                     )
-                    async with websockets.connect(
+                    async with websocket_connect(
                         source.url + RAW_STREAM_PATH,
                         max_size=source.frame_max_bytes,
                         open_timeout=source.connect_timeout_s,

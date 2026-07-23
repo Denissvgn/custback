@@ -1,0 +1,13 @@
+{
+  "include": [
+    "src",
+    "tests",
+    "examples",
+    "scripts/release",
+    "packaging/windows/pyinstaller"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic"
+}

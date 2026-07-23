@@ -13,6 +13,8 @@ namespace Custback.Shell;
 internal sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly Engine _engine;
+    private readonly VirtualCameraSession _vcam = new();
+    private readonly string _logFile;
     private readonly CancellationTokenSource _cts = new();
     private readonly NotifyIcon _tray;
     private readonly SynchronizationContext _ui;
@@ -25,6 +27,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     internal TrayApplicationContext(EngineOptions options)
     {
+        _logFile = options.LogFile;
         _engine = new Engine(options);
         _engine.Crashed += OnEngineCrashed;
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
@@ -71,6 +74,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
             ShowFatal("Custback could not start its engine.", ex);
             return;
         }
+
+        // WIN-6.1: bring up the native virtual camera only after the engine is
+        // ready (its frame ring exists from the first output frame). Optional
+        // and best-effort — absence or failure leaves the OBS path in charge.
+        _vcam.TryStart(Log);
 
         await ShowWindowAsync().ConfigureAwait(true);
     }
@@ -204,6 +212,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _tray.Visible = false;
         try
         {
+            // Remove the virtual camera before the engine stops so consumers
+            // see a clean device removal instead of a stalled stream.
+            _vcam.Stop(Log);
+
             // Graceful stop drains camera/output before the process exits.
             await _engine.RequestShutdownAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(true);
         }
@@ -211,6 +223,18 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             _cts.Cancel();
             ExitThread();
+        }
+    }
+
+    private void Log(string line)
+    {
+        try
+        {
+            File.AppendAllText(_logFile, line + Environment.NewLine);
+        }
+        catch (IOException)
+        {
+            // Shell diagnostics must never take down the lifecycle.
         }
     }
 
@@ -230,6 +254,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             _cts.Cancel();
+            _vcam.Dispose();
             _activate?.Dispose();
             _webView?.Dispose();
             _window?.Dispose();

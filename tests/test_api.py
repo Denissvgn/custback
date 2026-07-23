@@ -15,6 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -27,9 +28,11 @@ import starlette
 from fastapi import HTTPException, Request
 
 if int(starlette.__version__.split(".", 1)[0]) >= 1:
-    from httpx2 import ASGITransport, AsyncClient
+    from httpx2 import ASGITransport as _ASGITransport
+    from httpx2 import AsyncClient as _AsyncClient
 else:  # Starlette < 1 uses the original httpx client contract.
-    from httpx import ASGITransport, AsyncClient
+    from httpx import ASGITransport as _ASGITransport
+    from httpx import AsyncClient as _AsyncClient
 
 from custback.api.security import SESSION_COOKIE, SecurityPolicy
 import custback.api.server as server_mod
@@ -44,6 +47,22 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 RENDERER_TOKEN = "test-renderer-token-which-is-at-least-32-characters"
 RENDERER_AUTH = {"Authorization": f"Bearer {RENDERER_TOKEN}"}
 ORIGIN = "http://testserver"
+
+
+def _async_client(app: object) -> Any:
+    """Return a client across the incompatible httpx/httpx2 transport types."""
+
+    transport = cast(Any, _ASGITransport)(app=app)
+    return cast(Any, _AsyncClient)(
+        transport=transport,
+        base_url="http://testserver",
+    )
+
+
+def _error_code(error: HTTPException) -> object:
+    """Read the structured detail payload asserted by upload validation tests."""
+
+    return cast(dict[str, object], error.detail)["code"]
 
 
 async def _with_event_loop_heartbeat(awaitable):
@@ -89,11 +108,7 @@ class Stack:
     upload_dir: object
 
     async def arequest(self, method: str, path: str, **kwargs):
-        transport = ASGITransport(app=self.app)
-        async with AsyncClient(
-            transport=transport,
-            base_url="http://testserver",
-        ) as client:
+        async with _async_client(self.app) as client:
             return await client.request(method, path, **kwargs)
 
     def request(self, method: str, path: str, **kwargs):
@@ -333,10 +348,7 @@ def test_exact_origin_is_enforced_even_with_token(stack):
 
 def test_browser_session_cookie(stack):
     async def scenario():
-        transport = ASGITransport(app=stack.app)
-        async with AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with _async_client(stack.app) as client:
             denied = await client.post(
                 "/auth/session",
                 json={"token": "x" * 40},
@@ -1494,7 +1506,7 @@ def test_image_full_pillow_decode_happens_before_opencv(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as caught:
         store._validate(path, "image")
     assert caught.value.status_code == 422
-    assert caught.value.detail["code"] == "invalid_media"
+    assert _error_code(caught.value) == "invalid_media"
     assert calls == 2
 
 
@@ -1515,7 +1527,7 @@ def test_image_dimension_limit_is_checked_before_opencv_decode(tmp_path, monkeyp
     with pytest.raises(HTTPException) as caught:
         store._validate(path, "image")
     assert caught.value.status_code == 422
-    assert caught.value.detail["code"] == "image_dimensions_exceeded"
+    assert _error_code(caught.value) == "image_dimensions_exceeded"
 
 
 def test_pillow_decompression_bomb_is_mapped_without_opencv_decode(
@@ -1541,7 +1553,7 @@ def test_pillow_decompression_bomb_is_mapped_without_opencv_decode(
     with pytest.raises(HTTPException) as caught:
         store._validate(path, "image")
     assert caught.value.status_code == 422
-    assert caught.value.detail["code"] == "image_dimensions_exceeded"
+    assert _error_code(caught.value) == "image_dimensions_exceeded"
 
 
 def test_websocket_jpeg_header_bomb_is_rejected_before_opencv(monkeypatch):
@@ -1595,7 +1607,7 @@ def test_video_metadata_limit_is_checked_before_first_frame_decode(
     with pytest.raises(HTTPException) as caught:
         store._validate(path, "video")
     assert caught.value.status_code == 422
-    assert caught.value.detail["code"] == "video_dimensions_exceeded"
+    assert _error_code(caught.value) == "video_dimensions_exceeded"
     assert not capture.read_called
     assert capture.released
 
@@ -1639,7 +1651,7 @@ def test_video_later_frame_limit_rejects_the_whole_upload(tmp_path, monkeypatch)
     with pytest.raises(HTTPException) as caught:
         store._validate(path, "video")
     assert caught.value.status_code == 422
-    assert caught.value.detail["code"] == "video_dimensions_exceeded"
+    assert _error_code(caught.value) == "video_dimensions_exceeded"
     assert capture.released
 
 

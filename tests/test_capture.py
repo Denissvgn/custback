@@ -494,7 +494,9 @@ def test_reconnect_backoff_sequence_is_exact_and_saturates(monkeypatch):
             capture._backoff_index = 0
             for now in (10.0, 20.0, 30.0, 40.0, 50.0):
                 capture._schedule_reopen_locked(now)
-                delays.append(capture._next_reopen_at - now)
+                next_reopen_at = capture._next_reopen_at
+                assert next_reopen_at is not None
+                delays.append(next_reopen_at - now)
         assert delays == [0.5, 1.0, 2.0, 4.0, 4.0]
     finally:
         capture.close()
@@ -609,9 +611,14 @@ def test_reader_surviving_release_and_join_is_terminal(monkeypatch):
         error = wait_for_error(capture, CaptureWorkerError, timeout=0.3)
         assert "remained blocked" in str(error)
         deadline = time.monotonic() + 0.2
-        while capture._controller_thread.is_alive() and time.monotonic() < deadline:
+        controller = capture._controller_thread
+        while (
+            controller is not None
+            and controller.is_alive()
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.002)
-        assert not capture._controller_thread.is_alive()
+        assert controller is None or not controller.is_alive()
     finally:
         # Native Python threads cannot be force-cancelled safely.  Production
         # exits the failed pipeline/process; unblock only this fake so the test

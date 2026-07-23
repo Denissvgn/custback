@@ -624,7 +624,9 @@ class SessionStore:
         with self._lock:
             self._purge(now)
             while len(self._sessions) >= self.max_sessions:
-                oldest = min(self._sessions, key=self._sessions.get)
+                oldest = min(
+                    self._sessions, key=lambda session: self._sessions[session]
+                )
                 self._sessions.pop(oldest, None)
             self._sessions[session] = now + self.ttl_s
         return session
@@ -723,12 +725,14 @@ class SecurityPolicy:
         if bind_host is None:
             raise SecurityConfigurationError(f"invalid API bind host: {host!r}")
         raw_origins = frozenset(allowed_origins) or default_origins(host, port, tls=tls)
-        normalized_origins = {canonical_origin(origin) for origin in raw_origins}
-        if None in normalized_origins:
-            invalid = next(
-                origin for origin in raw_origins if canonical_origin(origin) is None
-            )
-            raise SecurityConfigurationError(f"invalid exact API origin: {invalid!r}")
+        normalized_origins: set[str] = set()
+        for origin in raw_origins:
+            canonical = canonical_origin(origin)
+            if canonical is None:
+                raise SecurityConfigurationError(
+                    f"invalid exact API origin: {origin!r}"
+                )
+            normalized_origins.add(canonical)
         origins = frozenset(normalized_origins)
         expected_scheme = "https" if tls else "http"
         if any(urlsplit(origin).scheme != expected_scheme for origin in origins):

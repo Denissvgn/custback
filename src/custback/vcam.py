@@ -126,6 +126,14 @@ def _classify_output_failure(exc: BaseException) -> str:
 def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
     if cfg.backend == "null":
         return NullOutput()
+    if cfg.backend == "native":
+        # WIN-6.1: the Windows 11 Media Foundation virtual camera.  Explicit
+        # opt-in only — `auto` keeps the OBS/pyvirtualcam path until the native
+        # camera passes its own clean-machine gate (feature-matrix guardrail).
+        # An explicit backend fails loudly rather than silently degrading.
+        from . import vcam_native
+
+        return vcam_native.NativeVirtualCameraOutput(width, height)
     try:
         return PyVirtualCamOutput(cfg, width, height)
     except Exception as exc:

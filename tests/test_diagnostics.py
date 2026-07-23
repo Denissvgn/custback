@@ -49,9 +49,11 @@ def test_configure_logging_creates_secure_default_log_and_run_id(tmp_path):
         logger.info("ready")
         assert session.file_logging is True
         assert session.log_path == tmp_path / "custback" / "custback.log"
-        assert "[run=run12345]" in session.log_path.read_text(encoding="utf-8")
-        assert _mode(session.log_path.parent) == 0o700
-        assert _mode(session.log_path) == 0o600
+        log_path = session.log_path
+        assert log_path is not None
+        assert "[run=run12345]" in log_path.read_text(encoding="utf-8")
+        assert _mode(log_path.parent) == 0o700
+        assert _mode(log_path) == 0o600
     finally:
         session.close()
 

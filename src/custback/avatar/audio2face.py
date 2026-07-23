@@ -124,7 +124,7 @@ class MicrophoneSource(AudioSource):
 
     def __init__(self, sample_rate: int):
         try:
-            import sounddevice
+            import sounddevice  # pyright: ignore[reportMissingImports] - optional extra
         except (ImportError, OSError) as exc:  # OSError: missing PortAudio
             raise DriverUnavailableError(
                 "sounddevice (and the PortAudio library) is required for "
@@ -158,7 +158,7 @@ def microphone_available() -> bool:
     """Return whether the optional microphone binding can load PortAudio."""
 
     try:
-        import sounddevice  # noqa: F401
+        import sounddevice  # pyright: ignore[reportMissingImports]  # noqa: F401
     except (ImportError, OSError):
         return False
     return True
@@ -203,12 +203,14 @@ class _OwnedAudio2FaceGeneration:
 
 def _load_protocol() -> _Protocol:
     try:
-        import grpc
-        from nvidia_ace.audio_pb2 import AudioHeader
-        from nvidia_audio2face_3d.audio2face_pb2_grpc import (
+        import grpc  # pyright: ignore[reportMissingModuleSource] - optional extra
+        from nvidia_ace.audio_pb2 import (  # pyright: ignore[reportMissingImports] - optional extra
+            AudioHeader,
+        )
+        from nvidia_audio2face_3d.audio2face_pb2_grpc import (  # pyright: ignore[reportMissingImports] - optional extra
             A2FControllerServiceStub,
         )
-        from nvidia_audio2face_3d.messages_pb2 import (
+        from nvidia_audio2face_3d.messages_pb2 import (  # pyright: ignore[reportMissingImports] - optional extra
             AudioWithEmotion,
             AudioWithEmotionStream,
             AudioWithEmotionStreamHeader,

@@ -7,7 +7,7 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal, cast
 
 import yaml
 from pydantic import (
@@ -33,7 +33,7 @@ SegmentationBackend = Literal["auto", "rvm", "mediapipe", "heuristic", "none"]
 SegmentationDelegate = Literal["cpu", "gpu"]
 AccelerationMode = Literal["auto", "cpu", "gpu_required"]
 AccelerationProvider = Literal["auto", "cuda", "directml"]
-OutputBackend = Literal["auto", "pyvirtualcam", "null"]
+OutputBackend = Literal["auto", "pyvirtualcam", "native", "null"]
 CameraPixelFormat = Literal["auto", "mjpeg", "backend"]
 CameraModeMismatch = Literal["warn", "error"]
 ColorChannel = Annotated[int, Field(ge=0, le=255)]
@@ -151,15 +151,18 @@ class _StrictModel(BaseModel):
         strict config object in an invalid mode/path or half-TLS state.
         """
         fields = type(self).model_fields
-        if name not in fields or name not in self.__dict__:
+        values = cast(dict[str, Any], self.__dict__)
+        if name not in fields or name not in values:
             super().__setattr__(name, value)
             return
-        previous = self.__dict__[name]
+        previous = values[name]
         previous_fields_set = self.__pydantic_fields_set__.copy()
         try:
             super().__setattr__(name, value)
         except BaseException:
-            self.__dict__[name] = previous
+            # Pydantic may replace the instance dictionary while applying an
+            # assignment validator, so restore through its current mapping.
+            cast(dict[str, Any], self.__dict__)[name] = previous
             self.__pydantic_fields_set__.clear()
             self.__pydantic_fields_set__.update(previous_fields_set)
             raise

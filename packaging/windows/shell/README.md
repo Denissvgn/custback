@@ -13,7 +13,8 @@ engine in `engine\`.
 | WIN-5.2 | Single-instance mutex; reserve loopback port; supervise engine; wait for explicit readiness; host UI; show startup/doctor failures first; do **not** weaken the engine's Host/Origin/cookie/bearer boundary | `Program.cs`, `Engine.cs`, `TrayApplicationContext.cs` |
 | WIN-5.3 | HttpOnly session without the bearer in a URL/cmdline/web storage/log; private lifecycle/shutdown channel | `SessionBootstrap.cs`, `Engine.RequestShutdownAsync` |
 | WIN-5.4 | Keep processing when hidden to tray; graceful shutdown drains camera/output; crash/suspend handling; launch-at-login | `TrayApplicationContext.cs`, `AutoStart` |
-| WIN-5.5 | Supervise the avatar second process only when installed | `Engine` (`SuperviseAvatar`) |
+| WIN-5.5 / WIN-6.4 | Supervise the avatar second process only when installed: started after engine readiness with the real CLI contract (`--source`, `--source-token-file`, `--api-token-file` — paths, never secrets), bounded restart budget | `Engine` (`SuperviseAvatar`, `StartAvatar`) |
+| WIN-6.1 | Own the native Media Foundation virtual camera lifecycle: `MFCreateVirtualCamera` with session lifetime + current-user access after engine readiness; stop/remove on quit; feature-gated on `CustbackVCam.dll` being installed | `VirtualCameraSession.cs`, `TrayApplicationContext` |
 
 ## Security model (WIN-5.3)
 

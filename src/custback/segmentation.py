@@ -31,7 +31,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import Any, BinaryIO, Iterator, cast
 
 import numpy as np
 
@@ -49,9 +49,14 @@ from .acceleration import (
 from .config import AccelerationConfig, SegmentationConfig
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover
-    cv2 = None
+    _cv2 = None
+
+# OpenCV and the ML runtimes below are native/dynamically generated APIs. Keep
+# the deliberate runtime fallback, but do not model their implementation
+# details throughout the segmentation pipeline.
+cv2: Any = _cv2
 
 log = logging.getLogger(__name__)
 
@@ -207,7 +212,7 @@ def _stream_model(
             read = getattr(response, "read1", None)
             if not callable(read):
                 read = response.read
-            chunk = read(min(_DOWNLOAD_CHUNK_SIZE, spec.size - size + 1))
+            chunk = cast(bytes, read(min(_DOWNLOAD_CHUNK_SIZE, spec.size - size + 1)))
             if time.monotonic() >= deadline:
                 raise ModelAcquisitionError(
                     f"download timed out after {MODEL_DOWNLOAD_TIMEOUT_S:.0f}s: "
@@ -455,6 +460,7 @@ class HeuristicSegmenter(Segmenter):
             yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
             dist = ((xx - w / 2) / (w * 0.45)) ** 2 + ((yy - h / 2) / (h * 0.6)) ** 2
             self._prior = np.clip(1.5 - dist, 0.0, 1.0)
+        assert self._prior is not None
         return self._prior
 
     def segment(self, frame_bgr: np.ndarray) -> np.ndarray:
@@ -469,9 +475,9 @@ class MediaPipeSegmenter(Segmenter):
     """MediaPipe Tasks ImageSegmenter with the selfie segmentation model."""
 
     def __init__(self, cfg: SegmentationConfig, *, allow_model_download: bool = True):
-        import mediapipe as mp
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision as mp_vision
+        mp: Any = importlib.import_module("mediapipe")
+        mp_python: Any = importlib.import_module("mediapipe.tasks.python")
+        mp_vision: Any = importlib.import_module("mediapipe.tasks.python.vision")
 
         if cfg.model_path and Path(cfg.model_path).suffix.lower() == ".tflite":
             model_path = Path(cfg.model_path)
@@ -490,7 +496,7 @@ class MediaPipeSegmenter(Segmenter):
             )
             return mp_vision.ImageSegmenter.create_from_options(options)
 
-        self._segmenter = None
+        self._segmenter: Any = None
         if cfg.delegate == "gpu":
             try:
                 self._segmenter = make(mp_python.BaseOptions.Delegate.GPU)
@@ -535,7 +541,7 @@ class RVMSegmenter(Segmenter):
         acceleration: AccelerationConfig | None = None,
         allow_model_download: bool = True,
     ):
-        import onnxruntime as ort
+        ort: Any = importlib.import_module("onnxruntime")
 
         if cfg.model_path and Path(cfg.model_path).suffix.lower() == ".onnx":
             model_path = Path(cfg.model_path)
@@ -549,30 +555,30 @@ class RVMSegmenter(Segmenter):
         )
         #: Truthful, latched acceleration lifecycle (read by /status and doctor).
         self.accel = AccelerationState(self._accel_cfg)
-        self._session = self._build_session()
+        self._session: Any = self._build_session()
         self._downsample = cfg.rvm_downsample
         self._rec: list[np.ndarray] | None = None
         self._size: tuple[int, int] | None = None
 
     # -- session construction / acceleration policy -------------------
-    def _new_session_options(self):
+    def _new_session_options(self) -> Any:
         options = self._ort.SessionOptions()
         options.log_severity_level = 3  # hide per-node provider assignment noise
         return options
 
-    def _make_session(self, providers: list) -> object:
+    def _make_session(self, providers: list[Any]) -> Any:
         return self._ort.InferenceSession(
             self._model_path,
             sess_options=self._new_session_options(),
             providers=providers,
         )
 
-    def _build_cpu_session(self) -> object:
+    def _build_cpu_session(self) -> Any:
         """Construct a deterministic CPU-only session."""
 
         return self._make_session([CPU_PROVIDER])
 
-    def _build_session(self) -> object:
+    def _build_session(self) -> Any:
         """Resolve the acceleration policy into a proven production session.
 
         GPU providers are proven against the real RVM graph before use; a

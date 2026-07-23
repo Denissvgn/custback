@@ -6,6 +6,7 @@ import io
 import ssl
 import zipfile
 from dataclasses import dataclass
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -18,9 +19,11 @@ import starlette
 from fastapi import FastAPI
 
 if int(starlette.__version__.split(".", 1)[0]) >= 1:
-    from httpx2 import ASGITransport, AsyncClient
+    from httpx2 import ASGITransport as _ASGITransport
+    from httpx2 import AsyncClient as _AsyncClient
 else:  # Starlette < 1 uses the original httpx client contract.
-    from httpx import ASGITransport, AsyncClient
+    from httpx import ASGITransport as _ASGITransport
+    from httpx import AsyncClient as _AsyncClient
 
 import custback.api.avatar_proxy as avatar_proxy_module
 from custback.api.avatar_proxy import register_avatar_proxy
@@ -37,6 +40,16 @@ CORE_TOKEN = "core-api-test-token-which-is-long-enough-000"
 AVATAR_TOKEN = "avatar-api-test-token-which-is-long-enough-1"
 AUTH = {"Authorization": f"Bearer {CORE_TOKEN}"}
 ORIGIN = "http://testserver"
+
+
+def _async_client(app: object) -> Any:
+    """Return a client across the incompatible httpx/httpx2 transport types."""
+
+    transport = cast(Any, _ASGITransport)(app=app)
+    return cast(Any, _AsyncClient)(
+        transport=transport,
+        base_url="http://testserver",
+    )
 
 
 async def _with_event_loop_heartbeat(awaitable):
@@ -93,10 +106,7 @@ class Stack:
     avatar_service: AvatarService
 
     async def arequest(self, method: str, path: str, **kwargs):
-        transport = ASGITransport(app=self.app)
-        async with AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with _async_client(self.app) as client:
             return await client.request(method, path, **kwargs)
 
     def request(self, method: str, path: str, **kwargs):
@@ -501,8 +511,10 @@ def _proxy_only_app(runtime, handler=None, client_factory=None):
     if client_factory is None:
         assert handler is not None
 
-        def client_factory():
+        def mock_client_factory():
             return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        client_factory = mock_client_factory
 
     register_avatar_proxy(app, runtime, client_factory=client_factory)
     return app

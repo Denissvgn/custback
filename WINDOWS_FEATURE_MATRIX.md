@@ -30,7 +30,7 @@ Baseline product target (from `WINDOWS_DECISIONS.md`): **Windows 11 x64**,
 | Full local API + NTFS storage | Planned (WIN-2) | Not planned | Not planned |
 | Camera → OBS virtual camera | Planned (WIN-3) | Not planned | Not planned |
 | Desktop installer | Planned (WIN-5) | Not planned | Not planned |
-| Any support at all | Yes (target) | Not planned (revisit D1) | Planned (WIN-6.3) |
+| Any support at all | Yes (target) | Not planned (revisit D1) | Planned (WIN-6.3) — build/dependency machinery landed (`WINDOWS_ARM64.md`; every build script takes an arch parameter); hardware evidence pending |
 
 Windows 10 and ARM64 are gated behind a concrete customer requirement (decision
 D1). ARM64 has an explicit later task (WIN-6.3); Windows 10 reopens the capture
@@ -40,7 +40,7 @@ and virtual-camera matrix and has no task yet.
 
 | Backend / provider | CPU | NVIDIA CUDA | AMD/Intel (DirectML) | NPU (Windows ML) |
 | --- | --- | --- | --- | --- |
-| RVM (matting) | Planned (WIN-1/WIN-4) → gate WIN-1.8, WIN-4 | Planned (WIN-4) → hardware gate | Spike only (WIN-4.7); Planned (WIN-6.2) if go | Not planned (spike WIN-4.7) |
+| RVM (matting) | Planned (WIN-1/WIN-4) → gate WIN-1.8, WIN-4 | Planned (WIN-4) → hardware gate | Planned (WIN-6.2) — gate machinery landed (`directml` extra + `scripts/release/windows-acceleration-gate.py`); claim requires AMD+Intel evidence passing `check` | Not planned (spike WIN-4.7) |
 | MediaPipe | Planned (WIN-1) | Not planned | Not planned | Not planned |
 | Heuristic / none | Planned (WIN-1) | N/A | N/A | N/A |
 
@@ -60,7 +60,7 @@ WIN-4):
 | --- | --- | --- |
 | OBS Virtual Camera via `pyvirtualcam` | Planned (WIN-3.7) | Camera → Teams/Zoom/Meet/browser stable |
 | Unity Capture via `pyvirtualcam` | Not planned (secondary compat option) | — |
-| Native Media Foundation virtual camera | Planned (WIN-6.1) | Own C++/WinRT clean-machine gate |
+| Native Media Foundation virtual camera | Planned (WIN-6.1) — machinery landed (`packaging/windows/vcam/`, `output.backend: native` opt-in; `auto` never selects it) | Own C++/WinRT clean-machine gate: visible + stable in Teams/Zoom/Meet + browser with no OBS installed |
 | Legacy DirectShow driver | Not planned | — |
 
 ## 4. Camera input
@@ -99,7 +99,7 @@ state, not a regression.
 | Embedded web UI in WebView2 | Planned (WIN-5.2) | — |
 | Secure WebView session bootstrap (no token in URL/args/log) | Planned (WIN-5.3) | Clean-VM: no secret in process args/URLs |
 | Tray lifecycle / suspend / crash recovery | Planned (WIN-5.4) | — |
-| Avatar second process supervision | Planned (WIN-5.5), feature-gated | — |
+| Avatar second process supervision | Planned (WIN-5.5/WIN-6.4), feature-gated — machinery landed (`custback-avatar.exe` frozen beside the engine, real CLI supervision contract, `-IncludeAvatar` installer gating; vision/audio2face one-per-payload) | Avatar smoke + supervised run on the WIN-1.8 job |
 | Native HighGUI preview | Not planned (decision D8) | — |
 
 ## 7. Distribution

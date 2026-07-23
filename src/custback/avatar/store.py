@@ -47,6 +47,7 @@ from ..storage_tx import (
 from .config import (
     AVATAR_PARTS,
     AppearanceConfig,
+    AvatarFraming,
     StorageConfig,
 )
 from .renderer import compose_avatar
@@ -584,7 +585,7 @@ def render_avatar_thumbnail(
     *,
     avatar: str = "casey",
     style: str = "cartoon",
-    framing: str = "bust",
+    framing: AvatarFraming = "bust",
     size: tuple[int, int] = THUMBNAIL_SIZE,
     rig_layer_max_pixels: int = DEFAULT_RIG_LAYER_MAX_PIXELS,
     rig_total_max_pixels: int = DEFAULT_RIG_TOTAL_MAX_PIXELS,

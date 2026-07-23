@@ -257,8 +257,12 @@ def test_workbench_navigation_and_accessibility_hooks_are_present():
     assert WEBUI_HTML.count('role="tab"') == 4
     assert WEBUI_HTML.count('role="tabpanel"') == 4
     for view in views:
-        tab = re.search(rf'<button[^>]+id="tab-{view}"[^>]*>', WEBUI_HTML).group()
-        panel = re.search(rf'<div[^>]+id="view-{view}"[^>]*>', WEBUI_HTML).group()
+        tab_match = re.search(rf'<button[^>]+id="tab-{view}"[^>]*>', WEBUI_HTML)
+        panel_match = re.search(rf'<div[^>]+id="view-{view}"[^>]*>', WEBUI_HTML)
+        assert tab_match is not None
+        assert panel_match is not None
+        tab = tab_match.group()
+        panel = panel_match.group()
         assert f'aria-controls="view-{view}"' in tab
         assert f'aria-labelledby="tab-{view}"' in panel
     assert WEBUI_HTML.count('aria-selected="true"') == 1

@@ -1,6 +1,7 @@
 # WIN-4.7 — DirectML / Windows ML acceleration go/no-go spike
 
-Status: planning gate (code hook landed; benchmark + decision pending hardware)
+Status: planning gate (code hook + WIN-6.2 gate harness landed; benchmark +
+decision pending hardware)
 · Companion to `WINDOWS_IMPLEMENTATION_PLAN.md` Phase 4 · Feeds WIN-6.2
 
 This is the go/no-go spike required by WIN-4.7. Its job is not to ship a generic
@@ -49,6 +50,28 @@ A written go/no-go for each of:
    (CUDA) cannot both be installed (mirrors the CUDA/CPU either-or in
    `install.js`). Confirm the installer profile selection story before any
    bundling.
+
+## Gate harness (WIN-6.2, landed)
+
+The method below is now executable, not prose:
+`scripts/release/windows-acceleration-gate.py` implements both halves —
+
+- `run` (Windows hardware): proves DirectML RVM execution via
+  `custback.acceleration.prove_rvm_provider`, measures alpha drift against the
+  CPU reference and 720p/1080p frame times, records adapter identity and the
+  wheel-conflict state, and writes one evidence JSON per machine.
+- `check` (any OS, stdlib-only): validates the evidence against the exact
+  schema and the go/no-go criteria (both-vendor coverage, drift tolerance
+  mean ≤ 0.005 / max ≤ 0.02, 720p ≥ target FPS, no CUDA/DirectML
+  co-installation). Exit 0 = go. `tests/test_windows_acceleration_gate.py`
+  pins these criteria so they cannot drift silently.
+
+The `directml` pip extra (`onnxruntime-directml`) exists for the harness and
+the opt-in profile; `packaging/windows/pyinstaller/build.ps1` refuses to
+freeze `gpu` and `directml` together (question 4's either-or, enforced).
+This checker becomes the `windows-acceleration` gate validator once WIN-1.8 /
+WIN-5.8 wire a Windows evidence source; until evidence passes, the feature
+matrix keeps DirectML unadvertised.
 
 ## Benchmark method (reproducible)
 

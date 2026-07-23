@@ -43,6 +43,21 @@ from PyInstaller.utils.hooks import (
 )
 
 # --------------------------------------------------------------------------- #
+# Avatar driver profile (WIN-6.4).  The `mediapipe` (vision driver) and
+# `audio2face` (gRPC driver) extras cannot share one environment — NVIDIA's
+# protocol wheels require protobuf>=5.29 while mediapipe requires protobuf<5 —
+# so one frozen payload carries exactly one driver stack.  `vision` is the
+# shipped default (D7 / driver `auto`); `audio2face` is the opt-in second
+# flavor built from a venv holding the audio2face extra instead of mediapipe.
+# --------------------------------------------------------------------------- #
+AVATAR_PROFILE = os.environ.get("CUSTBACK_AVATAR_PROFILE", "vision").strip().lower()
+if AVATAR_PROFILE not in ("vision", "audio2face"):
+    raise SystemExit(
+        f"CUSTBACK_AVATAR_PROFILE must be 'vision' or 'audio2face', "
+        f"not {AVATAR_PROFILE!r}"
+    )
+
+# --------------------------------------------------------------------------- #
 # Resolve the version once so the executable's file-version resource matches
 # the single source of truth (pyproject / __init__).  Never hard-code it here:
 # the release gate pins the version across every manifest and drift would be a
@@ -88,8 +103,10 @@ for _pkg in ("mediapipe", "cv2"):
 _datas += collect_data_files("custback", includes=["**/*.yaml"])
 
 # uvicorn/websockets select their loop/protocol implementations by string import
-# at runtime; FastAPI + pydantic pull optional submodules the same way.
-for _pkg in ("uvicorn", "websockets", "anyio", "pydantic"):
+# at runtime; FastAPI + pydantic pull optional submodules the same way.  The
+# MediaPipe tasks tree (avatar vision driver, WIN-6.4) is likewise reached via
+# `mediapipe.tasks.python` at driver-start time, not import time.
+for _pkg in ("uvicorn", "websockets", "anyio", "pydantic", "mediapipe"):
     try:
         _hiddenimports += collect_submodules(_pkg)
     except Exception:
@@ -127,8 +144,28 @@ _excludes = [
     "PyQt6",
     "PySide2",
     "PySide6",
-    "custback.avatar.audio2face",  # WIN-6.4 second-service parity, not this build
 ]
+
+# WIN-6.4: exactly one avatar driver stack per payload (see AVATAR_PROFILE).
+if AVATAR_PROFILE == "audio2face":
+    _excludes += ["mediapipe"]
+    _hiddenimports += [
+        "custback.avatar.audio2face",
+        "grpc",
+        "sounddevice",
+        "nvidia_ace.audio_pb2",
+        "nvidia_audio2face_3d.audio2face_pb2_grpc",
+        "nvidia_audio2face_3d.messages_pb2",
+    ]
+    for _pkg in ("grpc", "sounddevice"):
+        try:
+            _binaries += collect_dynamic_libs(_pkg)
+        except Exception:
+            pass
+else:
+    # The vision profile ships without the gRPC driver; `driver: auto` and an
+    # explicit `audio2face` config degrade with a clear error, never a crash.
+    _excludes += ["custback.avatar.audio2face"]
 
 block_cipher = None
 
@@ -146,10 +183,29 @@ a = Analysis(
     cipher=block_cipher,
 )
 
+# WIN-6.4: the avatar service is a second executable in the *same* onedir
+# payload — the shell expects engine\custback-avatar.exe (WIN-5.5) and both
+# processes share one dependency set, so freezing them together keeps the
+# artifact small and the DLL story single-sourced.
+a_avatar = Analysis(
+    ["entry_custback_avatar.py"],
+    pathex=[],
+    binaries=_binaries,
+    datas=_datas,
+    hiddenimports=_hiddenimports,
+    hookspath=[os.path.join(SPECPATH, "hooks")],
+    hooksconfig={},
+    runtime_hooks=[os.path.join(SPECPATH, "rthooks", "pyi_rth_custback.py")],
+    excludes=_excludes,
+    noarchive=False,
+    cipher=block_cipher,
+)
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz_avatar = PYZ(a_avatar.pure, a_avatar.zipped_data, cipher=block_cipher)
 
 
-def _version_resource():
+def _version_resource(description, original_filename):
     """Build a Windows VS_VERSION_INFO resource matching CUSTBACK_VERSION.
 
     Returns ``None`` on any failure so a non-Windows dev machine can still parse
@@ -185,10 +241,13 @@ def _version_resource():
                         "040904B0",
                         [
                             StringStruct("CompanyName", "Bramen"),
-                            StringStruct("FileDescription", "Custback engine"),
+                            StringStruct("FileDescription", description),
                             StringStruct("FileVersion", CUSTBACK_VERSION),
-                            StringStruct("InternalName", "custback"),
-                            StringStruct("OriginalFilename", "custback.exe"),
+                            StringStruct(
+                                "InternalName",
+                                os.path.splitext(original_filename)[0],
+                            ),
+                            StringStruct("OriginalFilename", original_filename),
                             StringStruct("ProductName", "Custback"),
                             StringStruct("ProductVersion", CUSTBACK_VERSION),
                         ],
@@ -216,15 +275,37 @@ exe = EXE(
     # capturing stdout/stderr for supervision and doctor output.
     console=True,
     disable_windowed_traceback=False,
-    version=_version_resource(),
+    version=_version_resource("Custback engine", "custback.exe"),
+    icon=_icon if os.path.exists(_icon) else None,
+)
+
+# Same supervision contract as the engine: console=True + CREATE_NO_WINDOW in
+# the shell keeps the avatar's stdout/stderr in the supervision log (WIN-5.5).
+exe_avatar = EXE(
+    pyz_avatar,
+    a_avatar.scripts,
+    [],
+    exclude_binaries=True,
+    name="custback-avatar",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    disable_windowed_traceback=False,
+    version=_version_resource("Custback avatar service", "custback-avatar.exe"),
     icon=_icon if os.path.exists(_icon) else None,
 )
 
 coll = COLLECT(
     exe,
+    exe_avatar,
     a.binaries,
     a.zipfiles,
     a.datas,
+    a_avatar.binaries,
+    a_avatar.zipfiles,
+    a_avatar.datas,
     strip=False,
     upx=False,
     upx_exclude=[],

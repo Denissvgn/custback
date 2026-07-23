@@ -70,7 +70,7 @@ class FakeOrt:
         self.session_provider = session_provider
         self.output = output
         self.observed_model = None
-        self.observed_options = None
+        self.observed_options: FakeOptions | None = None
 
     def get_available_providers(self):
         return self.providers
@@ -97,6 +97,7 @@ def test_probe_requires_verified_cuda_node_and_output():
     assert result["profile_verified"] is True
     assert result["error"] == ""
     assert ort.observed_model == _CUDA_PROBE_MODEL
+    assert ort.observed_options is not None
     assert ort.observed_options.entries == {"session.disable_cpu_ep_fallback": "1"}
 
 

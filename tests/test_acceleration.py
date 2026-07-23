@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import types
+from typing import Any
 
 import numpy as np
 import pytest
@@ -159,7 +160,7 @@ def test_fallback_reason_is_bounded():
 
 
 def _fake_ort(*, active_provider_in_profile):
-    mod = types.ModuleType("onnxruntime")
+    mod: Any = types.ModuleType("onnxruntime")
 
     class SessionOptions:
         def __init__(self):
@@ -219,7 +220,7 @@ def test_prove_rvm_provider_rejects_registered_but_cpu_executed():
 
 
 def test_prove_rvm_provider_handles_construction_failure():
-    ort = types.ModuleType("onnxruntime")
+    ort: Any = types.ModuleType("onnxruntime")
 
     class SessionOptions:
         def add_session_config_entry(self, *a):

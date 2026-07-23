@@ -191,9 +191,11 @@ class FakeCustback:
         return self
 
     async def __aexit__(self, *_exc):
-        self._server.close()
+        server = self._server
+        assert server is not None
+        server.close()
         with contextlib.suppress(Exception):
-            await self._server.wait_closed()
+            await server.wait_closed()
 
 
 @pytest.fixture()
@@ -357,7 +359,9 @@ def test_auto_driver_keeps_idle_fallback_for_missing_custom_model(tmp_path):
     try:
         state = service.activate_initial()
         assert state.version == 0
-        assert service._components.driver.name == "idle"
+        driver = service._components.driver
+        assert driver is not None
+        assert driver.name == "idle"
     finally:
         service.close()
 

@@ -36,6 +36,7 @@ def _spec_text() -> str:
     [
         "custback.spec",
         "entry_custback.py",
+        "entry_custback_avatar.py",
         "hooks/hook-custback.py",
         "rthooks/pyi_rth_custback.py",
     ],
@@ -103,3 +104,76 @@ def test_build_smoke_scrubs_toolchain_environment() -> None:
     for scrubbed in ("PYTHONPATH", "PYTHONHOME", "CUDA_PATH"):
         assert scrubbed in build
     assert "--synthetic" in build and "--no-vcam" in build and "--no-api" in build
+
+
+# -- Phase 6 -----------------------------------------------------------------
+def _build_script() -> str:
+    return (SPEC_DIR / "build.ps1").read_text(encoding="utf-8")
+
+
+def test_spec_freezes_avatar_second_executable() -> None:
+    # WIN-6.4: one onedir payload, two console executables; the shell expects
+    # engine\custback-avatar.exe (WIN-5.5) beside the engine.
+    text = _spec_text()
+    assert "entry_custback_avatar.py" in text
+    assert 'name="custback-avatar"' in text
+    assert text.count("exclude_binaries=True") == 2
+    assert text.count("COLLECT(") == 1  # shared payload, not two artifacts
+
+
+def test_spec_avatar_profiles_are_mutually_exclusive() -> None:
+    # The mediapipe (vision) and audio2face driver stacks conflict on
+    # protobuf; the spec must carry exactly one per payload (WIN-6.4).
+    text = _spec_text()
+    assert "CUSTBACK_AVATAR_PROFILE" in text
+    assert '_excludes += ["mediapipe"]' in text
+    assert '_excludes += ["custback.avatar.audio2face"]' in text
+    build = _build_script()
+    assert "-AvatarProfile" in build or "AvatarProfile" in build
+    assert "protobuf conflict" in build
+
+
+def test_build_script_smokes_frozen_avatar() -> None:
+    assert "--smoke" in _build_script()
+
+
+def test_build_script_guards_acceleration_and_arch_profiles() -> None:
+    build = _build_script()
+    # WIN-6.2: CUDA and DirectML wheels cannot share a freeze venv.
+    assert "mutually exclusive" in build
+    # WIN-6.3: no cross-freeze, no CUDA/mediapipe on ARM64.
+    assert "arm64" in build
+    assert "platform.machine()" in build
+    for guard in (
+        "'gpu' (CUDA) extra is not available on Windows ARM64",
+        "no Windows ARM64 wheel",
+    ):
+        assert guard in build, f"missing ARM64 guard: {guard}"
+
+
+def test_shell_supervises_avatar_with_real_cli_contract() -> None:
+    shell_dir = SPEC_DIR.parents[0] / "shell"
+    engine = (shell_dir / "Engine.cs").read_text(encoding="utf-8")
+    # The avatar CLI has no "serve" subcommand; supervision must pass the
+    # real flags: engine WS source, renderer token path, avatar API token path
+    # (paths, never secrets, on the command line — WIN-5.3 discipline).
+    assert '"serve"' not in engine
+    for flag in ("--source", "--source-token-file", "--api-token-file"):
+        assert flag in engine, f"avatar supervision is missing {flag}"
+    assert "MaxAvatarRestarts" in engine
+    csproj = (shell_dir / "Custback.Shell.csproj").read_text(encoding="utf-8")
+    assert "win-arm64" in csproj  # WIN-6.3 publish RID
+
+
+def test_installer_is_arch_parameterized_and_avatar_gated() -> None:
+    installer_dir = SPEC_DIR.parents[0] / "installer"
+    build = (installer_dir / "build.ps1").read_text(encoding="utf-8")
+    # WIN-6.3: MSI/bundle arch and the matching VC++ redistributable.
+    assert '"x64", "arm64"' in build
+    assert "-arch $Arch" in build
+    bundle = (installer_dir / "Bundle.wxs").read_text(encoding="utf-8")
+    assert "VC_redist.$(var.Arch).exe" in bundle
+    # WIN-6.4/WIN-5.5: the avatar ships only on request; default payload
+    # drops custback-avatar.exe before harvesting.
+    assert "IncludeAvatar" in build
+    assert "custback-avatar.exe" in build

@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import os
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -66,16 +67,22 @@ async def main() -> None:
         if "additional_headers" in connect_parameters
         else "extra_headers"
     )
-    proxy_args = {"proxy": None} if "proxy" in connect_parameters else {}
+    # The header keyword changed across supported websockets releases.  Keep
+    # the dynamically selected keyword at this compatibility boundary rather
+    # than making the rest of the connection call untyped.
+    connect_kwargs: dict[str, Any] = {header_arg: headers}
+    if "proxy" in connect_parameters:
+        connect_kwargs["proxy"] = None
     async with websockets.connect(
         CUSTBACK_WS,
         max_size=16 * 1024 * 1024,
-        **proxy_args,
-        **{header_arg: headers},
+        **connect_kwargs,
     ) as ws:
         print(f"connected to {CUSTBACK_WS}")
         while True:
             data = await ws.recv()
+            if not isinstance(data, bytes):
+                raise RuntimeError("frame WebSocket returned a non-binary message")
             frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
                 continue

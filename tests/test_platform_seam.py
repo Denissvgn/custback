@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
+from typing import Any
 
 import pytest
 
@@ -157,7 +158,9 @@ def test_is_private_to_owner_false_when_group_or_other_readable(tmp_path):
     not WINDOWS, reason="NTFS owner-only DACL is protected (no inheritance)"
 )
 def test_private_dacl_is_owner_only_and_protected(tmp_path):
-    import win32security
+    import win32security as _win32security  # pyright: ignore[reportMissingModuleSource]
+
+    win32security: Any = _win32security
 
     target = tmp_path / "private"
     _make_private_file(target)

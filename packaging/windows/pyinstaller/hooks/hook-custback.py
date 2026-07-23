@@ -14,7 +14,10 @@ Model *weights* (``*.onnx`` / ``*.tflite``) are deliberately excluded — they a
 licensing-gated and downloaded on first run (WIN-0.4, D6).
 """
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import (  # pyright: ignore[reportMissingModuleSource] - build-time-only dependency
+    collect_data_files,
+    collect_submodules,
+)
 
 hiddenimports = collect_submodules("custback")
 

@@ -685,10 +685,12 @@ def test_failed_staging_unlink_remains_reserved_and_retryable(
     kind,
 ):
     cfg = storage(tmp_path)
-    store = MediaStore(cfg) if kind == "media" else RigStore(cfg)
-    reservation = (
-        store.open_staging("image") if kind == "media" else store.open_staging()
-    )
+    if kind == "media":
+        store = MediaStore(cfg)
+        reservation = store.open_staging("image")
+    else:
+        store = RigStore(cfg)
+        reservation = store.open_staging()
     reservation.write(b"reserved bytes")
     original_unlink = Path.unlink
     failed = False

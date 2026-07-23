@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import numpy as np
+from typing import Any
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover
-    cv2 = None
+    _cv2 = None
+
+# OpenCV is a compiled optional boundary. Keep its runtime ``None`` fallback
+# while treating the dynamically exposed API as opaque to static analysis.
+cv2: Any = _cv2
 
 
 def _downscaled_blur(image: np.ndarray, scale: int = 8, kernel: int = 9) -> np.ndarray:

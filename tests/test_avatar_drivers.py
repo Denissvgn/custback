@@ -8,10 +8,12 @@ import time
 import wave
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import pytest
 
+import custback.avatar.audio2face as audio2face_mod
 import custback.avatar.drivers as drivers_mod
 from custback.avatar.audio2face import (
     Audio2FaceDriver,
@@ -19,7 +21,7 @@ from custback.avatar.audio2face import (
     arkit_channel_name,
     map_blendshape_frame,
 )
-from custback.avatar.config import Audio2FaceConfig, DriverConfig
+from custback.avatar.config import Audio2FaceConfig, DriverConfig, VisionConfig
 from custback.api.security import SecurityConfigurationError
 from custback.avatar.drivers import (
     FACE_LANDMARKER_MODEL,
@@ -32,6 +34,18 @@ from custback.avatar.drivers import (
     prepare_driver,
 )
 from custback.avatar.state import ARKIT_BLENDSHAPES, FaceState, StateSmoother
+
+
+def _partial_protocol(**members: Any) -> audio2face_mod._Protocol:
+    """Type a test double that supplies only the gRPC members exercised here."""
+
+    return cast(audio2face_mod._Protocol, SimpleNamespace(**members))
+
+
+def _partial_audio_source(value: object) -> audio2face_mod.AudioSource:
+    """Mark a deliberately partial source double at the private-call boundary."""
+
+    return cast(audio2face_mod.AudioSource, value)
 
 
 def test_idle_driver_is_deterministic_and_present():
@@ -94,7 +108,7 @@ def test_create_driver_idle_and_auto_fallback():
     assert create_driver(DriverConfig(backend="idle")).name == "idle"
     pytest.importorskip("cv2")
     try:
-        import mediapipe  # noqa: F401
+        import mediapipe  # pyright: ignore[reportMissingImports]  # noqa: F401
     except ImportError:
         # auto degrades to idle instead of failing the service.
         assert create_driver(DriverConfig(backend="auto")).name == "idle"
@@ -185,7 +199,7 @@ def test_prepared_custom_model_is_not_revalidated_on_render_lane(monkeypatch, tm
             AssertionError("a custom model must not use managed acquisition")
         ),
     )
-    cfg = DriverConfig(backend="vision", vision={"model_path": str(model)})
+    cfg = DriverConfig(backend="vision", vision=VisionConfig(model_path=str(model)))
 
     preparation = prepare_driver(cfg)
     model.unlink()  # construction consumes the prepared result without stat I/O
@@ -205,11 +219,13 @@ def test_prepare_driver_preserves_auto_fallback_for_missing_custom_model(
             AssertionError("custom path validation must happen before imports")
         ),
     )
-    auto = DriverConfig(backend="auto", vision={"model_path": str(missing)})
+    auto = DriverConfig(backend="auto", vision=VisionConfig(model_path=str(missing)))
     preparation = prepare_driver(auto)
     assert create_driver(auto, preparation=preparation).name == "idle"
 
-    vision = DriverConfig(backend="vision", vision={"model_path": str(missing)})
+    vision = DriverConfig(
+        backend="vision", vision=VisionConfig(model_path=str(missing))
+    )
     with pytest.raises(DriverUnavailableError, match="does not exist"):
         prepare_driver(vision)
 
@@ -242,9 +258,13 @@ def test_create_driver_rejects_preparation_for_a_different_candidate(
     second.write_bytes(b"second")
     bindings, _captured = _fake_vision_bindings()
     monkeypatch.setattr(drivers_mod, "_load_vision_bindings", lambda: bindings)
-    original = DriverConfig(backend="vision", vision={"model_path": str(first)})
+    original = DriverConfig(
+        backend="vision", vision=VisionConfig(model_path=str(first))
+    )
     preparation = prepare_driver(original)
-    changed = DriverConfig(backend="vision", vision={"model_path": str(second)})
+    changed = DriverConfig(
+        backend="vision", vision=VisionConfig(model_path=str(second))
+    )
 
     with pytest.raises(ValueError, match="does not match"):
         create_driver(changed, preparation=preparation)
@@ -435,10 +455,13 @@ def test_audio2face_concurrent_close_waits_for_one_terminal_operation():
     release = threading.Event()
     returns = []
 
-    class Source:
+    class Source(audio2face_mod.AudioSource):
         closes = 0
 
-        def close(self):
+        def read(self, _frames: int) -> bytes:
+            return b""
+
+        def close(self) -> None:
             self.closes += 1
             entered.set()
             release.wait()
@@ -477,10 +500,13 @@ def test_audio2face_close_bounds_and_retains_blocked_native_interrupt(monkeypatc
     entered = threading.Event()
     release = threading.Event()
 
-    class Source:
+    class Source(audio2face_mod.AudioSource):
         closes = 0
 
-        def close(self):
+        def read(self, _frames: int) -> bytes:
+            return b""
+
+        def close(self) -> None:
             self.closes += 1
             entered.set()
             release.wait()
@@ -512,12 +538,13 @@ def test_audio2face_interruption_completion_race_retains_identity():
 
     pending = audio2face_mod._PendingInterruption("source", object())
 
-    class CompletingEvent:
-        def __init__(self):
+    class CompletingEvent(threading.Event):
+        def __init__(self) -> None:
+            super().__init__()
             self.calls = 0
             self.completed = False
 
-        def is_set(self):
+        def is_set(self) -> bool:
             self.calls += 1
             if self.calls == 2:
                 # Completion lands immediately after the classifier's state
@@ -527,7 +554,7 @@ def test_audio2face_interruption_completion_race_retains_identity():
                 return False
             return self.completed
 
-        def wait(self, _timeout=None):
+        def wait(self, _timeout: float | None = None) -> bool:
             return self.completed
 
     pending.done = CompletingEvent()
@@ -550,15 +577,15 @@ def test_audio2face_close_interrupts_pacing_wait():
         def __init__(self, **_kwargs):
             pass
 
-    protocol = SimpleNamespace(
+    protocol = _partial_protocol(
         audio_header=AudioHeader,
         audio_stream_header=lambda **kwargs: kwargs,
         audio_stream=lambda **kwargs: kwargs,
         audio_with_emotion=lambda **kwargs: kwargs,
     )
 
-    class EmptySource:
-        def read(self, _frames):
+    class EmptySource(audio2face_mod.AudioSource):
+        def read(self, _frames: int) -> bytes:
             entered.set()
             return b""
 
@@ -710,12 +737,12 @@ def test_audio2face_rejected_call_cancel_failure_is_reclaimed_on_close():
             driver._stop.set()
             return call
 
-    protocol = SimpleNamespace(
+    protocol = _partial_protocol(
         grpc=SimpleNamespace(insecure_channel=lambda _url, **_kwargs: channel),
         stub_class=Stub,
     )
 
-    driver._run_session(protocol, object())
+    driver._run_session(protocol, _partial_audio_source(object()))
 
     assert call.cancels == 1
     assert channel.closes == 1
@@ -776,9 +803,9 @@ def test_audio2face_remote_session_uses_verified_secure_channel():
         def ProcessAudioStream(self, _requests):
             return ()
 
-    protocol = SimpleNamespace(grpc=Grpc, stub_class=Stub)
+    protocol = _partial_protocol(grpc=Grpc, stub_class=Stub)
     driver = Audio2FaceDriver(Audio2FaceConfig(url="grpcs://a2f.example:52000"))
-    driver._run_session(protocol, SimpleNamespace())
+    driver._run_session(protocol, _partial_audio_source(SimpleNamespace()))
 
     assert (
         "secure",
@@ -819,7 +846,9 @@ def test_audio2face_loopback_channel_disables_environment_proxying():
             return ()
 
     driver = Audio2FaceDriver(Audio2FaceConfig(url="grpc://127.0.0.1:52000"))
-    driver._run_session(SimpleNamespace(grpc=Grpc, stub_class=Stub), object())
+    driver._run_session(
+        _partial_protocol(grpc=Grpc, stub_class=Stub), _partial_audio_source(object())
+    )
 
     assert calls == [("127.0.0.1:52000", (("grpc.enable_http_proxy", 0),))]
 
@@ -899,7 +928,9 @@ def test_audio2face_snapshots_tls_trust_before_reconnects(tmp_path):
         def ProcessAudioStream(self, _requests):
             return ()
 
-    driver._run_session(SimpleNamespace(grpc=Grpc, stub_class=Stub), object())
+    driver._run_session(
+        _partial_protocol(grpc=Grpc, stub_class=Stub), _partial_audio_source(object())
+    )
 
     credential_call = next(call for call in calls if call[0] == "credentials")
     assert credential_call[1]["root_certificates"] == ca_bytes

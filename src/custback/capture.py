@@ -14,7 +14,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -23,9 +23,13 @@ from .config import CameraConfig
 from .diagnostics import redact_sensitive_text, sanitized_source
 
 try:
-    import cv2
+    import cv2 as _cv2
 except ImportError:  # pragma: no cover
-    cv2 = None
+    _cv2 = None
+
+# OpenCV is a compiled optional boundary. Keep its runtime ``None`` fallback
+# while treating the dynamically exposed API as opaque to static analysis.
+cv2: Any = _cv2
 
 
 log = logging.getLogger(__name__)
@@ -101,7 +105,7 @@ def _safe_get(cap: Any, prop: int | None) -> float | None:
 def _fourcc_value(code: str) -> int:
     writer_fourcc = getattr(cv2, "VideoWriter_fourcc", None)
     if callable(writer_fourcc):
-        return int(writer_fourcc(*code))
+        return int(cast(Any, writer_fourcc)(*code))
     return sum(ord(char) << (8 * index) for index, char in enumerate(code))
 
 
@@ -157,7 +161,7 @@ class OpenCVCapture(CaptureSource):
     is created, ensuring that two readers never access the device concurrently.
     """
 
-    _BACKOFFS = (0.5, 1.0, 2.0, 4.0)
+    _BACKOFFS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     _READER_JOIN_TIMEOUT_S = 1.0
     _RATE_WINDOW_S = 2.0
     _RATE_WARNING_AFTER_S = 5.0

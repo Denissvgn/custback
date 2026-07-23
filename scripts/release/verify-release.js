@@ -65,6 +65,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/segmentation.py',
   'custback/storage_tx.py',
   'custback/vcam.py',
+  'custback/vcam_native.py',
 ];
 const REVIEWED_PYTHON_TESTS = [
   'tests/test_acceleration.py',
@@ -101,7 +102,9 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_streaming.py',
   'tests/test_vcam.py',
   'tests/test_webui.py',
+  'tests/test_windows_acceleration_gate.py',
   'tests/test_windows_packaging.py',
+  'tests/test_windows_vcam.py',
   'tests/fixtures/migration/expected-0.4.0-local-camera.yaml',
   'tests/fixtures/migration/legacy-0.3.0-default.yaml',
   'tests/fixtures/migration/legacy-0.3.0-local-camera.yaml',
@@ -147,6 +150,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'scripts/release/two-host-system-test.py',
   'scripts/release/two-host/Dockerfile',
   'scripts/release/two-host/probe.py',
+  'scripts/release/windows-acceleration-gate.py',
   'scripts/release/verify-clean-tree.js',
   'scripts/release/verify-release.js',
   'scripts/release/remediation-blockers.json',
@@ -171,6 +175,10 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
   mediapipe: ['mediapipe>=0.10.14,<0.11'],
   rvm: ['onnxruntime>=1.17,<2'],
   gpu: ['onnxruntime-gpu>=1.17,<1.27'],
+  // Windows-only DirectML acceleration profile (WIN-6.2). Mutually exclusive
+  // with `gpu` in any one environment (same `onnxruntime` package); the
+  // freeze script and the WIN-6.2 gate both enforce the either-or.
+  directml: ['onnxruntime-directml>=1.17,<2'],
   // Windows filesystem-security backend (custback._platform.windows): LockFileEx,
   // owner-only DACLs, reparse-point rejection, SID ownership, MoveFileEx.
   windows: ['pywin32>=306'],

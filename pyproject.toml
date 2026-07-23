@@ -35,6 +35,13 @@ rvm = ["onnxruntime>=1.17,<2"]
 # ONNX Runtime 1.27 switched the Python 3.14 Linux wheel to CUDA 13, while
 # custback's supported GPU runtime line remains CUDA 12.
 gpu = ["onnxruntime-gpu>=1.17,<1.27"]
+# Windows-only: RVM on any Windows GPU via the DirectML execution provider
+# (WIN-6.2). Mutually exclusive with `gpu`: both wheels provide the same
+# `onnxruntime` import and must never share an environment — the frozen
+# installer picks exactly one profile, and the WIN-6.2 release gate
+# (scripts/release/windows-acceleration-gate.py) fails on co-installation.
+# Unadvertised until that gate passes on AMD and Intel hardware.
+directml = ["onnxruntime-directml>=1.17,<2"]
 # Windows filesystem-security backend (custback._platform.windows): the
 # LockFileEx/owner-only-DACL/reparse-rejection/SID/MoveFileEx primitives that
 # replace the POSIX fcntl/fchmod/O_NOFOLLOW/geteuid contract (Phase 2, WIN-2.x).

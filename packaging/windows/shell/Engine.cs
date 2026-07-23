@@ -19,6 +19,7 @@ internal sealed record EngineOptions(
     string? AvatarExe,
     string TokenFile,
     string RendererTokenFile,
+    string AvatarTokenFile,
     string LogFile)
 {
     internal bool SuperviseAvatar => AvatarExe is not null && File.Exists(AvatarExe);
@@ -42,6 +43,7 @@ internal sealed record EngineOptions(
             AvatarExe: File.Exists(avatarExe) ? avatarExe : null,
             TokenFile: Path.Combine(configDir, "api-token"),
             RendererTokenFile: Path.Combine(configDir, "renderer-token"),
+            AvatarTokenFile: Path.Combine(configDir, "avatar-api-token"),
             LogFile: Path.Combine(logDir, "shell.log"));
     }
 }
@@ -68,7 +70,13 @@ internal sealed class Engine : IDisposable
     private Process? _engineProcess;
     private Process? _avatarProcess;
     private string? _bearer;
+    private int _avatarRestarts;
     private volatile bool _shuttingDown;
+
+    // WIN-6.4: bounded avatar restart budget. The avatar service reconnects to
+    // the engine's WebSocket on its own; the shell only revives the *process*
+    // after an unexpected exit, and stops trying when it keeps dying.
+    private const int MaxAvatarRestarts = 3;
 
     internal Engine(EngineOptions options) => _options = options;
 
@@ -92,14 +100,29 @@ internal sealed class Engine : IDisposable
             "--renderer-token-file", _options.RendererTokenFile,
         });
 
+        await WaitForReadyAsync(cancellationToken).ConfigureAwait(false);
+
         if (_options.SuperviseAvatar)
         {
-            // The avatar service is a second process with its own storage and
-            // drivers; supervise it only when installed (WIN-5.5).
-            _avatarProcess = StartProcess(_options.AvatarExe!, new[] { "serve" });
+            // WIN-6.4: the avatar service starts only after the engine is
+            // ready — it consumes the engine's raw-frame WebSocket and reads
+            // the renderer token file the engine just provisioned. Paths, not
+            // secrets, on the command line (same rule as the engine's tokens).
+            StartAvatar();
         }
+    }
 
-        await WaitForReadyAsync(cancellationToken).ConfigureAwait(false);
+    private void StartAvatar()
+    {
+        // The avatar service is a second process with its own storage and
+        // drivers; supervise it only when installed (WIN-5.5).
+        _avatarProcess = StartProcess(_options.AvatarExe!, new[]
+        {
+            "--source", $"ws://127.0.0.1:{Port}",
+            "--source-token-file", _options.RendererTokenFile,
+            "--api-token-file", _options.AvatarTokenFile,
+            "--driver", "auto",
+        });
     }
 
     private static int ReserveLoopbackPort()
@@ -149,7 +172,40 @@ internal sealed class Engine : IDisposable
 
     private void OnProcessExited(object? sender, EventArgs e)
     {
-        if (_shuttingDown || !ReferenceEquals(sender, _engineProcess))
+        if (_shuttingDown)
+        {
+            return;
+        }
+
+        if (ReferenceEquals(sender, _avatarProcess))
+        {
+            // WIN-6.4: revive the avatar a bounded number of times; the engine
+            // keeps running either way (avatar is an optional second process).
+            var exited = _avatarProcess;
+            if (_avatarRestarts < MaxAvatarRestarts && _options.SuperviseAvatar)
+            {
+                _avatarRestarts++;
+                AppendLog($"avatar service exited; restart {_avatarRestarts}/{MaxAvatarRestarts}");
+                try
+                {
+                    StartAvatar();
+                }
+                catch (Exception ex)
+                {
+                    AppendLog($"avatar restart failed: {ex.Message}");
+                }
+            }
+            else
+            {
+                AppendLog("avatar service exited; restart budget exhausted");
+                _avatarProcess = null;
+            }
+
+            exited?.Dispose();
+            return;
+        }
+
+        if (!ReferenceEquals(sender, _engineProcess))
         {
             return;
         }
@@ -242,7 +298,10 @@ internal sealed class Engine : IDisposable
             // Engine may already be gone; fall through to the wait/kill below.
         }
 
-        await StopProcessAsync(_avatarProcess, timeout).ConfigureAwait(false);
+        // The avatar has no graceful-stop channel (it reconnects to a lost
+        // WebSocket by design), so give it only a short grace period before
+        // the tree kill; the engine keeps the full drain timeout.
+        await StopProcessAsync(_avatarProcess, TimeSpan.FromSeconds(2)).ConfigureAwait(false);
         await StopProcessAsync(_engineProcess, timeout).ConfigureAwait(false);
     }
 

@@ -868,14 +868,16 @@ class _UploadStore:
                     for record in self._ledger.records
                     if record.state == "cleanup"
                 )
-                self._active_temps = {
+                active_temps = {
                     path for record in pending_records for path in record.paths
-                } | {
+                }
+                active_temps.update(
                     path
                     for path in self._active_temps
-                    if self._ledger.find(path) is not None
-                    and self._ledger.find(path).state == "active"
-                }
+                    if (owned := self._ledger.find(path)) is not None
+                    and owned.state == "active"
+                )
+                self._active_temps = active_temps
                 for temporary, record in tuple(self._cleanup_pending.items()):
                     owned = self._ledger.find(*record[0])
                     if owned is None:

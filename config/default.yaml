@@ -62,7 +62,7 @@ compositing:
   use_model_foreground: true  # rvm only: color-spill removal on hair/edges
 
 output:
-  backend: auto        # auto | pyvirtualcam | null (API-only)
+  backend: auto        # auto | pyvirtualcam | native (Win11 MF camera) | null (API-only)
   device: ""           # e.g. /dev/video10 on Linux; empty = auto
   fps: 30
   preview: false       # on-screen window with the processed output (q/ESC quits)

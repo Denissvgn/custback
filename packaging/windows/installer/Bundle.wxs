@@ -19,6 +19,11 @@
 
   <?define ProductName = "Custback" ?>
   <?define Manufacturer = "Bramen" ?>
+  <!-- Target architecture (WIN-6.3): build.ps1 passes x64 or arm64; the
+       matching VC++ redistributable is chained below. -->
+  <?ifndef Arch ?>
+    <?define Arch = "x64" ?>
+  <?endif ?>
 
   <Bundle Name="$(ProductName)"
           Manufacturer="$(Manufacturer)"
@@ -64,7 +69,7 @@
            InstallCommand is silent; DetectCondition guards re-install. -->
       <ExePackage
           Id="VCppRuntime"
-          SourceFile="redist\VC_redist.x64.exe"
+          SourceFile="redist\VC_redist.$(var.Arch).exe"
           InstallArguments="/install /quiet /norestart"
           Permanent="yes"
           Vital="yes"

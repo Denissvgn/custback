@@ -172,6 +172,7 @@ def test_async_subscription_drops_backlog_and_delivers_latest_frame():
                 hub.publish_output(np.full((1, 1, 3), value, np.uint8))
             frame, seq = await subscription.get(-1, 0.1)
             assert seq == 3
+            assert frame is not None
             assert int(frame[0, 0, 0]) == 3
 
     asyncio.run(scenario())

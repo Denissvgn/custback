@@ -1015,6 +1015,7 @@ def main(
 
     try:
         if args.config is not None:
+            assert args.target_id is not None
             result = migrate_config(args.config, args.target_id)
             if result.status is MigrationStatus.OPERATOR_ACTION_REQUIRED:
                 print(

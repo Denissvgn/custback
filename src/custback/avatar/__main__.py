@@ -182,7 +182,14 @@ def export_avatar_config(
     return 0
 
 
-def _config_export_destination(argv: list[str]) -> str | None | object:
+class _NotConfigExport:
+    """Private sentinel for commands other than ``config export``."""
+
+
+_NOT_CONFIG_EXPORT = _NotConfigExport()
+
+
+def _config_export_destination(argv: list[str]) -> str | None | _NotConfigExport:
     """Parse the command without letting the runtime parser consume it."""
 
     if argv[:2] != ["config", "export"]:
@@ -190,9 +197,6 @@ def _config_export_destination(argv: list[str]) -> str | None | object:
     if len(argv) > 3:
         raise ValueError("usage: custback avatar config export [PATH]")
     return argv[2] if len(argv) == 3 else None
-
-
-_NOT_CONFIG_EXPORT = object()
 
 
 def config_from_args(args: argparse.Namespace) -> AvatarConfig:
@@ -437,7 +441,7 @@ def main(argv: list[str] | None = None, *, prog: str = "custback-avatar") -> int
     except ValueError as exc:
         print(f"{prog}: {exc}", file=sys.stderr)
         return EXIT_CONFIG
-    if destination is not _NOT_CONFIG_EXPORT:
+    if not isinstance(destination, _NotConfigExport):
         try:
             return export_avatar_config(destination)
         except (OSError, ValueError) as exc:

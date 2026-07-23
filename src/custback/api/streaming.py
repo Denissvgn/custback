@@ -148,10 +148,12 @@ class JpegBroadcaster:
 
         # Wake clients before registering the next callback. If the next
         # encoder is extremely fast, add_done_callback may run inline.
-        if error is None:
-            delivery.set_result((data, seq))
-        else:
+        if error is not None:
             delivery.set_exception(error)
+        elif data is not None:
+            delivery.set_result((data, seq))
+        else:  # pragma: no cover - Future[bytes] cannot normally produce None
+            delivery.set_exception(RuntimeError("JPEG encoder completed without data"))
         if next_job is not None:
             next_job.add_done_callback(self._completed)
 
@@ -176,18 +178,21 @@ class JpegBroadcaster:
                 )
                 created_job = self._start_locked(frame, seq, delivery)
             elif seq <= self._running_seq:
-                delivery = self._running_delivery
-                if delivery is None:  # pragma: no cover - invariant guard
+                running_delivery = self._running_delivery
+                if running_delivery is None:  # pragma: no cover - invariant guard
                     raise RuntimeError("JPEG encoder delivery is unavailable")
+                delivery = running_delivery
             else:
-                if self._pending_delivery is None:
-                    self._pending_delivery = concurrent.futures.Future()
+                pending_delivery = self._pending_delivery
+                if pending_delivery is None:
+                    pending_delivery = concurrent.futures.Future()
+                    self._pending_delivery = pending_delivery
                 if seq > self._pending_seq:
                     # One pending frame is retained. Every newer sequence
                     # replaces it while all callers share the same delivery.
                     self._pending_seq = seq
                     self._pending_frame = frame
-                delivery = self._pending_delivery
+                delivery = pending_delivery
 
         # A suspended caller must not retain its superseded input frame. The
         # running worker and the single pending slot now own the only frames

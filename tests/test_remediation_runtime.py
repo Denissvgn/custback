@@ -36,6 +36,7 @@ from custback.avatar.config import (
     AvatarRuntime,
     StorageConfig,
 )
+from custback.avatar.drivers import FaceDriver
 from custback.avatar.rig import alpha_over
 from custback.avatar.service import (
     ActivationError as AvatarActivationError,
@@ -47,7 +48,7 @@ from custback.avatar.state import FaceState
 from custback.avatar.store import MediaStore, RigStore, StoreError
 from custback.config import AppConfig, RuntimeConfig, SegmentationConfig
 from custback.hub import FrameHub
-from custback.pipeline import ActivationError, Pipeline, _Resources
+from custback.pipeline import ActivationError, Pipeline, _Activation, _Resources
 
 
 async def _with_event_loop_heartbeat(awaitable):
@@ -327,7 +328,7 @@ def test_LIFE_01_session_waits_for_inflight_render_before_returning(monkeypatch)
 def test_CFG_01_failed_candidate_preserves_complete_live_generation():
     created = []
 
-    class Driver:
+    class Driver(FaceDriver):
         name = "tracked"
         device = "cpu"
 
@@ -380,7 +381,7 @@ def test_CFG_01_partial_candidate_construction_closes_staged_driver(
 ):
     created = []
 
-    class Driver:
+    class Driver(FaceDriver):
         name = "partial-candidate"
         device = "cpu"
 
@@ -487,7 +488,7 @@ def test_CFG_01_concurrent_avatar_patches_cas_or_conflict(monkeypatch):
 
 
 def test_CFG_01_concurrent_driver_preparation_linearizes_to_conflict(monkeypatch):
-    class Driver:
+    class Driver(FaceDriver):
         device = "cpu"
 
         def __init__(self, name):
@@ -765,7 +766,7 @@ def test_LIFE_01_replacement_waits_for_terminal_render_ownership():
     old_closed = threading.Event()
     created = []
 
-    class Driver:
+    class Driver(FaceDriver):
         name = "owned"
         device = "cpu"
 
@@ -872,7 +873,7 @@ def test_LIFE_01_cancelled_staging_close_failure_poison_is_terminal():
     trial_release = threading.Event()
     created = []
 
-    class Driver:
+    class Driver(FaceDriver):
         name = "owned"
         device = "cpu"
 
@@ -1009,7 +1010,7 @@ def test_LIFE_01_cancelled_render_never_publishes_stale_preview(monkeypatch):
 
 
 def test_LIFE_01_failed_component_close_is_owned_and_retryable():
-    class FlakyDriver:
+    class FlakyDriver(FaceDriver):
         name = "flaky-close"
         device = "cpu"
 
@@ -1275,7 +1276,7 @@ def test_SEG_03_trial_rejects_invalid_raw_mask_before_refine(invalid_mask):
         frame,
         np.zeros(frame.shape[:2], dtype=np.float32),
     )
-    activation = SimpleNamespace(
+    activation = _Activation(
         candidate=candidate,
         segmenter=_FixedMaskSegmenter(invalid_mask),
         refiner=segmentation_mod.MaskRefiner(candidate.segmentation),
@@ -1337,7 +1338,7 @@ def test_RENDER_01_half_alpha_layer_is_not_double_multiplied():
 
 # RENDER-02 permanent regression: follow_pose affects both render paths.
 def test_RENDER_02_follow_pose_false_changes_rendered_output():
-    class PoseDriver:
+    class PoseDriver(FaceDriver):
         name = "pose-test"
         device = "cpu"
 

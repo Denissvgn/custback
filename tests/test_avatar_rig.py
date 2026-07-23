@@ -566,6 +566,7 @@ def test_create_avatar_backdrop_modes(tmp_path):
     color = create_avatar_backdrop(
         AvatarBackgroundConfig(mode="color", color=(1, 2, 3))
     )
+    assert color is not None
     frame = color.frame(32, 16)
     assert frame.shape == (16, 32, 3)
     assert (frame == (1, 2, 3)).all()
@@ -576,6 +577,7 @@ def test_create_avatar_backdrop_modes(tmp_path):
     image = create_avatar_backdrop(
         AvatarBackgroundConfig(mode="image", image_path=str(image_path))
     )
+    assert image is not None
     assert image.frame(32, 16).shape == (16, 32, 3)
 
 
