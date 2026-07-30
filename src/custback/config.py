@@ -37,11 +37,107 @@ AccelerationProvider = Literal["auto", "cuda", "directml"]
 OutputBackend = Literal["auto", "pyvirtualcam", "native", "null"]
 CameraPixelFormat = Literal["auto", "mjpeg", "backend"]
 CameraModeMismatch = Literal["warn", "error"]
+FitMode = Literal["cover", "contain", "stretch"]
+RightAngleRotation = Literal[0, 90, 180, 270]
+BlendSpace = Literal["srgb_legacy", "linear_srgb"]
+ColorCorrectionMode = Literal["off", "auto"]
+VideoColorMatrix = Literal["auto", "bt601", "bt709"]
+VideoColorRange = Literal["auto", "limited", "full"]
+VideoColorPrimaries = Literal["auto", "bt709", "bt470bg", "smpte170m"]
+VideoColorTransfer = Literal["auto", "srgb", "bt709"]
+LEGACY_CONFIG_SCHEMA_VERSION = 1
+CURRENT_CONFIG_SCHEMA_VERSION = 1
 ColorChannel = Annotated[int, Field(ge=0, le=255)]
+FrameDimension = Annotated[int, Field(ge=16, le=7680)]
+Anchor = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+UnitStrength = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+ExposureLimitEv = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+AdaptationTimeSeconds = Annotated[float, Field(ge=0.05, le=10.0, allow_inf_nan=False)]
+SchemaVersion = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=LEGACY_CONFIG_SCHEMA_VERSION,
+        le=CURRENT_CONFIG_SCHEMA_VERSION,
+    ),
+]
 SAFE_IMAGE_MAX_PIXELS = 89_478_485
 _BACKDROP_TARGET_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\\\/]")
+
+
+def materialize_config_schema_defaults(data: dict[str, Any]) -> dict[str, Any]:
+    """Copy a persisted mapping and bind absent fields to its schema semantics.
+
+    Keeping this dispatch separate from Pydantic model defaults is what makes a
+    versionless or explicit schema-v1 document retain v1 behavior after a later
+    release introduces different new-install defaults.
+    """
+
+    version = data.get("schema_version", LEGACY_CONFIG_SCHEMA_VERSION)
+    materialized = {"schema_version": version}
+    materialized.update(
+        (key, value) for key, value in data.items() if key != "schema_version"
+    )
+    if type(version) is not int or version != LEGACY_CONFIG_SCHEMA_VERSION:
+        # Strict schema validation reports malformed and unsupported versions.
+        # A later supported version must add its own explicit defaults here.
+        return materialized
+
+    def bind_section(section_name: str, defaults: dict[str, Any]) -> None:
+        section = materialized.get(section_name)
+        if section is None and section_name not in materialized:
+            materialized[section_name] = dict(defaults)
+        elif isinstance(section, dict):
+            bound = dict(section)
+            for field_name, value in defaults.items():
+                bound.setdefault(field_name, value)
+            materialized[section_name] = bound
+
+    bind_section(
+        "camera",
+        {
+            "fit_mode": "stretch",
+            "anchor_x": 0.5,
+            "anchor_y": 0.5,
+            "rotation": 0,
+        },
+    )
+    bind_section(
+        "background",
+        {
+            "fit_mode": "cover",
+            "anchor_x": 0.5,
+            "anchor_y": 0.5,
+            "video_color_matrix": "auto",
+            "video_color_range": "auto",
+            "video_color_primaries": "auto",
+            "video_color_transfer": "auto",
+        },
+    )
+    bind_section("output", {"width": None, "height": None})
+    bind_section("compositing", {"blend_space": "srgb_legacy"})
+
+    compositing = materialized.get("compositing")
+    if isinstance(compositing, dict):
+        correction_defaults = {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8,
+        }
+        correction = compositing.get("color_correction")
+        if correction is None and "color_correction" not in compositing:
+            compositing["color_correction"] = correction_defaults
+        elif isinstance(correction, dict):
+            bound_correction = dict(correction)
+            for field_name, value in correction_defaults.items():
+                bound_correction.setdefault(field_name, value)
+            compositing["color_correction"] = bound_correction
+    return materialized
+
 
 # These fields select the avatar proxy's outbound security boundary.  They are
 # consumed when the API application is constructed and cannot safely diverge
@@ -172,12 +268,16 @@ class _StrictModel(BaseModel):
 
 class CameraConfig(_StrictModel):
     device: int | str = 0
-    width: int = Field(default=1280, ge=16, le=7680)
-    height: int = Field(default=720, ge=16, le=7680)
+    width: FrameDimension = 1280
+    height: FrameDimension = 720
     fps: int = Field(default=30, ge=1, le=240)
     pixel_format: CameraPixelFormat = "auto"
     mode_mismatch: CameraModeMismatch = "warn"
     recovery_timeout_s: float = Field(default=10.0, ge=2.0, le=300.0)
+    fit_mode: FitMode = "stretch"
+    anchor_x: Anchor = 0.5
+    anchor_y: Anchor = 0.5
+    rotation: RightAngleRotation = 0
     synthetic: bool = False
     mirror: bool = False
 
@@ -185,6 +285,15 @@ class CameraConfig(_StrictModel):
     @classmethod
     def _valid_device(cls, value: int | str) -> int | str:
         return _clean_device(value, allow_empty=False)
+
+    @field_validator("rotation", mode="before")
+    @classmethod
+    def _strict_right_angle_rotation(cls, value: object) -> object:
+        # Pydantic's integer Literal matching otherwise accepts 90.0 as equal
+        # to 90 even under a strict parent model.
+        if type(value) is not int or value not in (0, 90, 180, 270):
+            raise ValueError("rotation must be one of 0, 90, 180, or 270")
+        return value
 
     @model_validator(mode="after")
     def _recovery_outlasts_stall_detection(self) -> "CameraConfig":
@@ -224,6 +333,16 @@ class BackgroundConfig(_StrictModel):
     camera_target: str = ""
     color: tuple[ColorChannel, ColorChannel, ColorChannel] = (18, 100, 32)
     blur_strength: int = Field(default=31, ge=3, le=151)
+    fit_mode: FitMode = "cover"
+    anchor_x: Anchor = 0.5
+    anchor_y: Anchor = 0.5
+    # Metadata is resolved from each decoded frame first. These YAML-only
+    # overrides are for reproducible operator-owned assets with absent/wrong
+    # declarations; no pixel histogram inference is permitted.
+    video_color_matrix: VideoColorMatrix = "auto"
+    video_color_range: VideoColorRange = "auto"
+    video_color_primaries: VideoColorPrimaries = "auto"
+    video_color_transfer: VideoColorTransfer = "auto"
     # Local mode restored when remote/avatar mode is disabled. While remote is
     # active, every renderer failure emits the fixed input-independent slate.
     remote_fallback_mode: LocalBackgroundMode = "blur"
@@ -369,12 +488,33 @@ class AccelerationConfig(_StrictModel):
         return self
 
 
+class ColorCorrectionConfig(_StrictModel):
+    """Bounded policy consumed by the foreground harmonization stage.
+
+    Compatibility defaults deliberately describe an identity transform.  The
+    implemented automatic mode and any future default flip are separately
+    qualified.
+    """
+
+    mode: ColorCorrectionMode = "off"
+    strength: UnitStrength = 0.5
+    exposure_limit_ev: ExposureLimitEv = 0.85
+    white_balance_strength: UnitStrength = 0.5
+    adaptation_time_s: AdaptationTimeSeconds = 0.8
+
+
 class CompositingConfig(_StrictModel):
     light_wrap: float = Field(default=0.25, ge=0.0, le=1.0)
     use_model_foreground: bool = True
+    blend_space: BlendSpace = "srgb_legacy"
+    color_correction: ColorCorrectionConfig = Field(
+        default_factory=ColorCorrectionConfig
+    )
 
 
 class OutputConfig(_StrictModel):
+    width: FrameDimension | None = None
+    height: FrameDimension | None = None
     backend: OutputBackend = "auto"
     device: str = ""
     fps: int = Field(default=30, ge=1, le=240)
@@ -384,6 +524,12 @@ class OutputConfig(_StrictModel):
     @classmethod
     def _valid_output_device(cls, value: str) -> str:
         return _clean_config_string(value)
+
+    @model_validator(mode="after")
+    def _paired_canvas_dimensions(self) -> "OutputConfig":
+        if (self.width is None) != (self.height is None):
+            raise ValueError("output width and height must be configured together")
+        return self
 
 
 class UploadLimits(_StrictModel):
@@ -542,6 +688,7 @@ class AvatarRemoteConfig(_StrictModel):
 
 
 class AppConfig(_StrictModel):
+    schema_version: SchemaVersion = CURRENT_CONFIG_SCHEMA_VERSION
     camera: CameraConfig = Field(default_factory=CameraConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
     backdrop_targets: dict[str, BackdropTargetConfig] = Field(default_factory=dict)
@@ -596,10 +743,10 @@ class AppConfig(_StrictModel):
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "AppConfig":
         if data is None:
-            data = {}
+            return cls()
         if not isinstance(data, dict):
             raise TypeError("configuration root must be a mapping")
-        return cls.model_validate(data)
+        return cls.model_validate(materialize_config_schema_defaults(data))
 
     @classmethod
     def load(cls, path: str | Path | None) -> "AppConfig":
@@ -636,6 +783,25 @@ class AppConfig(_StrictModel):
         if not isinstance(patch, dict):
             raise TypeError("config patch must be a mapping")
         return type(self).from_dict(merge_patch(self.to_dict(), patch))
+
+
+def resolved_output_size(config: AppConfig) -> tuple[int, int]:
+    """Return the one canonical canvas-size decision for a configuration.
+
+    Capture, processing, remote protocols, and every output sink consume this
+    helper.  Until paired output dimensions are configured, the historical
+    camera request remains the canvas size.
+    """
+
+    width = config.output.width
+    height = config.output.height
+    if width is None or height is None:
+        # OutputConfig validation guarantees that neither half can be configured
+        # alone; retain a defensive paired check at this public resolver boundary.
+        if width is not None or height is not None:  # pragma: no cover - invariant
+            raise ValueError("output width and height must be configured together")
+        return config.camera.width, config.camera.height
+    return width, height
 
 
 @dataclass(frozen=True)

@@ -16,6 +16,9 @@ real camera ──► segmentation ──► compositor ──► virtual camera
 * **Rendering quality**: true alpha matting (RVM), edge-aware mask
   refinement, light wrap, color-spill removal, person-free background blur —
   see [Rendering quality & GPU](#rendering-quality--gpu-acceleration).
+* **Visual consistency**: one canonical output canvas, proportional fit modes,
+  profile-aware local media, linear-light compositing, and bounded foreground
+  color correction with frame-aligned diagnostics and reversible rollout.
 * **NVIDIA GPU acceleration** (optional): matting runs on CUDA 12 when
   `onnxruntime-gpu` completes verified CUDA inference; use the `rvm` extra for an
   explicitly CPU-only npm installation.
@@ -141,6 +144,14 @@ custback --camera-pixel-format backend       # opt out of V4L2 MJPEG negotiation
 custback --camera-mode-mismatch error        # fail instead of warning on mismatch
 ```
 
+Geometry, canvas, blend-space, and color-correction policy are configured in
+YAML (or through the authenticated hot API where supported). Start with the
+annotated `config/default.yaml`; the complete policy, migration, mode
+eligibility, troubleshooting, and rollback guide is
+[Visual-consistency configuration and rollout](docs/visual-consistency-rollout.md).
+Camera geometry and output-canvas fields require a restart; backdrop geometry
+and compositing fields activate transactionally at a frame boundary.
+
 Live-camera sources are startup authority. Remote URI schemes are rejected
 because OpenCV cannot enforce verified TLS, redirect, proxy, and address-class
 policy. Operators can define immutable local sources under `backdrop_targets`
@@ -194,7 +205,8 @@ tokens.
 ## Rendering quality & GPU acceleration
 
 The person/background boundary is where composites live or die, so several
-stages work on it (all tunable live via `PATCH /config`, defaults on):
+stages work on it. The compatibility defaults and which fields are hot are
+listed below; do not assume every available quality policy is enabled:
 
 * **Segmentation backends** — `segmentation.backend: auto` picks the best
   installed one: **rvm** ([Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting),
@@ -222,6 +234,46 @@ stages work on it (all tunable live via `PATCH /config`, defaults on):
   background blur (normalized masked convolution), so they leave no smeared
   ghost around their own silhouette. The blur also runs at reduced
   resolution: same look, roughly 10x cheaper at 720p.
+* **Canonical geometry** — camera and backdrop frames use the same
+  `cover` / `contain` / explicit `stretch` planner, with orientation before
+  viewer-horizontal mirror and anchor-controlled crop or padding. The
+  schema-1 camera default remains legacy `stretch`; backdrop fit defaults to
+  `cover`.
+* **Linear compositing** — `compositing.blend_space: linear_srgb` performs
+  correction, model-foreground replacement, light wrap, and alpha blending in
+  linear light. Schema 1 keeps `srgb_legacy` for byte-compatible rollout.
+* **Bounded foreground harmonization** —
+  `compositing.color_correction.mode: auto` estimates restrained exposure and
+  white-balance changes for image, video, and live-camera backdrops. It is
+  excluded for passthrough, blur, solid color, and remote output; low
+  confidence safely holds/decays or uses identity. Schema 1 keeps it `off`.
+
+### Visual-policy rollout status
+
+The active release stage is `compatibility`:
+
+| Policy | Current schema-1 default | Opt-in target |
+| --- | --- | --- |
+| Main-camera fit | `stretch` | `cover` |
+| Composite space | `srgb_legacy` | `linear_srgb` |
+| Foreground correction | `off` | `auto` |
+
+The target values are implemented but are not default claims. Each flip is a
+separate future commit and schema stage after VIS-4.2 calibrated fixtures,
+physical cameras, consumer sinks, platform performance, privacy, and rollback
+evidence approve it. The executable stage ledger is
+`scripts/release/visual-policy-rollout.json`; release checks reject ledger,
+template, evidence, and commit drift. Existing versionless and schema-1 files
+always retain `stretch` / `srgb_legacy` / `off`.
+
+Use `GET /status` to diagnose the exact output frame: it reports delivered,
+oriented, normalized, and canvas dimensions; crop/pad/scale plans; capture and
+output rates; color-correction state/reason/confidence/EV/WB/timing/counters;
+the external color assumption; video tag/override/assumption status; and
+read-only camera auto-control observations. The preview HUD summarizes the
+same geometry and correction state. See the
+[rollout guide](docs/visual-consistency-rollout.md#troubleshooting) for crop,
+bars, low confidence, camera auto-controls, and tagged/untagged media.
 
 ### Using the NVIDIA GPU
 
@@ -313,6 +365,12 @@ Examples:
 auth_header | curl --config - -X PATCH http://127.0.0.1:8710/config \
      -H 'content-type: application/json' \
      -d '{"background": {"mode": "blur", "blur_strength": 51}}'
+auth_header | curl --config - -X PATCH http://127.0.0.1:8710/config \
+     -H 'content-type: application/merge-patch+json' \
+     -d '{"compositing": {"blend_space": "linear_srgb"}}'
+auth_header | curl --config - -X PATCH http://127.0.0.1:8710/config \
+     -H 'content-type: application/merge-patch+json' \
+     -d '{"compositing": {"color_correction": {"mode": "auto", "strength": 0.5}}}'
 auth_header | curl --config - -X POST http://127.0.0.1:8710/background/image \
      -F file=@office.jpg
 auth_header | curl --config - -X POST http://127.0.0.1:8710/background/video \
@@ -519,6 +577,17 @@ can be rerun after interruption. URI, remote, relative, conflicting, symlinked,
 or otherwise ambiguous sources exit with status 4 and require explicit operator
 action; they are never converted into hot network authority.
 
+Versionless and explicit schema-1 configurations deterministically retain the
+visual compatibility profile: camera `stretch`, `srgb_legacy` compositing,
+correction `off`, and an output canvas derived from the camera request when
+`output.width` / `height` are absent. The migrator materializes those values;
+ordinary loading does not rewrite the file. When the negotiated camera aspect
+differs from the canvas, custback emits one upgrade note per capture lifetime
+explaining that a future staged `cover` default would crop rather than
+distort, and how to pin or preview the policy. Later default schemas and their
+rollbacks are defined in the
+[visual-consistency rollout guide](docs/visual-consistency-rollout.md#deterministic-upgrade-behavior).
+
 Storage audit is no-follow and non-mutating. Repair first rejects symlinks,
 special files, foreign ownership, overlapping roots, and inode changes, then
 sets safe managed directories to `0700` and regular assets to `0600`. Durable
@@ -580,6 +649,14 @@ pytest
 npm test
 npm run release:check -- --quick  # intentionally fails closed while REL-01 is open
 ```
+
+Geometry and color contracts run in every supported Python version, minimum
+and newest dependency profiles, the OpenCV/NumPy compatibility matrix, and
+the optional MediaPipe/RVM profiles. Artifact smoke installs the clean wheel,
+sdist, and npm tarball; Windows jobs build the exact native camera and frozen
+engine and exercise tagged-video normalization. Workflow definitions are
+coverage commitments until their exact external runs are attached as
+evidence—local green tests are not represented as physical-device approval.
 
 While `REL-01` is open, use the exact diagnostic regressions and CI's
 non-authorizing package-smoke job for development evidence. All ordinary

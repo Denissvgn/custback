@@ -196,10 +196,16 @@ def test_ready_and_shutdown_records_are_ordered_and_complete(monkeypatch, caplog
     assert ready < shutdown
     assert "camera_requested=auto/64x36@30" in caplog.text
     assert "camera_negotiated=" in caplog.text
+    assert "visual_policy=schema_version=1" in caplog.text
+    assert "camera.fit_mode=stretch" in caplog.text
+    assert "background.fit_mode=cover" in caplog.text
+    assert "compositing.blend_space=srgb_legacy" in caplog.text
+    assert "compositing.color_correction.mode=off" in caplog.text
     for field in (
         "capture_read_ms=",
         "segmentation_ms=",
         "background_ms=",
+        "color_correction_ms=",
         "composite_ms=",
         "output_send_ms=",
         "frame_processing_ms=",

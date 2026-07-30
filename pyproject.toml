@@ -13,6 +13,8 @@ license-files = ["LICENSE"]
 dependencies = [
     "numpy>=1.24,<3",
     "opencv-contrib-python>=4.8,<6",
+    "av>=17,<18; python_version < '3.11'",
+    "av>=18,<19; python_version >= '3.11'",
     "pillow>=10,<13",
     "pydantic>=2.7,<3",
     "pyvirtualcam>=0.11,<1; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64')",
@@ -81,6 +83,7 @@ custback-avatar = "custback.avatar.__main__:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"custback" = ["default.yaml"]
 "custback.avatar" = ["avatar.yaml"]
 
 [tool.pytest.ini_options]

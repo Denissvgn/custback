@@ -219,6 +219,59 @@ class ASGIWebSocket:
         await self._finish()
 
 
+async def _first_mjpeg_frame(app: Any) -> bytes:
+    """Read one encoded frame through the real streaming ASGI route."""
+
+    incoming: asyncio.Queue = asyncio.Queue()
+    outgoing: asyncio.Queue = asyncio.Queue()
+
+    async def receive():
+        return await incoming.get()
+
+    async def send(message):
+        await outgoing.put(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "scheme": "http",
+        "method": "GET",
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 12345),
+        "root_path": "",
+        "path": "/video/mjpeg",
+        "raw_path": b"/video/mjpeg",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"authorization", AUTH["Authorization"].encode()),
+        ],
+        "state": {},
+        "extensions": {},
+    }
+    task = asyncio.create_task(app(scope, receive, send))
+    try:
+        await incoming.put({"type": "http.request", "body": b"", "more_body": False})
+        started = await asyncio.wait_for(outgoing.get(), 2.0)
+        assert started["type"] == "http.response.start"
+        assert started["status"] == 200
+        body = await asyncio.wait_for(outgoing.get(), 3.0)
+        assert body["type"] == "http.response.body"
+        header, payload = body["body"].split(b"\r\n\r\n", 1)
+        length_line = next(
+            line
+            for line in header.split(b"\r\n")
+            if line.startswith(b"Content-Length:")
+        )
+        length = int(length_line.split(b":", 1)[1].strip())
+        return payload[:length]
+    finally:
+        await incoming.put({"type": "http.disconnect"})
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(task, 2.0)
+
+
 @pytest.fixture()
 def stack(tmp_path):
     cfg = AppConfig.from_dict(
@@ -290,6 +343,7 @@ def test_status_and_config_with_bearer(stack):
         "output_target_fps",
         "output_repeated_frames",
         "processing_deadline_misses",
+        "color_correction_ms",
         "frame_processing_ms",
         "output_fallback_active",
         "segmentation_fallback_active",
@@ -329,6 +383,9 @@ def test_public_config_exposes_only_backdrop_target_ids():
     assert background["camera_target"] == "side-camera"
     assert background["camera_targets"] == ("desk-camera", "side-camera")
     assert background["camera_source_configured"] is True
+    assert background["fit_mode"] == "cover"
+    assert background["anchor_x"] == 0.5
+    assert background["anchor_y"] == 0.5
     assert "camera_device" not in background
     assert "backdrop_targets" not in public
     assert secret_source not in repr(public)
@@ -423,6 +480,89 @@ def test_restart_only_patch_is_409_and_atomic(stack):
     assert current.config.background.mode == "color"
 
 
+def test_visual_policy_patch_is_hot_atomic_and_public(stack):
+    response = stack.patch(
+        "/config",
+        json={
+            "background": {
+                "fit_mode": "contain",
+                "anchor_x": 0.25,
+                "anchor_y": 0.75,
+            },
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "color_correction": {
+                    "mode": "auto",
+                    "strength": 0.7,
+                    "exposure_limit_ev": 0.9,
+                    "white_balance_strength": 0.4,
+                    "adaptation_time_s": 1.2,
+                },
+            },
+        },
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["config_version"] == 1
+    public = response.json()["config"]
+    assert public["schema_version"] == 1
+    assert public["background"]["fit_mode"] == "contain"
+    assert public["background"]["anchor_x"] == 0.25
+    assert public["background"]["anchor_y"] == 0.75
+    assert public["compositing"]["blend_space"] == "linear_srgb"
+    assert public["compositing"]["color_correction"] == {
+        "mode": "auto",
+        "strength": 0.7,
+        "exposure_limit_ev": 0.9,
+        "white_balance_strength": 0.4,
+        "adaptation_time_s": 1.2,
+    }
+
+
+def test_schema_version_patch_is_restart_required_even_when_unchanged(stack):
+    response = stack.patch(
+        "/config",
+        json={"schema_version": 1, "background": {"anchor_x": 0.25}},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "restart_required"
+    assert detail["fields"] == ["schema_version"]
+    assert detail["current_version"] == 0
+    current = stack.runtime.read()
+    assert current.version == 0
+    assert current.config.schema_version == 1
+    assert current.config.background.anchor_x == 0.5
+
+
+def test_canvas_and_camera_geometry_patch_is_restart_required_and_atomic(stack):
+    response = stack.patch(
+        "/config",
+        json={
+            "camera": {"fit_mode": "cover", "rotation": 90},
+            "output": {"width": 1920, "height": 1080},
+            "background": {"anchor_x": 0.25},
+        },
+        headers=AUTH,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["fields"] == [
+        "camera.fit_mode",
+        "camera.rotation",
+        "output.height",
+        "output.width",
+    ]
+    current = stack.runtime.read()
+    assert current.version == 0
+    assert current.config.camera.fit_mode == "stretch"
+    assert (current.config.output.width, current.config.output.height) == (None, None)
+    assert current.config.background.anchor_x == 0.5
+
+
 def test_hot_camera_backdrop_source_patch_is_restart_required(stack):
     response = stack.patch(
         "/config",
@@ -500,6 +640,226 @@ def test_snapshot_returns_jpeg(stack):
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/jpeg"
     assert response.content[:2] == b"\xff\xd8"
+
+
+def test_active_auto_frame_is_consistent_across_raw_output_snapshot_and_mjpeg(
+    stack,
+    tmp_path,
+):
+    height, width = 72, 128
+    y, x = np.indices((height, width), dtype=np.int16)
+    backdrop = np.stack(
+        (
+            125 + (x % 17),
+            145 + (y % 13),
+            165 + ((x + y) % 11),
+        ),
+        axis=-1,
+    ).astype(np.uint8)
+    image_path = tmp_path / "auto-backdrop.png"
+    assert cv2.imwrite(str(image_path), backdrop)
+    with image_path.open("rb") as handle:
+        uploaded = stack.post(
+            "/background/image",
+            files={"file": ("auto-backdrop.png", handle, "image/png")},
+            headers=AUTH,
+        )
+    assert uploaded.status_code == 201
+    configured = stack.patch(
+        "/config",
+        json={
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "light_wrap": 0.0,
+                "color_correction": {
+                    "mode": "auto",
+                    "strength": 0.7,
+                },
+            }
+        },
+        headers=AUTH,
+    )
+    assert configured.status_code == 200
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        stats = stack.hub.stats_dict()
+        if (
+            stats["color_correction_active"] is True
+            and stats["color_correction_applied_frames"] >= 1
+        ):
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("automatic correction never became active")
+
+    # Freeze a single generation so every transport must encode the same raw
+    # or composited pixels rather than merely a nearby synthetic-camera frame.
+    stack.pipeline.stop()
+    raw_exact = stack.hub.raw.latest()[0]
+    output_exact = stack.hub.output.latest()[0]
+    assert raw_exact is not None and output_exact is not None
+    assert not np.array_equal(raw_exact, output_exact)
+
+    async def read_websockets() -> tuple[bytes, bytes]:
+        raw_socket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        output_socket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=output",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        try:
+            return (
+                await raw_socket.receive_bytes(),
+                await output_socket.receive_bytes(),
+            )
+        finally:
+            await raw_socket.close()
+            await output_socket.close()
+
+    raw_jpeg, output_ws_jpeg = run_async(read_websockets())
+    mjpeg = run_async(_first_mjpeg_frame(stack.app))
+    snapshot = stack.get("/video/snapshot.jpg", headers=AUTH)
+    assert snapshot.status_code == 200
+
+    def decode(jpeg: bytes) -> np.ndarray:
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        assert frame is not None
+        return frame
+
+    decoded_raw = decode(raw_jpeg)
+    decoded_outputs = [
+        decode(value) for value in (output_ws_jpeg, mjpeg, snapshot.content)
+    ]
+    assert (
+        float(
+            np.mean(np.abs(decoded_raw.astype(np.int16) - raw_exact.astype(np.int16)))
+        )
+        < 4.0
+    )
+    for decoded in decoded_outputs:
+        assert (
+            float(
+                np.mean(
+                    np.abs(decoded.astype(np.int16) - output_exact.astype(np.int16))
+                )
+            )
+            < 4.0
+        )
+    np.testing.assert_array_equal(decoded_outputs[0], decoded_outputs[1])
+    np.testing.assert_array_equal(decoded_outputs[0], decoded_outputs[2])
+    assert not np.array_equal(decoded_raw, decoded_outputs[0])
+
+
+def test_remote_near_raw_echo_reaches_mjpeg_only_as_privacy_slate(stack):
+    configured = stack.patch(
+        "/config",
+        json={
+            "background": {
+                "mode": "remote",
+                "remote_fallback_mode": "color",
+            },
+            "api": {"remote_timeout_ms": 5_000},
+        },
+        headers=AUTH,
+    )
+    assert configured.status_code == 200
+
+    async def trigger_privacy_gate() -> tuple[np.ndarray, np.ndarray, dict]:
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**AUTH, "Origin": ORIGIN},
+        ).connect()
+        try:
+            # Drain the frame which may predate renderer-session activation.
+            await websocket.receive_bytes()
+            raw_jpeg = await websocket.receive_bytes()
+            raw = cv2.imdecode(
+                np.frombuffer(raw_jpeg, dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            assert raw is not None and raw.shape == (72, 128, 3)
+
+            # The fixture intentionally limits renderer frames to 1 KiB. Use
+            # the highest quality that fits, preserving a recognizable JPEG
+            # near-echo while still traversing the real WebSocket decoder.
+            echo_jpeg = None
+            for quality in (60, 50, 40, 30, 25, 20, 15, 10):
+                ok, encoded = cv2.imencode(
+                    ".jpg",
+                    raw,
+                    [cv2.IMWRITE_JPEG_QUALITY, quality],
+                )
+                assert ok
+                if encoded.nbytes <= stack.runtime.snapshot().api.ws_max_bytes:
+                    echo_jpeg = encoded.tobytes()
+                    break
+            assert echo_jpeg is not None
+            near_echo = cv2.imdecode(
+                np.frombuffer(echo_jpeg, dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            assert near_echo is not None
+            assert (
+                float(
+                    np.mean(np.abs(near_echo.astype(np.int16) - raw.astype(np.int16)))
+                )
+                < 8.0
+            )
+            await websocket.send_bytes(echo_jpeg)
+
+            slate = Pipeline._privacy_slate(raw.shape)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                stats = stack.hub.stats_dict()
+                protected = stack.hub.output.latest()[0]
+                if (
+                    stats["remote_fallback_reason"]
+                    in {"privacy-raw-echo", "privacy-delayed-raw-echo"}
+                    and protected is not None
+                    and np.array_equal(protected, slate)
+                ):
+                    # Stop while the renderer session and echo classification
+                    # are current, freezing one exact protected generation for
+                    # every transport assertion below.
+                    stack.pipeline.stop()
+                    frozen = stack.hub.output.latest()[0]
+                    assert frozen is not None
+                    return raw, frozen.copy(), stats
+                await asyncio.sleep(0.02)
+            raise AssertionError(
+                "near-raw renderer echo never reached the privacy gate"
+            )
+        finally:
+            await websocket.close()
+
+    echoed_raw, frozen, privacy_stats = run_async(trigger_privacy_gate())
+    slate = Pipeline._privacy_slate(frozen.shape)
+    np.testing.assert_array_equal(frozen, slate)
+    assert not np.array_equal(echoed_raw, frozen)
+    assert privacy_stats["remote_fallback_active"] is True
+    assert privacy_stats["remote_fallback_mode"] == "privacy-slate"
+    assert privacy_stats["remote_fallback_reason"] in {
+        "privacy-raw-echo",
+        "privacy-delayed-raw-echo",
+    }
+
+    mjpeg = run_async(_first_mjpeg_frame(stack.app))
+    snapshot = stack.get("/video/snapshot.jpg", headers=AUTH)
+    assert snapshot.status_code == 200
+    for jpeg in (mjpeg, snapshot.content):
+        decoded = cv2.imdecode(
+            np.frombuffer(jpeg, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        assert decoded is not None and decoded.shape == slate.shape
+        error = np.abs(decoded.astype(np.int16) - slate.astype(np.int16))
+        assert float(np.mean(error)) < 4.0
 
 
 def test_upload_image_validates_and_switches_mode(stack, tmp_path):
@@ -875,12 +1235,44 @@ def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
     schema = stack.get("/openapi.json", headers=AUTH).json()
     assert "requestBody" in schema["paths"]["/auth/session"]["post"]
     assert "requestBody" in schema["paths"]["/config"]["patch"]
+    patch_content = schema["paths"]["/config"]["patch"]["requestBody"]["content"]
+    expected_visual_examples = {
+        "camera-cover-restart",
+        "backdrop-contain",
+        "linear-compositing",
+        "automatic-color-correction",
+        "visual-quality-hot",
+    }
+    for media_type in ("application/json", "application/merge-patch+json"):
+        assert set(patch_content[media_type]["examples"]) == expected_visual_examples
+        examples = patch_content[media_type]["examples"]
+        assert examples["camera-cover-restart"]["value"] == {
+            "camera": {"fit_mode": "cover"}
+        }
+        assert examples["linear-compositing"]["value"] == {
+            "compositing": {"blend_space": "linear_srgb"}
+        }
+        assert examples["automatic-color-correction"]["value"] == {
+            "compositing": {"color_correction": {"mode": "auto", "strength": 0.5}}
+        }
+        assert examples["visual-quality-hot"]["value"] == {
+            "background": {
+                "fit_mode": "cover",
+                "anchor_x": 0.5,
+                "anchor_y": 0.25,
+            },
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "color_correction": {"mode": "auto", "strength": 0.5},
+            },
+        }
     get_config = schema["paths"]["/config"]["get"]
     public_config_ref = get_config["responses"]["200"]["content"]["application/json"][
         "schema"
     ]["$ref"]
     assert public_config_ref.endswith("/PublicAppConfig")
     schemas = schema["components"]["schemas"]
+    assert "schema_version" in schemas["PublicAppConfig"]["properties"]
     assert {
         "token_file",
         "renderer_token_file",
@@ -893,6 +1285,43 @@ def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
         "tls_keyfile",
     }.isdisjoint(schemas["PublicAvatarRemoteConfig"]["properties"])
     assert "camera_device" not in schemas["PublicBackgroundConfig"]["properties"]
+    assert {"fit_mode", "anchor_x", "anchor_y"} <= set(
+        schemas["PublicBackgroundConfig"]["properties"]
+    )
+    assert {"fit_mode", "anchor_x", "anchor_y", "rotation"} <= set(
+        schemas["CameraConfig"]["properties"]
+    )
+    assert schemas["CameraConfig"]["properties"]["fit_mode"]["default"] == "stretch"
+    assert {"width", "height"} <= set(schemas["OutputConfig"]["properties"])
+    assert {"blend_space", "color_correction"} <= set(
+        schemas["CompositingConfig"]["properties"]
+    )
+    assert (
+        schemas["CompositingConfig"]["properties"]["blend_space"]["default"]
+        == "srgb_legacy"
+    )
+    assert {
+        "mode",
+        "strength",
+        "exposure_limit_ev",
+        "white_balance_strength",
+        "adaptation_time_s",
+    } <= set(schemas["ColorCorrectionConfig"]["properties"])
+    assert schemas["ColorCorrectionConfig"]["properties"]["mode"]["default"] == "off"
+    executable_example = patch_content["application/merge-patch+json"]["examples"][
+        "visual-quality-hot"
+    ]["value"]
+    applied = stack.patch(
+        "/config",
+        headers={**AUTH, "content-type": "application/merge-patch+json"},
+        json=executable_example,
+    )
+    assert applied.status_code == 200
+    effective = applied.json()["config"]
+    assert effective["background"]["fit_mode"] == "cover"
+    assert effective["background"]["anchor_y"] == 0.25
+    assert effective["compositing"]["blend_space"] == "linear_srgb"
+    assert effective["compositing"]["color_correction"]["mode"] == "auto"
     patch_schema = schema["paths"]["/config"]["patch"]["responses"]["200"]["content"][
         "application/json"
     ]["schema"]
@@ -1468,38 +1897,18 @@ def test_image_header_rejection_happens_before_opencv_decode(tmp_path, monkeypat
     assert caught.value.status_code == 422
 
 
-def test_image_full_pillow_decode_happens_before_opencv(tmp_path, monkeypatch):
+def test_shared_image_decoder_rejects_before_opencv(tmp_path, monkeypatch):
     path = tmp_path / "corrupt-compressed.png"
     path.write_bytes(b"container accepted by the test decoder")
     calls = 0
 
-    class PillowImage:
-        format = "PNG"
-        size = (2, 2)
-
-        def __init__(self, fail_load):
-            self.fail_load = fail_load
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_exc_info):
-            return False
-
-        def verify(self):
-            return None
-
-        def load(self):
-            if self.fail_load:
-                raise OSError("corrupt compressed pixels")
-
-    def open_image(_path):
+    def reject_image(*_args):
         nonlocal calls
         calls += 1
-        return PillowImage(fail_load=calls == 2)
+        raise server_mod.ColorError("invalid image")
 
     store = _UploadStore(tmp_path, _UploadLimits(image_max_pixels=100))
-    monkeypatch.setattr(server_mod.Image, "open", open_image)
+    monkeypatch.setattr(server_mod, "decode_image_to_srgb_bgr", reject_image)
     monkeypatch.setattr(
         server_mod.cv2,
         "imread",
@@ -1512,7 +1921,7 @@ def test_image_full_pillow_decode_happens_before_opencv(tmp_path, monkeypatch):
         store._validate(path, "image")
     assert caught.value.status_code == 422
     assert _error_code(caught.value) == "invalid_media"
-    assert calls == 2
+    assert calls == 1
 
 
 def test_image_dimension_limit_is_checked_before_opencv_decode(tmp_path, monkeypatch):
@@ -1542,10 +1951,12 @@ def test_pillow_decompression_bomb_is_mapped_without_opencv_decode(
     path.write_bytes(b"forged image header")
     store = _UploadStore(tmp_path, _UploadLimits())
     monkeypatch.setattr(
-        server_mod.Image,
-        "open",
+        server_mod,
+        "decode_image_to_srgb_bgr",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            server_mod.Image.DecompressionBombError("too many pixels")
+            server_mod.ColorError(
+                f"image exceeds {store.limits.image_max_pixels} pixels"
+            )
         ),
     )
     monkeypatch.setattr(

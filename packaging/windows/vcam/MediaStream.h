@@ -61,8 +61,8 @@ struct MediaStream : winrt::implements<MediaStream, IMFMediaStream2,
     // Reads the negotiated geometry from the descriptor's current media type.
     HRESULT RefreshNegotiatedType();
 
-    // Builds the outgoing RGB32 payload: the engine frame centered into the
-    // negotiated geometry, or the placeholder when the ring is unavailable.
+    // Builds the outgoing RGB32 payload only for an exact ring/media match;
+    // missing or mismatched rings produce the input-independent placeholder.
     void ComposeFrame(std::vector<uint8_t>& out);
 
     winrt::com_ptr<IMFMediaEventQueue> m_eventQueue;

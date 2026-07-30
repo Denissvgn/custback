@@ -4,8 +4,9 @@
 
 .DESCRIPTION
     Compiles CustbackVCam.vcxproj with MSBuild for the requested architecture
-    and verifies the produced DLL exports the in-proc COM surface.  Runs on
-    windows-latest (VS 2022 build tools + Windows 11 SDK 22000+).
+    and verifies the produced DLL exports the in-proc COM surface.  CI runs
+    this on the pinned windows-2022 runner (VS 2022 build tools + Windows 11
+    SDK 22621, with a 22000 runtime floor).
 
     The DLL is consumed by the installer (Package.wxs registers its CLSID
     per-user and removes it on uninstall) and by the shell, which creates the
@@ -33,10 +34,18 @@ $here = $PSScriptRoot
 $platform = if ($Arch -eq "arm64") { "ARM64" } else { "x64" }
 $gateDiagnosticsValue = if ($GateDiagnostics) { "true" } else { "false" }
 
-$msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-    -latest -requires Microsoft.Component.MSBuild `
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$msbuild = & $vswhere -latest -products * `
+    -requires Microsoft.Component.MSBuild `
+    Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
     -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
 if (-not $msbuild) { throw "MSBuild not found (install VS 2022 build tools)" }
+
+$dumpbin = & $vswhere -latest -products * `
+    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" |
+    Select-Object -First 1
+if (-not $dumpbin) { throw "dumpbin not found (install VS 2022 C++ build tools)" }
 
 & $msbuild (Join-Path $here "CustbackVCam.vcxproj") `
     /nologo /m `
@@ -49,7 +58,7 @@ $dll = Join-Path $here "dist\$platform\$Configuration\CustbackVCam.dll"
 if (-not (Test-Path $dll)) { throw "build did not produce $dll" }
 
 # The COM surface the installer/shell relies on must actually be exported.
-$exports = & dumpbin /nologo /exports $dll
+$exports = & $dumpbin /nologo /exports $dll
 foreach ($required in "DllGetClassObject", "DllCanUnloadNow") {
     if ($exports -notmatch $required) {
         throw "$dll does not export $required"

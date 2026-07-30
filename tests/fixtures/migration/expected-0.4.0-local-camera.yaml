@@ -1,3 +1,4 @@
+schema_version: 1
 camera:
   device: 0
   width: 1280
@@ -5,6 +6,10 @@ camera:
   fps: 30
   mirror: false
   synthetic: false
+  fit_mode: stretch
+  anchor_x: 0.5
+  anchor_y: 0.5
+  rotation: 0
 background:
   mode: camera
   blur_strength: 31
@@ -16,6 +21,13 @@ background:
   - 32
   remote_fallback_mode: blur
   camera_target: legacy-camera
+  fit_mode: cover
+  anchor_x: 0.5
+  anchor_y: 0.5
+  video_color_matrix: auto
+  video_color_range: auto
+  video_color_primaries: auto
+  video_color_transfer: auto
 backdrop_targets:
   legacy-camera:
     source: /dev/video2
@@ -32,11 +44,20 @@ segmentation:
 compositing:
   light_wrap: 0.25
   use_model_foreground: true
+  blend_space: srgb_legacy
+  color_correction:
+    mode: 'off'
+    strength: 0.5
+    exposure_limit_ev: 0.85
+    white_balance_strength: 0.5
+    adaptation_time_s: 0.8
 output:
   backend: auto
   device: ''
   fps: 30
   preview: false
+  width: null
+  height: null
 api:
   enabled: true
   host: 127.0.0.1

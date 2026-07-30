@@ -44,6 +44,10 @@ def create_avatar_backdrop(
             cfg.video_path,
             max_width=video_max_width,
             max_height=video_max_height,
+            color_matrix=cfg.video_color_matrix,
+            color_range=cfg.video_color_range,
+            color_primaries=cfg.video_color_primaries,
+            color_transfer=cfg.video_color_transfer,
         )
     return None  # blur uses the raw frame
 

@@ -1,0 +1,407 @@
+{
+  "algorithm_comparison": {
+    "aggressive_moment": {
+      "clothing_preservation": {
+        "delta_e76": 75.225449,
+        "hue_drift_degrees": 73.737636,
+        "normalized_chroma_drift_percent": 97.299316
+      },
+      "estimate": {
+        "behavior": "aggressive_moment",
+        "confidence": 0.970241,
+        "exposure_confidence": 0.970241,
+        "exposure_ev": 0.425,
+        "method": "aggressive_moment",
+        "moment_offset": [
+          0.310913,
+          0.237202,
+          0.234925
+        ],
+        "moment_scale": [
+          0.174193,
+          0.4212,
+          0.077587
+        ],
+        "neutral_source": 3453,
+        "neutral_target": 3465,
+        "target_is_local": true,
+        "usable_source": 5184,
+        "usable_target": 3465,
+        "wb_gains": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "white_balance_confidence": 0.970241
+      },
+      "luminance_gap_ev": {
+        "after": 0.01111,
+        "before": 0.966233,
+        "reduction_percent": 98.85
+      },
+      "neutral_axis_error_delta_e_ab": {
+        "after": 0.848003,
+        "before": 12.467391,
+        "reduction_percent": 93.198
+      },
+      "skin_preservation": {
+        "delta_e76": 16.4752,
+        "hue_drift_degrees": 34.157691,
+        "normalized_chroma_drift_percent": 54.465758
+      }
+    },
+    "bounded_wb": {
+      "clothing_preservation": {
+        "delta_e76": 6.6453,
+        "hue_drift_degrees": 1.122619,
+        "normalized_chroma_drift_percent": 8.851431
+      },
+      "estimate": {
+        "behavior": "bounded_wb",
+        "confidence": 0.970241,
+        "exposure_confidence": 0.970241,
+        "exposure_ev": 0.425,
+        "method": "bounded_wb",
+        "moment_offset": null,
+        "moment_scale": null,
+        "neutral_source": 3453,
+        "neutral_target": 3465,
+        "target_is_local": true,
+        "usable_source": 5184,
+        "usable_target": 3465,
+        "wb_gains": [
+          1.077033,
+          1.0198,
+          0.927362
+        ],
+        "white_balance_confidence": 0.970241
+      },
+      "luminance_gap_ev": {
+        "after": 0.508483,
+        "before": 0.966233,
+        "reduction_percent": 47.375
+      },
+      "neutral_axis_error_delta_e_ab": {
+        "after": 9.501521,
+        "before": 12.467391,
+        "reduction_percent": 23.789
+      },
+      "skin_preservation": {
+        "delta_e76": 10.770838,
+        "hue_drift_degrees": 2.154625,
+        "normalized_chroma_drift_percent": 10.683854
+      }
+    },
+    "exposure_only": {
+      "clothing_preservation": {
+        "delta_e76": 9.854918,
+        "hue_drift_degrees": 1e-06,
+        "normalized_chroma_drift_percent": 3.267561
+      },
+      "estimate": {
+        "behavior": "exposure_only",
+        "confidence": 0.970241,
+        "exposure_confidence": 0.970241,
+        "exposure_ev": 0.425,
+        "method": "exposure_only",
+        "moment_offset": null,
+        "moment_scale": null,
+        "neutral_source": 3453,
+        "neutral_target": 3465,
+        "target_is_local": true,
+        "usable_source": 5184,
+        "usable_target": 3465,
+        "wb_gains": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "white_balance_confidence": 0.970241
+      },
+      "luminance_gap_ev": {
+        "after": 0.541234,
+        "before": 0.966233,
+        "reduction_percent": 43.985
+      },
+      "neutral_axis_error_delta_e_ab": {
+        "after": 13.01884,
+        "before": 12.467391,
+        "reduction_percent": -4.423
+      },
+      "skin_preservation": {
+        "delta_e76": 8.04732,
+        "hue_drift_degrees": 1e-06,
+        "normalized_chroma_drift_percent": 2.499194
+      }
+    }
+  },
+  "constants": {
+    "analysis_long_edge": 192,
+    "default_strength": 0.5,
+    "default_white_balance_strength": 0.5,
+    "exposure_clamp_ev": 0.85,
+    "minimum_confidence": 0.45,
+    "minimum_samples": 96,
+    "near_black": 0.02,
+    "near_clip": 0.98,
+    "neutral_saturation_max": 0.3,
+    "wb_gain_range": [
+      0.86,
+      1.16
+    ]
+  },
+  "current_baseline": {
+    "alpha_50_percent": {
+      "edge_linear_luminance_error_percent": -55.872,
+      "legacy_encoded_u8": 100,
+      "linear_light_reference_u8": 146
+    },
+    "exposure_pairs": {
+      "minus_one_ev": {
+        "applied_ev": -0.425,
+        "behavior": "exposure_only",
+        "gap_after_ev": 0.575,
+        "gap_before_ev": 1.0,
+        "requested_ev": -1.0
+      },
+      "plus_one_ev": {
+        "applied_ev": 0.425,
+        "behavior": "exposure_only",
+        "gap_after_ev": 0.575,
+        "gap_before_ev": 1.0,
+        "requested_ev": 1.0
+      }
+    },
+    "geometry": {
+      "axis_ratio": 1.333333,
+      "distortion_percent": 33.333
+    }
+  },
+  "deterministic_sha256": "1871e8ea3c00304fd86a62d240831cb8548f99de27c53732ba20c6c7be73a5f8",
+  "edge_cases": {
+    "all_one_mask": {
+      "behavior": "exposure_only",
+      "confidence": 0.991319,
+      "exposure_confidence": 0.991319,
+      "neutral_source": 18825,
+      "neutral_target": 20736,
+      "target_is_local": false,
+      "white_balance_confidence": 0.0
+    },
+    "all_zero_mask": {
+      "behavior": "identity",
+      "confidence": 0.0,
+      "exposure_confidence": 0.0,
+      "neutral_source": 0,
+      "neutral_target": 0,
+      "target_is_local": false,
+      "white_balance_confidence": 0.0
+    },
+    "clipped_foreground": {
+      "behavior": "identity",
+      "confidence": 0.0,
+      "exposure_confidence": 0.0,
+      "neutral_source": 0,
+      "neutral_target": 0,
+      "target_is_local": true,
+      "white_balance_confidence": 0.0
+    },
+    "saturated_backdrop": {
+      "behavior": "exposure_only",
+      "confidence": 0.970241,
+      "exposure_confidence": 0.970241,
+      "neutral_source": 3453,
+      "neutral_target": 0,
+      "target_is_local": true,
+      "white_balance_confidence": 0.0
+    },
+    "tiny_mask": {
+      "behavior": "identity",
+      "confidence": 0.0,
+      "exposure_confidence": 0.0,
+      "neutral_source": 0,
+      "neutral_target": 0,
+      "target_is_local": true,
+      "white_balance_confidence": 0.0
+    }
+  },
+  "fixtures": {
+    "color_cases": [
+      "warm_and_cool_neutral_casts",
+      "plus_minus_one_ev",
+      "clipped_highlights",
+      "deep_shadows",
+      "skin_like_patch",
+      "saturated_clothing_patch",
+      "neutral_and_saturated_backdrops",
+      "static_noise",
+      "slow_drift",
+      "hard_scene_cut",
+      "reconnect"
+    ],
+    "geometry": {
+      "cover_4_3_to_16_9_center_crop": {
+        "bottom": 210.0,
+        "left": 0.0,
+        "right": 320.0,
+        "scale": 1.0,
+        "top": 30.0
+      },
+      "fixture_sizes_height_width": {
+        "four_three": [
+          240,
+          320
+        ],
+        "odd": [
+          181,
+          319
+        ],
+        "portrait": [
+          320,
+          180
+        ],
+        "sixteen_nine": [
+          180,
+          320
+        ],
+        "square": [
+          201,
+          201
+        ],
+        "ultrawide": [
+          144,
+          384
+        ]
+      },
+      "orientation_output_shapes": {
+        "1": [
+          31,
+          47
+        ],
+        "2": [
+          31,
+          47
+        ],
+        "3": [
+          31,
+          47
+        ],
+        "4": [
+          31,
+          47
+        ],
+        "5": [
+          47,
+          31
+        ],
+        "6": [
+          47,
+          31
+        ],
+        "7": [
+          47,
+          31
+        ],
+        "8": [
+          47,
+          31
+        ]
+      },
+      "stretch_4_3_to_16_9": {
+        "axis_ratio": 1.333333,
+        "distortion_percent": 33.333
+      }
+    },
+    "profiles": {
+      "Adobe-RGB": {
+        "container": "PNG",
+        "dimensions": [
+          47,
+          33
+        ],
+        "generator": "tests/visual_consistency_evidence.py",
+        "mode": "RGB",
+        "payload_bytes": 1432,
+        "payload_sha256": "dcf4bcccf0b8ca4194f11ff7d4da86271e59da0ef520b4930058789a5995512c",
+        "profile_description": "VIS-0 generated Adobe-RGB",
+        "profile_sha256": "0246d302d3663301656455873f9095ae512ebb4265a03dfe9be82e3068b55cb3",
+        "provenance": "generated in repository; CC0; no external binary"
+      },
+      "CMYK": {
+        "container": "TIFF",
+        "dimensions": [
+          47,
+          33
+        ],
+        "generator": "tests/visual_consistency_evidence.py",
+        "mode": "CMYK",
+        "payload_bytes": 8582,
+        "payload_sha256": "618ddd7803cf3fb034fa9ad6c34f260900be0effb07ba2243b770c02748675d1",
+        "profile_description": "VIS-0 generated synthetic CMYK",
+        "profile_sha256": "f99312d78f09c5a4877f305d52f6097905f1cd606cb29a272eb76cf5c275e3ea",
+        "provenance": "generated in repository; CC0; no external binary"
+      },
+      "Display-P3": {
+        "container": "PNG",
+        "dimensions": [
+          47,
+          33
+        ],
+        "generator": "tests/visual_consistency_evidence.py",
+        "mode": "RGB",
+        "payload_bytes": 1458,
+        "payload_sha256": "ad8ba65c89fdad546859cb89e2d43c263924bc4bac88a1026e15ffc5c881dcb7",
+        "profile_description": "VIS-0 generated Display-P3",
+        "profile_sha256": "76f4dae691ac878c4e8a5ce3a5ef2e6f957ccf5ea1af70873f7fe85b0f3d3bdf",
+        "provenance": "generated in repository; CC0; no external binary"
+      },
+      "sRGB": {
+        "container": "PNG",
+        "dimensions": [
+          47,
+          33
+        ],
+        "generator": "tests/visual_consistency_evidence.py",
+        "mode": "RGB",
+        "payload_bytes": 1448,
+        "payload_sha256": "4bad4985df6b18092c457f932e4d8267441bae30a47d976254cacb4c7427ba42",
+        "profile_description": "VIS-0 generated sRGB",
+        "profile_sha256": "5bdb783790846f04e5f97c4b0614c236961adf556a03f23068eb0959a19c71c6",
+        "provenance": "generated in repository; CC0; no external binary"
+      }
+    },
+    "rotation_metadata_video": {
+      "generated": false,
+      "reason": "No ffmpeg/ffprobe in the qualification environment; EXIF orientations 1-8 are covered in-memory."
+    }
+  },
+  "recommendation": {
+    "all_one_mask_semantics": "exposure_only",
+    "all_zero_or_tiny_mask_semantics": "identity_no_update",
+    "clothing_hue_drift_max_degrees": 8.0,
+    "clothing_normalized_chroma_drift_max_percent": 15.0,
+    "default_strength": 0.5,
+    "default_white_balance_strength": 0.5,
+    "exposure_clamp_ev": 0.85,
+    "low_confidence_instantaneous_semantics": "identity_no_update",
+    "method": "bounded_wb",
+    "mode_default_for_first_compatibility_release": "off",
+    "qualified_target_default_after_rollout_gates": "auto",
+    "saturated_target_semantics": "exposure_only",
+    "skin_hue_drift_max_degrees": 5.0,
+    "skin_normalized_chroma_drift_max_percent": 12.0,
+    "wb_gain_range": [
+      0.86,
+      1.16
+    ]
+  },
+  "schema": "custback.visual_consistency.phase0.evidence.v1",
+  "temporal": {
+    "first_valid_frame_after_reconnect_behavior": "bounded_wb",
+    "hard_cut_instantaneous_settling_frames": 0,
+    "reconnect_frame_has_no_estimate": true,
+    "slow_drift_total_applied_ev": 0.093878,
+    "static_noise_ev_delta_p95": 0.000981,
+    "static_noise_gain_delta_ev_p95": 0.001044
+  }
+}

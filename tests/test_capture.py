@@ -135,6 +135,15 @@ class SlowReleaseCap(FakeCap):
         self.release_unblock.wait(2.0)
 
 
+class ExplodingCap(FakeCap):
+    def read(self):
+        raise RuntimeError("backend exposed /private/operator/camera0?token=do-not-log")
+
+    def release(self):
+        self.released = True
+        raise RuntimeError("release exposed /private/operator/camera0?token=do-not-log")
+
+
 class FakeCV2:
     CAP_PROP_FRAME_WIDTH = 3
     CAP_PROP_FRAME_HEIGHT = 4
@@ -546,6 +555,26 @@ def test_repeated_no_frame_recovery_warning_is_deduplicated(monkeypatch, caplog)
     finally:
         capture.close()
     assert caplog.text.count("reopened camera still produced no frame") == 1
+
+
+def test_reader_failure_log_is_transition_only_and_path_free(monkeypatch, caplog):
+    cap = ExplodingCap()
+    monkeypatch.setattr(capture_mod, "cv2", FakeCV2([cap]))
+
+    with caplog.at_level("DEBUG", logger="custback.capture"):
+        capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
+        try:
+            deadline = time.monotonic() + 0.5
+            while "camera read failed" not in caplog.text:
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+        finally:
+            capture.close()
+
+    assert caplog.text.count("camera read failed") == 1
+    assert "RuntimeError" in caplog.text
+    assert "/private/operator" not in caplog.text
+    assert "do-not-log" not in caplog.text
 
 
 def test_shutdown_during_reconnect_backoff_does_not_reopen(monkeypatch):

@@ -20,6 +20,15 @@ winrt::com_ptr<IMFMediaType> MakeVideoType(const StreamFormat& format) {
                                              MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
     winrt::check_hresult(type->SetUINT32(MF_MT_INTERLACE_MODE,
                                          MFVideoInterlace_Progressive));
+    // The Python pipeline publishes canonical full-range display-referred
+    // sRGB BGR, and the ring writer only appends an opaque X byte.  Therefore
+    // RGB32 consumers receive the same proven BT.709/sRGB/0..255 contract.
+    winrt::check_hresult(type->SetUINT32(
+        MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709));
+    winrt::check_hresult(type->SetUINT32(
+        MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_sRGB));
+    winrt::check_hresult(type->SetUINT32(
+        MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255));
     winrt::check_hresult(type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE));
     winrt::check_hresult(type->SetUINT32(MF_MT_DEFAULT_STRIDE,
                                          format.width * kBytesPerPixel));
@@ -47,12 +56,31 @@ HRESULT MediaSource::RuntimeClassInitialize() try {
 }
 
 HRESULT MediaSource::CreateStreamDescriptor(IMFStreamDescriptor** descriptor) try {
-    winrt::com_ptr<IMFMediaType> types[ARRAYSIZE(kStreamFormats)];
-    IMFMediaType* raw[ARRAYSIZE(kStreamFormats)];
-    for (size_t i = 0; i < ARRAYSIZE(kStreamFormats); ++i) {
-        types[i] = MakeVideoType(kStreamFormats[i]);
-        raw[i] = types[i].get();
+    size_t selectedFormat = 0;
+    FrameRingReader ring;
+    uint32_t ringWidth = 0;
+    uint32_t ringHeight = 0;
+    if (ring.Open()) {
+        if (!ring.ReadGeometry(ringWidth, ringHeight)) {
+            winrt::check_hresult(MF_E_INVALIDMEDIATYPE);
+        }
+        bool matched = false;
+        for (size_t i = 0; i < ARRAYSIZE(kStreamFormats); ++i) {
+            if (kStreamFormats[i].width == ringWidth &&
+                kStreamFormats[i].height == ringHeight) {
+                selectedFormat = i;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            winrt::check_hresult(MF_E_INVALIDMEDIATYPE);
+        }
     }
+
+    winrt::com_ptr<IMFMediaType> type =
+        MakeVideoType(kStreamFormats[selectedFormat]);
+    IMFMediaType* raw[] = {type.get()};
 
     winrt::com_ptr<IMFStreamDescriptor> sd;
     winrt::check_hresult(MFCreateStreamDescriptor(

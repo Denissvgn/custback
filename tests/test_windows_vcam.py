@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VCAM_DIR = ROOT / "packaging" / "windows" / "vcam"
 SHELL_DIR = ROOT / "packaging" / "windows" / "shell"
 INSTALLER_DIR = ROOT / "packaging" / "windows" / "installer"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 pytestmark = pytest.mark.skipif(
     not (VCAM_DIR / "FrameRing.h").exists(),
@@ -62,6 +63,20 @@ def _frame(width: int = 8, height: int = 6, value: int = 17) -> np.ndarray:
     frame = np.full((height, width, 3), value, dtype=np.uint8)
     frame[0, 0] = (1, 2, 3)
     return frame
+
+
+def test_rgb32_media_type_declares_the_proven_canonical_output_color() -> None:
+    source = (VCAM_DIR / "MediaSource.cpp").read_text(encoding="utf-8")
+    make_type = source[
+        source.index("winrt::com_ptr<IMFMediaType> MakeVideoType") : source.index(
+            "}  // namespace"
+        )
+    ]
+
+    assert "MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709" in make_type
+    assert "MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_sRGB" in make_type
+    assert "MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255" in make_type
+    assert "MF_MT_YUV_MATRIX" not in make_type
 
 
 # -- frame-ring protocol -----------------------------------------------------
@@ -107,6 +122,31 @@ def test_reader_rejects_torn_write_and_inactive_ring() -> None:
     assert vcam_native.read_latest_frame(buffer) is None
 
 
+def test_reader_rechecks_inactive_flag_after_payload_copy() -> None:
+    class InactivatingBuffer(bytearray):
+        def __init__(self, size: int) -> None:
+            super().__init__(size)
+            self.inactivated_during_copy = False
+
+        def __getitem__(self, key):
+            value = super().__getitem__(key)
+            if (
+                isinstance(key, slice)
+                and key.start == vcam_native.HEADER_SIZE
+                and not self.inactivated_during_copy
+            ):
+                struct.pack_into("<I", self, 28, 0)
+                self.inactivated_during_copy = True
+            return value
+
+    buffer = InactivatingBuffer(vcam_native.ring_size(8, 6))
+    writer = vcam_native.FrameRingWriter(buffer, 8, 6)
+    writer.publish(_frame())
+
+    assert vcam_native.read_latest_frame(buffer) is None
+    assert buffer.inactivated_during_copy
+
+
 def test_writer_rejects_geometry_mismatch() -> None:
     writer = vcam_native.FrameRingWriter(_ring_buffer(), 8, 6)
     with pytest.raises(ValueError, match="ring is 8x6"):
@@ -120,6 +160,23 @@ def test_reader_rejects_wrong_magic_or_version() -> None:
     writer = vcam_native.FrameRingWriter(buffer, 8, 6)
     writer.publish(_frame())
     buffer[0:4] = b"XXXX"
+    assert vcam_native.read_latest_frame(buffer) is None
+
+
+def test_reader_rejects_truncated_header_without_raising() -> None:
+    assert vcam_native.read_latest_frame(bytearray(vcam_native.HEADER_SIZE - 1)) is None
+
+
+def test_reader_rejects_wrong_fourcc_or_stride() -> None:
+    buffer = _ring_buffer()
+    writer = vcam_native.FrameRingWriter(buffer, 8, 6)
+    writer.publish(_frame())
+
+    buffer[20:24] = b"RGBA"
+    assert vcam_native.read_latest_frame(buffer) is None
+    buffer[20:24] = vcam_native.FOURCC
+
+    struct.pack_into("<I", buffer, 16, 8 * 4 + 4)
     assert vcam_native.read_latest_frame(buffer) is None
 
 
@@ -220,12 +277,33 @@ def test_frame_ring_header_mirrors_python_protocol() -> None:
     # The reader must pair CPython's release-ordered publication with acquire
     # loads/fencing; plain seq loads can admit torn frames on ARM64.
     assert "#include <atomic>" in text
-    assert text.count("std::atomic_ref<const uint32_t>") == 2
-    assert text.count("std::memory_order_acquire") == 3
-    payload_copy = text.index("std::memcpy(frame.data(), m_view + kHeaderSize,")
-    acquire_fence = text.index("std::atomic_thread_fence(std::memory_order_acquire);")
+    assert text.count("std::atomic_ref<const uint32_t>") == 6
+    assert text.count("std::memory_order_acquire") == 8
+    assert "header.fourcc != kFourcc" in text
+    assert "header.stride != static_cast<uint32_t>(expectedStride)" in text
+    assert "available / expectedStride" in text
+    payload_copy = text.index("std::memcpy(m_candidate.data(), m_view + kHeaderSize,")
+    acquire_fence = text.index(
+        "std::atomic_thread_fence(std::memory_order_acquire);",
+        payload_copy,
+    )
     seq_recheck = text.index("const uint32_t seqAfter =", acquire_fence)
-    assert payload_copy < acquire_fence < seq_recheck
+    active_recheck = text.index("const uint32_t flagsAfter =", seq_recheck)
+    inactive_decision = text.index(
+        "if ((flagsAfter & kFlagActive) == 0)",
+        active_recheck,
+    )
+    sequence_retry = text.index("if (seqAfter != seqBefore)", inactive_decision)
+    candidate_swap = text.index("frame.swap(m_candidate)", sequence_retry)
+    assert (
+        payload_copy
+        < acquire_fence
+        < seq_recheck
+        < active_recheck
+        < inactive_decision
+        < sequence_retry
+        < candidate_swap
+    )
 
 
 def test_mit_c1_gate_build_reports_frame_ring_open_error() -> None:
@@ -300,7 +378,7 @@ def test_friendly_name_is_loop_prevented() -> None:
 def test_native_backend_fails_closed_off_windows() -> None:
     cfg = OutputConfig(backend="native")
     with pytest.raises(RuntimeError, match="Windows 11"):
-        open_output(cfg, 8, 6)
+        open_output(cfg, 1280, 720)
 
 
 def test_explicit_native_backend_fails_when_component_is_not_installed(
@@ -323,7 +401,7 @@ def test_explicit_native_backend_fails_when_component_is_not_installed(
     )
 
     with pytest.raises(RuntimeError, match="component is not installed"):
-        open_output(OutputConfig(backend="native"), 8, 6)
+        open_output(OutputConfig(backend="native"), 1280, 720)
 
 
 def test_native_output_publishes_via_injected_buffer() -> None:
@@ -356,7 +434,7 @@ def test_auto_backend_does_not_select_native(monkeypatch) -> None:
         "native_camera_component_available",
         lambda: pytest.fail("disabled native rung must not probe the component"),
     )
-    output = open_output(OutputConfig(backend="auto"), 8, 6)
+    output = open_output(OutputConfig(backend="auto"), 1280, 720)
     try:
         assert isinstance(output, NullOutput)
     finally:
@@ -376,7 +454,7 @@ def test_auto_backend_uses_native_second_when_gate_flag_is_enabled(
         def close(self):
             calls.append("close")
 
-    def open_native(*_args):
+    def open_native(*_args, **_kwargs):
         calls.append("native")
         return NativeMarker()
 
@@ -390,7 +468,7 @@ def test_auto_backend_uses_native_second_when_gate_flag_is_enabled(
     )
     monkeypatch.setattr(vcam_native, "NativeVirtualCameraOutput", open_native)
 
-    output = open_output(OutputConfig(backend="auto"), 8, 6)
+    output = open_output(OutputConfig(backend="auto"), 1280, 720)
     assert calls == ["pyvirtualcam", "native"]
     output.close()
 
@@ -404,7 +482,7 @@ def test_auto_backend_falls_through_native_to_null_when_both_fail(
         calls.append("pyvirtualcam")
         raise RuntimeError("OBS unavailable")
 
-    def unavailable_native(*_args):
+    def unavailable_native(*_args, **_kwargs):
         calls.append("native")
         raise RuntimeError("native unavailable")
 
@@ -418,7 +496,7 @@ def test_auto_backend_falls_through_native_to_null_when_both_fail(
     )
     monkeypatch.setattr(vcam_native, "NativeVirtualCameraOutput", unavailable_native)
 
-    output = open_output(OutputConfig(backend="auto"), 8, 6)
+    output = open_output(OutputConfig(backend="auto"), 1280, 720)
     try:
         assert isinstance(output, NullOutput)
         assert calls == ["pyvirtualcam", "native"]
@@ -456,7 +534,7 @@ def test_auto_backend_skips_uninstalled_native_component_and_returns_null(
         unexpected_native_open,
     )
 
-    output = open_output(OutputConfig(backend="auto"), 8, 6)
+    output = open_output(OutputConfig(backend="auto"), 1280, 720)
     try:
         assert isinstance(output, NullOutput)
         assert calls == ["pyvirtualcam", "component-probe"]
@@ -465,6 +543,17 @@ def test_auto_backend_skips_uninstalled_native_component_and_returns_null(
 
 
 # -- packaging wiring --------------------------------------------------------
+def test_vcxproj_targets_sdk_installed_on_pinned_windows_runner() -> None:
+    project = (VCAM_DIR / "CustbackVCam.vcxproj").read_text(encoding="utf-8")
+    assert (
+        "<WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>"
+    ) in project
+    assert (
+        "<WindowsTargetPlatformMinVersion>10.0.22000.0"
+        "</WindowsTargetPlatformMinVersion>"
+    ) in project
+
+
 def test_vcxproj_lists_exactly_the_sources_on_disk() -> None:
     project = (VCAM_DIR / "CustbackVCam.vcxproj").read_text(encoding="utf-8")
     listed = set(re.findall(r'<Cl(?:Compile|Include) Include="([^"]+)"', project))
@@ -474,6 +563,19 @@ def test_vcxproj_lists_exactly_the_sources_on_disk() -> None:
     assert listed == on_disk
     assert "CustbackVCam.def" in project
     assert "<LanguageStandard>stdcpp20</LanguageStandard>" in project
+
+
+def test_ci_compiles_native_vcam_on_pinned_windows_runner() -> None:
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    job = workflow.split("\n  windows-native-vcam:\n", 1)[1].split("\n  node:\n", 1)[0]
+    assert "runs-on: windows-2022" in job
+    assert "actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955" in job
+    assert "./packaging/windows/vcam/build.ps1 -Arch x64" in job
+
+    build = (VCAM_DIR / "build.ps1").read_text(encoding="utf-8")
+    assert "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" in build
+    assert '-find "VC\\Tools\\MSVC\\**\\bin\\Hostx64\\x64\\dumpbin.exe"' in build
+    assert "& $dumpbin /nologo /exports $dll" in build
 
 
 def test_def_exports_the_com_surface() -> None:

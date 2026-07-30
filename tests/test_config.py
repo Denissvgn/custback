@@ -1,14 +1,21 @@
+import json
 import threading
 import time
+from importlib import resources
+from pathlib import Path
 
 import pytest
 
 from custback.__main__ import build_parser, config_from_args
 from custback.config import (
+    CURRENT_CONFIG_SCHEMA_VERSION,
+    LEGACY_CONFIG_SCHEMA_VERSION,
     AVATAR_PROXY_RESTART_ONLY_FIELDS,
     AppConfig,
     ConfigVersionConflictError,
     RuntimeConfig,
+    materialize_config_schema_defaults,
+    resolved_output_size,
 )
 
 
@@ -25,11 +32,124 @@ def test_avatar_proxy_security_boundary_fields_are_restart_only():
 def test_defaults_valid():
     cfg = AppConfig()
     cfg.validate()
+    assert cfg.schema_version == 1
     assert cfg.background.mode == "blur"
     assert cfg.camera.pixel_format == "auto"
     assert cfg.camera.mode_mismatch == "warn"
     assert cfg.camera.recovery_timeout_s == 10.0
+    assert cfg.camera.fit_mode == "stretch"
+    assert (cfg.camera.anchor_x, cfg.camera.anchor_y, cfg.camera.rotation) == (
+        0.5,
+        0.5,
+        0,
+    )
+    assert cfg.background.fit_mode == "cover"
+    assert (cfg.background.anchor_x, cfg.background.anchor_y) == (0.5, 0.5)
+    assert cfg.output.width is None
+    assert cfg.output.height is None
+    assert cfg.compositing.blend_space == "srgb_legacy"
+    correction = cfg.compositing.color_correction
+    assert correction.mode == "off"
+    assert correction.strength == 0.5
+    assert correction.exposure_limit_ev == 0.85
+    assert correction.white_balance_strength == 0.5
+    assert correction.adaptation_time_s == 0.8
     assert cfg.api.renderer_token_file == "~/.config/custback/renderer-token"
+
+
+def test_packaged_default_yaml_pins_compatibility_visual_policy():
+    repository_template = Path(__file__).parents[1] / "config" / "default.yaml"
+    packaged_template = resources.files("custback").joinpath("default.yaml")
+    assert packaged_template.read_bytes() == repository_template.read_bytes()
+    cfg = AppConfig.load(repository_template)
+
+    assert cfg.camera.fit_mode == "stretch"
+    assert cfg.background.fit_mode == "cover"
+    assert cfg.compositing.blend_space == "srgb_legacy"
+    assert cfg.compositing.color_correction == AppConfig().compositing.color_correction
+    assert resolved_output_size(cfg) == (cfg.camera.width, cfg.camera.height)
+
+
+def test_release_rollout_ledger_matches_current_model_defaults_and_stays_pending():
+    root = Path(__file__).parents[1]
+    ledger = json.loads(
+        (root / "scripts" / "release" / "visual-policy-rollout.json").read_text()
+    )
+    cfg = AppConfig()
+
+    assert ledger["active_stage"] == "compatibility"
+    active = next(
+        stage for stage in ledger["stages"] if stage["id"] == ledger["active_stage"]
+    )
+    assert active["default_schema_version"] == cfg.schema_version == 1
+    assert active["defaults"] == {
+        "camera_fit_mode": cfg.camera.fit_mode,
+        "blend_space": cfg.compositing.blend_space,
+        "color_correction_mode": cfg.compositing.color_correction.mode,
+    }
+    assert [(stage["id"], stage["status"]) for stage in ledger["stages"]] == [
+        ("compatibility", "active"),
+        ("camera-cover", "pending"),
+        ("linear-compositing", "pending"),
+        ("automatic-correction", "pending"),
+    ]
+    for stage in ledger["stages"][1:]:
+        assert stage["change_commit"] is None
+        assert stage["evidence"] == []
+        assert stage["rollback"]["retain_schema_version"] is True
+
+
+def test_versionless_persisted_mapping_binds_legacy_schema_independently(
+    tmp_path,
+):
+    raw = {"camera": {"width": 640, "height": 480}}
+    path = tmp_path / "versionless.yaml"
+    path.write_text("camera:\n  width: 640\n  height: 480\n")
+
+    from_mapping = AppConfig.from_dict(raw)
+    from_file = AppConfig.load(path)
+    new_install = AppConfig.load(None)
+
+    assert from_mapping.schema_version == LEGACY_CONFIG_SCHEMA_VERSION
+    assert from_file.schema_version == LEGACY_CONFIG_SCHEMA_VERSION
+    assert new_install.schema_version == CURRENT_CONFIG_SCHEMA_VERSION
+    assert "schema_version" not in raw
+
+
+def test_schema_v1_absent_fields_are_bound_before_model_defaults():
+    raw = {
+        "schema_version": 1,
+        "camera": {"width": 640, "height": 480},
+        "compositing": {"color_correction": {"strength": 0.7}},
+    }
+
+    materialized = materialize_config_schema_defaults(raw)
+
+    assert materialized["camera"] == {
+        "width": 640,
+        "height": 480,
+        "fit_mode": "stretch",
+        "anchor_x": 0.5,
+        "anchor_y": 0.5,
+        "rotation": 0,
+    }
+    assert materialized["compositing"] == {
+        "color_correction": {
+            "strength": 0.7,
+            "mode": "off",
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8,
+        },
+        "blend_space": "srgb_legacy",
+    }
+    assert materialized["background"]["fit_mode"] == "cover"
+    assert materialized["output"] == {"width": None, "height": None}
+    assert raw == {
+        "schema_version": 1,
+        "camera": {"width": 640, "height": 480},
+        "compositing": {"color_correction": {"strength": 0.7}},
+    }
 
 
 def test_avatar_proxy_cli_overrides_map_atomically_into_runtime(tmp_path):
@@ -126,8 +246,104 @@ def test_round_trip_yaml(tmp_path):
     path = tmp_path / "cfg.yaml"
     cfg.save(path)
     loaded = AppConfig.load(path)
+    assert "schema_version: 1" in path.read_text()
     assert loaded.background.mode == "color"
     assert tuple(loaded.background.color) == (1, 2, 3)
+
+
+def test_visual_configuration_round_trips_and_resolves_explicit_canvas(tmp_path):
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {
+                "width": 640,
+                "height": 480,
+                "fit_mode": "contain",
+                "anchor_x": 0.25,
+                "anchor_y": 0.75,
+                "rotation": 270,
+            },
+            "background": {
+                "fit_mode": "stretch",
+                "anchor_x": 0.1,
+                "anchor_y": 0.9,
+            },
+            "output": {"width": 1920, "height": 1080},
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "color_correction": {
+                    "mode": "auto",
+                    "strength": 0.7,
+                    "exposure_limit_ev": 0.9,
+                    "white_balance_strength": 0.4,
+                    "adaptation_time_s": 1.25,
+                },
+            },
+        }
+    )
+    path = tmp_path / "visual.yaml"
+    cfg.save(path)
+
+    loaded = AppConfig.load(path)
+
+    assert loaded == cfg
+    assert resolved_output_size(loaded) == (1920, 1080)
+
+
+def test_output_size_falls_back_to_camera_request_for_legacy_configuration():
+    cfg = AppConfig.from_dict(
+        {"camera": {"width": 640, "height": 480}, "compositing": {}}
+    )
+
+    assert resolved_output_size(cfg) == (640, 480)
+    assert cfg.schema_version == 1
+    assert cfg.camera.fit_mode == "stretch"
+    assert cfg.compositing.blend_space == "srgb_legacy"
+    assert cfg.compositing.color_correction.mode == "off"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"width": 1920},
+        {"height": 1080},
+        {"width": None, "height": 1080},
+        {"width": 1920, "height": None},
+    ],
+)
+def test_output_canvas_dimensions_must_be_configured_as_a_pair(output):
+    with pytest.raises(ValueError, match="configured together"):
+        AppConfig.from_dict({"output": output})
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"camera": {"fit_mode": "crop"}},
+        {"camera": {"rotation": 45}},
+        {"camera": {"rotation": 90.0}},
+        {"camera": {"anchor_x": -0.01}},
+        {"camera": {"anchor_y": 1.01}},
+        {"camera": {"anchor_x": float("nan")}},
+        {"background": {"fit_mode": "letterbox"}},
+        {"background": {"anchor_x": float("inf")}},
+        {"compositing": {"blend_space": "display_p3"}},
+        {"compositing": {"color_correction": {"mode": "on"}}},
+        {"compositing": {"color_correction": {"strength": -0.01}}},
+        {"compositing": {"color_correction": {"strength": 1.01}}},
+        {"compositing": {"color_correction": {"exposure_limit_ev": 1.01}}},
+        {"compositing": {"color_correction": {"white_balance_strength": float("nan")}}},
+        {"compositing": {"color_correction": {"adaptation_time_s": 0.0}}},
+        {"compositing": {"color_correction": {"adaptation_time_s": 10.01}}},
+        {"compositing": {"color_correction": {"strength": "0.6"}}},
+        {"schema_version": 0},
+        {"schema_version": 2},
+        {"schema_version": 1.0},
+        {"schema_version": True},
+    ],
+)
+def test_visual_configuration_is_strict_finite_and_bounded(data):
+    with pytest.raises(ValueError):
+        AppConfig.from_dict(data)
 
 
 def test_invalid_mode_rejected():

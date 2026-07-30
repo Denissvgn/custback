@@ -15,8 +15,8 @@
       "sha256": "3d721e04d8d75c97d08706886f179616aa3d070792f56218d04f5bdcf9b49144"
     },
     "expected-0.4.0-local-camera.yaml": {
-      "derivation": "custback migrate --target-id legacy-camera applied to legacy-0.3.0-local-camera.yaml",
-      "sha256": "d9d2bbdd68a2ad084285ec119fd2f5f68a7be4bcc9b4ed985b7dd26d5c5ba46f"
+      "derivation": "custback migrate --target-id legacy-camera applied to legacy-0.3.0-local-camera.yaml; visual schema v1 materialized",
+      "sha256": "699d56178c5c5353c9fd4dca2d9b5ef3bbad81a4ef8abe18692e1e14c2f4f637"
     }
   }
 }

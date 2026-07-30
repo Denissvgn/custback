@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from .config import OutputConfig
+from .geometry import validate_bgr_frame
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,45 @@ log = logging.getLogger(__name__)
 # constant enables the already-tested Windows auto ladder
 # (pyvirtualcam -> native -> null).
 _AUTO_NATIVE_ENABLED = False
+SUPPORTED_NATIVE_MODES = frozenset(
+    {
+        (1280, 720, 30),
+        (1920, 1080, 30),
+    }
+)
+
+
+def _validate_sink_frame(
+    frame_bgr: np.ndarray,
+    width: int | None,
+    height: int | None,
+    *,
+    sink: str,
+) -> np.ndarray:
+    frame = validate_bgr_frame(
+        frame_bgr,
+        name=f"{sink} output",
+        require_contiguous=True,
+    )
+    if width is not None and height is not None:
+        expected = (height, width, 3)
+        if frame.shape != expected:
+            raise ValueError(
+                f"{sink} output must match {width}x{height}, got "
+                f"{frame.shape[1]}x{frame.shape[0]}"
+            )
+    return frame
+
+
+def _native_mode_error(width: int, height: int, fps: int) -> RuntimeError:
+    supported = ", ".join(
+        f"{mode_width}x{mode_height}@{mode_fps}"
+        for mode_width, mode_height, mode_fps in sorted(SUPPORTED_NATIVE_MODES)
+    )
+    return RuntimeError(
+        f"native virtual camera does not support {width}x{height}@{fps}; "
+        f"supported exact modes: {supported}"
+    )
 
 
 def virtual_camera_setup_hint(platform: str | None = None) -> str:
@@ -59,6 +99,9 @@ class VideoOutput(ABC):
     paces = False
     fallback_active = False
     fallback_reason = ""
+    width: int | None = None
+    height: int | None = None
+    fps: int | None = None
 
     @abstractmethod
     def send(self, frame_bgr: np.ndarray) -> None: ...
@@ -71,13 +114,30 @@ class NullOutput(VideoOutput):
     """Discards frames; useful when only the HTTP/WebSocket API is consumed."""
 
     def __init__(
-        self, *, fallback_active: bool = False, fallback_reason: str = ""
+        self,
+        width: int | None = None,
+        height: int | None = None,
+        fps: int | None = None,
+        *,
+        fallback_active: bool = False,
+        fallback_reason: str = "",
     ) -> None:
+        if (width is None) != (height is None):
+            raise ValueError("null output width and height must be configured together")
+        self.width = width
+        self.height = height
+        self.fps = fps
         self.frames_sent = 0
         self.fallback_active = fallback_active
         self.fallback_reason = fallback_reason
 
     def send(self, frame_bgr: np.ndarray) -> None:
+        _validate_sink_frame(
+            frame_bgr,
+            self.width,
+            self.height,
+            sink="null",
+        )
         self.frames_sent += 1
 
 
@@ -97,6 +157,9 @@ class PyVirtualCamOutput(VideoOutput):
             fmt=pyvirtualcam.PixelFormat.BGR,
             **kwargs,
         )
+        self.width = int(getattr(self.cam, "width", width))
+        self.height = int(getattr(self.cam, "height", height))
+        self.fps = int(getattr(self.cam, "fps", cfg.fps))
         log.info(
             "virtual camera started: %s (%dx%d @ %d fps)",
             self.cam.device,
@@ -106,6 +169,12 @@ class PyVirtualCamOutput(VideoOutput):
         )
 
     def send(self, frame_bgr: np.ndarray) -> None:
+        _validate_sink_frame(
+            frame_bgr,
+            self.width,
+            self.height,
+            sink="pyvirtualcam",
+        )
         self.cam.send(frame_bgr)
         self.cam.sleep_until_next_frame()
 
@@ -130,15 +199,19 @@ def _classify_output_failure(exc: BaseException) -> str:
 
 def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
     if cfg.backend == "null":
-        return NullOutput()
+        return NullOutput(width, height, cfg.fps)
     if cfg.backend == "native":
         # WIN-6.1: the Windows 11 Media Foundation virtual camera.  Explicit
         # opt-in while the auto-native feature flag remains off.
         # An explicit backend fails loudly rather than silently degrading.
+        mode = (width, height, cfg.fps)
+        if mode not in SUPPORTED_NATIVE_MODES:
+            raise _native_mode_error(*mode)
+
         from . import vcam_native
 
         vcam_native.require_native_camera_component()
-        return vcam_native.NativeVirtualCameraOutput(width, height)
+        return vcam_native.NativeVirtualCameraOutput(width, height, fps=cfg.fps)
     try:
         return PyVirtualCamOutput(cfg, width, height)
     except Exception as exc:
@@ -150,6 +223,22 @@ def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
             # Latent WIN-6.1 rung. Auto continues down the ladder on native
             # failure; unlike an explicit `native` selection it never turns a
             # missing optional camera into a fatal engine startup.
+            mode = (width, height, cfg.fps)
+            if mode not in SUPPORTED_NATIVE_MODES:
+                log.info(
+                    "native virtual camera skipped for unsupported exact mode %dx%d@%d",
+                    width,
+                    height,
+                    cfg.fps,
+                )
+                return NullOutput(
+                    width,
+                    height,
+                    cfg.fps,
+                    fallback_active=True,
+                    fallback_reason=reason,
+                )
+
             from . import vcam_native
 
             if not vcam_native.native_camera_component_available():
@@ -159,7 +248,11 @@ def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
                 )
             else:
                 try:
-                    return vcam_native.NativeVirtualCameraOutput(width, height)
+                    return vcam_native.NativeVirtualCameraOutput(
+                        width,
+                        height,
+                        fps=cfg.fps,
+                    )
                 except Exception as native_exc:
                     log.info(
                         "native virtual camera unavailable (%s); continuing to "
@@ -173,6 +266,9 @@ def open_output(cfg: OutputConfig, width: int, height: int) -> VideoOutput:
             hint,
         )
         return NullOutput(
+            width,
+            height,
+            cfg.fps,
             fallback_active=True,
             fallback_reason=reason,
         )

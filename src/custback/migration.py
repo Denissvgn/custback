@@ -36,7 +36,11 @@ from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
 from . import _platform as platform_fs
-from .config import AppConfig, format_config_error
+from .config import (
+    AppConfig,
+    format_config_error,
+    materialize_config_schema_defaults,
+)
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_JOURNAL_BYTES = 16 * 1024
@@ -403,6 +407,12 @@ def _safe_legacy_source(value: Any) -> tuple[bool, int | str | None]:
     return False, None
 
 
+def _materialize_visual_schema_v1(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return an explicit schema-v1 document without changing pinned values."""
+
+    return materialize_config_schema_defaults(copy.deepcopy(raw))
+
+
 def _plan_config_migration(raw: dict[str, Any], target_id: str) -> _ConfigPlan:
     if not _TARGET_ID_RE.fullmatch(target_id):
         raise MigrationError("target ID must match [a-z][a-z0-9_-]{0,63}")
@@ -417,9 +427,33 @@ def _plan_config_migration(raw: dict[str, Any], target_id: str) -> _ConfigPlan:
             raise MigrationError(
                 f"configuration is not valid for this release: {format_config_error(exc)}"
             ) from exc
+        migrated = _materialize_visual_schema_v1(raw)
+        if migrated != raw:
+            try:
+                AppConfig.from_dict(copy.deepcopy(migrated))
+                encoded = yaml.safe_dump(
+                    migrated,
+                    sort_keys=False,
+                    allow_unicode=True,
+                ).encode("utf-8")
+            except (
+                TypeError,
+                ValueError,
+                yaml.YAMLError,
+                RecursionError,
+            ) as exc:
+                raise MigrationError(
+                    f"schema-v1 configuration is invalid: {format_config_error(exc)}"
+                ) from exc
+            return _ConfigPlan(
+                MigrationStatus.MIGRATED,
+                "configuration materialized with explicit visual schema-v1 policy",
+                encoded,
+            )
         return _ConfigPlan(
             MigrationStatus.ALREADY_CURRENT,
-            "configuration has no legacy live-backdrop source",
+            "configuration already uses the current schema and has no legacy "
+            "live-backdrop source",
         )
 
     safe, source = _safe_legacy_source(background.get("camera_device"))
@@ -462,6 +496,7 @@ def _plan_config_migration(raw: dict[str, Any], target_id: str) -> _ConfigPlan:
         migrated = ordered
 
     try:
+        migrated = _materialize_visual_schema_v1(migrated)
         AppConfig.from_dict(copy.deepcopy(migrated))
         encoded = yaml.safe_dump(
             migrated,

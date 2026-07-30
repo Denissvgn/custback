@@ -265,7 +265,8 @@
     {"id": "stream-connection-caps", "minimum_iterations": 100},
     {"id": "upload-reservations", "minimum_iterations": 100},
     {"id": "cleanup-retries", "minimum_iterations": 100},
-    {"id": "audio2face-shutdown", "minimum_iterations": 100}
+    {"id": "audio2face-shutdown", "minimum_iterations": 100},
+    {"id": "visual-generation-hot-changes", "minimum_iterations": 100}
   ],
   "tls_scenarios": [
     "nominal-rendering",
@@ -298,6 +299,7 @@
     "migrations",
     "ruff",
     "stress",
+    "visual-qualification-deterministic",
     "artifact-integrity",
     "clean-tree",
     "two-host-tls",
@@ -319,6 +321,7 @@
       "migrations",
       "ruff",
       "stress",
+      "visual-qualification-deterministic",
       "clean-tree",
       "two-host-tls",
       "two-clean-hosts",

@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "active_stage": "compatibility",
+  "qualification_authority": "VIS-4.2 calibrated-fixture, physical-camera, consumer-sink, performance, privacy, and rollback approval",
+  "stages": [
+    {
+      "id": "compatibility",
+      "sequence": 1,
+      "status": "active",
+      "default_schema_version": 1,
+      "defaults": {
+        "camera_fit_mode": "stretch",
+        "blend_space": "srgb_legacy",
+        "color_correction_mode": "off"
+      },
+      "requires": [],
+      "evidence": [],
+      "change_commit": null,
+      "rollback": null
+    },
+    {
+      "id": "camera-cover",
+      "sequence": 2,
+      "status": "pending",
+      "default_schema_version": 2,
+      "defaults": {
+        "camera_fit_mode": "cover",
+        "blend_space": "srgb_legacy",
+        "color_correction_mode": "off"
+      },
+      "requires": [
+        "VIS-4.2 calibrated geometry approval",
+        "VIS-4.2 physical camera and consumer-sink approval",
+        "one-time aspect-mismatch upgrade note verified",
+        "schema-v1 preservation and explicit migration verified"
+      ],
+      "evidence": [],
+      "change_commit": null,
+      "rollback": {
+        "pin": {
+          "camera.fit_mode": "stretch"
+        },
+        "retain_schema_version": true,
+        "instructions": "Stop custback, restore or add the explicit camera.fit_mode: stretch pin, restart, and verify GET /config plus the preview before rejoining a call."
+      }
+    },
+    {
+      "id": "linear-compositing",
+      "sequence": 3,
+      "status": "pending",
+      "default_schema_version": 3,
+      "defaults": {
+        "camera_fit_mode": "cover",
+        "blend_space": "linear_srgb",
+        "color_correction_mode": "off"
+      },
+      "requires": [
+        "camera-cover stage approved and released",
+        "VIS-4.2 golden image and foreground-preservation approval",
+        "VIS-4.2 physical consumer-sink approval",
+        "VIS-4.2 platform performance budget approval"
+      ],
+      "evidence": [],
+      "change_commit": null,
+      "rollback": {
+        "pin": {
+          "compositing.blend_space": "srgb_legacy"
+        },
+        "retain_schema_version": true,
+        "instructions": "PATCH or restore compositing.blend_space: srgb_legacy, confirm the returned config version, and verify a fresh output frame; restart only if applying through a persisted file."
+      }
+    },
+    {
+      "id": "automatic-correction",
+      "sequence": 4,
+      "status": "pending",
+      "default_schema_version": 4,
+      "defaults": {
+        "camera_fit_mode": "cover",
+        "blend_space": "linear_srgb",
+        "color_correction_mode": "auto"
+      },
+      "requires": [
+        "linear-compositing stage approved and released",
+        "VIS-4.2 calibrated color, temporal, and scene-cut approval",
+        "VIS-4.2 physical camera auto-control interaction approval",
+        "VIS-4.2 physical consumer-sink approval",
+        "VIS-4.2 platform performance and privacy approval"
+      ],
+      "evidence": [],
+      "change_commit": null,
+      "rollback": {
+        "pin": {
+          "compositing.color_correction.mode": "off"
+        },
+        "retain_schema_version": true,
+        "instructions": "PATCH or restore compositing.color_correction.mode: off, confirm color_correction_active=false on the next output, and retain the other qualified visual-policy pins."
+      }
+    }
+  ],
+  "legacy_switch_retirement": {
+    "earliest": "a later documented release after at least one stable release with the final target stage",
+    "switches": [
+      "camera.fit_mode: stretch",
+      "compositing.blend_space: srgb_legacy",
+      "compositing.color_correction.mode: off"
+    ]
+  }
+}

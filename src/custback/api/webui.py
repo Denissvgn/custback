@@ -261,6 +261,15 @@ input[type="checkbox"],input[type="radio"]{width:1.15rem;height:1.15rem;accent-c
 .notice{padding:var(--space-sm) var(--space-md);border:var(--rule-thin) solid var(--color-warning);
   border-radius:var(--radius-control);background:var(--color-warning-soft);color:var(--color-warning);font-size:var(--text-sm)}
 .notice.err{border-color:var(--color-danger);background:var(--color-danger-soft);color:var(--color-danger)}
+.notice.good{border-color:var(--color-success);background:var(--color-success-soft);color:var(--color-success)}
+.notice.neutral{border-color:var(--color-rule);background:var(--color-paper-2);color:var(--color-ink-2)}
+.restart-tag{display:inline-flex;align-items:center;min-height:1.5rem;margin-inline-start:var(--space-xs);
+  padding:0 var(--space-xs);border:var(--rule-thin) solid var(--color-warning);border-radius:var(--radius-round);
+  background:var(--color-warning-soft);color:var(--color-warning);font-size:var(--text-xs);
+  font-weight:650;white-space:nowrap;vertical-align:middle}
+.advanced-grid{display:grid;gap:var(--space-lg);padding-block-start:var(--space-sm)}
+.advanced-group{display:grid;gap:var(--space-md)}
+.advanced-group+.advanced-group{padding-block-start:var(--space-md);border-block-start:var(--rule-thin) solid var(--color-rule)}
 .provider-planner{display:grid;gap:var(--space-md);padding:var(--space-md);border:var(--rule-thin) solid var(--color-rule);
   border-radius:var(--radius-panel);background:var(--color-paper-2)}
 .provider-status{display:flex;align-items:center;justify-content:space-between;gap:var(--space-md);font-size:var(--text-sm)}
@@ -481,7 +490,33 @@ source:
     </div>
 
     <div class="view-panel" id="view-quality" data-panel="quality" role="tabpanel" aria-labelledby="tab-quality" hidden>
-      <header class="panel-head"><h2>Tune camera quality</h2><p>Adjust subject separation and edge blending. Defaults are a good starting point for most cameras.</p></header>
+      <header class="panel-head"><h2>Tune camera quality</h2><p>Match foreground colour, frame the scene, and adjust subject separation. Defaults are a good starting point for most cameras.</p></header>
+      <section class="control-section">
+        <div class="section-copy"><h3>Colour match</h3><p>Gently adapt the camera foreground to supported image, video, or secondary-camera backgrounds.</p></div>
+        <div class="inline-toggle"><label for="quality-color-auto">Automatic colour correction<small>Applies only when the pipeline has a reliable background estimate.</small></label>
+          <span class="switch"><input type="checkbox" id="quality-color-auto"><span></span></span></div>
+        <div class="field"><label for="quality-color-strength">Correction strength</label>
+          <div class="range-line"><input type="range" id="quality-color-strength" min="0" max="1" step="0.05" aria-describedby="quality-color-strength-help"><span class="value" id="quality-color-strength-value"></span></div>
+          <small id="quality-color-strength-help">Lower values preserve more of the camera's original exposure and white balance.</small></div>
+        <p class="notice" id="quality-color-status" role="status" aria-live="polite" aria-atomic="true">Waiting for colour-correction status…</p>
+      </section>
+      <section class="control-section">
+        <div class="section-copy"><h3>Scene framing</h3><p>Choose how the camera and backdrop fill the output. Backdrop focal points keep the important area in view when cropping.</p></div>
+        <div class="field-grid two">
+          <div class="field"><label for="quality-background-fit">Background fit</label>
+            <select id="quality-background-fit"><option value="cover">Fill and crop</option><option value="contain">Fit with padding</option><option value="stretch">Stretch to fill</option></select>
+            <small>Applies immediately to image, video, and secondary-camera backgrounds.</small></div>
+          <div class="field"><label for="quality-camera-fit">Camera fit <span class="restart-tag">Restart required</span></label>
+            <select id="quality-camera-fit" aria-describedby="quality-camera-fit-help"><option value="cover">Fill and crop</option><option value="contain">Fit with padding</option><option value="stretch">Stretch to fill</option></select>
+            <small id="quality-camera-fit-help">Camera geometry is fixed when capture starts. A rejected change is restored to the effective setting.</small></div>
+          <div class="field"><label for="quality-background-anchor-x">Backdrop horizontal focal point</label>
+            <div class="range-line"><input type="range" id="quality-background-anchor-x" min="0" max="1" step="0.05" aria-describedby="quality-background-anchor-x-help"><span class="value" id="quality-background-anchor-x-value"></span></div>
+            <small id="quality-background-anchor-x-help">Left to right; affects cropped backdrops.</small></div>
+          <div class="field"><label for="quality-background-anchor-y">Backdrop vertical focal point</label>
+            <div class="range-line"><input type="range" id="quality-background-anchor-y" min="0" max="1" step="0.05" aria-describedby="quality-background-anchor-y-help"><span class="value" id="quality-background-anchor-y-value"></span></div>
+            <small id="quality-background-anchor-y-help">Top to bottom; affects cropped backdrops.</small></div>
+        </div>
+      </section>
       <section class="control-section">
         <div class="section-copy"><h3>Subject detection</h3><p>The backend finds you in each frame before custback replaces the room.</p></div>
         <div class="field-grid two">
@@ -505,6 +540,38 @@ source:
         </div>
         <div class="inline-toggle"><label for="quality-edge-refine">Refine subject edges<small>Improves the boundary around hair and shoulders.</small></label><span class="switch"><input type="checkbox" id="quality-edge-refine"><span></span></span></div>
         <div class="inline-toggle"><label for="quality-model-foreground">Use model foreground<small>Uses the model's colour output to reduce edge spill.</small></label><span class="switch"><input type="checkbox" id="quality-model-foreground"><span></span></span></div>
+      </section>
+      <section class="control-section">
+        <details><summary>Advanced colour and canvas controls</summary>
+          <div class="advanced-grid">
+            <div class="advanced-group">
+              <div class="section-copy"><h3>Correction limits</h3><p>These bounded expert controls apply live. Keep conservative values unless a calibrated workflow calls for more.</p></div>
+              <div class="field-grid two">
+                <div class="field"><label for="quality-exposure-limit">Exposure limit</label>
+                  <div class="range-line"><input type="range" id="quality-exposure-limit" min="0" max="1" step="0.05"><span class="value" id="quality-exposure-limit-value"></span></div><small>Maximum exposure adjustment in EV.</small></div>
+                <div class="field"><label for="quality-wb-strength">White-balance strength</label>
+                  <div class="range-line"><input type="range" id="quality-wb-strength" min="0" max="1" step="0.05"><span class="value" id="quality-wb-strength-value"></span></div><small>Restrains red, green, and blue gain matching.</small></div>
+                <div class="field"><label for="quality-adaptation-time">Adaptation time</label>
+                  <div class="range-line"><input type="range" id="quality-adaptation-time" min="0.05" max="10" step="0.05"><span class="value" id="quality-adaptation-time-value"></span></div><small>Seconds used to smooth reliable estimates.</small></div>
+                <div class="field"><label for="quality-blend-space">Blend-space compatibility</label>
+                  <select id="quality-blend-space"><option value="srgb_legacy">Legacy sRGB</option><option value="linear_srgb">Linear sRGB</option></select><small>Linear sRGB is photometrically correct; legacy mode preserves older output.</small></div>
+              </div>
+            </div>
+            <div class="advanced-group">
+              <div class="section-copy"><h3>Capture canvas <span class="restart-tag">Restart required</span></h3><p>These values are fixed when the pipeline starts. The API rejects live changes and this page restores the effective configuration.</p></div>
+              <div class="field-grid two">
+                <div class="field"><label for="quality-camera-rotation">Camera rotation</label>
+                  <select id="quality-camera-rotation" aria-describedby="quality-camera-rotation-help"><option value="0">0°</option><option value="90">90° clockwise</option><option value="180">180°</option><option value="270">270° clockwise</option></select>
+                  <small id="quality-camera-rotation-help">Applied before camera fit and mirroring.</small></div>
+                <div class="field"><label for="quality-output-width">Output width</label>
+                  <input type="number" id="quality-output-width" min="16" max="7680" step="1" inputmode="numeric" aria-describedby="quality-output-size-help"></div>
+                <div class="field"><label for="quality-output-height">Output height</label>
+                  <input type="number" id="quality-output-height" min="16" max="7680" step="1" inputmode="numeric" aria-describedby="quality-output-size-help"></div>
+              </div>
+              <p class="hint" id="quality-output-size-help">Set both output dimensions, or leave both blank to inherit the requested camera size.</p>
+            </div>
+          </div>
+        </details>
       </section>
     </div>
 
@@ -681,7 +748,7 @@ async function withBusy(button, label, action) {
 }
 
 function titleCase(value) {
-  return String(value || "—").replace(/_/g, " ")
+  return String(value || "—").replace(/[_-]/g, " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
@@ -734,6 +801,29 @@ async function patchCore(patch) {
   state.core = body.config;
   state.coreVersion = body.config_version;
   renderAll();
+}
+
+async function patchCoreControl(patch) {
+  try {
+    return await patchCore(patch);
+  } catch (err) {
+    let refreshError = null;
+    if (err instanceof ApiError && [409, 422, 503].includes(err.status)) {
+      try {
+        state.core = await api("GET", "/config");
+      } catch (caught) {
+        refreshError = caught;
+      }
+    }
+    // PATCH is atomic. Render either the freshly fetched effective config or
+    // the last known effective config so an optimistic browser control cannot
+    // retain a value that the pipeline rejected.
+    renderAll();
+    if (refreshError instanceof ApiError && refreshError.status === 401) {
+      throw refreshError;
+    }
+    throw err;
+  }
 }
 
 async function patchAvatar(patch) {
@@ -1688,15 +1778,109 @@ $("provider-copy").addEventListener("click", async (event) => {
 
 // -- camera quality -----------------------------------------------------------
 
+function formatAnchor(value, axis) {
+  const numeric = Number(value);
+  const percent = Math.round(numeric * 100) + "%";
+  if (numeric === 0) return percent + (axis === "x" ? " · left" : " · top");
+  if (numeric === 0.5) return percent + " · centre";
+  if (numeric === 1) return percent + (axis === "x" ? " · right" : " · bottom");
+  return percent;
+}
+
+function colorCorrectionSummary(status) {
+  if (!status || status.color_correction_state === undefined) {
+    return ["Waiting for detailed colour-correction status…", "warn"];
+  }
+  const phase = status.color_correction_state;
+  const configured = status.color_correction_mode;
+  const active = status.color_correction_active === true;
+  if (configured === "off" || phase === "disabled") {
+    return ["Off · disabled in the effective configuration", ""];
+  }
+  if (phase === "mode-excluded") {
+    return ["Bypassed · this output mode does not use colour correction", ""];
+  }
+  if (phase === "scene-cut") {
+    return ["Scene changed · the previous estimate was cleared", "warn"];
+  }
+  if (phase === "warming" || status.color_correction_warming === true) {
+    return ["Warming up · no fresh correction is available yet", "warn"];
+  }
+  if (phase === "low-confidence") {
+    return [
+      active
+        ? "Low confidence · the previous correction is being held"
+        : "Low confidence · correction is currently bypassed",
+      "warn",
+    ];
+  }
+  if (phase === "stale-decay" || status.color_correction_stale === true) {
+    return [
+      active
+        ? "Stale estimate · the previous correction is fading toward neutral"
+        : "Stale estimate · correction has returned to neutral",
+      "warn",
+    ];
+  }
+  const effective = status.color_correction_effective_mode;
+  if (effective === "bypass") {
+    return [
+      "Bypassed · " + titleCase(status.color_correction_reason || "pipeline fallback"),
+      "warn",
+    ];
+  }
+  if (phase !== "active" || !active
+      || ["off", "bypass", "identity"].includes(effective)) {
+    return ["Ready · no foreground adjustment is currently applied", ""];
+  }
+  const details = [];
+  const exposure = Number(status.color_correction_exposure_ev);
+  if (Number.isFinite(exposure)) {
+    details.push((exposure >= 0 ? "+" : "") + exposure.toFixed(2) + " EV");
+  }
+  if (String(effective).includes("white-balance")) details.push("WB active");
+  const confidence = Number(status.color_correction_confidence);
+  if (Number.isFinite(confidence)) {
+    details.push(Math.round(Math.max(0, Math.min(1, confidence)) * 100) + "% confidence");
+  }
+  return ["Active" + (details.length ? " · " + details.join(" · ") : ""), "good"];
+}
+
+function renderColorCorrectionStatus() {
+  const [message, tone] = colorCorrectionSummary(state.status);
+  $("quality-color-status").textContent = message;
+  $("quality-color-status").className = "notice " + (tone || "neutral");
+}
+
 function renderQuality() {
   if (!state.core) return;
   const segmentation = state.core.segmentation;
   const compositing = state.core.compositing;
+  const correction = compositing.color_correction;
+  const background = state.core.background;
+  const camera = state.core.camera;
+  const output = state.core.output;
+  $("quality-color-auto").checked = correction.mode === "auto";
+  $("quality-color-strength").disabled = correction.mode !== "auto";
+  $("quality-background-fit").value = background.fit_mode;
+  $("quality-camera-fit").value = camera.fit_mode;
+  $("quality-camera-rotation").value = String(camera.rotation);
+  $("quality-blend-space").value = compositing.blend_space;
+  $("quality-output-width").value = output.width ?? "";
+  $("quality-output-height").value = output.height ?? "";
+  $("quality-output-width").setAttribute("aria-invalid", "false");
+  $("quality-output-height").setAttribute("aria-invalid", "false");
   $("quality-backend").value = segmentation.backend;
   $("quality-delegate").value = segmentation.delegate;
   const gpu = $("quality-delegate").querySelector('option[value="gpu"]');
   gpu.disabled = ["rvm", "heuristic", "none"].includes(segmentation.backend);
   for (const [id, value, output, formatter] of [
+    ["quality-color-strength", correction.strength, "quality-color-strength-value", (v) => Math.round(Number(v) * 100) + "%"],
+    ["quality-background-anchor-x", background.anchor_x, "quality-background-anchor-x-value", (v) => formatAnchor(v, "x")],
+    ["quality-background-anchor-y", background.anchor_y, "quality-background-anchor-y-value", (v) => formatAnchor(v, "y")],
+    ["quality-exposure-limit", correction.exposure_limit_ev, "quality-exposure-limit-value", (v) => Number(v).toFixed(2) + " EV"],
+    ["quality-wb-strength", correction.white_balance_strength, "quality-wb-strength-value", (v) => Math.round(Number(v) * 100) + "%"],
+    ["quality-adaptation-time", correction.adaptation_time_s, "quality-adaptation-time-value", (v) => Number(v).toFixed(2) + " s"],
     ["quality-threshold", segmentation.threshold, "quality-threshold-value", (v) => Number(v).toFixed(2)],
     ["quality-rvm-downsample", segmentation.rvm_downsample, "quality-rvm-downsample-value", (v) => Number(v) === 0 ? "Auto" : Number(v).toFixed(2)],
     ["quality-mask-blur", segmentation.mask_blur, "quality-mask-blur-value", String],
@@ -1709,18 +1893,84 @@ function renderQuality() {
   }
   $("quality-edge-refine").checked = segmentation.edge_refine;
   $("quality-model-foreground").checked = compositing.use_model_foreground;
+  renderColorCorrectionStatus();
 }
+
+$("quality-color-auto").addEventListener("change", (event) => {
+  patchCoreControl({compositing: {color_correction: {
+    mode: event.target.checked ? "auto" : "off",
+  }}}).catch(reportError);
+});
+$("quality-background-fit").addEventListener("change", (event) => {
+  patchCoreControl({background: {fit_mode: event.target.value}}).catch(reportError);
+});
+$("quality-camera-fit").addEventListener("change", (event) => {
+  patchCoreControl({camera: {fit_mode: event.target.value}}).catch(reportError);
+});
+$("quality-blend-space").addEventListener("change", (event) => {
+  patchCoreControl({compositing: {blend_space: event.target.value}}).catch(reportError);
+});
+$("quality-camera-rotation").addEventListener("change", (event) => {
+  patchCoreControl({camera: {rotation: parseInt(event.target.value, 10)}})
+    .catch(reportError);
+});
+
+for (const [id, output, field, axis] of [
+  ["quality-background-anchor-x", "quality-background-anchor-x-value", "anchor_x", "x"],
+  ["quality-background-anchor-y", "quality-background-anchor-y-value", "anchor_y", "y"],
+]) {
+  $(id).addEventListener("input", (event) => {
+    $(output).textContent = formatAnchor(event.target.value, axis);
+  });
+  $(id).addEventListener("change", (event) => {
+    patchCoreControl({background: {[field]: parseFloat(event.target.value)}})
+      .catch(reportError);
+  });
+}
+
+for (const [id, output, field, formatter] of [
+  ["quality-color-strength", "quality-color-strength-value", "strength", (v) => Math.round(Number(v) * 100) + "%"],
+  ["quality-exposure-limit", "quality-exposure-limit-value", "exposure_limit_ev", (v) => Number(v).toFixed(2) + " EV"],
+  ["quality-wb-strength", "quality-wb-strength-value", "white_balance_strength", (v) => Math.round(Number(v) * 100) + "%"],
+  ["quality-adaptation-time", "quality-adaptation-time-value", "adaptation_time_s", (v) => Number(v).toFixed(2) + " s"],
+]) {
+  $(id).addEventListener("input", (event) => {
+    $(output).textContent = formatter(event.target.value);
+  });
+  $(id).addEventListener("change", (event) => {
+    patchCoreControl({compositing: {color_correction: {
+      [field]: parseFloat(event.target.value),
+    }}}).catch(reportError);
+  });
+}
+
+function commitOutputCanvas() {
+  const rawWidth = $("quality-output-width").value.trim();
+  const rawHeight = $("quality-output-height").value.trim();
+  const incomplete = (rawWidth === "") !== (rawHeight === "");
+  $("quality-output-width").setAttribute("aria-invalid", String(incomplete));
+  $("quality-output-height").setAttribute("aria-invalid", String(incomplete));
+  if (incomplete) {
+    toast("Set both output dimensions, or leave both blank.", "err");
+    return;
+  }
+  const width = rawWidth === "" ? null : parseInt(rawWidth, 10);
+  const height = rawHeight === "" ? null : parseInt(rawHeight, 10);
+  patchCoreControl({output: {width, height}}).catch(reportError);
+}
+$("quality-output-width").addEventListener("change", commitOutputCanvas);
+$("quality-output-height").addEventListener("change", commitOutputCanvas);
 
 $("quality-backend").addEventListener("change", (event) => {
   const backend = event.target.value;
   const patch = {segmentation: {backend}};
   if (["rvm", "heuristic", "none"].includes(backend)
       && state.core.segmentation.delegate === "gpu") patch.segmentation.delegate = "cpu";
-  patchCore(patch).catch((err) => { reportError(err); renderQuality(); });
+  patchCoreControl(patch).catch(reportError);
 });
 $("quality-delegate").addEventListener("change", (event) => {
-  patchCore({segmentation: {delegate: event.target.value}})
-    .catch((err) => { reportError(err); renderQuality(); });
+  patchCoreControl({segmentation: {delegate: event.target.value}})
+    .catch(reportError);
 });
 
 for (const [id, output, section, field, parse, format] of [
@@ -1735,17 +1985,17 @@ for (const [id, output, section, field, parse, format] of [
     $(output).textContent = format(event.target.value);
   });
   $(id).addEventListener("change", (event) => {
-    patchCore({[section]: {[field]: parse(event.target.value)}})
-      .catch((err) => { reportError(err); renderQuality(); });
+    patchCoreControl({[section]: {[field]: parse(event.target.value)}})
+      .catch(reportError);
   });
 }
 $("quality-edge-refine").addEventListener("change", (event) => {
-  patchCore({segmentation: {edge_refine: event.target.checked}})
-    .catch((err) => { reportError(err); renderQuality(); });
+  patchCoreControl({segmentation: {edge_refine: event.target.checked}})
+    .catch(reportError);
 });
 $("quality-model-foreground").addEventListener("change", (event) => {
-  patchCore({compositing: {use_model_foreground: event.target.checked}})
-    .catch((err) => { reportError(err); renderQuality(); });
+  patchCoreControl({compositing: {use_model_foreground: event.target.checked}})
+    .catch(reportError);
 });
 
 // -- diagnostics and safe runtime settings -----------------------------------
@@ -1759,12 +2009,45 @@ function formatDuration(seconds) {
   return minutes ? minutes + " min" : total + " s";
 }
 
+function cameraControlsSummary(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "—";
+  const parts = [
+    titleCase(value.policy || "unknown policy"),
+    titleCase(value.backend_family || "unknown backend"),
+    titleCase(value.qualification || "unqualified"),
+    value.writes_performed ? "writes observed" : "no writes",
+  ];
+  if (Number.isInteger(value.generation)) {
+    parts.push("generation " + value.generation);
+  }
+  const properties = value.properties;
+  if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+    for (const [name, observation] of Object.entries(properties)) {
+      if (!observation || typeof observation !== "object") continue;
+      const reading = observation.value === null || observation.value === undefined
+        ? "" : " " + new Intl.NumberFormat().format(observation.value);
+      parts.push(titleCase(name) + ": " + titleCase(observation.status) + reading);
+    }
+  }
+  return parts.join(" · ");
+}
+
 function formatDiagnostic(key, value) {
   if (value === null || value === undefined || value === "") return "—";
+  if (key === "camera_controls") return cameraControlsSummary(value);
+  if (Array.isArray(value)) {
+    return value.length ? value.map((item) => titleCase(item)).join(", ") : "None";
+  }
   if (typeof value === "boolean") return value ? "Yes" : "No";
   if (typeof value === "number") {
     if (key.endsWith("_ms")) return value.toFixed(1) + " ms";
     if (key.endsWith("_s")) return formatDuration(value);
+    if (key.endsWith("_ev")) return (value >= 0 ? "+" : "") + value.toFixed(2) + " EV";
+    if (key.includes("_wb_gain_") || key.endsWith("_scale_x") || key.endsWith("_scale_y")) {
+      return value.toFixed(3);
+    }
+    if (key.endsWith("_confidence")) return value.toFixed(2);
+    if (key.endsWith("_rotation")) return value + "°";
     if (key.includes("fps") || key.endsWith("_pct") || key.endsWith("_ratio")) {
       return value.toFixed(1);
     }
@@ -1776,11 +2059,22 @@ function formatDiagnostic(key, value) {
     "driver_backend", "driver_device",
     "acceleration_mode", "acceleration_requested_provider",
     "acceleration_active_provider", "acceleration_state",
+    "color_correction_mode", "color_correction_effective_mode",
+    "color_correction_state", "color_correction_reason",
+    "camera_fit", "background_fit", "color_input_assumption",
+    "background_video_decoder_backend", "background_video_color_status",
   ]);
   return enumKeys.has(key) ? titleCase(value) : String(value);
 }
 
 function diagnosticTone(key, value) {
+  if (key === "color_correction_state") {
+    if (value === "active") return "good";
+    if (["warming", "low-confidence", "stale-decay", "scene-cut"].includes(value)) {
+      return "warn";
+    }
+    return "";
+  }
   if ((key.includes("failure") || key.includes("miss") || key.includes("dropped")
       || key.includes("restart")) && Number(value) > 0) return "bad";
   if ((key.includes("fallback") || key.includes("stalled")) && value === true) return "warn";
@@ -1800,9 +2094,33 @@ function diagnosticLabel(key) {
     acceleration_fallback_count: "GPU fallback count", acceleration_device_id: "Accelerator device",
     acceleration_last_transition_ms: "Acceleration transition age",
     capture_dropped_frames: "Dropped camera frames", processing_deadline_misses: "Processing deadline misses",
+    capture_delivered_width: "Delivered camera width", capture_delivered_height: "Delivered camera height",
+    capture_oriented_width: "Oriented camera width", capture_oriented_height: "Oriented camera height",
+    capture_normalized_width: "Normalized camera width", capture_normalized_height: "Normalized camera height",
+    capture_generation: "Capture generation", camera_fit: "Camera fit", camera_rotation: "Camera rotation",
+    camera_mirror: "Camera mirror", camera_scale_x: "Camera horizontal scale",
+    camera_scale_y: "Camera vertical scale", background_fit: "Background fit",
+    background_scale_x: "Background horizontal scale", background_scale_y: "Background vertical scale",
+    camera_controls: "Camera-control qualification",
+    background_video_decoder_backend: "Video decoder backend",
+    background_video_color_status: "Video colour status",
+    background_video_input_color: "Declared video input colour",
+    background_video_output_color: "Normalized video output colour",
+    background_video_color_assumed_fields: "Assumed video colour fields",
+    background_video_color_overridden_fields: "Overridden video colour fields",
+    color_correction_mode: "Configured colour correction",
+    color_correction_active: "Colour transform applied",
+    color_correction_effective_mode: "Effective colour correction",
+    color_correction_state: "Colour correction state",
+    color_correction_reason: "Colour correction reason",
+    color_correction_confidence: "Colour estimate confidence",
+    color_correction_exposure_ev: "Exposure correction",
+    color_correction_wb_gain_r: "Red gain", color_correction_wb_gain_g: "Green gain",
+    color_correction_wb_gain_b: "Blue gain", color_correction_warming: "Correction warming",
+    color_correction_stale: "Correction stale", color_input_assumption: "Input colour assumption",
     uptime_s: "Uptime", connected: "Camera feed connected", driver_backend: "Following driver",
     face_present: "Face detected", render_ms: "Avatar render time", render_failures: "Render failures",
-    output_width: "Avatar output width", output_height: "Avatar output height",
+    output_width: "Output width", output_height: "Output height",
   };
   return labels[key] || titleCase(key);
 }
@@ -1829,8 +2147,54 @@ function allDiagnosticRows(object) {
   ]);
 }
 
+function geometrySummary(status) {
+  if (!status || !status.camera_fit) return "Waiting for geometry status";
+  const sourceWidth = status.capture_delivered_width;
+  const sourceHeight = status.capture_delivered_height;
+  const outputWidth = status.output_width;
+  const outputHeight = status.output_height;
+  const source = sourceWidth && sourceHeight
+    ? sourceWidth + " × " + sourceHeight : "camera";
+  const output = outputWidth && outputHeight
+    ? outputWidth + " × " + outputHeight : "output";
+  const scaledWidth = Number(status.capture_oriented_width)
+    * Number(status.camera_scale_x);
+  const scaledHeight = Number(status.capture_oriented_height)
+    * Number(status.camera_scale_y);
+  const crop = Number.isFinite(scaledWidth) && Number.isFinite(scaledHeight)
+    && scaledWidth > 0 && scaledHeight > 0
+    && (
+      Number(status.camera_crop_left) > 0
+      || Number(status.camera_crop_top) > 0
+      || Number(status.camera_crop_right) < Math.round(scaledWidth)
+      || Number(status.camera_crop_bottom) < Math.round(scaledHeight)
+    );
+  const pad = ["left", "top", "right", "bottom"].some((edge) =>
+    Number(status["camera_pad_" + edge]) > 0);
+  const operation = crop ? "crop" : (pad ? "pad" : "no crop");
+  return source + " → " + titleCase(status.camera_fit) + " / " + operation
+    + " → " + output;
+}
+
+function videoColorSummary(status) {
+  const colorStatus = status && status.background_video_color_status;
+  if (!colorStatus) return ["Not applicable", ""];
+  const parts = [titleCase(colorStatus)];
+  if (status.background_video_decoder_backend) {
+    parts.push(titleCase(status.background_video_decoder_backend));
+  }
+  if (status.background_video_input_color && status.background_video_output_color) {
+    parts.push(status.background_video_input_color + " → "
+      + status.background_video_output_color);
+  }
+  const warning = String(colorStatus).includes("legacy")
+    || String(colorStatus).includes("assumption");
+  return [parts.join(" · "), warning ? "warn" : "good"];
+}
+
 function renderDiagnostics() {
   const status = state.status;
+  renderColorCorrectionStatus();
   if (status) {
     const dimensions = status.capture_width && status.capture_height
       ? status.capture_width + " × " + status.capture_height : "Negotiating";
@@ -1848,7 +2212,12 @@ function renderDiagnostics() {
         : titleCase(status.acceleration_active_provider);
       coreRows.push(["Acceleration", accelValue, status.acceleration_fallback_active ? "warn" : ""]);
     }
+    if (status.background_video_color_status) {
+      coreRows.push(["Video colour", ...videoColorSummary(status)]);
+    }
     coreRows.push(
+      ["Geometry", geometrySummary(status), ""],
+      ["Colour correction", ...colorCorrectionSummary(status)],
       ["Frame processing", formatDiagnostic("frame_processing_ms", status.frame_processing_ms), ""],
       ["Dropped camera frames", new Intl.NumberFormat().format(status.capture_dropped_frames), status.capture_dropped_frames ? "bad" : ""],
       ["Uptime", formatDuration(status.uptime_s), ""],

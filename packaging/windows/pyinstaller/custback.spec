@@ -42,6 +42,7 @@ from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
     collect_submodules,
+    get_package_paths,
 )
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +88,7 @@ _hiddenimports = []
 # predicate here so PyInstaller neither collects nor force-imports an absent
 # package.  build.ps1 verifies that the running interpreter matches -Arch.
 _WINDOWS_ARM64 = sys.platform == "win32" and platform.machine().upper() == "ARM64"
-_native_packages = ["cv2", "onnxruntime", "mediapipe", "numpy"]
+_native_packages = ["av", "cv2", "onnxruntime", "mediapipe", "numpy"]
 if not _WINDOWS_ARM64:
     _native_packages.append("pyvirtualcam")
 
@@ -96,6 +97,39 @@ for _pkg in _native_packages:
         _binaries += collect_dynamic_libs(_pkg)
     except Exception:  # a package absent from this profile is not fatal
         pass
+
+# PyAV is a core dependency and its Cython extension modules reach parts of the
+# package and standard library dynamically.  Keep this explicit instead of
+# depending solely on the version of pyinstaller-hooks-contrib installed beside
+# PyInstaller.
+try:
+    _hiddenimports += collect_submodules("av")
+except Exception as exc:
+    raise SystemExit("the frozen build requires an importable PyAV package") from exc
+_hiddenimports += ["dataclasses", "fractions", "uuid"]
+
+# Since PyAV 9.1.1, Windows wheels place their private FFmpeg DLLs in the
+# sibling ``site-packages/av.libs`` directory.  ``collect_dynamic_libs("av")``
+# cannot see outside the package directory.  Preserve that exact sibling
+# layout as data: treating the DLLs as ordinary binaries makes PyInstaller
+# analyze and duplicate them at the onedir root, while PyAV's wheel loader
+# expects ``av.libs``.
+if sys.platform == "win32":
+    try:
+        _av_package_base, _av_package_dir = get_package_paths("av")
+    except Exception as exc:
+        raise SystemExit("cannot locate PyAV for the frozen build") from exc
+    _av_lib_dir = os.path.join(_av_package_base, "av.libs")
+    if not os.path.isdir(_av_lib_dir):
+        raise SystemExit(f"PyAV wheel is missing its native bundle: {_av_lib_dir}")
+    _av_lib_files = [
+        os.path.join(_av_lib_dir, _name)
+        for _name in sorted(os.listdir(_av_lib_dir))
+        if os.path.isfile(os.path.join(_av_lib_dir, _name))
+    ]
+    if not _av_lib_files:
+        raise SystemExit(f"PyAV native bundle is empty: {_av_lib_dir}")
+    _datas += [(_source, "av.libs") for _source in _av_lib_files]
 
 # MediaPipe ships its graph configs and the selfie-segmenter task graph as data;
 # without these the delegate import at custback.segmentation succeeds but the

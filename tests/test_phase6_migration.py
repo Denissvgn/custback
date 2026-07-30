@@ -64,6 +64,12 @@ def test_golden_config_migration_is_private_atomic_and_idempotent(tmp_path):
     assert loaded.background.camera_device == ""
     assert loaded.background.camera_target == "legacy-camera"
     assert loaded.backdrop_targets["legacy-camera"].source == "/dev/video2"
+    assert loaded.schema_version == 1
+    assert loaded.camera.fit_mode == "stretch"
+    assert loaded.background.fit_mode == "cover"
+    assert loaded.compositing.blend_space == "srgb_legacy"
+    assert loaded.compositing.color_correction.mode == "off"
+    assert (loaded.output.width, loaded.output.height) == (None, None)
 
     before = {
         path: (path.lstat().st_ino, path.lstat().st_mtime_ns, path.read_bytes())
@@ -76,6 +82,68 @@ def test_golden_config_migration_is_private_atomic_and_idempotent(tmp_path):
         path: (path.lstat().st_ino, path.lstat().st_mtime_ns, path.read_bytes())
         for path in (config, artifacts.backup)
     } == before
+
+
+def test_explicit_migration_materializes_versionless_visual_schema_v1(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_bytes(_fixture("legacy-0.3.0-default.yaml"))
+
+    result = migration.migrate_config(config, "legacy-camera")
+
+    assert result.status is migration.MigrationStatus.MIGRATED
+    raw = yaml.safe_load(config.read_text())
+    assert raw["schema_version"] == 1
+    assert (
+        raw["camera"]
+        | {
+            "fit_mode": "stretch",
+            "anchor_x": 0.5,
+            "anchor_y": 0.5,
+            "rotation": 0,
+        }
+        == raw["camera"]
+    )
+    assert (
+        raw["background"]
+        | {
+            "fit_mode": "cover",
+            "anchor_x": 0.5,
+            "anchor_y": 0.5,
+        }
+        == raw["background"]
+    )
+    assert raw["compositing"]["blend_space"] == "srgb_legacy"
+    assert raw["compositing"]["color_correction"] == {
+        "mode": "off",
+        "strength": 0.5,
+        "exposure_limit_ev": 0.85,
+        "white_balance_strength": 0.5,
+        "adaptation_time_s": 0.8,
+    }
+    assert (raw["output"]["width"], raw["output"]["height"]) == (None, None)
+    loaded = AppConfig.load(config)
+    assert loaded.schema_version == 1
+
+    again = migration.migrate_config(config, "legacy-camera")
+    assert again.status is migration.MigrationStatus.ALREADY_CURRENT
+
+
+def test_explicit_schema_v1_migration_materializes_absent_visual_policy(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("schema_version: 1\nbackground:\n  mode: blur\n")
+
+    result = migration.migrate_config(config, "legacy-camera")
+
+    assert result.status is migration.MigrationStatus.MIGRATED
+    raw = yaml.safe_load(config.read_text())
+    assert raw["schema_version"] == 1
+    assert raw["camera"]["fit_mode"] == "stretch"
+    assert raw["background"]["fit_mode"] == "cover"
+    assert raw["compositing"]["blend_space"] == "srgb_legacy"
+    assert raw["compositing"]["color_correction"]["mode"] == "off"
+    assert raw["output"] == {"width": None, "height": None}
+    again = migration.migrate_config(config, "legacy-camera")
+    assert again.status is migration.MigrationStatus.ALREADY_CURRENT
 
 
 @pytest.mark.parametrize("boundary", migration.DURABLE_BOUNDARIES)

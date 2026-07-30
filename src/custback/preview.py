@@ -578,6 +578,34 @@ def _status_overlay_lines(
         capture_backend = str(stats.get("capture_backend") or "camera")
         status.append(f"CAPTURE {capture_backend}: " + "  ".join(capture_parts))
 
+    delivered_width = stats.get("capture_delivered_width")
+    delivered_height = stats.get("capture_delivered_height")
+    output_width = stats.get("output_width")
+    output_height = stats.get("output_height")
+    camera_fit = str(stats.get("camera_fit") or "")
+    if (
+        delivered_width
+        and delivered_height
+        and output_width
+        and output_height
+        and camera_fit
+    ):
+        status.append(
+            f"GEOMETRY {delivered_width}x{delivered_height} -> "
+            f"{camera_fit} -> {output_width}x{output_height}"
+        )
+
+    correction_state = str(stats.get("color_correction_state") or "")
+    if correction_state:
+        effective = str(stats.get("color_correction_effective_mode") or "unknown")
+        reason = str(stats.get("color_correction_reason") or "unknown")
+        confidence = _as_float(stats.get("color_correction_confidence")) or 0.0
+        exposure_ev = _as_float(stats.get("color_correction_exposure_ev")) or 0.0
+        status.append(
+            f"COLOR {correction_state}/{effective}  {exposure_ev:+.2f} EV  "
+            f"confidence {confidence:.2f}  reason {reason}"
+        )
+
     timing_mode = str(stats.get("background_video_timing_mode") or "")
     source_fps = _as_float(stats.get("background_video_source_fps"))
     video_frames = _as_int(stats.get("background_video_frames_displayed")) or 0
@@ -598,6 +626,12 @@ def _status_overlay_lines(
         )
     elif stats.get("capture_target_met") is False:
         warnings.append("CAPTURE BELOW TARGET")
+
+    if correction_state == "low-confidence":
+        reason = str(stats.get("color_correction_reason") or "unspecified")
+        warnings.append(f"COLOR LOW CONFIDENCE: {reason[:120]}")
+    elif correction_state == "stale-decay":
+        warnings.append("COLOR CORRECTION STALE: decaying to identity")
 
     fallback_fields = (
         ("output_fallback_active", "output_fallback_reason", "OUTPUT FALLBACK"),

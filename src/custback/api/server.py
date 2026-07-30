@@ -38,14 +38,23 @@ except ImportError:  # python-multipart 0.0.9 minimum compatibility
 from .. import __version__
 from .. import _platform as platform_fs
 from ..backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, VIDEO_EXTS
+from ..color import ColorError, decode_image_to_srgb_bgr
 from ..config import (
     MODES,
+    Anchor,
     CameraConfig,
     CompositingConfig,
+    FitMode,
     OutputConfig,
     RuntimeConfig,
+    SchemaVersion,
     SegmentationConfig,
     UploadLimits,
+    VideoColorMatrix,
+    VideoColorPrimaries,
+    VideoColorRange,
+    VideoColorTransfer,
+    resolved_output_size,
 )
 from ..hub import FrameHub
 from ..storage_tx import OwnedPath, OwnershipLedger, rename_noreplace
@@ -97,6 +106,70 @@ _IMAGE_FORMATS = {
 }
 _STAGED_UPLOAD_RE = re.compile(r"\.upload-[0-9a-f]{32}(?:\.part|\.[a-z0-9]+)\Z")
 _FINAL_UPLOAD_RE = re.compile(r"[0-9a-f]{32}\.[a-z0-9]+\Z")
+_VISUAL_CONFIG_PATCH_EXAMPLES = {
+    "camera-cover-restart": {
+        "summary": "Select proportional camera cover (restart required)",
+        "description": (
+            "Camera geometry is restart-only. A 409 response leaves the active "
+            "configuration unchanged; persist the field and restart."
+        ),
+        "value": {"camera": {"fit_mode": "cover"}},
+    },
+    "backdrop-contain": {
+        "summary": "Contain a backdrop and move its focal point",
+        "description": "Backdrop geometry is hot and commits at a frame boundary.",
+        "value": {
+            "background": {
+                "fit_mode": "contain",
+                "anchor_x": 0.5,
+                "anchor_y": 0.25,
+            }
+        },
+    },
+    "linear-compositing": {
+        "summary": "Opt into linear-light compositing",
+        "description": (
+            "This hot opt-in does not change the schema-1 srgb_legacy default."
+        ),
+        "value": {"compositing": {"blend_space": "linear_srgb"}},
+    },
+    "automatic-color-correction": {
+        "summary": "Opt into bounded automatic foreground correction",
+        "description": (
+            "Automatic correction is eligible only for image, video, and camera "
+            "backdrops; low confidence remains an observable safe bypass."
+        ),
+        "value": {
+            "compositing": {
+                "color_correction": {
+                    "mode": "auto",
+                    "strength": 0.5,
+                }
+            }
+        },
+    },
+    "visual-quality-hot": {
+        "summary": "Atomically update backdrop geometry and color policy",
+        "description": (
+            "All fields in this example are hot. The candidate geometry and "
+            "color state commit together or the old output remains active."
+        ),
+        "value": {
+            "background": {
+                "fit_mode": "cover",
+                "anchor_x": 0.5,
+                "anchor_y": 0.25,
+            },
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "color_correction": {
+                    "mode": "auto",
+                    "strength": 0.5,
+                },
+            },
+        },
+    },
+}
 
 LOGIN_HTML = """<!doctype html>
 <meta charset="utf-8"><title>custback login</title>
@@ -293,10 +366,18 @@ class PublicBackgroundConfig(BaseModel):
     camera_source_configured: bool
     color: tuple[int, int, int]
     blur_strength: int
+    fit_mode: FitMode
+    anchor_x: Anchor
+    anchor_y: Anchor
+    video_color_matrix: VideoColorMatrix
+    video_color_range: VideoColorRange
+    video_color_primaries: VideoColorPrimaries
+    video_color_transfer: VideoColorTransfer
     remote_fallback_mode: str
 
 
 class PublicAppConfig(BaseModel):
+    schema_version: SchemaVersion
     camera: CameraConfig
     background: PublicBackgroundConfig
     segmentation: SegmentationConfig
@@ -342,6 +423,28 @@ class _StatusResponse(BaseModel):
     capture_fourcc: str | None
     capture_width: int | None
     capture_height: int | None
+    capture_delivered_width: int | None
+    capture_delivered_height: int | None
+    capture_oriented_width: int | None
+    capture_oriented_height: int | None
+    capture_normalized_width: int | None
+    capture_normalized_height: int | None
+    capture_generation: int
+    capture_geometry_transitions: int
+    camera_fit: str
+    camera_rotation: int
+    camera_mirror: bool
+    camera_scale_x: float | None
+    camera_scale_y: float | None
+    camera_crop_left: int | None
+    camera_crop_top: int | None
+    camera_crop_right: int | None
+    camera_crop_bottom: int | None
+    camera_pad_left: int
+    camera_pad_top: int
+    camera_pad_right: int
+    camera_pad_bottom: int
+    camera_controls: dict[str, object]
     capture_fps_reported: float | None
     capture_target_fps: int
     capture_fps: float
@@ -353,12 +456,49 @@ class _StatusResponse(BaseModel):
     capture_stalled: bool
     capture_frame_age_ms: float | None
     output_target_fps: int
+    output_width: int | None
+    output_height: int | None
+    output_fps: int | None
+    output_effective_fps: float
     fps_attainment_pct: float | None
     output_repeated_frames: int
     processing_deadline_misses: int
     capture_read_ms: float | None
     segmentation_ms: float | None
     background_ms: float | None
+    color_correction_ms: float | None
+    background_fit: str
+    background_rotation: int
+    background_mirror: bool
+    background_scale_x: float | None
+    background_scale_y: float | None
+    background_crop_left: int | None
+    background_crop_top: int | None
+    background_crop_right: int | None
+    background_crop_bottom: int | None
+    background_pad_left: int
+    background_pad_top: int
+    background_pad_right: int
+    background_pad_bottom: int
+    background_geometry_transitions: int
+    color_correction_mode: str
+    color_correction_active: bool
+    color_correction_effective_mode: str
+    color_correction_state: str
+    color_correction_reason: str
+    color_correction_confidence: float
+    color_correction_exposure_ev: float
+    color_correction_wb_gain_r: float
+    color_correction_wb_gain_g: float
+    color_correction_wb_gain_b: float
+    color_correction_wb_active: bool
+    color_correction_warming: bool
+    color_correction_stale: bool
+    color_correction_applied_frames: int
+    color_correction_bypassed_frames: int
+    color_correction_scene_cuts: int
+    color_correction_transitions: int
+    color_input_assumption: str
     composite_ms: float | None
     output_send_ms: float | None
     frame_processing_ms: float | None
@@ -366,6 +506,15 @@ class _StatusResponse(BaseModel):
     output_fallback_reason: str
     segmentation_fallback_active: bool
     segmentation_fallback_reason: str
+    acceleration_mode: str
+    acceleration_requested_provider: str
+    acceleration_device_id: int
+    acceleration_state: str
+    acceleration_active_provider: str
+    acceleration_fallback_active: bool
+    acceleration_fallback_reason: str
+    acceleration_fallback_count: int
+    acceleration_last_transition_ms: float | None
     background_video_source_fps: float | None
     background_video_timing_mode: str | None
     background_video_frames_displayed: int
@@ -374,6 +523,15 @@ class _StatusResponse(BaseModel):
     background_video_skip_ratio: float
     background_video_seek_count: int
     background_video_decode_failures: int
+    background_video_orientation_status: str | None
+    background_video_metadata_rotation: int | None
+    background_video_auto_rotation_disabled: bool | None
+    background_video_decoder_backend: str | None
+    background_video_color_status: str | None
+    background_video_input_color: str | None
+    background_video_output_color: str | None
+    background_video_color_assumed_fields: list[str]
+    background_video_color_overridden_fields: list[str]
     uptime_s: float
 
 
@@ -1321,65 +1479,37 @@ class _UploadStore:
             raise _error(503, "decoder_unavailable", "opencv-python is unavailable")
         suffix = (suffix or path.suffix).lower()
         if kind == "image":
-            if Image is None:
-                raise _error(503, "decoder_unavailable", "Pillow is unavailable")
             try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error")
-                    with Image.open(path) as image:
-                        if image.format != _IMAGE_FORMATS.get(suffix):
-                            raise ValueError(
-                                f"image header does not match {suffix or 'filename'}"
-                            )
-                        width, height = image.size
-                        if width <= 0 or height <= 0:
-                            raise ValueError("invalid dimensions")
-                        if width * height > self.limits.image_max_pixels:
-                            raise _error(
-                                422,
-                                "image_dimensions_exceeded",
-                                "image pixel limit exceeded",
-                                limit=self.limits.image_max_pixels,
-                            )
-                        image.verify()
-                    # ``verify`` validates headers and container integrity but
-                    # does not fully decompress pixel data. Reopen and load so
-                    # corrupt compressed payloads never reach OpenCV.
-                    with Image.open(path) as decoded:
-                        if decoded.format != _IMAGE_FORMATS.get(
-                            suffix
-                        ) or decoded.size != (width, height):
-                            raise ValueError("image changed during validation")
-                        decoded.load()
-            except HTTPException:
-                raise
-            except (
-                Image.DecompressionBombError,
-                Image.DecompressionBombWarning,
-            ) as exc:
+                image = decode_image_to_srgb_bgr(
+                    path,
+                    _IMAGE_FORMATS.get(suffix, ""),
+                    self.limits.image_max_pixels,
+                )
+            except ColorError as exc:
+                if str(exc) == (f"image exceeds {self.limits.image_max_pixels} pixels"):
+                    raise _error(
+                        422,
+                        "image_dimensions_exceeded",
+                        "image pixel limit exceeded",
+                        limit=self.limits.image_max_pixels,
+                    ) from exc
                 raise _error(
                     422,
-                    "image_dimensions_exceeded",
-                    "image pixel limit exceeded",
-                    limit=self.limits.image_max_pixels,
+                    "invalid_media",
+                    "image cannot be decoded",
                 ) from exc
-            except (OSError, ValueError, Warning, UnidentifiedImageError) as exc:
-                raise _error(422, "invalid_media", "image cannot be decoded") from exc
-            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-            if (
-                image is None
-                or image.dtype != np.uint8
-                or image.ndim != 3
-                or image.shape[2] != 3
-            ):
-                raise _error(422, "invalid_media", "image cannot be decoded")
-            height, width = image.shape[:2]
-            if width * height > self.limits.image_max_pixels:
+            except (FileNotFoundError, OSError, ValueError) as exc:
                 raise _error(
                     422,
-                    "image_dimensions_exceeded",
-                    "image pixel limit exceeded",
-                    limit=self.limits.image_max_pixels,
+                    "invalid_media",
+                    "image cannot be decoded",
+                ) from exc
+            height, width = image.shape[:2]
+            if width <= 0 or height <= 0:
+                raise _error(
+                    422,
+                    "invalid_media",
+                    "image cannot be decoded",
                 )
             return width, height
 
@@ -1818,8 +1948,14 @@ def create_app(
             "requestBody": {
                 "required": True,
                 "content": {
-                    "application/json": {"schema": {"type": "object"}},
-                    "application/merge-patch+json": {"schema": {"type": "object"}},
+                    "application/json": {
+                        "schema": {"type": "object"},
+                        "examples": _VISUAL_CONFIG_PATCH_EXAMPLES,
+                    },
+                    "application/merge-patch+json": {
+                        "schema": {"type": "object"},
+                        "examples": _VISUAL_CONFIG_PATCH_EXAMPLES,
+                    },
                 },
             }
         },
@@ -1887,7 +2023,12 @@ def create_app(
         cached = thumbnails.get(key)
         if cached is None:
             try:
-                cached = await asyncio.to_thread(render_media_thumbnail, path, kind)
+                cached = await asyncio.to_thread(
+                    render_media_thumbnail,
+                    path,
+                    kind,
+                    max_pixels=store.limits.image_max_pixels,
+                )
             except StoreError as exc:
                 raise _error(exc.status, exc.code, str(exc)) from exc
             thumbnails.put(key, cached)
@@ -2054,9 +2195,14 @@ def create_app(
         frame, _ = hub.output.latest()
         if frame is None:
             raise _error(503, "frame_unavailable", "no frame yet")
+        height, width = frame.shape[:2]
         return Response(
             content=await asyncio.to_thread(_encode_jpeg, frame),
             media_type="image/jpeg",
+            headers={
+                "X-Frame-Width": str(width),
+                "X-Frame-Height": str(height),
+            },
         )
 
     @app.get(
@@ -2075,6 +2221,7 @@ def create_app(
     )
     async def mjpeg() -> StreamingResponse:
         boundary = "custbackframe"
+        canvas_width, canvas_height = resolved_output_size(_state(runtime).config)
         lease = stream_connections.try_acquire()
         if lease is None:
             raise _error(
@@ -2094,6 +2241,8 @@ def create_app(
                         yield (
                             (
                                 f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
+                                f"X-Frame-Width: {canvas_width}\r\n"
+                                f"X-Frame-Height: {canvas_height}\r\n"
                                 f"Content-Length: {len(jpeg)}\r\n\r\n"
                             ).encode()
                             + jpeg
@@ -2150,7 +2299,13 @@ def create_app(
 
         remote_session = None
         try:
-            await ws.accept()
+            canvas_width, canvas_height = resolved_output_size(_state(runtime).config)
+            await ws.accept(
+                headers=[
+                    (b"x-custback-frame-width", str(canvas_width).encode("ascii")),
+                    (b"x-custback-frame-height", str(canvas_height).encode("ascii")),
+                ]
+            )
             remote_session = hub.remote_client_connected() if stream == "raw" else None
             jpegs = raw_jpegs if stream == "raw" else output_jpegs
             stop = asyncio.Event()
@@ -2189,8 +2344,7 @@ def create_app(
                             reason="output stream is read-only",
                         )
                         return
-                expected = _state(runtime).config.camera
-                expected_size = (expected.width, expected.height)
+                expected_size = resolved_output_size(_state(runtime).config)
                 while True:
                     message = await ws.receive()
                     kind = message.get("type")

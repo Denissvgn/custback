@@ -47,6 +47,7 @@ from typing import Any, TypedDict, cast
 
 import numpy as np
 
+from .geometry import validate_bgr_frame
 from .vcam import VideoOutput
 
 log = logging.getLogger(__name__)
@@ -350,20 +351,26 @@ class FrameRingWriter:
     def publish(self, frame_bgr: np.ndarray) -> None:
         """Publish one BGR frame (torn-write-safe for concurrent readers)."""
 
-        if frame_bgr.shape[:2] != (self.height, self.width):
+        frame = validate_bgr_frame(
+            frame_bgr,
+            name="native ring frame",
+            require_contiguous=True,
+        )
+        if frame.shape != (self.height, self.width, 3):
             raise ValueError(
-                f"frame is {frame_bgr.shape[1]}x{frame_bgr.shape[0]}, "
+                f"frame is {frame.shape[1]}x{frame.shape[0]}, "
                 f"ring is {self.width}x{self.height}"
             )
         bgrx = np.empty((self.height, self.width, BYTES_PER_PIXEL), dtype=np.uint8)
-        bgrx[:, :, :3] = frame_bgr
+        bgrx[:, :, :3] = frame
         bgrx[:, :, 3] = 255
+        payload = bgrx.tobytes()
 
         # Seqlock: odd seq marks the write in progress; the full header is
         # rewritten after the payload so geometry/seq/counter stay coherent.
         self._seq += 1
         struct.pack_into("<I", self._buffer, _SEQ_OFFSET, self._seq & 0xFFFFFFFF)
-        self._buffer[HEADER_SIZE : HEADER_SIZE + bgrx.nbytes] = bgrx.tobytes()
+        self._buffer[HEADER_SIZE : HEADER_SIZE + len(payload)] = payload
         self._seq += 1
         self._frame_counter += 1
         self._write_header(flags=FLAG_ACTIVE, timestamp_100ns=self._now_100ns())
@@ -383,9 +390,15 @@ def read_latest_frame(buffer, *, max_attempts: int = 4) -> np.ndarray | None:
     protocol before wrapping the bytes in an ``IMFSample``.
     """
 
+    if len(buffer) < HEADER_SIZE:
+        return None
     for _ in range(max_attempts):
         header = unpack_header(buffer)
-        if header["magic"] != MAGIC or header["version"] != PROTOCOL_VERSION:
+        if (
+            header["magic"] != MAGIC
+            or header["version"] != PROTOCOL_VERSION
+            or header["fourcc"] != FOURCC
+        ):
             return None
         if not header["flags"] & FLAG_ACTIVE:
             return None
@@ -394,13 +407,20 @@ def read_latest_frame(buffer, *, max_attempts: int = 4) -> np.ndarray | None:
             continue
         width = int(header["width"])
         height = int(header["height"])
-        if width <= 0 or height <= 0 or len(buffer) < ring_size(width, height):
+        expected_stride = width * BYTES_PER_PIXEL
+        if (
+            width <= 0
+            or height <= 0
+            or header["stride"] != expected_stride
+            or len(buffer) < HEADER_SIZE + expected_stride * height
+        ):
             return None
-        payload = bytes(
-            buffer[HEADER_SIZE : HEADER_SIZE + width * height * BYTES_PER_PIXEL]
-        )
-        if unpack_header(buffer)["seq"] != seq:  # torn: writer moved on
+        payload = bytes(buffer[HEADER_SIZE : HEADER_SIZE + expected_stride * height])
+        final_header = unpack_header(buffer)
+        if final_header["seq"] != seq:  # torn: writer moved on
             continue
+        if not final_header["flags"] & FLAG_ACTIVE:
+            return None
         return np.frombuffer(payload, dtype=np.uint8).reshape(
             (height, width, BYTES_PER_PIXEL)
         )
@@ -445,9 +465,13 @@ class NativeVirtualCameraOutput(VideoOutput):
         width: int,
         height: int,
         *,
+        fps: int = 30,
         section_name: str = SECTION_NAME,
         buffer=None,
     ) -> None:
+        self.width = width
+        self.height = height
+        self.fps = fps
         self._mapping = None
         if buffer is None:
             buffer = self._mapping = open_shared_ring(width, height, section_name)

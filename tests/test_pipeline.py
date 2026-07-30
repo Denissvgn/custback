@@ -3,14 +3,30 @@ no hardware, no mediapipe, no virtual camera module required."""
 
 import time
 import threading
+from typing import Any, cast
 
 import numpy as np
 import pytest
 
 cv2 = pytest.importorskip("cv2")
 
+import custback.compositor as compositor_mod
 import custback.pipeline as pipeline_mod
 from custback.capture import CaptureHealth
+from custback.color import (
+    ANALYSIS_LONG_EDGE,
+    ColorBehavior,
+    ColorEstimate,
+    ColorHarmonizer,
+    ColorReason,
+    ColorSceneSignature,
+    ColorTransform,
+    HarmonizerPhase,
+    IDENTITY_TRANSFORM,
+    apply_color_transform,
+    bgr_u8_to_linear_rgb,
+    linear_rgb_to_bgr_u8,
+)
 from custback.config import AppConfig, RuntimeConfig
 from custback.hub import FrameHub
 from custback.pipeline import (
@@ -92,6 +108,79 @@ def test_passthrough_mode_is_identity():
         assert out.shape == raw.shape
     finally:
         pipeline.stop()
+
+
+def test_open_resources_configure_canvas_failure_closes_each_owner_once(
+    monkeypatch,
+):
+    cfg = make_runtime(mode="color").snapshot()
+    close_counts = {
+        "capture": 0,
+        "segmenter": 0,
+        "backdrop": 0,
+        "output": 0,
+    }
+    executor_shutdowns = []
+
+    class Resource:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            close_counts[self.name] += 1
+
+    class AnalysisExecutor:
+        def __init__(self, *, max_workers, thread_name_prefix):
+            assert max_workers == 3
+            assert thread_name_prefix == "custback-color-analysis"
+
+        def shutdown(self, *, wait, cancel_futures):
+            executor_shutdowns.append((wait, cancel_futures))
+
+    capture = Resource("capture")
+    segmenter = Resource("segmenter")
+    backdrop = Resource("backdrop")
+    output = Resource("output")
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_capture",
+        lambda *_args, **_kwargs: capture,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_segmenter",
+        lambda *_args, **_kwargs: segmenter,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "refiner_for",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(pipeline_mod, "_build_backdrop", lambda _cfg: backdrop)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_output",
+        lambda *_args, **_kwargs: output,
+    )
+    monkeypatch.setattr(pipeline_mod, "ThreadPoolExecutor", AnalysisExecutor)
+
+    class FailingHub:
+        @staticmethod
+        def configure_canvas(_size):
+            raise RuntimeError("configure canvas failed")
+
+    pipeline = Pipeline(RuntimeConfig(cfg), cast(FrameHub, FailingHub()))
+
+    with pytest.raises(RuntimeError, match="configure canvas failed"):
+        pipeline._open_resources(pipeline_mod.ConfigState(cfg, 0))
+
+    assert executor_shutdowns == [(True, True)]
+    assert close_counts == {
+        "capture": 1,
+        "segmenter": 1,
+        "backdrop": 1,
+        "output": 1,
+    }
 
 
 def test_hot_mode_switch():
@@ -879,7 +968,11 @@ def test_runtime_privacy_gate_protects_vcam_and_preview(monkeypatch):
             pass
 
     output = RecordingOutput()
-    monkeypatch.setattr(pipeline_mod, "open_capture", lambda _cfg: FixedCapture())
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_capture",
+        lambda _cfg, _canvas: FixedCapture(),
+    )
     monkeypatch.setattr(
         pipeline_mod,
         "open_output",
@@ -942,7 +1035,11 @@ def test_privacy_capacity_exhaustion_revokes_renderer_and_slates_all_sinks(
             pass
 
     output = RecordingOutput()
-    monkeypatch.setattr(pipeline_mod, "open_capture", lambda _cfg: FixedCapture())
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_capture",
+        lambda _cfg, _canvas: FixedCapture(),
+    )
     monkeypatch.setattr(pipeline_mod, "open_output", lambda *_args, **_kwargs: output)
     runtime = make_runtime(mode="remote", remote_fallback_mode="color")
     hub = FrameHub()
@@ -1158,6 +1255,30 @@ def test_restart_only_patch_rejected_and_noop_does_not_bump_version():
         pipeline.stop()
 
 
+def test_invalid_and_restart_visual_patches_never_prepare_resources(monkeypatch):
+    runtime = make_runtime(mode="color")
+    pipeline, hub = run_pipeline(runtime)
+
+    def unexpected_preparation(*_args, **_kwargs):
+        pytest.fail("rejected patch reached resource preparation")
+
+    monkeypatch.setattr(pipeline, "_prepare_patch_request", unexpected_preparation)
+    try:
+        _, sequence = wait_for_frame(hub)
+        with pytest.raises(ValueError):
+            pipeline.apply_config_patch({"background": {"anchor_x": 1.01}})
+        with pytest.raises(RestartRequiredError):
+            pipeline.apply_config_patch({"camera": {"rotation": 90}})
+
+        assert runtime.version == 0
+        assert runtime.snapshot().background.anchor_x == 0.5
+        assert runtime.snapshot().camera.rotation == 0
+        wait_for_frame(hub, sequence)
+        assert pipeline.running
+    finally:
+        pipeline.stop()
+
+
 @pytest.mark.parametrize(
     ("patch", "expected"),
     [
@@ -1166,7 +1287,15 @@ def test_restart_only_patch_rejected_and_noop_does_not_bump_version():
         ({"camera": {"height": 480}}, ["camera.height"]),
         ({"camera": {"fps": 31}}, ["camera.fps"]),
         ({"camera": {"synthetic": True}}, ["camera.synthetic"]),
+        ({"camera": {"fit_mode": "cover"}}, ["camera.fit_mode"]),
+        ({"camera": {"anchor_x": 0.25}}, ["camera.anchor_x"]),
+        ({"camera": {"anchor_y": 0.75}}, ["camera.anchor_y"]),
+        ({"camera": {"rotation": 90}}, ["camera.rotation"]),
         ({"camera": {"mirror": True}}, ["camera.mirror"]),
+        (
+            {"output": {"width": 1920, "height": 1080}},
+            ["output.height", "output.width"],
+        ),
         ({"output": {"backend": "null"}}, ["output.backend"]),
         ({"output": {"device": "camera"}}, ["output.device"]),
         ({"output": {"fps": 31}}, ["output.fps"]),
@@ -1233,6 +1362,277 @@ def test_every_restart_only_field_is_classified(patch, expected):
     current = AppConfig()
     candidate = current.patched(patch)
     assert _restart_only_changes(current, candidate) == expected
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"background": {"fit_mode": "contain"}},
+        {"background": {"anchor_x": 0.25, "anchor_y": 0.75}},
+        {"compositing": {"blend_space": "linear_srgb"}},
+        {"compositing": {"color_correction": {"mode": "auto"}}},
+        {"compositing": {"color_correction": {"strength": 0.7}}},
+    ],
+)
+def test_background_geometry_and_color_policy_remain_hot(patch):
+    current = AppConfig()
+    candidate = current.patched(patch)
+    assert _restart_only_changes(current, candidate) == []
+
+
+def test_backdrop_provider_and_visual_keys_separate_video_lifetime_from_geometry(
+    monkeypatch,
+):
+    current = AppConfig.from_dict(
+        {
+            "background": {
+                "mode": "video",
+                "video_path": "/operator/background.mp4",
+            },
+            "segmentation": {"backend": "heuristic"},
+        }
+    )
+    candidate = current.patched(
+        {
+            "background": {
+                "fit_mode": "contain",
+                "anchor_x": 0.25,
+                "anchor_y": 0.75,
+            }
+        }
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_backdrop",
+        lambda *_args, **_kwargs: pytest.fail(
+            "presentation-only geometry must not reopen the video provider"
+        ),
+    )
+
+    activation = Pipeline._prepare_activation_off_lane(current, candidate)
+
+    assert pipeline_mod._backdrop_provider_key(
+        current
+    ) == pipeline_mod._backdrop_provider_key(candidate)
+    assert pipeline_mod._backdrop_visual_key(
+        current
+    ) != pipeline_mod._backdrop_visual_key(candidate)
+    hash(pipeline_mod._visual_state_key(candidate))
+    assert activation.replace_backdrop is False
+    assert activation.visual_state_changed is True
+
+
+def test_hot_geometry_commit_refits_reused_provider_and_failed_trial_is_inert(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "anchored.png"
+    pixels = np.zeros((64, 32, 3), np.uint8)
+    pixels[:16] = (10, 20, 30)
+    pixels[-16:] = (210, 220, 230)
+    assert cv2.imwrite(str(path), pixels)
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {"width": 64, "height": 32},
+            "background": {
+                "mode": "image",
+                "image_path": str(path),
+                "fit_mode": "cover",
+                "anchor_y": 0.0,
+            },
+            "segmentation": {"backend": "heuristic"},
+            "output": {"backend": "null"},
+        }
+    )
+    runtime = RuntimeConfig(cfg)
+    pipeline = Pipeline(runtime, FrameHub())
+    backdrop = pipeline_mod._build_backdrop(cfg)
+    assert backdrop is not None
+
+    class Segmenter:
+        device = "cpu"
+        last_foreground = None
+
+        def close(self):
+            pass
+
+    class Refiner:
+        pass
+
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        None,
+        Segmenter(),
+        Refiner(),
+        backdrop,
+        NullOutput(64, 32, 30),
+    )
+    trial_frame = np.zeros((32, 64, 3), np.uint8)
+    top_anchored = backdrop.frame(64, 32).copy()
+
+    committed_cfg = cfg.patched({"background": {"anchor_y": 1.0}})
+    request = pipeline_mod._PatchRequest(
+        committed_cfg,
+        0,
+        prepared_activation=pipeline._prepare_activation_off_lane(
+            cfg,
+            committed_cfg,
+        ),
+    )
+    pipeline._handle_patch_request(resources, request, trial_frame)
+
+    assert request.error is None
+    assert request.result is not None and request.result.version == 1
+    assert resources.backdrop is backdrop
+    assert resources.visual_generation == 1
+    assert backdrop.geometry.anchor_y == 1.0
+    bottom_anchored = backdrop.frame(64, 32).copy()
+    assert not np.array_equal(top_anchored, bottom_anchored)
+
+    failed_cfg = committed_cfg.patched({"background": {"anchor_y": 0.25}})
+    failed = pipeline_mod._PatchRequest(
+        failed_cfg,
+        1,
+        prepared_activation=pipeline._prepare_activation_off_lane(
+            committed_cfg,
+            failed_cfg,
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "apply_transform",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("detached geometry trial failed")
+        ),
+    )
+    pipeline._handle_patch_request(resources, failed, trial_frame)
+
+    assert failed.result is None
+    assert isinstance(failed.error, ActivationError)
+    assert runtime.read().version == resources.version == 1
+    assert resources.cfg.background.anchor_y == 1.0
+    assert resources.visual_generation == 1
+    assert backdrop.geometry.anchor_y == 1.0
+    assert np.array_equal(backdrop.frame(64, 32), bottom_anchored)
+    backdrop.close()
+
+
+def test_visual_generation_changes_without_replacing_reused_backdrop():
+    current = AppConfig.from_dict(
+        {
+            "background": {
+                "mode": "video",
+                "video_path": "/operator/background.mp4",
+            },
+            "segmentation": {"backend": "heuristic"},
+        }
+    )
+    candidate = current.patched(
+        {
+            "compositing": {
+                "color_correction": {
+                    "mode": "auto",
+                    "adaptation_time_s": 1.5,
+                }
+            }
+        }
+    )
+    backdrop = object()
+    refiner = object()
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        None,
+        refiner,
+        backdrop,
+        None,
+        visual_generation=4,
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    pipeline._active_state = pipeline_mod.ConfigState(current, 0)
+    prepared = Pipeline._prepare_activation_off_lane(current, candidate)
+    staged = pipeline._stage_activation(resources, candidate, prepared)
+
+    old_backdrop, _old_segmenter, _old_cfg = pipeline._install_activation(
+        resources, staged, 1
+    )
+
+    assert old_backdrop is None
+    assert resources.backdrop is backdrop
+    assert resources.visual_generation == 5
+    assert resources.cfg.compositing.color_correction.mode == "auto"
+
+
+def test_failed_visual_install_rolls_back_generation_and_reused_resources():
+    current = AppConfig()
+    candidate = current.patched(
+        {
+            "background": {"anchor_x": 0.25},
+            "compositing": {"color_correction": {"mode": "auto"}},
+        }
+    )
+    old_backdrop = object()
+    old_segmenter = object()
+    old_refiner = object()
+    old_harmonizer = ColorHarmonizer(0.8, mode=current.background.mode)
+    old_harmonizer.reset(5.0, reason=ColorReason.INVALID)
+    old_harmonizer_snapshot = old_harmonizer.snapshot()
+    replacement_harmonizer = ColorHarmonizer(0.8, mode=candidate.background.mode)
+
+    class FailingResources:
+        version = 7
+        capture = None
+        segmenter = old_segmenter
+        refiner = old_refiner
+        backdrop = old_backdrop
+        output = None
+        visual_generation = 3
+        harmonizer = old_harmonizer
+        color_reset_token = ("stable",)
+
+        def __init__(self):
+            self._cfg = current
+
+        @property
+        def cfg(self):
+            return self._cfg
+
+        @cfg.setter
+        def cfg(self, value):
+            if value is candidate:
+                raise RuntimeError("injected install failure")
+            self._cfg = value
+
+    resources = FailingResources()
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    old_state = pipeline_mod.ConfigState(current, 7)
+    pipeline._active_state = old_state
+    activation = pipeline_mod._Activation(
+        candidate=candidate,
+        refiner=old_refiner,
+        backdrop=old_backdrop,
+        visual_state_changed=True,
+        replace_harmonizer=True,
+        harmonizer=replacement_harmonizer,
+    )
+
+    with pytest.raises(RuntimeError, match="injected install failure"):
+        pipeline._install_activation(
+            cast(pipeline_mod._Resources, resources), activation, 8
+        )
+
+    assert resources.cfg is current
+    assert resources.version == 7
+    assert resources.segmenter is old_segmenter
+    assert resources.refiner is old_refiner
+    assert resources.backdrop is old_backdrop
+    assert resources.harmonizer is old_harmonizer
+    assert resources.harmonizer.snapshot() == old_harmonizer_snapshot
+    assert resources.color_reset_token == ("stable",)
+    assert resources.visual_generation == 3
+    assert pipeline._active_state is old_state
 
 
 def test_backdrop_preparation_key_includes_decode_limits(monkeypatch):
@@ -1437,6 +1837,7 @@ def test_teardown_thread_start_failure_is_deferred_without_raising(monkeypatch):
 def test_success_ack_precedes_exactly_once_old_resource_close(monkeypatch):
     cfg = AppConfig.from_dict(
         {
+            "camera": {"width": 128, "height": 72},
             "background": {"mode": "color", "color": [1, 1, 1]},
             "segmentation": {"backend": "heuristic"},
             "output": {"backend": "null"},
@@ -1602,10 +2003,10 @@ def test_startup_timeout_reports_worker_that_survives_shutdown_request(monkeypat
     release = threading.Event()
     real_open_capture = pipeline_mod.open_capture
 
-    def blocked_open(cfg):
+    def blocked_open(cfg, canvas_size):
         entered.set()
         release.wait(1.0)
-        return real_open_capture(cfg)
+        return real_open_capture(cfg, canvas_size)
 
     monkeypatch.setattr(pipeline_mod, "open_capture", blocked_open)
     with pytest.raises(pipeline_mod.ReconfigurationUnavailable, match="still running"):
@@ -1683,7 +2084,11 @@ def test_slow_capture_repeats_last_safe_output_without_backlog(monkeypatch):
             pass
 
     capture = SlowLatestCapture()
-    monkeypatch.setattr(pipeline_mod, "open_capture", lambda _cfg: capture)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_capture",
+        lambda _cfg, _canvas: capture,
+    )
     runtime = make_runtime(mode="color")
     pipeline, hub = run_pipeline(runtime)
     try:
@@ -1819,3 +2224,1285 @@ def test_fallback_logs_only_transitions_and_recovery(monkeypatch, caplog):
     assert caplog.text.count("output fallback active") == 1
     assert caplog.text.count("segmentation fallback active") == 1
     assert caplog.text.count("segmentation fallback recovered") == 1
+
+
+# VIS-2.5 deterministic color-integration fixtures and regressions.
+
+
+def _color_integration_config(
+    mode: str = "image",
+    *,
+    correction_mode: str = "auto",
+    blend_space: str = "linear_srgb",
+    use_model_foreground: bool = False,
+) -> AppConfig:
+    background: dict[str, Any] = {"mode": mode}
+    if mode == "image":
+        background["image_path"] = "/deterministic/background.png"
+    elif mode == "video":
+        background["video_path"] = "/deterministic/background.mp4"
+    elif mode == "camera":
+        background["camera_device"] = 1
+    return AppConfig.from_dict(
+        {
+            "camera": {"width": 32, "height": 24, "fps": 60},
+            "background": background,
+            "segmentation": {
+                "backend": "heuristic",
+                "temporal_smoothing": 0.0,
+            },
+            "compositing": {
+                "blend_space": blend_space,
+                "light_wrap": 0.0,
+                "use_model_foreground": use_model_foreground,
+                "color_correction": {"mode": correction_mode},
+            },
+            "output": {"backend": "null", "fps": 60},
+            "api": {"enabled": False},
+        }
+    )
+
+
+class _FixedMaskSegmenter:
+    device = "cpu"
+    produces_matte = False
+
+    def __init__(
+        self,
+        mask: np.ndarray,
+        edge_foreground: np.ndarray | None = None,
+    ):
+        self.mask = mask
+        self.last_foreground = edge_foreground
+        self.closed = False
+
+    def segment(self, _frame):
+        return self.mask.copy()
+
+    def close(self):
+        self.closed = True
+
+
+class _IdentityRefiner:
+    def refine(self, mask, _frame):
+        return np.ascontiguousarray(mask, dtype=np.float32)
+
+
+class _FixedBackdrop:
+    def __init__(self, pixels: np.ndarray):
+        self.pixels = pixels
+
+    def frame(self, width, height):
+        assert self.pixels.shape == (height, width, 3)
+        return self.pixels.copy()
+
+    def close(self):
+        pass
+
+
+class _GeometryTokenBackdrop(_FixedBackdrop):
+    def __init__(self, pixels: np.ndarray, token: object):
+        super().__init__(pixels)
+        self.token = token
+
+    def content_rect(self, width, height):
+        return (0, 0, width, height)
+
+    def transform_plan(self, _width, _height):
+        return self.token
+
+
+class _SpyHarmonizer(ColorHarmonizer):
+    def __init__(self, transform: ColorTransform = IDENTITY_TRANSFORM):
+        super().__init__(0.8, mode="image")
+        self.returned_transform = transform
+        self.reset_calls = []
+        self.update_calls = []
+        self.error_calls = []
+
+    def reset(self, now_s, *, reason=ColorReason.INVALID, source_generation=None):
+        self.reset_calls.append((now_s, reason, source_generation))
+        return IDENTITY_TRANSFORM
+
+    def update(self, estimate, now_s, *, source_generation=None):
+        self.update_calls.append((estimate, now_s, source_generation))
+        return self.returned_transform
+
+    def reset_and_update(self, estimate, now_s, *, source_generation=None):
+        self.reset(
+            now_s,
+            reason=ColorReason.INVALID,
+            source_generation=source_generation,
+        )
+        return self.update(
+            estimate,
+            now_s,
+            source_generation=source_generation,
+        )
+
+    def on_error(self, now_s, *, source_generation=None):
+        self.error_calls.append((now_s, source_generation))
+        return IDENTITY_TRANSFORM
+
+
+class _SequenceCapture:
+    def __init__(self, frames: list[np.ndarray | None]):
+        self.frames = list(frames)
+        self.frames_read = 0
+
+    def read(self):
+        value = self.frames.pop(0) if self.frames else None
+        if value is not None:
+            self.frames_read += 1
+            return value.copy()
+        return None
+
+    def health_snapshot(self):
+        return CaptureHealth(
+            generation=0,
+            geometry_generation=0,
+            backend="deterministic",
+            width=32,
+            height=24,
+            normalized_width=32,
+            normalized_height=24,
+            frames_read=self.frames_read,
+        )
+
+    def close(self):
+        pass
+
+
+class _StopAfterOutput:
+    paces = True
+    fallback_active = False
+    fallback_reason = ""
+
+    def __init__(self, pipeline: Pipeline, count: int):
+        self.pipeline = pipeline
+        self.count = count
+        self.frames = []
+
+    def send(self, frame):
+        self.frames.append(frame.copy())
+        if len(self.frames) >= self.count:
+            self.pipeline._stop.set()
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("background_mode", "correction_mode", "eligible"),
+    [
+        ("image", "auto", True),
+        ("video", "auto", True),
+        ("camera", "auto", True),
+        ("image", "off", False),
+        ("blur", "auto", False),
+        ("color", "auto", False),
+        ("passthrough", "auto", False),
+        ("remote", "auto", False),
+    ],
+)
+def test_color_correction_eligibility_is_explicit_and_bypasses_to_identity(
+    monkeypatch,
+    background_mode,
+    correction_mode,
+    eligible,
+):
+    cfg = _color_integration_config(
+        background_mode,
+        correction_mode=correction_mode,
+    )
+    transform = ColorTransform(exposure_ev=0.25)
+    harmonizer = _SpyHarmonizer(transform)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+        harmonizer=harmonizer,
+    )
+    estimator_calls = []
+    estimate_token = object()
+
+    def estimate(*args, **kwargs):
+        estimator_calls.append((args, kwargs))
+        return estimate_token
+
+    monkeypatch.setattr(pipeline_mod, "estimate_color_transform_linear", estimate)
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    prepared = pipeline._prepare_color_frame(
+        resources,
+        np.full((24, 32, 3), 80, np.uint8),
+        np.full((24, 32, 3), 20, np.uint8),
+        np.full((24, 32), 0.5, np.float32),
+        None,
+        now_s=10.0,
+    )
+
+    if eligible:
+        assert prepared.transform == transform
+        assert prepared.foreground_linear_bgr is not None
+        assert prepared.backdrop_linear_bgr is not None
+        assert len(estimator_calls) == len(harmonizer.update_calls) == 1
+        assert estimator_calls[0][1]["mode"] == background_mode
+        assert len(harmonizer.reset_calls) == 1
+    else:
+        assert prepared == pipeline_mod._PreparedColorFrame()
+        assert not estimator_calls
+        assert not harmonizer.reset_calls
+        assert not harmonizer.update_calls
+        assert not harmonizer.error_calls
+
+
+def test_image_backdrop_analysis_cache_is_bounded_and_generation_scoped(
+    monkeypatch,
+    tmp_path,
+):
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    y, x = np.indices((256, 384), dtype=np.uint16)
+    first_source = np.stack(
+        (
+            (x % 256).astype(np.uint8),
+            (y % 256).astype(np.uint8),
+            ((x + y) % 256).astype(np.uint8),
+        ),
+        axis=2,
+    )
+    second_source = np.ascontiguousarray(255 - first_source)
+    assert cv2.imwrite(str(first_path), first_source)
+    assert cv2.imwrite(str(second_path), second_source)
+
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {"width": 384, "height": 216, "fps": 60},
+            "background": {
+                "mode": "image",
+                "image_path": str(first_path),
+                "fit_mode": "cover",
+                "anchor_x": 0.5,
+            },
+            "segmentation": {"backend": "heuristic"},
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "color_correction": {"mode": "auto"},
+            },
+            "output": {"backend": "null", "fps": 60},
+            "api": {"enabled": False},
+        }
+    )
+    provider = pipeline_mod.ImageBackdrop(str(first_path))
+    harmonizer = _SpyHarmonizer()
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(np.full((216, 384), 0.5, np.float32)),
+        _IdentityRefiner(),
+        provider,
+        None,
+        harmonizer=harmonizer,
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    pipeline._active_state = pipeline_mod.ConfigState(cfg, 0)
+    foreground = np.full((216, 384, 3), 80, np.uint8)
+    mask = np.full((216, 384), 0.5, np.float32)
+    estimate_token = object()
+    estimator_analyses = []
+    analysis_builds = []
+    real_analysis_builder = pipeline_mod._linear_bgr_analysis_raster_prevalidated
+
+    def estimate(*_args, **kwargs):
+        estimator_analyses.append(kwargs["backdrop_analysis_linear_bgr"])
+        return estimate_token
+
+    def build_analysis(value):
+        result = real_analysis_builder(value)
+        analysis_builds.append(result)
+        return result
+
+    monkeypatch.setattr(pipeline_mod, "estimate_color_transform_linear", estimate)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "_linear_bgr_analysis_raster_prevalidated",
+        build_analysis,
+    )
+
+    try:
+        backdrop = provider.frame(384, 216)
+        for timestamp in (1.0, 2.0):
+            pipeline._prepare_color_frame(
+                resources,
+                foreground,
+                backdrop,
+                mask,
+                None,
+                now_s=timestamp,
+            )
+        assert len(analysis_builds) == 1
+        assert estimator_analyses[0] is estimator_analyses[1]
+        assert estimator_analyses[0].dtype == np.float32
+        assert max(estimator_analyses[0].shape[:2]) == ANALYSIS_LONG_EDGE
+
+        geometry_cfg = cfg.patched({"background": {"anchor_x": 0.25}})
+        geometry_activation = pipeline_mod._Activation(
+            candidate=geometry_cfg,
+            refiner=resources.refiner,
+            backdrop=provider,
+            visual_state_changed=True,
+        )
+        old_backdrop, _, _ = pipeline._install_activation(
+            resources,
+            geometry_activation,
+            1,
+        )
+        assert old_backdrop is None
+        assert resources.color_backdrop_analysis_linear_bgr is None
+        backdrop = provider.frame(384, 216)
+        pipeline._prepare_color_frame(
+            resources,
+            foreground,
+            backdrop,
+            mask,
+            None,
+            now_s=3.0,
+        )
+        assert len(analysis_builds) == 2
+        assert estimator_analyses[2] is not estimator_analyses[1]
+
+        replacement_cfg = geometry_cfg.patched(
+            {"background": {"image_path": str(second_path)}}
+        )
+        replacement = pipeline_mod.ImageBackdrop(
+            str(second_path),
+            fit_mode=replacement_cfg.background.fit_mode,
+            anchor_x=replacement_cfg.background.anchor_x,
+            anchor_y=replacement_cfg.background.anchor_y,
+        )
+        replacement_activation = pipeline_mod._Activation(
+            candidate=replacement_cfg,
+            refiner=resources.refiner,
+            replace_backdrop=True,
+            backdrop=replacement,
+            visual_state_changed=True,
+        )
+        old_backdrop, _, _ = pipeline._install_activation(
+            resources,
+            replacement_activation,
+            2,
+        )
+        assert old_backdrop is provider
+        assert resources.color_backdrop_analysis_linear_bgr is None
+        backdrop = replacement.frame(384, 216)
+        pipeline._prepare_color_frame(
+            resources,
+            foreground,
+            backdrop,
+            mask,
+            None,
+            now_s=4.0,
+        )
+        assert len(analysis_builds) == 3
+        assert estimator_analyses[3] is not estimator_analyses[2]
+        old_backdrop.close()
+    finally:
+        resources.close()
+
+    assert resources.color_backdrop_analysis_token is None
+    assert resources.color_backdrop_analysis_linear_bgr is None
+
+
+def test_live_reset_consumes_first_reliable_estimate_with_production_harmonizer(
+    monkeypatch,
+):
+    cfg = _color_integration_config("image")
+    harmonizer = ColorHarmonizer(0.8, mode="image")
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+        harmonizer=harmonizer,
+    )
+    signature = ColorSceneSignature(
+        source_log_luminance=-2.0,
+        target_log_luminance=-1.5,
+        source_chroma_log2=(0.0, 0.0, 0.0),
+        target_chroma_log2=(0.0, 0.0, 0.0),
+    )
+    estimate = ColorEstimate(
+        transform=ColorTransform(exposure_ev=0.4),
+        behavior=ColorBehavior.EXPOSURE_ONLY,
+        reason=ColorReason.OK,
+        confidence=0.9,
+        exposure_confidence=0.9,
+        white_balance_confidence=0.0,
+        usable_source=512,
+        usable_target=512,
+        neutral_source=0,
+        neutral_target=0,
+        target_is_local=True,
+        reliable=True,
+        signature=signature,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: estimate,
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    foreground = np.full((24, 32, 3), 80, np.uint8)
+    backdrop = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+
+    first = pipeline._prepare_color_frame(
+        resources,
+        foreground,
+        backdrop,
+        mask,
+        None,
+        now_s=10.0,
+    )
+    snapshot = harmonizer.snapshot()
+    assert first.transform.is_identity
+    assert snapshot.reliable
+    assert snapshot.signature == signature
+    assert snapshot.phase is HarmonizerPhase.WARMING
+    assert snapshot.last_timestamp_s == 10.0
+    assert resources.color_reset_token is not None
+
+    second = pipeline._prepare_color_frame(
+        resources,
+        foreground,
+        backdrop,
+        mask,
+        None,
+        now_s=10.0 + 1.0 / 30.0,
+    )
+    assert second.transform.exposure_ev > 0.0
+
+
+def test_live_backdrop_geometry_token_change_hard_resets_harmonizer(monkeypatch):
+    cfg = _color_integration_config("video")
+    harmonizer = ColorHarmonizer(0.8, mode="video")
+    backdrop_provider = _GeometryTokenBackdrop(
+        np.full((24, 32, 3), 20, np.uint8),
+        ("source-size", 640, 480),
+    )
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        backdrop_provider,
+        None,
+        harmonizer=harmonizer,
+    )
+    signature = ColorSceneSignature(
+        source_log_luminance=-2.0,
+        target_log_luminance=-1.5,
+        source_chroma_log2=(0.0, 0.0, 0.0),
+        target_chroma_log2=(0.0, 0.0, 0.0),
+    )
+    estimate = ColorEstimate(
+        transform=ColorTransform(exposure_ev=0.4),
+        behavior=ColorBehavior.EXPOSURE_ONLY,
+        reason=ColorReason.OK,
+        confidence=0.9,
+        exposure_confidence=0.9,
+        white_balance_confidence=0.0,
+        usable_source=512,
+        usable_target=512,
+        neutral_source=0,
+        neutral_target=0,
+        target_is_local=True,
+        reliable=True,
+        signature=signature,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: estimate,
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    foreground = np.full((24, 32, 3), 80, np.uint8)
+    backdrop = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+
+    pipeline._prepare_color_frame(
+        resources,
+        foreground,
+        backdrop,
+        mask,
+        None,
+        now_s=10.0,
+    )
+    active = pipeline._prepare_color_frame(
+        resources,
+        foreground,
+        backdrop,
+        mask,
+        None,
+        now_s=10.0 + 1.0 / 30.0,
+    )
+    assert active.transform.exposure_ev > 0.0
+
+    backdrop_provider.token = ("source-size", 720, 1280)
+    reset = pipeline._prepare_color_frame(
+        resources,
+        foreground,
+        backdrop,
+        mask,
+        None,
+        now_s=10.0 + 2.0 / 30.0,
+    )
+    snapshot = harmonizer.snapshot()
+    assert reset.transform.is_identity
+    assert snapshot.reliable
+    assert snapshot.signature == signature
+    assert snapshot.phase is HarmonizerPhase.WARMING
+
+
+def test_active_correction_preserves_raw_hub_bytes_and_is_mask_local(monkeypatch):
+    cfg = _color_integration_config("image")
+    raw = np.full((24, 32, 3), 64, np.uint8)
+    background = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.zeros((24, 32), np.float32)
+    mask[:, :16] = 1.0
+    transform = ColorTransform(exposure_ev=1.0)
+    harmonizer = _SpyHarmonizer(transform)
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    output = _StopAfterOutput(pipeline, 1)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([raw]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(background),
+        output,
+        harmonizer=harmonizer,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    pipeline._loop(resources)
+
+    published_raw, _ = hub.raw.latest()
+    published_output, _ = hub.output.latest()
+    assert published_raw is not None and published_output is not None
+    assert np.array_equal(published_raw, raw)
+    assert np.array_equal(published_output[:, 16:], background[:, 16:])
+    expected_foreground = linear_rgb_to_bgr_u8(
+        apply_color_transform(bgr_u8_to_linear_rgb(raw), transform)
+    )
+    assert np.array_equal(published_output[:, :16], expected_foreground[:, :16])
+    assert not np.array_equal(published_output[:, :16], raw[:, :16])
+    assert len(harmonizer.update_calls) == 1
+
+
+def test_auto_legacy_reuses_estimator_decodes_for_foreground_and_rvm_edge(
+    monkeypatch,
+):
+    cfg = _color_integration_config(
+        "image",
+        blend_space="srgb_legacy",
+        use_model_foreground=True,
+    )
+    frame = np.full((24, 32, 3), 40, np.uint8)
+    clean_edge = np.full((24, 32, 3), 80, np.uint8)
+    background = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask, clean_edge),
+        _IdentityRefiner(),
+        _FixedBackdrop(background),
+        None,
+        harmonizer=_SpyHarmonizer(ColorTransform(exposure_ev=0.5)),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: object(),
+    )
+    calls = {"decode": 0, "legacy_predecoded": 0}
+    real_decode = pipeline_mod.bgr_u8_to_linear_rgb
+    real_legacy_predecoded = pipeline_mod.composite_legacy_predecoded
+
+    def counted_decode(value):
+        calls["decode"] += 1
+        return real_decode(value)
+
+    def counted_legacy_predecoded(*args, **kwargs):
+        calls["legacy_predecoded"] += 1
+        return real_legacy_predecoded(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "bgr_u8_to_linear_rgb", counted_decode)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "composite_legacy_predecoded",
+        counted_legacy_predecoded,
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+
+    rendered, reason = pipeline._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+    )
+
+    assert reason == ""
+    assert rendered.dtype == np.uint8
+    assert calls == {"decode": 3, "legacy_predecoded": 1}
+
+
+def test_rvm_edge_foreground_receives_the_same_color_transform(monkeypatch):
+    cfg = _color_integration_config("image", use_model_foreground=True)
+    frame = np.full((24, 32, 3), 40, np.uint8)
+    clean_edge = np.full((24, 32, 3), 80, np.uint8)
+    background = np.zeros((24, 32, 3), np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    transform = ColorTransform(exposure_ev=1.0)
+    harmonizer = _SpyHarmonizer(transform)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask, clean_edge),
+        _IdentityRefiner(),
+        _FixedBackdrop(background),
+        None,
+        harmonizer=harmonizer,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: object(),
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+
+    rendered, reason = pipeline._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+    )
+
+    transformed_edge = apply_color_transform(
+        bgr_u8_to_linear_rgb(clean_edge),
+        transform,
+    )
+    expected = linear_rgb_to_bgr_u8(transformed_edge * np.float32(0.5))
+    assert reason == ""
+    assert np.array_equal(rendered, expected)
+    assert len(harmonizer.update_calls) == 1
+
+
+def test_estimator_exception_is_fail_soft_with_identity_render(monkeypatch):
+    cfg = _color_integration_config("image")
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    background = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    harmonizer = _SpyHarmonizer(ColorTransform(exposure_ev=0.5))
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(background),
+        None,
+        harmonizer=harmonizer,
+    )
+
+    def estimator_failure(*_args, **_kwargs):
+        raise RuntimeError("estimator failed")
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        estimator_failure,
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    rendered, reason = pipeline._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+    )
+    expected = pipeline_mod.composite(
+        frame,
+        background,
+        mask,
+        blend_space="linear_srgb",
+        color_transform=IDENTITY_TRANSFORM,
+    )
+
+    assert reason == ""
+    assert np.array_equal(rendered, expected)
+    assert not harmonizer.update_calls
+    assert len(harmonizer.error_calls) == 1
+
+
+@pytest.mark.parametrize("operation", ["transform", "encode"])
+def test_opencv_photometric_error_retries_identity_exactly_once(
+    monkeypatch,
+    operation,
+):
+    cfg = _color_integration_config("image")
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    background = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(background),
+        None,
+        harmonizer=_SpyHarmonizer(ColorTransform(exposure_ev=0.5)),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: object(),
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    real_identity_composite = pipeline_mod.composite
+    expected = real_identity_composite(
+        frame,
+        background,
+        mask,
+        blend_space="linear_srgb",
+        color_transform=IDENTITY_TRANSFORM,
+    )
+    calls = {"photometric_failure": 0, "identity_retry": 0}
+
+    def fail(*_args, **_kwargs):
+        calls["photometric_failure"] += 1
+        raise compositor_mod.cv2.error(f"forced {operation} failure")
+
+    if operation == "transform":
+        monkeypatch.setattr(compositor_mod.cv2, "transform", fail)
+    else:
+        monkeypatch.setattr(
+            compositor_mod,
+            "_consume_linear_bgr_to_bgr_u8_prevalidated",
+            fail,
+        )
+
+    def identity_retry(*args, **kwargs):
+        calls["identity_retry"] += 1
+        assert kwargs["color_transform"].is_identity
+        return real_identity_composite(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "composite", identity_retry)
+    rendered, _ = pipeline._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+    )
+
+    assert np.array_equal(rendered, expected)
+    assert calls == {"photometric_failure": 1, "identity_retry": 1}
+
+
+@pytest.mark.parametrize("failure", ["structural", "invalid-output"])
+def test_malformed_compositor_or_output_remains_strict(monkeypatch, failure):
+    cfg = _color_integration_config("image")
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    background = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(background),
+        None,
+        harmonizer=_SpyHarmonizer(),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: object(),
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    if failure == "structural":
+        monkeypatch.setattr(
+            pipeline,
+            "_composite_prepared_color",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ValueError("structural compositor failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            pipeline,
+            "_composite_prepared_color",
+            lambda *_args, **_kwargs: np.zeros((24, 32, 3), np.float32),
+        )
+
+    with pytest.raises(ValueError):
+        pipeline._local_composite(resources, frame, privacy_safe=False)
+
+
+@pytest.mark.parametrize(
+    ("second_capture", "processed_frames", "repeated_frames"),
+    [
+        pytest.param("pixel-identical", 2, 0, id="successful-identical-read"),
+        pytest.param("missing", 1, 1, id="synthesized-output-repeat"),
+    ],
+)
+def test_repeat_output_does_not_advance_harmonizer(
+    monkeypatch,
+    second_capture,
+    processed_frames,
+    repeated_frames,
+):
+    cfg = _color_integration_config("image")
+    raw = np.full((24, 32, 3), 64, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    harmonizer = _SpyHarmonizer(ColorTransform(exposure_ev=0.5))
+    estimator_calls = []
+    capture_frames = [raw, raw.copy() if second_capture == "pixel-identical" else None]
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    output = _StopAfterOutput(pipeline, 2)
+
+    class CountingSegmenter(_FixedMaskSegmenter):
+        def __init__(self):
+            super().__init__(mask)
+            self.calls = 0
+
+        def segment(self, frame):
+            self.calls += 1
+            return super().segment(frame)
+
+    segmenter = CountingSegmenter()
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture(capture_frames),
+        segmenter,
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        output,
+        harmonizer=harmonizer,
+    )
+
+    def estimate(*_args, **_kwargs):
+        estimator_calls.append(True)
+        return object()
+
+    monkeypatch.setattr(pipeline_mod, "estimate_color_transform_linear", estimate)
+    pipeline._loop(resources)
+
+    assert len(output.frames) == 2
+    assert np.array_equal(output.frames[1], output.frames[0])
+    assert segmenter.calls == processed_frames
+    assert len(estimator_calls) == processed_frames
+    assert len(harmonizer.update_calls) == processed_frames
+    assert len(harmonizer.reset_calls) == 1
+    stats = hub.stats_dict()
+    assert stats["frames_in"] == processed_frames
+    assert stats["capture_frames_read"] == processed_frames
+    assert stats["output_repeated_frames"] == repeated_frames
+
+
+@pytest.mark.parametrize("remote_candidate", [False, True])
+def test_auto_correction_leaves_remote_candidate_or_privacy_slate_untouched(
+    monkeypatch,
+    remote_candidate,
+):
+    cfg = _color_integration_config("remote")
+    raw_values = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
+    raw = (raw_values % 251).astype(np.uint8)
+    candidate = np.full((24, 32, 3), (7, 101, 223), np.uint8)
+    harmonizer = _SpyHarmonizer(ColorTransform(exposure_ev=1.0))
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    output = _StopAfterOutput(pipeline, 1)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([raw]),
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        output,
+        harmonizer=harmonizer,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: pytest.fail(
+            "remote output reached local color estimation"
+        ),
+    )
+    session = hub.remote_client_connected() if remote_candidate else None
+    if session is not None:
+        assert hub.push_remote_frame(candidate, session)
+    try:
+        pipeline._loop(resources)
+    finally:
+        if session is not None:
+            hub.remote_client_disconnected(session)
+
+    expected = candidate if remote_candidate else Pipeline._privacy_slate(raw.shape)
+    published, _ = hub.output.latest()
+    assert published is not None
+    assert np.array_equal(published, expected)
+    assert np.array_equal(output.frames[0], expected)
+    assert not harmonizer.reset_calls
+    assert not harmonizer.update_calls
+    assert not harmonizer.error_calls
+
+
+def test_color_correction_has_a_separate_deterministic_timing_bucket(monkeypatch):
+    cfg = _color_integration_config("image")
+    mask = np.full((24, 32), 0.5, np.float32)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+        harmonizer=_SpyHarmonizer(),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: object(),
+    )
+    ticks = iter(
+        [
+            0,
+            1_000_000,
+            2_000_000,
+            4_000_000,
+            5_000_000,
+            12_000_000,
+            13_000_000,
+            16_000_000,
+        ]
+    )
+    monkeypatch.setattr(pipeline_mod.time, "monotonic_ns", lambda: next(ticks))
+    timings = {}
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+
+    pipeline._local_composite(
+        resources,
+        np.full((24, 32, 3), 80, np.uint8),
+        privacy_safe=False,
+        timings=timings,
+    )
+
+    assert timings == {
+        "segmentation_ms": 1.0,
+        "background_ms": 2.0,
+        "color_correction_ms": 7.0,
+        "composite_ms": 3.0,
+    }
+
+
+@pytest.mark.parametrize("change", ["visual", "segmentation"])
+def test_successful_color_state_commit_installs_pristine_harmonizer(
+    monkeypatch,
+    change,
+):
+    current = _color_integration_config("image")
+    if change == "visual":
+        candidate = current.patched({"background": {"anchor_x": 0.25}})
+    else:
+        candidate = current.patched({"segmentation": {"threshold": 0.61}})
+        monkeypatch.setattr(
+            pipeline_mod,
+            "create_segmenter",
+            lambda *_args, **_kwargs: _FixedMaskSegmenter(
+                np.full((24, 32), 0.5, np.float32)
+            ),
+        )
+        monkeypatch.setattr(
+            pipeline_mod,
+            "refiner_for",
+            lambda *_args, **_kwargs: _IdentityRefiner(),
+        )
+
+    live = ColorHarmonizer(0.8, mode="image")
+    live.reset(5.0, reason=ColorReason.INVALID)
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.zeros((24, 32, 3), np.uint8)),
+        None,
+        harmonizer=live,
+        color_reset_token=("live",),
+    )
+    runtime = RuntimeConfig(current)
+    pipeline = Pipeline(runtime, FrameHub())
+    activation = pipeline._prepare_activation_off_lane(current, candidate)
+    staged_harmonizer = activation.harmonizer
+    assert staged_harmonizer is not None
+    pristine = staged_harmonizer.snapshot()
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        0,
+        prepared_activation=activation,
+    )
+
+    pipeline._handle_patch_request(
+        resources,
+        request,
+        np.zeros((24, 32, 3), np.uint8),
+    )
+
+    assert request.error is None
+    assert request.result is not None
+    assert resources.harmonizer is staged_harmonizer
+    assert staged_harmonizer.snapshot() == pristine
+    assert resources.color_reset_token is None
+
+
+def test_unrelated_hot_commit_preserves_harmonizer_object_and_snapshot():
+    current = _color_integration_config("image")
+    candidate = current.patched({"api": {"remote_timeout_ms": 750}})
+    live = ColorHarmonizer(0.8, mode="image")
+    live.reset(5.0, reason=ColorReason.INVALID)
+    snapshot = live.snapshot()
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.zeros((24, 32, 3), np.uint8)),
+        None,
+        harmonizer=live,
+        color_reset_token=("stable",),
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        0,
+        prepared_activation=pipeline._prepare_activation_off_lane(
+            current,
+            candidate,
+        ),
+    )
+
+    pipeline._handle_patch_request(
+        resources,
+        request,
+        np.zeros((24, 32, 3), np.uint8),
+    )
+
+    assert request.error is None
+    assert resources.harmonizer is live
+    assert live.snapshot() == snapshot
+    assert resources.color_reset_token == ("stable",)
+
+
+@pytest.mark.parametrize("outcome", ["trial", "conflict", "cancel"])
+def test_rejected_activation_paths_do_not_mutate_live_harmonizer(
+    monkeypatch,
+    outcome,
+):
+    current = _color_integration_config("image")
+    candidate = current.patched({"background": {"anchor_x": 0.25}})
+    live = ColorHarmonizer(0.8, mode="image")
+    live.reset(5.0, reason=ColorReason.INVALID)
+    snapshot = live.snapshot()
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.zeros((24, 32, 3), np.uint8)),
+        None,
+        harmonizer=live,
+        color_reset_token=("stable",),
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        1 if outcome == "conflict" else 0,
+        prepared_activation=pipeline._prepare_activation_off_lane(
+            current,
+            candidate,
+        ),
+    )
+    if outcome == "cancel":
+        request.cancelled = True
+    elif outcome == "trial":
+        monkeypatch.setattr(
+            pipeline,
+            "_trial_activation",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ActivationError("trial failed")
+            ),
+        )
+
+    pipeline._handle_patch_request(
+        resources,
+        request,
+        np.zeros((24, 32, 3), np.uint8),
+    )
+
+    assert resources.harmonizer is live
+    assert live.snapshot() == snapshot
+    assert resources.color_reset_token == ("stable",)
+    assert resources.cfg is current
+    assert resources.version == 0
+
+
+def test_preparation_timeout_does_not_mutate_live_harmonizer(monkeypatch):
+    real_factory = pipeline_mod._new_color_harmonizer
+    created = []
+
+    def tracked_factory(cfg):
+        harmonizer = real_factory(cfg)
+        created.append(harmonizer)
+        return harmonizer
+
+    monkeypatch.setattr(pipeline_mod, "_new_color_harmonizer", tracked_factory)
+    runtime = make_runtime(mode="color")
+    pipeline, _hub = run_pipeline(runtime)
+    live = created[0]
+    live.reset(5.0, reason=ColorReason.INVALID)
+    snapshot = live.snapshot()
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class CandidateSegmenter:
+        device = "cpu"
+        last_foreground = None
+        produces_matte = False
+
+        def segment(self, frame):
+            return np.full(frame.shape[:2], 0.5, np.float32)
+
+        def close(self):
+            closed.set()
+
+    def blocked_build(*_args, **_kwargs):
+        entered.set()
+        release.wait(1.0)
+        return CandidateSegmenter()
+
+    monkeypatch.setattr(pipeline_mod, "create_segmenter", blocked_build)
+    try:
+        with pytest.raises(ReconfigurationUnavailable, match="preparation exceeded"):
+            pipeline.apply_config_patch(
+                {"segmentation": {"threshold": 0.61}},
+                timeout=0.03,
+            )
+        assert entered.is_set()
+        assert live.snapshot() == snapshot
+
+        release.set()
+        assert closed.wait(1.0)
+        assert len(created) == 2
+        assert created[0] is live
+        assert created[1] is not live
+        assert live.snapshot() == snapshot
+        assert runtime.version == 0
+    finally:
+        release.set()
+        pipeline.stop()
+
+
+def test_queued_ack_timeout_and_late_cancel_ack_preserve_live_harmonizer(
+    monkeypatch,
+):
+    current = _color_integration_config("image")
+    candidate = current.patched({"background": {"anchor_x": 0.25}})
+    live = ColorHarmonizer(0.8, mode="image")
+    live.reset(5.0, reason=ColorReason.INVALID)
+    snapshot = live.snapshot()
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.zeros((24, 32, 3), np.uint8)),
+        None,
+        harmonizer=live,
+        color_reset_token=("stable",),
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        0,
+        prepared_activation=pipeline._prepare_activation_off_lane(
+            current,
+            candidate,
+        ),
+    )
+
+    class ImmediateTimeoutEvent:
+        def __init__(self):
+            self.set_calls = 0
+
+        def wait(self, _timeout=None):
+            return False
+
+        def set(self):
+            self.set_calls += 1
+
+    request.done = cast(Any, ImmediateTimeoutEvent())
+    monkeypatch.setattr(
+        pipeline,
+        "_enqueue_request",
+        lambda queued: pipeline._requests.put(queued),
+    )
+
+    with pytest.raises(
+        ReconfigurationUnavailable,
+        match="did not acknowledge",
+    ):
+        pipeline._submit_patch(request, timeout=1.0)
+
+    assert request.cancelled
+    assert request.prepared_activation is None
+    assert resources.harmonizer is live
+    assert live.snapshot() == snapshot
+    queued = pipeline._requests.get_nowait()
+    assert queued is request
+
+    pipeline._handle_patch_request(
+        resources,
+        request,
+        np.zeros((24, 32, 3), np.uint8),
+    )
+
+    assert resources.harmonizer is live
+    assert live.snapshot() == snapshot
+    assert resources.color_reset_token == ("stable",)
+    assert resources.cfg is current
+    assert resources.version == 0

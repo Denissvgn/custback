@@ -18,7 +18,14 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from .. import _platform as platform_fs
-from ..config import _clean_config_string, _StrictModel
+from ..config import (
+    VideoColorMatrix,
+    VideoColorPrimaries,
+    VideoColorRange,
+    VideoColorTransfer,
+    _clean_config_string,
+    _StrictModel,
+)
 from ..config_merge import merge_patch
 from .state import ARKIT_BLENDSHAPES  # noqa: F401  (re-exported contract)
 
@@ -276,6 +283,10 @@ class AvatarBackgroundConfig(_StrictModel):
     image_path: str = ""
     video_path: str = ""
     blur_strength: int = Field(default=31, ge=3, le=151)
+    video_color_matrix: VideoColorMatrix = "auto"
+    video_color_range: VideoColorRange = "auto"
+    video_color_primaries: VideoColorPrimaries = "auto"
+    video_color_transfer: VideoColorTransfer = "auto"
 
     @field_validator("image_path", "video_path")
     @classmethod

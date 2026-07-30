@@ -14,7 +14,10 @@ when it is absent (e.g. running from an installed wheel/sdist that ships only
 
 from __future__ import annotations
 
+import os
 import py_compile
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -86,6 +89,28 @@ def test_spec_carries_dynamic_custback_imports() -> None:
         assert needed in text, f"spec is missing hidden import {needed!r}"
 
 
+def test_spec_carries_both_annotated_configuration_templates() -> None:
+    text = _spec_text()
+    assert 'collect_data_files("custback", includes=["**/*.yaml"])' in text
+    assert (PROJECT_ROOT / "src" / "custback" / "default.yaml").read_bytes() == (
+        PROJECT_ROOT / "config" / "default.yaml"
+    ).read_bytes()
+    assert (
+        PROJECT_ROOT / "src" / "custback" / "avatar" / "avatar.yaml"
+    ).read_bytes() == (PROJECT_ROOT / "config" / "avatar.yaml").read_bytes()
+
+
+def test_spec_carries_pyav_submodules_and_private_ffmpeg_bundle() -> None:
+    text = _spec_text()
+    assert '"av"' in text
+    assert 'collect_submodules("av")' in text
+    assert "collect_dynamic_libs(_pkg)" in text
+    assert 'get_package_paths("av")' in text
+    assert '"av.libs"' in text
+    assert '_datas += [(_source, "av.libs")' in text
+    assert "PyAV native bundle is empty" in text
+
+
 def test_windows_arm64_omits_pyvirtualcam_dependency_and_freeze_inputs() -> None:
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert f'"{PYVIRTUALCAM_REQUIREMENT}"' in pyproject
@@ -138,6 +163,61 @@ def test_build_smoke_scrubs_toolchain_environment() -> None:
     for scrubbed in ("PYTHONPATH", "PYTHONHOME", "CUDA_PATH"):
         assert scrubbed in build
     assert "--synthetic" in build and "--no-vcam" in build and "--no-api" in build
+    assert "--frozen-video-color-smoke" in build
+
+
+def test_frozen_entry_video_color_probe_is_offline_and_meaningful() -> None:
+    entry = (SPEC_DIR / "entry_custback.py").read_text(encoding="utf-8")
+    assert "VideoFrame.from_ndarray" in entry
+    assert "normalize_video_frame" in entry
+    assert "bt709/limited/bt709/srgb" in entry
+    assert "srgb-full-bgr" in entry
+    assert "av.open" not in entry
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SPEC_DIR / "entry_custback.py"),
+            "--frozen-video-color-smoke",
+        ],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_installed_artifact_smoke_also_normalizes_tagged_video_in_memory() -> None:
+    release = (PROJECT_ROOT / "scripts" / "release" / "verify-release.js").read_text(
+        encoding="utf-8"
+    )
+    assert "import av," in release
+    assert "custback.video_decoder" in release
+    assert "VideoFrame.from_ndarray" in release
+    assert "normalize_video_frame(video_frame" in release
+    assert "bt709/limited/bt709/srgb" in release
+
+
+def test_ci_runs_bounded_windows_frozen_engine_smoke() -> None:
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    marker = "\n  windows-frozen-engine:\n"
+    assert marker in workflow
+    job = workflow.split(marker, 1)[1].split("\n  node:\n", 1)[0]
+    assert "runs-on: windows-2022" in job
+    assert "timeout-minutes: 30" in job
+    assert 'python-version: "3.12"' in job
+    assert "cache: pip" in job
+    assert "./packaging/windows/pyinstaller/build.ps1" in job
+    assert "-Arch x64" in job
+    assert '-Extras "rvm,mediapipe,windows"' in job
+    assert "-AvatarProfile vision" in job
 
 
 # -- Phase 6 -----------------------------------------------------------------

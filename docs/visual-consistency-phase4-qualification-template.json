@@ -1,0 +1,120 @@
+{
+  "instructions": "Merge this physical object into a deterministic + pinned calibrated report; replace every pending row with hashed real artifacts, then set release_qualified=true and validate the release claim.",
+  "manifest_id": "custback-visual-qualification-v1",
+  "manifest_sha256": "a762fda177d2286192a019666a45cad5892b21447bb91099872906d378cd3649",
+  "physical": {
+    "consumers": [],
+    "rows": [
+      {
+        "artifacts": {},
+        "capture_backend": "v4l2",
+        "consumer_ids": [],
+        "id": "linux-v4l2-pyvirtualcam",
+        "measurements": null,
+        "notes": "manual physical qualification not supplied",
+        "os": "linux",
+        "output_backend": "pyvirtualcam",
+        "status": "pending",
+        "transport": "v4l2loopback",
+        "webcam_ids": []
+      },
+      {
+        "artifacts": {},
+        "capture_backend": "avfoundation",
+        "consumer_ids": [],
+        "id": "macos-obsvcam-pyvirtualcam",
+        "measurements": null,
+        "notes": "manual physical qualification not supplied",
+        "os": "macos",
+        "output_backend": "pyvirtualcam",
+        "status": "pending",
+        "transport": "obs-virtual-camera",
+        "webcam_ids": []
+      },
+      {
+        "artifacts": {},
+        "capture_backend": "msmf",
+        "consumer_ids": [],
+        "id": "windows-msmf-pyvirtualcam",
+        "measurements": null,
+        "notes": "manual physical qualification not supplied",
+        "os": "windows",
+        "output_backend": "pyvirtualcam",
+        "status": "pending",
+        "transport": "obs-virtual-camera",
+        "webcam_ids": []
+      },
+      {
+        "artifacts": {},
+        "capture_backend": "dshow",
+        "consumer_ids": [],
+        "id": "windows-dshow-pyvirtualcam",
+        "measurements": null,
+        "notes": "manual physical qualification not supplied",
+        "os": "windows",
+        "output_backend": "pyvirtualcam",
+        "status": "pending",
+        "transport": "obs-virtual-camera",
+        "webcam_ids": []
+      },
+      {
+        "artifacts": {},
+        "capture_backend": "msmf",
+        "consumer_ids": [],
+        "id": "windows-native",
+        "measurements": null,
+        "notes": "manual physical qualification not supplied",
+        "os": "windows",
+        "output_backend": "native",
+        "status": "pending",
+        "transport": "media-foundation-virtual-camera",
+        "webcam_ids": []
+      }
+    ],
+    "status": "pending",
+    "webcams": []
+  },
+  "schemas": {
+    "artifact": {
+      "bytes": 1,
+      "filename": "unique-relative-evidence-file.png",
+      "media_type": "image/png",
+      "sha256": "replace-with-lowercase-sha256"
+    },
+    "consumer": {
+      "id": "stable-consumer-id",
+      "name": "Meeting application name",
+      "os": "linux|macos|windows",
+      "version": "exact version"
+    },
+    "measurements": {
+      "all_consumers_match": false,
+      "clothing_chroma_drift_percent": 0.0,
+      "clothing_hue_drift_degrees": 0.0,
+      "crop_edge_error_pixels": 0,
+      "luminance_gap_reduction_percent": 0.0,
+      "neutral_error_reduction_percent": 0.0,
+      "no_temporal_oscillation": false,
+      "orientation_error_degrees": 0,
+      "preview_api_equal": false,
+      "skin_chroma_drift_percent": 0.0,
+      "skin_hue_drift_degrees": 0.0,
+      "steady_state_ev_delta_p95": 0.0,
+      "steady_state_wb_log2_delta_p95": 0.0,
+      "transport_mean_absolute_error": 0.0
+    },
+    "required_artifact_ids": {
+      "api_snapshot": "application/json",
+      "consumer_capture": "image/png",
+      "contact_sheet": "image/png",
+      "preview_capture": "image/png"
+    },
+    "webcam": {
+      "auto_exposure": "enabled|disabled|unavailable",
+      "auto_white_balance": "enabled|disabled|unavailable",
+      "id": "stable-webcam-id",
+      "manufacturer": "exact manufacturer",
+      "model": "exact model"
+    }
+  }
+}

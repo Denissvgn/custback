@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace custback::vcam {
@@ -44,6 +45,12 @@ inline constexpr uint32_t kBytesPerPixel = 4u;
 // Mirrors vcam_native.HEADER_SIZE / FLAG_ACTIVE.
 inline constexpr uint32_t kHeaderSize = 64u;
 inline constexpr uint32_t kFlagActive = 0x1u;
+
+enum class FrameReadStatus {
+    Complete,
+    Transient,
+    Unavailable,
+};
 
 #pragma pack(push, 1)
 struct FrameRingHeader {
@@ -65,8 +72,8 @@ static_assert(sizeof(FrameRingHeader) == kHeaderSize,
               "header layout must match vcam_native.HEADER_FORMAT");
 
 // Read-only view over the engine's shared ring.  All failures are soft: the
-// camera must keep serving frames (placeholder) when the engine is not
-// running, so Open()/CopyLatest() report false rather than throwing.
+// camera must keep serving frames when the engine is not running, so Open()
+// and CopyLatest() report status rather than throwing.
 class FrameRingReader {
  public:
     FrameRingReader() = default;
@@ -117,10 +124,11 @@ class FrameRingReader {
         m_viewSize = 0;
     }
 
-    // Copies the newest complete frame into `frame` (resized to fit) and
-    // reports its geometry.  Mirrors vcam_native.read_latest_frame().
-    bool CopyLatest(std::vector<uint8_t>& frame, uint32_t& width,
-                    uint32_t& height, int maxAttempts = 4) {
+    // Reads a stable, valid ring geometry even while the writer is inactive.
+    // The Python writer publishes this header at construction, before its
+    // first frame, so MediaSource can advertise only the active exact mode.
+    bool ReadGeometry(uint32_t& width, uint32_t& height,
+                      int maxAttempts = 100) {
         if (!IsOpen()) {
             return false;
         }
@@ -133,29 +141,21 @@ class FrameRingReader {
                 std::atomic_ref<const uint32_t>(sharedSeq).load(
                     std::memory_order_acquire);
             if (seqBefore != header.seq || (seqBefore & 1u) != 0u) {
-                continue;  // torn header or write in progress
+                ::Sleep(1);
+                continue;
             }
-            if (header.magic != kMagic || header.version != kProtocolVersion) {
-                return false;
+            uint64_t payload = 0;
+            if (!ValidateGeometry(header, payload)) {
+                ::Sleep(1);
+                continue;
             }
-            if ((header.flags & kFlagActive) == 0) {
-                return false;
-            }
-            const uint64_t payload =
-                uint64_t{header.width} * header.height * kBytesPerPixel;
-            if (header.width == 0 || header.height == 0 ||
-                kHeaderSize + payload > m_viewSize) {
-                return false;
-            }
-            frame.resize(static_cast<size_t>(payload));
-            std::memcpy(frame.data(), m_view + kHeaderSize,
-                        static_cast<size_t>(payload));
             std::atomic_thread_fence(std::memory_order_acquire);
             const uint32_t seqAfter =
                 std::atomic_ref<const uint32_t>(sharedSeq).load(
                     std::memory_order_acquire);
             if (seqAfter != seqBefore) {
-                continue;  // torn: the writer moved on mid-copy
+                ::Sleep(1);
+                continue;
             }
             width = header.width;
             height = header.height;
@@ -164,7 +164,89 @@ class FrameRingReader {
         return false;
     }
 
+    // Copies the newest complete, exact-BGRX frame into `frame` and reports
+    // its geometry.  Mirrors vcam_native.read_latest_frame().
+    FrameReadStatus CopyLatest(std::vector<uint8_t>& frame, uint32_t& width,
+                               uint32_t& height, int maxAttempts = 4) {
+        if (!IsOpen()) {
+            return FrameReadStatus::Unavailable;
+        }
+        for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+            FrameRingHeader header{};
+            std::memcpy(&header, m_view, sizeof(header));
+            const auto& sharedSeq = *reinterpret_cast<const uint32_t*>(
+                m_view + offsetof(FrameRingHeader, seq));
+            const auto& sharedFlags = *reinterpret_cast<const uint32_t*>(
+                m_view + offsetof(FrameRingHeader, flags));
+            const uint32_t seqBefore =
+                std::atomic_ref<const uint32_t>(sharedSeq).load(
+                    std::memory_order_acquire);
+            const uint32_t flagsBefore =
+                std::atomic_ref<const uint32_t>(sharedFlags).load(
+                    std::memory_order_acquire);
+            uint64_t payload = 0;
+            if (!ValidateGeometry(header, payload)) {
+                return FrameReadStatus::Unavailable;
+            }
+            if ((header.flags & kFlagActive) == 0 ||
+                (flagsBefore & kFlagActive) == 0) {
+                return FrameReadStatus::Unavailable;
+            }
+            if (seqBefore != header.seq || (seqBefore & 1u) != 0u) {
+                ::Sleep(0);
+                continue;  // torn header or write in progress
+            }
+            m_candidate.resize(static_cast<size_t>(payload));
+            std::memcpy(m_candidate.data(), m_view + kHeaderSize,
+                        static_cast<size_t>(payload));
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint32_t seqAfter =
+                std::atomic_ref<const uint32_t>(sharedSeq).load(
+                    std::memory_order_acquire);
+            const uint32_t flagsAfter =
+                std::atomic_ref<const uint32_t>(sharedFlags).load(
+                    std::memory_order_acquire);
+            if ((flagsAfter & kFlagActive) == 0) {
+                return FrameReadStatus::Unavailable;
+            }
+            if (seqAfter != seqBefore) {
+                ::Sleep(0);
+                continue;  // torn: the writer moved on mid-copy
+            }
+            frame.swap(m_candidate);
+            width = header.width;
+            height = header.height;
+            return FrameReadStatus::Complete;
+        }
+        return FrameReadStatus::Transient;
+    }
+
  private:
+    bool ValidateGeometry(const FrameRingHeader& header,
+                          uint64_t& payload) const {
+        if (header.magic != kMagic ||
+            header.version != kProtocolVersion ||
+            header.fourcc != kFourcc ||
+            header.width == 0 ||
+            header.height == 0) {
+            return false;
+        }
+        const uint64_t expectedStride =
+            uint64_t{header.width} * kBytesPerPixel;
+        if (expectedStride > std::numeric_limits<uint32_t>::max() ||
+            header.stride != static_cast<uint32_t>(expectedStride)) {
+            return false;
+        }
+        const uint64_t available =
+            static_cast<uint64_t>(m_viewSize - kHeaderSize);
+        if (static_cast<uint64_t>(header.height) >
+            available / expectedStride) {
+            return false;
+        }
+        payload = expectedStride * static_cast<uint64_t>(header.height);
+        return true;
+    }
+
 #if defined(CUSTBACK_VCAM_GATE_DIAGNOSTICS)
     void TraceOpenFailure(const wchar_t* sectionName, DWORD error) {
         if (m_reportedOpenFailure && error == m_lastReportedOpenError) {
@@ -190,6 +272,7 @@ class FrameRingReader {
     HANDLE m_section = nullptr;
     const uint8_t* m_view = nullptr;
     SIZE_T m_viewSize = 0;
+    std::vector<uint8_t> m_candidate;
 };
 
 }  // namespace custback::vcam

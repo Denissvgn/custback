@@ -4,15 +4,26 @@ import numpy as np
 import pytest
 
 import custback.backgrounds as backgrounds_mod
+import custback.compositor as compositor_mod
 import custback.segmentation as segmentation_mod
 from custback.backgrounds import (
     BlurBackdrop,
     ColorBackdrop,
     VideoBackdrop,
-    _fit,
     create_backdrop,
 )
-from custback.compositor import composite
+from custback.color import (
+    ColorError,
+    ColorTransform,
+    apply_color_transform,
+    bgr_u8_to_linear_rgb,
+    linear_rgb_to_bgr_u8,
+)
+from custback.compositor import (
+    composite,
+    composite_legacy_predecoded,
+    composite_linear_predecoded,
+)
 from custback.config import BackgroundConfig, SegmentationConfig
 from custback.segmentation import (
     HeuristicSegmenter,
@@ -24,6 +35,31 @@ from custback.segmentation import (
 
 def frame(h=72, w=128, value=100):
     return np.full((h, w, 3), value, dtype=np.uint8)
+
+
+def legacy_composite_reference(
+    foreground,
+    backdrop,
+    mask,
+    *,
+    light_wrap=0.0,
+    edge_foreground=None,
+):
+    """Frozen pre-VIS-2.2 encoded-value arithmetic for compatibility tests."""
+
+    alpha = mask[..., None].astype(np.float32)
+    working = foreground.astype(np.float32)
+    if light_wrap > 0.0 or edge_foreground is not None:
+        band = 4.0 * alpha * (1.0 - alpha)
+        if edge_foreground is not None:
+            working = working * (1.0 - band) + edge_foreground.astype(np.float32) * band
+        if light_wrap > 0.0 and compositor_mod.cv2 is not None:
+            wrap = compositor_mod._downscaled_blur(backdrop)
+            amount = light_wrap * band
+            working = working * (1.0 - amount) + wrap * amount
+    return (working * alpha + backdrop.astype(np.float32) * (1.0 - alpha)).astype(
+        np.uint8
+    )
 
 
 class FakeVideoCapture:
@@ -139,6 +175,423 @@ class TestCompositor:
         out = composite(fg, bg, np.full((72, 128), 0.5, np.float32))
         assert abs(int(out[0, 0, 0]) - 100) <= 1
 
+    def test_linear_half_mask_blends_in_linear_light(self):
+        fg, bg = frame(value=200), frame(value=0)
+        out = composite(
+            fg,
+            bg,
+            np.full((72, 128), 0.5, np.float32),
+            blend_space="linear_srgb",
+        )
+        assert abs(int(out[0, 0, 0]) - 146) <= 1
+
+    def test_linear_mask_endpoints_are_bit_exact_and_owned(self):
+        fg = np.arange(3 * 4 * 6, dtype=np.uint8).reshape(4, 6, 3)
+        bg = np.ascontiguousarray(255 - fg)
+        fg_before = fg.copy()
+        bg_before = bg.copy()
+        mask = np.array(
+            [
+                [0.0, 1.0, 0.25, 0.75, 0.0, 1.0],
+                [1.0, 0.0, 0.5, 0.5, 1.0, 0.0],
+                [0.0, 0.0, 1.0, 1.0, 0.25, 0.75],
+                [1.0, 1.0, 0.0, 0.0, 0.75, 0.25],
+            ],
+            dtype=np.float32,
+        )
+
+        out = composite(fg, bg, mask, blend_space="linear_srgb")
+
+        assert np.array_equal(out[mask == 0.0], bg[mask == 0.0])
+        assert np.array_equal(out[mask == 1.0], fg[mask == 1.0])
+        assert out.dtype == np.uint8
+        assert out.flags.c_contiguous
+        assert not np.shares_memory(out, fg)
+        assert not np.shares_memory(out, bg)
+        assert np.array_equal(fg, fg_before)
+        assert np.array_equal(bg, bg_before)
+
+    def test_predecoded_linear_compositor_uses_bgr_endpoint_authority(self):
+        fg = np.array([[[11, 22, 33], [44, 55, 66], [77, 88, 99]]], np.uint8)
+        bg = np.array([[[199, 188, 177], [166, 155, 144], [133, 122, 111]]], np.uint8)
+        mask = np.array([[0.0, 1.0, 0.5]], np.float32)
+        # Deliberately disagree with the BGR references. The predecoded arrays
+        # own soft-pixel math, while external BGR owns exact alpha endpoints.
+        foreground_linear = np.zeros((1, 3, 3), np.float32)
+        backdrop_linear = np.ones((1, 3, 3), np.float32)
+
+        out = composite_linear_predecoded(
+            fg,
+            bg,
+            mask,
+            foreground_linear_rgb=foreground_linear,
+            backdrop_linear_rgb=backdrop_linear,
+        )
+
+        assert np.array_equal(out[0, 0], bg[0, 0])
+        assert np.array_equal(out[0, 1], fg[0, 1])
+        assert out.dtype == np.uint8
+        assert out.flags.c_contiguous
+
+    def test_accelerated_linear_bgr_ramp_matches_public_rgb_and_exact_endpoints(self):
+        codes = np.arange(256, dtype=np.uint8)[None, :]
+        fg = np.stack(
+            (codes, np.roll(codes, 31, axis=1), np.roll(codes, 97, axis=1)),
+            axis=2,
+        )
+        bg = np.ascontiguousarray(255 - fg)
+        mask = np.linspace(0.0, 1.0, 256, dtype=np.float32)[None, :]
+        foreground_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(fg)
+        backdrop_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(bg)
+        expected = composite_linear_predecoded(
+            fg,
+            bg,
+            mask,
+            foreground_linear_rgb=np.ascontiguousarray(
+                foreground_linear_bgr[..., ::-1]
+            ),
+            backdrop_linear_rgb=np.ascontiguousarray(backdrop_linear_bgr[..., ::-1]),
+        )
+
+        actual = compositor_mod._composite_linear_bgr_prevalidated(
+            fg,
+            bg,
+            mask,
+            foreground_linear_bgr=foreground_linear_bgr,
+            backdrop_linear_bgr=backdrop_linear_bgr,
+        )
+
+        assert np.max(np.abs(actual.astype(np.int16) - expected.astype(np.int16))) <= 1
+        np.testing.assert_array_equal(actual[mask == 0.0], bg[mask == 0.0])
+        np.testing.assert_array_equal(actual[mask == 1.0], fg[mask == 1.0])
+
+    def test_accelerated_linear_bgr_random_transform_edge_and_wrap_match_public_rgb(
+        self,
+    ):
+        rng = np.random.default_rng(0xB6C0)
+        shape = (127, 193, 3)
+        fg = rng.integers(0, 256, shape, dtype=np.uint8)
+        bg = rng.integers(0, 256, shape, dtype=np.uint8)
+        edge = rng.integers(0, 256, shape, dtype=np.uint8)
+        mask = rng.random(shape[:2], dtype=np.float32)
+        mask[0, :] = 0.0
+        mask[-1, :] = 1.0
+        transform = ColorTransform(
+            exposure_ev=0.63,
+            wb_gains=(1.11, 0.97, 0.89),
+        )
+        foreground_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(fg)
+        backdrop_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(bg)
+        edge_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(edge)
+        expected = composite_linear_predecoded(
+            fg,
+            bg,
+            mask,
+            foreground_linear_rgb=np.ascontiguousarray(
+                foreground_linear_bgr[..., ::-1]
+            ),
+            backdrop_linear_rgb=np.ascontiguousarray(backdrop_linear_bgr[..., ::-1]),
+            light_wrap=0.25,
+            edge_foreground_bgr=edge,
+            edge_foreground_linear_rgb=np.ascontiguousarray(edge_linear_bgr[..., ::-1]),
+            color_transform=transform,
+        )
+
+        actual = compositor_mod._composite_linear_bgr_prevalidated(
+            fg,
+            bg,
+            mask,
+            foreground_linear_bgr=foreground_linear_bgr,
+            backdrop_linear_bgr=backdrop_linear_bgr,
+            light_wrap=0.25,
+            edge_foreground_bgr=edge,
+            edge_foreground_linear_bgr=edge_linear_bgr,
+            color_transform=transform,
+        )
+
+        assert np.max(np.abs(actual.astype(np.int16) - expected.astype(np.int16))) <= 1
+        np.testing.assert_array_equal(actual[mask == 0.0], bg[mask == 0.0])
+
+    @pytest.mark.parametrize("operation", ["transform", "encode"])
+    def test_accelerated_opencv_photometric_error_becomes_color_error(
+        self,
+        monkeypatch,
+        operation,
+    ):
+        fg = frame(h=8, w=12, value=80)
+        bg = frame(h=8, w=12, value=20)
+        mask = np.full((8, 12), 0.5, np.float32)
+        foreground_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(fg)
+        backdrop_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(bg)
+
+        def fail(*_args, **_kwargs):
+            raise compositor_mod.cv2.error(f"forced {operation} failure")
+
+        if operation == "transform":
+            monkeypatch.setattr(compositor_mod.cv2, "transform", fail)
+        else:
+            monkeypatch.setattr(
+                compositor_mod,
+                "_consume_linear_bgr_to_bgr_u8_prevalidated",
+                fail,
+            )
+
+        with pytest.raises(
+            ColorError,
+            match="OpenCV photometric composition failed",
+        ) as raised:
+            compositor_mod._composite_linear_bgr_prevalidated(
+                fg,
+                bg,
+                mask,
+                foreground_linear_bgr=foreground_linear_bgr,
+                backdrop_linear_bgr=backdrop_linear_bgr,
+                color_transform=ColorTransform(exposure_ev=0.25),
+            )
+
+        assert isinstance(raised.value.__cause__, compositor_mod.cv2.error)
+
+    def test_accelerated_malformed_structure_remains_strict_before_opencv(
+        self,
+        monkeypatch,
+    ):
+        fg = frame(h=8, w=12, value=80)
+        bg = frame(h=8, w=12, value=20)
+        mask = np.full((8, 12), 0.5, np.float32)
+        foreground_linear_bgr = (
+            compositor_mod._bgr_u8_to_linear_bgr_prevalidated(fg)
+        ).astype(np.float64)
+        backdrop_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(bg)
+        encode_calls = []
+
+        def unexpected_encode(*_args, **_kwargs):
+            encode_calls.append(True)
+            raise compositor_mod.cv2.error("encode should not run")
+
+        monkeypatch.setattr(
+            compositor_mod,
+            "_consume_linear_bgr_to_bgr_u8_prevalidated",
+            unexpected_encode,
+        )
+
+        with pytest.raises(ValueError, match="foreground_linear_bgr"):
+            compositor_mod._composite_linear_bgr_prevalidated(
+                fg,
+                bg,
+                mask,
+                foreground_linear_bgr=foreground_linear_bgr,
+                backdrop_linear_bgr=backdrop_linear_bgr,
+                color_transform=ColorTransform(exposure_ev=0.25),
+            )
+        assert not encode_calls
+
+    def test_legacy_identity_path_is_byte_identical_with_edge_and_wrap(self):
+        pytest.importorskip("cv2")
+        rng = np.random.default_rng(0xC057BAC)
+        fg = rng.integers(0, 256, size=(72, 128, 3), dtype=np.uint8)
+        bg = rng.integers(0, 256, size=(72, 128, 3), dtype=np.uint8)
+        clean = rng.integers(0, 256, size=(72, 128, 3), dtype=np.uint8)
+        mask = rng.random((72, 128), dtype=np.float32)
+        expected = legacy_composite_reference(
+            fg,
+            bg,
+            mask,
+            light_wrap=0.35,
+            edge_foreground=clean,
+        )
+
+        implicit = composite(
+            fg,
+            bg,
+            mask,
+            light_wrap=0.35,
+            edge_foreground=clean,
+        )
+        explicit = composite(
+            fg,
+            bg,
+            mask,
+            light_wrap=0.35,
+            edge_foreground=clean,
+            blend_space="srgb_legacy",
+            color_transform=ColorTransform(),
+        )
+        predecoded = composite_legacy_predecoded(
+            fg,
+            bg,
+            mask,
+            foreground_linear_rgb=bgr_u8_to_linear_rgb(fg),
+            light_wrap=0.35,
+            edge_foreground_bgr=clean,
+            edge_foreground_linear_rgb=bgr_u8_to_linear_rgb(clean),
+            color_transform=ColorTransform(),
+        )
+
+        assert np.array_equal(implicit, expected)
+        assert np.array_equal(explicit, expected)
+        assert np.array_equal(predecoded, expected)
+
+    def test_legacy_transform_is_applied_before_encoded_blending(self):
+        fg = frame(h=4, w=6, value=48)
+        bg = frame(h=4, w=6, value=8)
+        clean = frame(h=4, w=6, value=72)
+        mask = np.full((4, 6), 0.5, np.float32)
+        transform = ColorTransform(exposure_ev=0.5)
+        transformed_fg = linear_rgb_to_bgr_u8(
+            apply_color_transform(bgr_u8_to_linear_rgb(fg), transform)
+        )
+        transformed_clean = linear_rgb_to_bgr_u8(
+            apply_color_transform(bgr_u8_to_linear_rgb(clean), transform)
+        )
+        expected = legacy_composite_reference(
+            transformed_fg,
+            bg,
+            mask,
+            edge_foreground=transformed_clean,
+        )
+
+        out = composite(
+            fg,
+            bg,
+            mask,
+            edge_foreground=clean,
+            color_transform=transform,
+        )
+
+        assert np.array_equal(out, expected)
+
+    def test_legacy_predecoded_reuses_linear_foregrounds(self, monkeypatch):
+        fg = frame(h=4, w=6, value=48)
+        bg = frame(h=4, w=6, value=8)
+        clean = frame(h=4, w=6, value=72)
+        mask = np.full((4, 6), 0.5, np.float32)
+        transform = ColorTransform(exposure_ev=0.5)
+        foreground_linear = bgr_u8_to_linear_rgb(fg)
+        edge_linear = bgr_u8_to_linear_rgb(clean)
+        expected = composite(
+            fg,
+            bg,
+            mask,
+            edge_foreground=clean,
+            color_transform=transform,
+        )
+
+        def unexpected_decode(_value):
+            raise AssertionError("predecoded legacy compositor decoded an input")
+
+        monkeypatch.setattr(
+            compositor_mod,
+            "bgr_u8_to_linear_rgb",
+            unexpected_decode,
+        )
+        out = composite_legacy_predecoded(
+            fg,
+            bg,
+            mask,
+            foreground_linear_rgb=foreground_linear,
+            edge_foreground_bgr=clean,
+            edge_foreground_linear_rgb=edge_linear,
+            color_transform=transform,
+        )
+
+        assert np.array_equal(out, expected)
+
+    def test_linear_transform_applies_identically_to_camera_and_rvm_foreground(self):
+        fg = frame(h=4, w=6, value=48)
+        bg = frame(h=4, w=6, value=8)
+        clean = frame(h=4, w=6, value=72)
+        mask = np.full((4, 6), 0.5, np.float32)
+        mask[:, :2] = 1.0
+        transform = ColorTransform(
+            exposure_ev=0.5,
+            wb_gains=(1.05, 1.0, 0.95),
+        )
+        transformed_fg = apply_color_transform(
+            bgr_u8_to_linear_rgb(fg),
+            transform,
+        )
+        transformed_clean = apply_color_transform(
+            bgr_u8_to_linear_rgb(clean),
+            transform,
+        )
+        bg_linear = bgr_u8_to_linear_rgb(bg)
+        expected_core = linear_rgb_to_bgr_u8(transformed_fg)
+        expected_edge = linear_rgb_to_bgr_u8(transformed_clean * 0.5 + bg_linear * 0.5)
+
+        out = composite(
+            fg,
+            bg,
+            mask,
+            edge_foreground=clean,
+            blend_space="linear_srgb",
+            color_transform=transform,
+        )
+
+        assert np.array_equal(out[:, :2], expected_core[:, :2])
+        # At alpha=.5 the edge band is exactly one, so the RVM foreground fully
+        # replaces camera pixels before the same transformed linear blend.
+        assert np.array_equal(out[:, 2:], expected_edge[:, 2:])
+
+    def test_linear_path_decodes_each_input_once_and_encodes_once(self, monkeypatch):
+        calls = {"decode": 0, "encode": 0, "transform": 0, "predecoded": 0}
+        real_decode = compositor_mod.bgr_u8_to_linear_rgb
+        real_encode = compositor_mod.linear_rgb_to_bgr_u8
+        real_transform = compositor_mod.apply_color_transform
+        real_predecoded = compositor_mod.composite_linear_predecoded
+
+        def counted_decode(value):
+            calls["decode"] += 1
+            return real_decode(value)
+
+        def counted_encode(value):
+            calls["encode"] += 1
+            return real_encode(value)
+
+        def counted_transform(value, transform):
+            calls["transform"] += 1
+            return real_transform(value, transform)
+
+        def counted_predecoded(*args, **kwargs):
+            calls["predecoded"] += 1
+            return real_predecoded(*args, **kwargs)
+
+        monkeypatch.setattr(
+            compositor_mod,
+            "bgr_u8_to_linear_rgb",
+            counted_decode,
+        )
+        monkeypatch.setattr(
+            compositor_mod,
+            "linear_rgb_to_bgr_u8",
+            counted_encode,
+        )
+        monkeypatch.setattr(
+            compositor_mod,
+            "apply_color_transform",
+            counted_transform,
+        )
+        monkeypatch.setattr(
+            compositor_mod,
+            "composite_linear_predecoded",
+            counted_predecoded,
+        )
+
+        composite(
+            frame(value=60),
+            frame(value=20),
+            np.full((72, 128), 0.5, np.float32),
+            edge_foreground=frame(value=80),
+            blend_space="linear_srgb",
+            color_transform=ColorTransform(exposure_ev=0.25),
+        )
+
+        assert calls == {
+            "decode": 3,
+            "encode": 1,
+            "transform": 2,
+            "predecoded": 1,
+        }
+
     def test_shape_mismatch_raises(self):
         with pytest.raises(ValueError):
             composite(frame(), frame(h=10, w=10), np.ones((72, 128), np.float32))
@@ -151,19 +604,27 @@ class TestCompositor:
         mask[:, 64] = 0.5
         return mask
 
-    def test_light_wrap_tints_only_the_edge_band(self):
+    @pytest.mark.parametrize("blend_space", ["srgb_legacy", "linear_srgb"])
+    def test_light_wrap_tints_only_the_edge_band(self, blend_space):
         pytest.importorskip("cv2")
         fg = frame(value=50)
         bg = np.zeros((72, 128, 3), np.uint8)
         bg[:, :, 1] = 200  # green backdrop
         mask = self.edge_mask()
-        plain = composite(fg, bg, mask)
-        wrapped = composite(fg, bg, mask, light_wrap=0.5)
+        plain = composite(fg, bg, mask, blend_space=blend_space)
+        wrapped = composite(
+            fg,
+            bg,
+            mask,
+            light_wrap=0.5,
+            blend_space=blend_space,
+        )
         # the person's edge picks up backdrop light...
         assert int(wrapped[36, 64, 1]) > int(plain[36, 64, 1])
         # ...but the person core and the pure background are untouched
         assert (wrapped[:, :40] == plain[:, :40]).all()
         assert (wrapped[:, 100:] == plain[:, 100:]).all()
+        assert int(wrapped.max()) <= 200
 
     def test_edge_foreground_used_only_in_band(self):
         fg = frame(value=200)
@@ -178,22 +639,210 @@ class TestCompositor:
         # core person pixel unchanged
         assert tuple(out[36, 10]) == (200, 200, 200)
 
-    def test_edge_foreground_shape_mismatch_ignored(self):
+    def test_edge_foreground_shape_mismatch_raises(self):
         fg, bg = frame(value=200), frame(value=0)
-        out = composite(
-            fg,
-            bg,
-            self.edge_mask(),
-            edge_foreground=np.zeros((10, 10, 3), np.uint8),
-        )
-        assert tuple(out[36, 10]) == (200, 200, 200)
+        with pytest.raises(ValueError, match="shape mismatch"):
+            composite(
+                fg,
+                bg,
+                self.edge_mask(),
+                edge_foreground=np.zeros((10, 10, 3), np.uint8),
+            )
+
+    @pytest.mark.parametrize(
+        "bad_frame",
+        [
+            np.zeros((72, 128, 3), np.float32),
+            np.zeros((72, 128), np.uint8),
+            np.zeros((72, 128, 4), np.uint8),
+            np.zeros((0, 128, 3), np.uint8),
+            np.zeros((72, 256, 3), np.uint8)[:, ::2],
+        ],
+        ids=["dtype", "rank", "channels", "empty", "noncontiguous"],
+    )
+    def test_invalid_foreground_contract_raises(self, bad_frame):
+        with pytest.raises(ValueError, match="foreground"):
+            composite(
+                bad_frame,
+                frame(),
+                np.ones((72, 128), np.float32),
+            )
+
+    @pytest.mark.parametrize("argument", ["backdrop", "edge_foreground"])
+    @pytest.mark.parametrize(
+        "bad_frame",
+        [
+            np.zeros((72, 128, 3), np.float32),
+            np.zeros((72, 128), np.uint8),
+            np.zeros((72, 128, 4), np.uint8),
+            np.zeros((0, 128, 3), np.uint8),
+            np.zeros((72, 256, 3), np.uint8)[:, ::2],
+        ],
+        ids=["dtype", "rank", "channels", "empty", "noncontiguous"],
+    )
+    def test_invalid_secondary_frame_contract_raises(self, argument, bad_frame):
+        kwargs = {argument: bad_frame}
+        foreground = frame()
+        backdrop = kwargs.pop("backdrop", frame())
+        with pytest.raises(ValueError, match=argument):
+            composite(
+                foreground,
+                backdrop,
+                np.ones((72, 128), np.float32),
+                **kwargs,
+            )
+
+    @pytest.mark.parametrize(
+        "argument",
+        [
+            "foreground_linear_rgb",
+            "backdrop_linear_rgb",
+            "edge_foreground_linear_rgb",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "bad_linear",
+        [
+            np.zeros((72, 128, 3), np.float64),
+            np.zeros((72, 128), np.float32),
+            np.zeros((72, 128, 4), np.float32),
+            np.zeros((10, 10, 3), np.float32),
+            np.zeros((0, 128, 3), np.float32),
+            np.zeros((72, 256, 3), np.float32)[:, ::2],
+            np.full((72, 128, 3), np.nan, np.float32),
+            np.full((72, 128, 3), np.inf, np.float32),
+            np.full((72, 128, 3), -0.01, np.float32),
+            np.full((72, 128, 3), 1.01, np.float32),
+        ],
+        ids=[
+            "dtype",
+            "rank",
+            "channels",
+            "shape",
+            "empty",
+            "noncontiguous",
+            "nan",
+            "infinity",
+            "negative",
+            "above-one",
+        ],
+    )
+    def test_invalid_predecoded_frame_contract_raises(self, argument, bad_linear):
+        edge = frame(value=80)
+        foreground_linear = bgr_u8_to_linear_rgb(frame())
+        backdrop_linear = bgr_u8_to_linear_rgb(frame())
+        edge_linear = bgr_u8_to_linear_rgb(edge)
+        if argument == "foreground_linear_rgb":
+            foreground_linear = bad_linear
+        elif argument == "backdrop_linear_rgb":
+            backdrop_linear = bad_linear
+        else:
+            edge_linear = bad_linear
+
+        with pytest.raises(ValueError, match=argument):
+            composite_linear_predecoded(
+                frame(),
+                frame(),
+                np.ones((72, 128), np.float32),
+                foreground_linear_rgb=foreground_linear,
+                backdrop_linear_rgb=backdrop_linear,
+                edge_foreground_bgr=edge,
+                edge_foreground_linear_rgb=edge_linear,
+            )
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["edge_foreground_bgr", "edge_foreground_linear_rgb"],
+    )
+    def test_predecoded_edge_pair_must_be_complete(self, missing):
+        kwargs = {
+            "edge_foreground_bgr": frame(value=80),
+            "edge_foreground_linear_rgb": bgr_u8_to_linear_rgb(frame(value=80)),
+        }
+        kwargs[missing] = None
+
+        with pytest.raises(ValueError, match="must be provided together"):
+            composite_linear_predecoded(
+                frame(),
+                frame(),
+                np.ones((72, 128), np.float32),
+                foreground_linear_rgb=bgr_u8_to_linear_rgb(frame()),
+                backdrop_linear_rgb=bgr_u8_to_linear_rgb(frame()),
+                **kwargs,
+            )
+
+    def test_invalid_legacy_predecoded_foreground_raises(self):
+        with pytest.raises(ValueError, match="foreground_linear_rgb"):
+            composite_legacy_predecoded(
+                frame(),
+                frame(),
+                np.ones((72, 128), np.float32),
+                foreground_linear_rgb=np.zeros((72, 128, 3), np.float64),
+            )
+
+    @pytest.mark.parametrize(
+        "bad_mask",
+        [
+            np.ones((72, 128), np.float64),
+            np.ones((72, 128), np.int32),
+            np.ones((72, 128, 1), np.float32),
+            np.ones((10, 10), np.float32),
+            np.ones((0, 128), np.float32),
+            np.full((72, 128), np.nan, np.float32),
+            np.full((72, 128), np.inf, np.float32),
+            np.full((72, 128), -0.01, np.float32),
+            np.full((72, 128), 1.01, np.float32),
+            np.ones((72, 256), np.float32)[:, ::2],
+        ],
+        ids=[
+            "float64",
+            "integer",
+            "rank",
+            "shape",
+            "empty",
+            "nan",
+            "infinity",
+            "negative",
+            "above-one",
+            "noncontiguous",
+        ],
+    )
+    def test_invalid_mask_contract_raises(self, bad_mask):
+        with pytest.raises(ValueError, match="mask"):
+            composite(frame(), frame(), bad_mask)
+
+    @pytest.mark.parametrize(
+        "light_wrap",
+        [-0.01, 1.01, float("nan"), float("inf"), True, "0.5"],
+    )
+    def test_invalid_light_wrap_raises(self, light_wrap):
+        with pytest.raises(ValueError, match="light_wrap"):
+            composite(
+                frame(),
+                frame(),
+                np.ones((72, 128), np.float32),
+                light_wrap=light_wrap,
+            )
+
+    def test_invalid_blend_space_and_transform_raise(self):
+        mask = np.ones((72, 128), np.float32)
+        with pytest.raises(ValueError, match="blend_space"):
+            composite(
+                frame(),
+                frame(),
+                mask,
+                blend_space="display_p3",  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="color_transform"):
+            composite(
+                frame(),
+                frame(),
+                mask,
+                color_transform=object(),  # type: ignore[arg-type]
+            )
 
 
 class TestBackdrops:
-    def test_fit_center_crops_to_exact_size(self):
-        out = _fit(frame(h=100, w=100), 128, 72)
-        assert out.shape == (72, 128, 3)
-
     def test_color_backdrop(self):
         bd = ColorBackdrop((1, 2, 3))
         out = bd.frame(64, 32)
@@ -259,35 +908,19 @@ class TestBackdrops:
                 image_max_pixels=64,
             )
 
-    def test_image_backdrop_fully_decodes_with_pillow_before_opencv(self, monkeypatch):
+    def test_image_backdrop_uses_shared_secure_color_decoder(self, monkeypatch):
         pytest.importorskip("cv2")
-        open_calls = []
+        decode_calls = []
 
-        class FakeImage:
-            format = "PNG"
-            size = (8, 8)
+        def fail_decode(path, expected_format, max_pixels):
+            decode_calls.append((path, expected_format, max_pixels))
+            raise backgrounds_mod.ColorError("invalid image")
 
-            def __init__(self, decode):
-                self.decode = decode
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def verify(self):
-                return None
-
-            def load(self):
-                if self.decode:
-                    raise OSError("corrupt compressed pixels")
-
-        def fake_open(_path):
-            open_calls.append(len(open_calls))
-            return FakeImage(decode=len(open_calls) == 2)
-
-        monkeypatch.setattr(backgrounds_mod.Image, "open", fake_open)
+        monkeypatch.setattr(
+            backgrounds_mod,
+            "decode_image_to_srgb_bgr",
+            fail_decode,
+        )
         monkeypatch.setattr(
             backgrounds_mod.cv2,
             "imread",
@@ -298,7 +931,7 @@ class TestBackdrops:
 
         with pytest.raises(ValueError, match="invalid background image"):
             create_backdrop(BackgroundConfig(mode="image", image_path="corrupt.png"))
-        assert len(open_calls) == 2
+        assert decode_calls == [("corrupt.png", "PNG", 16_777_216)]
 
     def test_video_backdrop_loops(self, tmp_path):
         cv2 = pytest.importorskip("cv2")
@@ -504,7 +1137,13 @@ class TestBackdrops:
             assert int(backdrop.frame(6, 4).mean()) == 0
             now[0] = 0.5
             assert int(backdrop.frame(6, 4).mean()) == 5
-            assert not capture.set_calls  # five stale frames: sequential
+            # Orientation-control probing is construction-only; playback still
+            # needs no seek for this five-frame stale interval.
+            assert not [
+                call
+                for call in capture.set_calls
+                if call[0] != cv2.CAP_PROP_ORIENTATION_AUTO
+            ]
             assert capture.grab_calls == 4  # decode only the final skipped image
             now[0] = 1.5
             assert int(backdrop.frame(6, 4).mean()) == 15

@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "manifest_id": "custback-visual-qualification-v1",
+  "baseline": {
+    "path": "docs/visual-consistency-phase0-baseline.json",
+    "sha256": "e6ccca5dc8d29b61f60cba5576263864b64823ad3a6f12241c8430a733695c07"
+  },
+  "reference_runner": {
+    "os_family": "linux",
+    "rss_required": true
+  },
+  "performance_tiers": [
+    {
+      "id": "720p30",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "minimum_measured_frames": 300,
+      "maximum_added_p95_ms": 5.0
+    },
+    {
+      "id": "720p60",
+      "width": 1280,
+      "height": 720,
+      "fps": 60,
+      "minimum_measured_frames": 300,
+      "maximum_added_p95_ms": 5.0
+    },
+    {
+      "id": "1080p30",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "minimum_measured_frames": 300,
+      "maximum_added_p95_ms": 8.0
+    }
+  ],
+  "budgets": {
+    "maximum_relative_end_to_end_overhead_percent": 20.0,
+    "maximum_deadline_miss_increase_percentage_points": 1.0,
+    "minimum_fps_attainment_percent": 99.0,
+    "soak_frames": 10000,
+    "maximum_retained_growth_bytes": 5242880,
+    "maximum_fixed_session_state_bytes": 25165824,
+    "privacy_history_storage_bytes": 16777216,
+    "analysis_long_edge_pixels": 192,
+    "maximum_geometry_resizes_common_path": 1
+  },
+  "deterministic_contracts": [
+    "phase0-visual-improvement",
+    "foreground-preservation",
+    "common-path-single-resize",
+    "analysis-resolution-cap",
+    "repeated-output-work-skip",
+    "backdrop-source-pacing",
+    "bounded-session-history"
+  ],
+  "physical_matrix": [
+    {
+      "id": "linux-v4l2-pyvirtualcam",
+      "os": "linux",
+      "capture_backend": "v4l2",
+      "output_backend": "pyvirtualcam",
+      "transport": "v4l2loopback"
+    },
+    {
+      "id": "macos-obsvcam-pyvirtualcam",
+      "os": "macos",
+      "capture_backend": "avfoundation",
+      "output_backend": "pyvirtualcam",
+      "transport": "obs-virtual-camera"
+    },
+    {
+      "id": "windows-msmf-pyvirtualcam",
+      "os": "windows",
+      "capture_backend": "msmf",
+      "output_backend": "pyvirtualcam",
+      "transport": "obs-virtual-camera"
+    },
+    {
+      "id": "windows-dshow-pyvirtualcam",
+      "os": "windows",
+      "capture_backend": "dshow",
+      "output_backend": "pyvirtualcam",
+      "transport": "obs-virtual-camera"
+    },
+    {
+      "id": "windows-native",
+      "os": "windows",
+      "capture_backend": "msmf",
+      "output_backend": "native",
+      "transport": "media-foundation-virtual-camera"
+    }
+  ],
+  "physical_requirements": {
+    "minimum_distinct_webcams": 2,
+    "minimum_distinct_meeting_consumers": 2,
+    "require_different_auto_control_profiles": true,
+    "maximum_crop_edge_error_pixels": 1,
+    "maximum_orientation_error_degrees": 0,
+    "maximum_transport_mean_absolute_error": 3.0,
+    "minimum_luminance_gap_reduction_percent": 20.0,
+    "minimum_neutral_error_reduction_percent": 10.0,
+    "maximum_skin_hue_drift_degrees": 5.0,
+    "maximum_skin_chroma_drift_percent": 12.0,
+    "maximum_clothing_hue_drift_degrees": 8.0,
+    "maximum_clothing_chroma_drift_percent": 15.0,
+    "maximum_steady_state_ev_delta_p95": 0.05,
+    "maximum_steady_state_wb_log2_delta_p95": 0.02,
+    "required_artifacts": {
+      "contact_sheet": "image/png",
+      "preview_capture": "image/png",
+      "api_snapshot": "application/json",
+      "consumer_capture": "image/png"
+    }
+  }
+}

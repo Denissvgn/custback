@@ -16,6 +16,7 @@ from typing import Any
 
 from .backgrounds import IMAGE_EXTS, VIDEO_EXTS
 from .config import MODES, AppConfig, RuntimeConfig, format_config_error
+from .diagnostics import sanitized_config_summary
 from .hub import FrameHub
 from .pipeline import Pipeline
 
@@ -26,6 +27,24 @@ EXIT_CONFIG = 2
 EXIT_API = 3
 API_START_TIMEOUT_S = 5.0
 SignalHandler = Callable[[int, FrameType | None], Any] | int | signal.Handlers | None
+_VISUAL_POLICY_DIAGNOSTIC_FIELDS = (
+    "schema_version",
+    "camera.fit_mode",
+    "camera.anchor_x",
+    "camera.anchor_y",
+    "camera.rotation",
+    "background.fit_mode",
+    "background.anchor_x",
+    "background.anchor_y",
+    "output.width",
+    "output.height",
+    "compositing.blend_space",
+    "compositing.color_correction.mode",
+    "compositing.color_correction.strength",
+    "compositing.color_correction.exposure_limit_ev",
+    "compositing.color_correction.white_balance_strength",
+    "compositing.color_correction.adaptation_time_s",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -435,8 +454,10 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         "shutdown reason=%s exit=%d uptime=%.1fs frames_in=%d frames_out=%d "
         "capture_fps=%.1f output_fps=%.1f read_failures=%d restarts=%d "
         "repeats=%d video_skips=%d capture_read_ms=%s segmentation_ms=%s "
-        "background_ms=%s composite_ms=%s output_send_ms=%s "
-        "frame_processing_ms=%s",
+        "background_ms=%s color_correction_ms=%s composite_ms=%s output_send_ms=%s "
+        "frame_processing_ms=%s capture_generation=%d camera_geometry=%d "
+        "background_geometry=%d corrections_applied=%d corrections_bypassed=%d "
+        "color_scene_cuts=%d color_transitions=%d",
         reason,
         exit_code,
         stats["uptime_s"],
@@ -451,9 +472,17 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         stats["capture_read_ms"],
         stats["segmentation_ms"],
         stats["background_ms"],
+        stats["color_correction_ms"],
         stats["composite_ms"],
         stats["output_send_ms"],
         stats["frame_processing_ms"],
+        stats["capture_generation"],
+        stats["capture_geometry_transitions"],
+        stats["background_geometry_transitions"],
+        stats["color_correction_applied_frames"],
+        stats["color_correction_bypassed_frames"],
+        stats["color_correction_scene_cuts"],
+        stats["color_correction_transitions"],
     )
 
 
@@ -603,7 +632,7 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
             log.info(
                 "ready api=%s camera_requested=%s/%sx%s@%s "
                 "camera_negotiated=%s/%s %sx%s@%s segmenter=%s/%s output=%s "
-                "preview=%s",
+                "%sx%s@%s preview=%s visual_policy=%s",
                 api_address,
                 cfg.camera.pixel_format,
                 cfg.camera.width,
@@ -617,7 +646,11 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
                 ready["segmentation_backend"],
                 ready["segmentation_device"],
                 ready["output_backend"],
+                ready["output_width"],
+                ready["output_height"],
+                ready["output_fps"],
                 "native" if cfg.output.preview else "disabled",
+                sanitized_config_summary(cfg, list(_VISUAL_POLICY_DIAGNOSTIC_FIELDS)),
             )
 
             if cfg.output.preview:

@@ -24,6 +24,11 @@ const LINUX_MEMORY_BACKED_FILESYSTEM_MAGICS = new Set([
   0x01021994, // TMPFS_MAGIC
   0x858458f6, // RAMFS_MAGIC
 ]);
+const RELEASE_SOURCE_BRIDGE_ENV = Object.freeze({
+  root: 'CUSTBACK_RELEASE_GIT_ROOT',
+  commit: 'CUSTBACK_RELEASE_SOURCE_COMMIT',
+  tree: 'CUSTBACK_RELEASE_SOURCE_TREE',
+});
 const REVIEWED_PYTHON_MODULES = [
   'custback/__init__.py',
   'custback/__main__.py',
@@ -54,10 +59,13 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/backgrounds.py',
   'custback/camera_devices.py',
   'custback/capture.py',
+  'custback/color.py',
   'custback/compositor.py',
   'custback/config.py',
   'custback/config_merge.py',
+  'custback/default.yaml',
   'custback/diagnostics.py',
+  'custback/geometry.py',
   'custback/gpu_probe.py',
   'custback/hub.py',
   'custback/migration.py',
@@ -67,6 +75,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/storage_tx.py',
   'custback/vcam.py',
   'custback/vcam_native.py',
+  'custback/video_decoder.py',
 ];
 const REVIEWED_PYTHON_TESTS = [
   'tests/test_acceleration.py',
@@ -81,13 +90,20 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_avatar_rig.py',
   'tests/test_avatar_service.py',
   'tests/test_avatar_store.py',
+  'tests/test_background_geometry.py',
   'tests/test_camera_devices.py',
+  'tests/test_canonical_canvas.py',
   'tests/test_capture.py',
+  'tests/test_capture_geometry.py',
+  'tests/test_color.py',
   'tests/test_config.py',
   'tests/test_config_merge.py',
   'tests/test_diagnostics.py',
+  'tests/test_geometry.py',
   'tests/test_gpu_probe.py',
   'tests/test_model_acquisition.py',
+  'tests/test_observability.py',
+  'tests/test_output_geometry.py',
   'tests/test_pipeline.py',
   'tests/test_platform_seam.py',
   'tests/test_phase5_lifecycle.py',
@@ -101,15 +117,29 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_remediation_security.py',
   'tests/test_segmentation_rvm.py',
   'tests/test_streaming.py',
+  'tests/test_visual_consistency_e2e.py',
+  'tests/test_visual_consistency_evidence.py',
+  'tests/test_visual_consistency_qualification.py',
+  'tests/test_video_color.py',
   'tests/test_vcam.py',
   'tests/test_webui.py',
   'tests/test_windows_acceleration_gate.py',
   'tests/test_windows_packaging.py',
   'tests/test_windows_vcam.py',
+  'tests/visual_consistency_evidence.py',
   'tests/fixtures/migration/expected-0.4.0-local-camera.yaml',
   'tests/fixtures/migration/legacy-0.3.0-default.yaml',
   'tests/fixtures/migration/legacy-0.3.0-local-camera.yaml',
   'tests/fixtures/migration/provenance.json',
+];
+const REVIEWED_PYTHON_SDIST_DATA = [
+  'config/default.yaml',
+  'docs/visual-consistency-phase4-qualification-runbook.md',
+  'docs/visual-consistency-phase4-qualification-template.json',
+  'docs/visual-consistency-rollout.md',
+  'scripts/release/visual-qualification-manifest.json',
+  'scripts/release/visual-policy-rollout.json',
+  'scripts/release/visual_consistency_qualification.py',
 ];
 const REVIEWED_NPM_PAYLOAD = [
   '.github/workflows/ci.yml',
@@ -120,7 +150,23 @@ const REVIEWED_NPM_PAYLOAD = [
   'REMEDIATION_PLAN.md',
   'config/avatar.yaml',
   'config/default.yaml',
+  'docs/adr/0001-visual-consistency-contract.md',
+  'docs/camera-control-characterization.md',
   'docs/remote-deployment.md',
+  'docs/visual-consistency-phase0-baseline.json',
+  'docs/visual-consistency-phase0-contact-sheet.png',
+  'docs/visual-consistency-phase0-evidence.md',
+  'docs/visual-consistency-phase0-implementation-review.md',
+  'docs/visual-consistency-phase1-implementation-review.md',
+  'docs/visual-consistency-phase2-implementation-review.md',
+  'docs/visual-consistency-phase3-implementation-review.md',
+  'docs/visual-consistency-phase3-video-color-qualification.md',
+  'docs/visual-consistency-phase4-implementation-review.md',
+  'docs/visual-consistency-phase4-local-observation-contact-sheet.png',
+  'docs/visual-consistency-phase4-local-observation.json',
+  'docs/visual-consistency-phase4-qualification-runbook.md',
+  'docs/visual-consistency-phase4-qualification-template.json',
+  'docs/visual-consistency-rollout.md',
   'examples/avatar_client.py',
   'package.json',
   'packaging/npm/custback.js',
@@ -151,6 +197,9 @@ const REVIEWED_NPM_PAYLOAD = [
   'scripts/release/two-host-system-test.py',
   'scripts/release/two-host/Dockerfile',
   'scripts/release/two-host/probe.py',
+  'scripts/release/visual-qualification-manifest.json',
+  'scripts/release/visual-policy-rollout.json',
+  'scripts/release/visual_consistency_qualification.py',
   'scripts/release/windows-acceleration-gate.py',
   'scripts/release/verify-clean-tree.js',
   'scripts/release/verify-release.js',
@@ -162,6 +211,8 @@ const REVIEWED_BUILD_REQUIREMENTS = ['setuptools>=77,<84'];
 const REVIEWED_CORE_DEPENDENCIES = [
   'numpy>=1.24,<3',
   'opencv-contrib-python>=4.8,<6',
+  "av>=17,<18; python_version < '3.11'",
+  "av>=18,<19; python_version >= '3.11'",
   'pillow>=10,<13',
   'pydantic>=2.7,<3',
   "pyvirtualcam>=0.11,<1; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64')",
@@ -213,6 +264,7 @@ const REVIEWED_ACTIONS = new Set([
   'actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955',
   'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
   'actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065',
+  'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
 ]);
 const REVIEWED_LICENSE_COPYRIGHT = 'Copyright (c) 2026 Bramen';
 const REVIEWED_REMEDIATION_CONTRACT_SHA256 =
@@ -245,6 +297,9 @@ const REVIEWED_NPM_METADATA = {
     'tests/fixtures/migration/*',
     'config/*.yaml',
     'docs/*.md',
+    'docs/*.json',
+    'docs/*.png',
+    'docs/adr/*.md',
     'scripts/*.sh',
     'scripts/release/*.js',
     'scripts/release/*.json',
@@ -395,6 +450,16 @@ function verifyAvatarConfigTemplate(root = ROOT) {
   if (!fs.existsSync(canonicalPath) || !fs.existsSync(packagePath) ||
       !fs.readFileSync(canonicalPath).equals(fs.readFileSync(packagePath))) {
     fail('Python package avatar template must be byte-identical to config/avatar.yaml');
+  }
+}
+
+function verifyCoreConfigTemplate(root = ROOT) {
+  const canonicalPath = path.join(root, 'config', 'default.yaml');
+  const packagePath = path.join(root, 'src', 'custback', 'default.yaml');
+  const canonical = fs.readFileSync(canonicalPath);
+  const packaged = fs.readFileSync(packagePath);
+  if (!canonical.equals(packaged)) {
+    fail('Python package default template must be byte-identical to config/default.yaml');
   }
 }
 
@@ -980,6 +1045,9 @@ function verifyDocs(root = ROOT) {
   if (!readme.includes('(docs/remote-deployment.md)')) {
     fail('README must link the two-host remote deployment guide');
   }
+  if (!readme.includes('(docs/visual-consistency-rollout.md)')) {
+    fail('README must link the visual-consistency rollout and rollback guide');
+  }
   const deployment = fs.readFileSync(
     path.join(root, 'docs', 'remote-deployment.md'), 'utf8',
   );
@@ -1001,6 +1069,420 @@ function verifyDocs(root = ROOT) {
       fail(`remote deployment guide is missing ${description}`);
     }
   }
+  const rollout = fs.readFileSync(
+    path.join(root, 'docs', 'visual-consistency-rollout.md'), 'utf8',
+  );
+  const rolloutRequirements = [
+    [/active stage is `compatibility`/i, 'active compatibility stage'],
+    [/versionless.*schema-1/is, 'versionless schema-1 migration semantics'],
+    [/camera-cover.*linear-compositing.*automatic-correction/is, 'ordered stages'],
+    [/one clean commit/i, 'one-commit-per-default policy'],
+    [
+      /historical Git tree.*ancestor of\s+the clean release checkout/is,
+      'historical default-change evidence policy',
+    ],
+    [
+      /standalone Git-less archive.*fails closed/is,
+      'Git-less prepack failure policy',
+    ],
+    [/physical-camera/i, 'physical-camera prerequisite'],
+    [/consumer-sink/i, 'consumer-sink prerequisite'],
+    [/external.*full-range.*sRGB.*BGR/is, 'external-frame color assumption'],
+    [/`passthrough`.*`blur`.*`color`.*`remote`/is, 'mode exclusions'],
+    [/subject is cropped/i, 'crop troubleshooting'],
+    [/black bars appear/i, 'contain-bar troubleshooting'],
+    [/low confidence/i, 'low-confidence troubleshooting'],
+    [/auto-exposure\/WB loop/i, 'camera auto-control troubleshooting'],
+    [/tagged media is rejected/i, 'tagged-media troubleshooting'],
+    [/untagged image or video/i, 'untagged-media troubleshooting'],
+    [
+      /does not lower the highest recognized\s+schema version/i,
+      'schema-preserving rollback policy',
+    ],
+  ];
+  for (const [pattern, description] of rolloutRequirements) {
+    if (!pattern.test(rollout)) {
+      fail(`visual-consistency rollout guide is missing ${description}`);
+    }
+  }
+}
+
+function trustedReleaseSourceContext(
+  root = ROOT,
+  env = process.env,
+  gitRunner = spawnSync,
+) {
+  const values = Object.fromEntries(
+    Object.entries(RELEASE_SOURCE_BRIDGE_ENV)
+      .map(([name, variable]) => [name, env[variable]]),
+  );
+  const present = Object.values(values).filter(
+    (value) => typeof value === 'string' && value.length > 0,
+  ).length;
+  if (present === 0) return null;
+  if (present !== Object.keys(values).length) {
+    fail('trusted release source bridge is incomplete');
+  }
+  if (!/^[0-9a-f]{40}$/.test(values.commit) ||
+      !/^[0-9a-f]{40}$/.test(values.tree)) {
+    fail('trusted release source bridge has invalid commit metadata');
+  }
+
+  const requestedRoot = path.resolve(values.root);
+  let metadata;
+  try {
+    metadata = fs.lstatSync(requestedRoot);
+  } catch (err) {
+    fail(`trusted release Git root is unavailable: ${err.message}`);
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    fail('trusted release Git root must be a regular directory');
+  }
+  const sourceRoot = fs.realpathSync(requestedRoot);
+  if (sourceRoot !== requestedRoot) {
+    fail('trusted release Git root must not traverse symlinks');
+  }
+
+  const git = (args, encoding = 'utf8') => {
+    const result = gitRunner('git', ['-C', sourceRoot, ...args], {
+      encoding,
+      timeout: Math.min(COMMAND_TIMEOUT_MS, 30 * 1000),
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (result.error) {
+      fail(`trusted release Git query could not start: ${result.error.message}`);
+    }
+    if (result.status !== 0) {
+      fail(
+        'trusted release Git query failed: ' +
+        `${encoding === null ? '' : (result.stderr || '').trim()}`
+      );
+    }
+    return result.stdout;
+  };
+  const topLevel = fs.realpathSync(git(
+    ['rev-parse', '--show-toplevel'],
+  ).trim());
+  const head = git(['rev-parse', '--verify', 'HEAD']).trim();
+  const tree = git(['rev-parse', '--verify', 'HEAD^{tree}']).trim();
+  const status = git([
+    'status', '--porcelain=v1', '--untracked-files=all', '--ignored=no',
+  ]);
+  if (topLevel !== sourceRoot ||
+      head !== values.commit ||
+      tree !== values.tree ||
+      status !== '') {
+    fail('trusted release Git root is not the exact clean source commit');
+  }
+  return {
+    root: sourceRoot,
+    commit: values.commit,
+    tree: values.tree,
+    stagedRoot: fs.realpathSync(root),
+    git,
+  };
+}
+
+function verifyTrustedReleaseSourceFile(context, relativePath) {
+  if (!context) return;
+  verifyReviewedSourceFiles(context.stagedRoot, [relativePath]);
+  verifyReviewedSourceFiles(context.root, [relativePath]);
+  const staged = fs.readFileSync(path.join(context.stagedRoot, relativePath));
+  const working = fs.readFileSync(path.join(context.root, relativePath));
+  const committed = context.git(
+    ['show', `${context.commit}:${relativePath}`],
+    null,
+  );
+  if (!Buffer.isBuffer(committed) ||
+      !staged.equals(working) ||
+      !staged.equals(committed)) {
+    fail(`staged release source differs from trusted commit: ${relativePath}`);
+  }
+}
+
+function validateVisualQualificationApproval(reportPath, root = ROOT, options = {}) {
+  const expectedCommit = options.expectedCommit;
+  if (typeof expectedCommit !== 'string' ||
+      !/^[0-9a-f]{40}$/.test(expectedCommit)) {
+    fail('VIS-4.2 approval validation requires the rollout change commit');
+  }
+  if (typeof options.qualificationValidator === 'function') {
+    return options.qualificationValidator(reportPath, {
+      evidenceRoot: path.dirname(reportPath),
+      expectedCommit,
+    });
+  }
+  const python = options.python || process.env.CUSTBACK_RELEASE_PYTHON ||
+    (process.platform === 'win32' ? 'python' : 'python3');
+  const script = path.join(
+    root, 'scripts', 'release', 'visual_consistency_qualification.py',
+  );
+  const manifest = path.join(
+    root, 'scripts', 'release', 'visual-qualification-manifest.json',
+  );
+  verifyReviewedSourceFiles(root, [
+    'scripts/release/visual_consistency_qualification.py',
+    'scripts/release/visual-qualification-manifest.json',
+  ]);
+  const result = spawnSync(
+    python,
+    [
+      script,
+      '--manifest', manifest,
+      'validate',
+      '--report', reportPath,
+      '--claim', 'release',
+      '--evidence-root', path.dirname(reportPath),
+      '--expected-commit', expectedCommit,
+    ],
+    {
+      cwd: root,
+      env: options.env || process.env,
+      encoding: 'utf8',
+      timeout: Math.min(COMMAND_TIMEOUT_MS, 2 * 60 * 1000),
+    },
+  );
+  if (result.error) {
+    fail(`VIS-4.2 approval validator could not start: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail(
+      'VIS-4.2 approval report failed strict release validation: ' +
+      `${(result.stderr || result.stdout || '').trim()}`
+    );
+  }
+  return JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+}
+
+function verifyVisualPolicyRollout(root = ROOT, options = {}) {
+  const sourceContext = trustedReleaseSourceContext(
+    root,
+    options.env || process.env,
+    options.gitRunner || spawnSync,
+  );
+  const manifestPath = path.join(
+    root, 'scripts', 'release', 'visual-policy-rollout.json',
+  );
+  if (sourceContext) {
+    for (const relativePath of [
+      'config/default.yaml',
+      'scripts/release/visual-policy-rollout.json',
+      'scripts/release/visual-qualification-manifest.json',
+      'scripts/release/visual_consistency_qualification.py',
+      'src/custback/default.yaml',
+    ]) {
+      verifyTrustedReleaseSourceFile(sourceContext, relativePath);
+    }
+  }
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const expectedTopKeys = [
+    'active_stage',
+    'legacy_switch_retirement',
+    'qualification_authority',
+    'schema_version',
+    'stages',
+  ];
+  if (!isDeepStrictEqual(Object.keys(manifest).sort(), expectedTopKeys) ||
+      manifest.schema_version !== 1 ||
+      typeof manifest.qualification_authority !== 'string' ||
+      !/VIS-4\.2/.test(manifest.qualification_authority) ||
+      !/physical-camera/.test(manifest.qualification_authority) ||
+      !/consumer-sink/.test(manifest.qualification_authority)) {
+    fail('visual-policy rollout manifest header is invalid');
+  }
+
+  const expectedProfiles = [
+    {
+      id: 'compatibility',
+      default_schema_version: 1,
+      defaults: {
+        camera_fit_mode: 'stretch',
+        blend_space: 'srgb_legacy',
+        color_correction_mode: 'off',
+      },
+    },
+    {
+      id: 'camera-cover',
+      default_schema_version: 2,
+      defaults: {
+        camera_fit_mode: 'cover',
+        blend_space: 'srgb_legacy',
+        color_correction_mode: 'off',
+      },
+    },
+    {
+      id: 'linear-compositing',
+      default_schema_version: 3,
+      defaults: {
+        camera_fit_mode: 'cover',
+        blend_space: 'linear_srgb',
+        color_correction_mode: 'off',
+      },
+    },
+    {
+      id: 'automatic-correction',
+      default_schema_version: 4,
+      defaults: {
+        camera_fit_mode: 'cover',
+        blend_space: 'linear_srgb',
+        color_correction_mode: 'auto',
+      },
+    },
+  ];
+  const expectedRollbackPins = [
+    null,
+    { 'camera.fit_mode': 'stretch' },
+    { 'compositing.blend_space': 'srgb_legacy' },
+    { 'compositing.color_correction.mode': 'off' },
+  ];
+  if (!Array.isArray(manifest.stages) ||
+      manifest.stages.length !== expectedProfiles.length) {
+    fail('visual-policy rollout must contain exactly four ordered stages');
+  }
+  const activeIndex = expectedProfiles.findIndex(
+    (profile) => profile.id === manifest.active_stage,
+  );
+  if (activeIndex < 0) fail('visual-policy rollout active_stage is unknown');
+
+  const commits = new Set();
+  const evidencePaths = new Set();
+  for (let index = 0; index < expectedProfiles.length; index += 1) {
+    const stage = manifest.stages[index];
+    const expected = expectedProfiles[index];
+    const expectedStageKeys = [
+      'change_commit',
+      'default_schema_version',
+      'defaults',
+      'evidence',
+      'id',
+      'requires',
+      'rollback',
+      'sequence',
+      'status',
+    ];
+    if (!stage || !isDeepStrictEqual(Object.keys(stage).sort(), expectedStageKeys) ||
+        stage.id !== expected.id ||
+        stage.sequence !== index + 1 ||
+        stage.default_schema_version !== expected.default_schema_version ||
+        !isDeepStrictEqual(stage.defaults, expected.defaults)) {
+      fail(`visual-policy rollout stage ${index + 1} is invalid`);
+    }
+    const expectedStatus = index < activeIndex
+      ? 'complete'
+      : index === activeIndex ? 'active' : 'pending';
+    if (stage.status !== expectedStatus) {
+      fail(`visual-policy rollout stage ${stage.id} must be ${expectedStatus}`);
+    }
+    if (!Array.isArray(stage.requires) || !Array.isArray(stage.evidence)) {
+      fail(`visual-policy rollout stage ${stage.id} has invalid evidence fields`);
+    }
+
+    if (index === 0) {
+      if (stage.requires.length || stage.evidence.length ||
+          stage.change_commit !== null || stage.rollback !== null) {
+        fail('compatibility rollout stage must not fabricate qualification evidence');
+      }
+      continue;
+    }
+    if (!stage.requires.some((item) => /VIS-4\.2/.test(item)) ||
+        !stage.requires.some((item) => /physical/i.test(item)) ||
+        !stage.requires.some((item) => /consumer-sink/i.test(item)) ||
+        !stage.rollback || typeof stage.rollback.instructions !== 'string' ||
+        !stage.rollback.instructions.trim() ||
+        !stage.rollback.retain_schema_version ||
+        !isDeepStrictEqual(stage.rollback.pin, expectedRollbackPins[index])) {
+      fail(`visual-policy rollout stage ${stage.id} lacks prerequisites or rollback`);
+    }
+    const [rollbackName, rollbackValue] = Object.entries(stage.rollback.pin)[0];
+    if (!stage.rollback.instructions.includes(
+      `${rollbackName}: ${rollbackValue}`,
+    )) {
+      fail(`visual-policy rollout stage ${stage.id} has incomplete rollback instructions`);
+    }
+    if (stage.status === 'pending') {
+      if (stage.change_commit !== null || stage.evidence.length) {
+        fail(`pending rollout stage ${stage.id} must not claim evidence or a commit`);
+      }
+      continue;
+    }
+    if (typeof stage.change_commit !== 'string' ||
+        !/^[0-9a-f]{40}$/.test(stage.change_commit) ||
+        commits.has(stage.change_commit) ||
+        stage.evidence.length !== 1) {
+      fail(`approved rollout stage ${stage.id} needs distinct commit-bound evidence`);
+    }
+    commits.add(stage.change_commit);
+    for (const evidence of stage.evidence) {
+      if (typeof evidence !== 'string' ||
+          !/^docs\/[a-z0-9][a-z0-9._/-]*\.json$/.test(evidence) ||
+          evidence.includes('..') ||
+          evidencePaths.has(evidence)) {
+        fail(`rollout stage ${stage.id} has an unsafe evidence path`);
+      }
+      verifyReviewedSourceFiles(root, [evidence]);
+      verifyTrustedReleaseSourceFile(sourceContext, evidence);
+      const report = validateVisualQualificationApproval(
+        path.join(root, evidence), root,
+        {
+          ...options,
+          env: options.env || process.env,
+          expectedCommit: stage.change_commit,
+        },
+      );
+      if (!report || report.release_qualified !== true ||
+          !report.source || report.source.commit !== stage.change_commit ||
+          report.source.clean !== true) {
+        fail(
+          `rollout stage ${stage.id} approval is not bound to its clean change commit`
+        );
+      }
+      evidencePaths.add(evidence);
+    }
+  }
+
+  const config = fs.readFileSync(path.join(root, 'config', 'default.yaml'), 'utf8');
+  const topLevelBlock = (name) => {
+    const start = config.search(new RegExp(`^${name}:\\s*(?:#.*)?$`, 'm'));
+    if (start < 0) fail(`default config is missing section ${name}`);
+    const remainder = config.slice(start);
+    const firstNewline = remainder.indexOf('\n');
+    const body = remainder.slice(firstNewline + 1);
+    const next = body.search(/^[a-z][a-z0-9_]*:\s*(?:#.*)?$/m);
+    return next < 0 ? body : body.slice(0, next);
+  };
+  const scalar = (source, indent, name) => {
+    const match = source.match(
+      new RegExp(`^${' '.repeat(indent)}${name}:\\s*([^#\\n]+)`, 'm'),
+    );
+    if (!match) fail(`default config is missing ${name}`);
+    return match[1].trim().replace(/^["']|["']$/g, '');
+  };
+  const schemaMatch = config.match(/^schema_version:\s*([0-9]+)\s*$/m);
+  const active = manifest.stages[activeIndex];
+  const effective = {
+    default_schema_version: schemaMatch ? Number(schemaMatch[1]) : null,
+    defaults: {
+      camera_fit_mode: scalar(topLevelBlock('camera'), 2, 'fit_mode'),
+      blend_space: scalar(topLevelBlock('compositing'), 2, 'blend_space'),
+      color_correction_mode: scalar(topLevelBlock('compositing'), 4, 'mode'),
+    },
+  };
+  if (effective.default_schema_version !== active.default_schema_version ||
+      !isDeepStrictEqual(effective.defaults, active.defaults)) {
+    fail('distributed default config does not match the active rollout stage');
+  }
+
+  const retirement = manifest.legacy_switch_retirement;
+  if (!retirement || typeof retirement.earliest !== 'string' ||
+      !/later documented release/.test(retirement.earliest) ||
+      !isDeepStrictEqual(retirement.switches, [
+        'camera.fit_mode: stretch',
+        'compositing.blend_space: srgb_legacy',
+        'compositing.color_correction.mode: off',
+      ])) {
+    fail('visual-policy rollout must defer legacy-switch retirement');
+  }
+  return manifest;
 }
 
 function verifyCiWorkflow(root = ROOT) {
@@ -1231,6 +1713,9 @@ function verifyPack(version, root = ROOT) {
       'REMEDIATION_PLAN.md',
       '.github/workflows/ci.yml',
       'docs/remote-deployment.md',
+      'docs/visual-consistency-phase4-qualification-runbook.md',
+      'docs/visual-consistency-phase4-qualification-template.json',
+      'docs/visual-consistency-rollout.md',
       'package.json',
       'packaging/npm/custback.js',
       'packaging/npm/install.js',
@@ -1241,10 +1726,14 @@ function verifyPack(version, root = ROOT) {
       'scripts/install_linux.sh',
       'scripts/install_macos.sh',
       'scripts/release/package-smoke.js',
+      'scripts/release/visual-qualification-manifest.json',
+      'scripts/release/visual-policy-rollout.json',
+      'scripts/release/visual_consistency_qualification.py',
       'scripts/release/verify-release.js',
       'scripts/release/remediation-blockers.json',
       'src/custback/__init__.py',
       'src/custback/__main__.py',
+      'src/custback/default.yaml',
     ]) {
       if (!names.includes(required)) fail(`npm artifact is missing ${required}`);
     }
@@ -1357,6 +1846,7 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
     'pyproject.toml',
     ...REVIEWED_PYTHON_MODULES.map((name) => `src/${name}`),
     ...REVIEWED_PYTHON_TESTS,
+    ...REVIEWED_PYTHON_SDIST_DATA,
   ]);
   stageCleanSource(root, source);
   fs.mkdirSync(output);
@@ -1389,12 +1879,13 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
   const inspectCode = `
 import configparser, email.parser, io, json, pathlib, re, sys, tarfile, zipfile
 (
-    version, wheel_path, sdist_path, module_json, test_json,
+    version, wheel_path, sdist_path, module_json, test_json, sdist_data_json,
     core_json, optional_json, scripts_json, license_path,
 ) = sys.argv[1:]
 bad = ("/.venv/", "__pycache__", ".pyc", ".tgz", "/debug.txt", "/uninstall.log", "/build/")
 source_modules = set(json.loads(module_json))
 source_tests = set(json.loads(test_json))
+source_sdist_data = set(json.loads(sdist_data_json))
 core_dependencies = json.loads(core_json)
 optional_dependencies = json.loads(optional_json)
 console_scripts = json.loads(scripts_json)
@@ -1506,6 +1997,7 @@ with tarfile.open(sdist_path, "r:gz") as archive:
     }
     expected |= {f"{prefix}/src/{name}" for name in source_modules}
     expected |= {f"{prefix}/{name}" for name in source_tests}
+    expected |= {f"{prefix}/{name}" for name in source_sdist_data}
     require(names == expected, {
         "missing": sorted(expected - names),
         "unexpected": sorted(names - expected),
@@ -1532,6 +2024,7 @@ with tarfile.open(sdist_path, "r:gz") as archive:
   runChecked(python, [
     '-c', inspectCode, version, path.join(output, wheel), path.join(output, sdist),
     JSON.stringify(REVIEWED_PYTHON_MODULES), JSON.stringify(REVIEWED_PYTHON_TESTS),
+    JSON.stringify(REVIEWED_PYTHON_SDIST_DATA),
     JSON.stringify(REVIEWED_CORE_DEPENDENCIES),
     JSON.stringify(REVIEWED_OPTIONAL_DEPENDENCIES),
     JSON.stringify(REVIEWED_CONSOLE_SCRIPTS),
@@ -1540,11 +2033,15 @@ with tarfile.open(sdist_path, "r:gz") as archive:
 
   const importProbe = [
     'import importlib.metadata as m',
-    'import custback, custback.api.server, cv2, fastapi, numpy, pydantic, PIL, pyvirtualcam, uvicorn, websockets, yaml',
+    'import av, custback, custback.api.server, custback.color, custback.video_decoder, cv2, fastapi, numpy, pydantic, PIL, pyvirtualcam, uvicorn, websockets, yaml',
     `expected = ${JSON.stringify(version)}`,
     'metadata_version = m.version("custback")',
     'if metadata_version != expected:\n    raise RuntimeError(f"metadata version {metadata_version!r} != {expected!r}")',
     'if custback.__version__ != expected:\n    raise RuntimeError(f"source version {custback.__version__!r} != {expected!r}")',
+    'video_frame = av.VideoFrame.from_ndarray(numpy.stack((numpy.full((2, 2), 126, dtype=numpy.uint8), numpy.full((2, 2), 128, dtype=numpy.uint8), numpy.full((2, 2), 128, dtype=numpy.uint8))), format="yuv444p")',
+    'video_frame.colorspace, video_frame.color_range, video_frame.color_primaries, video_frame.color_trc = 1, 1, 1, 13',
+    'normalized, color_contract = custback.video_decoder.normalize_video_frame(video_frame, video_frame, custback.video_decoder.VideoColorOverrides())',
+    'if normalized.shape != (2, 2, 3) or normalized.dtype != numpy.uint8 or not normalized.flags.c_contiguous or int(numpy.max(numpy.abs(normalized.astype(numpy.int16) - 128))) > 2 or color_contract.declared_input != "bt709/limited/bt709/srgb" or color_contract.status != "tagged" or color_contract.output != "srgb-full-bgr" or color_contract.assumed_fields != () or color_contract.overridden_fields != ():\n    raise RuntimeError("installed tagged video normalization probe failed")',
   ].join('\n');
   for (const [kind, artifact] of [
     ['wheel', path.join(output, wheel)],
@@ -1716,7 +2213,9 @@ function verifyPackageSmoke(root = ROOT) {
   verifyDependencies(root);
   verifyLicenseMetadata(root);
   verifyAvatarConfigTemplate(root);
+  verifyCoreConfigTemplate(root);
   verifyDocs(root);
+  verifyVisualPolicyRollout(root);
   verifyCiWorkflow(root);
   verifyPhase6Contracts(root);
   verifyPlatformScope(root);
@@ -1749,7 +2248,9 @@ function main(argv = process.argv.slice(2)) {
     verifyDependencies();
     verifyLicenseMetadata();
     verifyAvatarConfigTemplate();
+    verifyCoreConfigTemplate();
     verifyDocs();
+    verifyVisualPolicyRollout();
     verifyCiWorkflow();
     verifyPhase6Contracts();
     verifyPlatformScope();
@@ -1784,6 +2285,7 @@ module.exports = {
   extraArtifactProfiles,
   exactNodeTapOutcome,
   filesystemIsMemoryBacked,
+  validateVisualQualificationApproval,
   main,
   parseNpmPackPayload,
   projectVersion,
@@ -1794,10 +2296,12 @@ module.exports = {
   remediationRegistry,
   runBlockerRegressionTests,
   staleArtifacts,
+  trustedReleaseSourceContext,
   verifyDependencies,
   verifyDocs,
   verifyBuiltArtifacts,
   verifyAvatarConfigTemplate,
+  verifyCoreConfigTemplate,
   verifyBlockerRegressionCoverage,
   verifyCiWorkflow,
   verifyLicenseMetadata,
@@ -1812,6 +2316,8 @@ module.exports = {
   verifyPythonArtifacts,
   verifyQualifiedCandidate,
   verifyReleaseWorkflow,
+  verifyTrustedReleaseSourceFile,
+  verifyVisualPolicyRollout,
   verifyVersions,
   withDisposableDirectory,
   withTemporaryEnvironment,

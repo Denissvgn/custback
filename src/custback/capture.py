@@ -1,8 +1,9 @@
 """Camera capture sources and bounded capture-worker health telemetry.
 
-All sources yield BGR uint8 frames of the configured size.  Real OpenCV
+All sources yield canonical-canvas, C-contiguous BGR uint8 frames. Device
+negotiation remains tied to the configured acquisition request. Real OpenCV
 capture runs in one dedicated reader because ``VideoCapture.read`` may block;
-the pipeline only ever consumes the newest completed frame.
+the pipeline only ever consumes the newest completed normalized frame.
 """
 
 from __future__ import annotations
@@ -13,14 +14,22 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import numpy as np
 
 from .camera_devices import camera_open_hint, preferred_capture_backends
 from .config import CameraConfig
-from .diagnostics import redact_sensitive_text, sanitized_source
+from .geometry import (
+    FrameValidationError,
+    Size,
+    TransformPlan,
+    apply_transform,
+    plan_transform,
+    transform_frame,
+    validate_bgr_frame,
+)
 
 try:
     import cv2 as _cv2
@@ -52,13 +61,69 @@ class _CaptureNegotiationRetry(CaptureError):
 
 
 @dataclass(frozen=True)
+class CameraControlObservation:
+    """One side-effect-free OpenCV camera-property observation.
+
+    OpenCV documents zero as the unsupported-property sentinel, but zero is
+    also a valid value for several camera controls.  The report therefore
+    distinguishes a non-zero value reported by the backend from an ambiguous
+    zero and never promotes either observation into permission to write.
+    """
+
+    name: str
+    status: str
+    value: float | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {"status": self.status, "value": self.value}
+
+
+@dataclass(frozen=True)
+class CameraControlReport:
+    """Immutable, path-free camera-control capability observation."""
+
+    policy: str = "preserve"
+    backend_family: str = "other"
+    qualification: str = "unqualified"
+    writes_performed: bool = False
+    generation: int = 0
+    properties: tuple[CameraControlObservation, ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "policy": self.policy,
+            "backend_family": self.backend_family,
+            "qualification": self.qualification,
+            "writes_performed": self.writes_performed,
+            "generation": self.generation,
+            "properties": {
+                observation.name: observation.as_dict()
+                for observation in self.properties
+            },
+        }
+
+
+@dataclass(frozen=True)
 class CaptureHealth:
     """Constant-space snapshot consumed by pipeline/status diagnostics."""
 
+    # ``generation`` and ``geometry_generation`` describe the last frame
+    # returned by ``read()``, not a newer frame waiting in the reader slot.
+    # This lets downstream temporal state reset at the exact frame boundary.
+    generation: int = 0
+    geometry_generation: int = 0
+    content_rect: tuple[int, int, int, int] | None = None
     backend: str = "unknown"
     fourcc: str | None = None
     width: int | None = None
     height: int | None = None
+    delivered_width: int | None = None
+    delivered_height: int | None = None
+    oriented_width: int | None = None
+    oriented_height: int | None = None
+    normalized_width: int | None = None
+    normalized_height: int | None = None
+    geometry_transitions: int = 0
     fps_reported: float | None = None
     capture_fps: float = 0.0
     target_met: bool | None = None
@@ -71,6 +136,7 @@ class CaptureHealth:
     read_ms: float | None = None
     fatal_error: str = ""
     worker_alive: bool = False
+    camera_controls: CameraControlReport = field(default_factory=CameraControlReport)
 
 
 class CaptureSource(ABC):
@@ -151,6 +217,62 @@ def _is_v4l2(backend: str) -> bool:
     return "V4L" in normalized
 
 
+def _camera_backend_family(backend: str) -> str:
+    normalized = "".join(
+        character for character in backend.upper() if character.isalnum()
+    )
+    if "V4L" in normalized:
+        return "v4l2"
+    if "MSMF" in normalized or "MEDIAFOUNDATION" in normalized:
+        return "msmf"
+    if "DSHOW" in normalized or "DIRECTSHOW" in normalized:
+        return "dshow"
+    return "other"
+
+
+def _observe_camera_controls(
+    cap: Any,
+    backend: str,
+    *,
+    generation: int,
+) -> CameraControlReport:
+    """Read the bounded control set once without calling ``VideoCapture.set``.
+
+    Generic OpenCV does not expose property ranges, flags, or a trustworthy
+    cross-backend support query.  A non-zero ``get`` result is recorded as
+    backend-reported, zero remains explicitly indeterminate, and a missing
+    constant/get failure is unavailable.  This keeps V4L2, MSMF, and DSHOW
+    observations honest while the only implemented policy is ``preserve``.
+    """
+
+    observations: list[CameraControlObservation] = []
+    for name, constant_name in (
+        ("auto_white_balance", "CAP_PROP_AUTO_WB"),
+        ("white_balance_temperature", "CAP_PROP_WB_TEMPERATURE"),
+        ("auto_exposure", "CAP_PROP_AUTO_EXPOSURE"),
+        ("exposure", "CAP_PROP_EXPOSURE"),
+        ("gain", "CAP_PROP_GAIN"),
+        ("gamma", "CAP_PROP_GAMMA"),
+    ):
+        prop = getattr(cv2, constant_name, None)
+        value = _safe_get(cap, prop)
+        if prop is None or value is None:
+            status = "unavailable"
+            value = None
+        elif value == 0.0:
+            status = "indeterminate-zero"
+        else:
+            status = "reported"
+        observations.append(
+            CameraControlObservation(name=name, status=status, value=value)
+        )
+    return CameraControlReport(
+        backend_family=_camera_backend_family(backend),
+        generation=generation,
+        properties=tuple(observations),
+    )
+
+
 class OpenCVCapture(CaptureSource):
     """Real camera with verified mode negotiation and bounded recovery.
 
@@ -167,10 +289,17 @@ class OpenCVCapture(CaptureSource):
     _RATE_WARNING_AFTER_S = 5.0
     _EWMA_ALPHA = 0.1
 
-    def __init__(self, cfg: CameraConfig):
+    def __init__(self, cfg: CameraConfig, canvas_size: Size | None = None):
         if cv2 is None:
             raise RuntimeError("opencv-python is required for camera capture")
         self.cfg = cfg
+        self.canvas_size = canvas_size or (cfg.width, cfg.height)
+        if (
+            not isinstance(self.canvas_size, tuple)
+            or len(self.canvas_size) != 2
+            or any(type(value) is not int or value <= 0 for value in self.canvas_size)
+        ):
+            raise ValueError("capture canvas dimensions must be positive integers")
         self._device = _device_value(cfg.device)
         self._lock = threading.RLock()
         self._closed = False
@@ -188,7 +317,15 @@ class OpenCVCapture(CaptureSource):
 
         self._slot: np.ndarray | None = None
         self._slot_sequence = 0
+        self._slot_generation = 0
+        self._slot_geometry_generation = 0
+        self._slot_content_rect: tuple[int, int, int, int] | None = None
+        self._slot_identity = CaptureHealth()
         self._delivered_sequence = 0
+        self._delivered_generation = 0
+        self._delivered_geometry_generation = 0
+        self._delivered_content_rect: tuple[int, int, int, int] | None = None
+        self._delivered_identity = CaptureHealth()
         self._last_frame_at: float | None = None
         self._first_frame_at: float | None = None
         self._capture_timestamps: deque[float] = deque(maxlen=1024)
@@ -197,9 +334,19 @@ class OpenCVCapture(CaptureSource):
         self._fourcc: str | None = None
         self._width: int | None = None
         self._height: int | None = None
+        self._delivered_width: int | None = None
+        self._delivered_height: int | None = None
+        self._oriented_width: int | None = None
+        self._oriented_height: int | None = None
+        self._normalized_width: int | None = None
+        self._normalized_height: int | None = None
+        self._generation_delivered_size: Size | None = None
+        self._geometry_signature: tuple[object, ...] | None = None
+        self._geometry_transitions = 0
         self._fps_reported: float | None = None
         self._target_met: bool | None = None
         self._logged_modes: set[tuple[Any, ...]] = set()
+        self._camera_controls = CameraControlReport()
 
         self._frames_read = 0
         self._dropped_frames = 0
@@ -224,6 +371,11 @@ class OpenCVCapture(CaptureSource):
         self._rate_recovery_windows = 0
         self._last_rate_evaluation = 0.0
         self._last_capture_log_state = ""
+        # A compatibility warning belongs to the capture lifetime, not a
+        # reconnect generation.  Once an operator has been told that a future
+        # proportional-fit rollout will change this framing, repeating it on
+        # every reconnect would only create log noise.
+        self._aspect_upgrade_note_emitted = False
 
         controller = threading.Thread(
             target=self._controller_loop,
@@ -262,11 +414,14 @@ class OpenCVCapture(CaptureSource):
                 # commonly succeeds under DSHOW (and vice versa).
                 try:
                     cap.release()
-                except Exception:
-                    log.debug("cannot release unopened camera", exc_info=True)
+                except Exception as exc:
+                    log.debug(
+                        "cannot release unopened camera (%s)",
+                        type(exc).__name__,
+                    )
                 continue
             return self._configure_capture(cap)
-        message = f"cannot open camera {sanitized_source(self.cfg.device)!r}"
+        message = "cannot open configured camera"
         if explicit:
             message = f"{message} ({camera_open_hint()})"
         raise CaptureError(message)
@@ -284,11 +439,7 @@ class OpenCVCapture(CaptureSource):
             if request_mjpeg:
                 accepted = cap.set(cv2.CAP_PROP_FOURCC, float(_fourcc_value("MJPG")))
                 if self.cfg.pixel_format == "mjpeg" and not bool(accepted):
-                    raise CaptureModeError(
-                        "camera "
-                        f"{sanitized_source(self.cfg.device)!r} rejected explicit "
-                        "MJPG format"
-                    )
+                    raise CaptureModeError("camera rejected explicit MJPG format")
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.cfg.width))
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.cfg.height))
             cap.set(cv2.CAP_PROP_FPS, float(self.cfg.fps))
@@ -296,8 +447,11 @@ class OpenCVCapture(CaptureSource):
         except BaseException:
             try:
                 cap.release()
-            except Exception:
-                log.debug("cannot release failed camera open", exc_info=True)
+            except Exception as exc:
+                log.debug(
+                    "cannot release failed camera open (%s)",
+                    type(exc).__name__,
+                )
             raise
 
     def _start_generation(self) -> None:
@@ -314,6 +468,8 @@ class OpenCVCapture(CaptureSource):
             self._reader_stop = stop
             self._generation_started_at = time.monotonic()
             self._generation_has_frame = False
+            self._generation_delivered_size = None
+            self._geometry_signature = None
             self._next_reopen_at = None
             self._capture_timestamps.clear()
             self._first_frame_at = None
@@ -331,7 +487,10 @@ class OpenCVCapture(CaptureSource):
 
     # -- negotiation --------------------------------------------------
     def _record_negotiated_mode(
-        self, cap: Any, raw_frame: np.ndarray
+        self,
+        cap: Any,
+        raw_frame: np.ndarray,
+        generation: int,
     ) -> CaptureError | None:
         backend = _backend_name(cap)
         frame_height, frame_width = raw_frame.shape[:2]
@@ -339,6 +498,11 @@ class OpenCVCapture(CaptureSource):
         prop_height = _safe_get(cap, getattr(cv2, "CAP_PROP_FRAME_HEIGHT", None))
         prop_fps = _safe_get(cap, getattr(cv2, "CAP_PROP_FPS", None))
         prop_fourcc = _safe_get(cap, getattr(cv2, "CAP_PROP_FOURCC", None))
+        camera_controls = _observe_camera_controls(
+            cap,
+            backend,
+            generation=generation,
+        )
 
         # The backend properties describe the negotiated device mode, while the
         # delivered array describes what OpenCV handed to the application.  A
@@ -426,6 +590,7 @@ class OpenCVCapture(CaptureSource):
             self._fps_reported = fps
             self._fourcc = fourcc
             self._target_met = target_met
+            self._camera_controls = camera_controls
             signature = (
                 self._backend,
                 fourcc,
@@ -475,6 +640,93 @@ class OpenCVCapture(CaptureSource):
             )
         return None
 
+    def _normalize_delivered_frame(
+        self,
+        frame: np.ndarray,
+        generation: int,
+    ) -> tuple[np.ndarray, TransformPlan]:
+        """Validate and normalize one delivered frame exactly once."""
+
+        source = validate_bgr_frame(frame, name="camera frame")
+        delivered_size = (source.shape[1], source.shape[0])
+        with self._lock:
+            previous_size = self._generation_delivered_size
+            if previous_size is None:
+                self._generation_delivered_size = delivered_size
+            elif previous_size != delivered_size:
+                if self.cfg.mode_mismatch == "error":
+                    raise CaptureModeError(
+                        "camera delivered resolution changed during generation "
+                        f"from {previous_size[0]}x{previous_size[1]} to "
+                        f"{delivered_size[0]}x{delivered_size[1]}"
+                    )
+                self._generation_delivered_size = delivered_size
+
+        normalized, plan = transform_frame(
+            source,
+            self.canvas_size,
+            rotation=self.cfg.rotation,
+            mirror=self.cfg.mirror,
+            fit=self.cfg.fit_mode,
+            anchors=(self.cfg.anchor_x, self.cfg.anchor_y),
+        )
+        signature = (
+            generation,
+            delivered_size,
+            plan.oriented_size,
+            plan.target_size,
+            plan.fit,
+            plan.rotation,
+            plan.mirror,
+            self.cfg.anchor_x,
+            self.cfg.anchor_y,
+        )
+        with self._lock:
+            changed = signature != self._geometry_signature
+            if changed:
+                self._geometry_signature = signature
+                self._geometry_transitions += 1
+            self._delivered_width, self._delivered_height = delivered_size
+            self._oriented_width, self._oriented_height = plan.oriented_size
+            self._normalized_width, self._normalized_height = plan.target_size
+            aspect_upgrade_note = (
+                not self._aspect_upgrade_note_emitted
+                and plan.fit == "stretch"
+                and plan.oriented_size[0] * plan.target_size[1]
+                != plan.oriented_size[1] * plan.target_size[0]
+            )
+            if aspect_upgrade_note:
+                self._aspect_upgrade_note_emitted = True
+        if changed:
+            self._log_capture_transition(
+                f"geometry:{signature!r}",
+                "camera geometry generation=%d delivered=%dx%d oriented=%dx%d "
+                "canvas=%dx%d fit=%s rotation=%d mirror=%s",
+                generation,
+                delivered_size[0],
+                delivered_size[1],
+                plan.oriented_size[0],
+                plan.oriented_size[1],
+                plan.target_size[0],
+                plan.target_size[1],
+                plan.fit,
+                plan.rotation,
+                plan.mirror,
+            )
+        if aspect_upgrade_note:
+            log.warning(
+                "visual-policy upgrade note: camera aspect %dx%d differs from "
+                "canvas %dx%d; schema-v1 stretch preserves legacy distortion. "
+                "The staged cover default will crop proportionally. Pin "
+                "camera.fit_mode=stretch to retain current framing or preview "
+                "camera.fit_mode=cover before upgrading",
+                plan.oriented_size[0],
+                plan.oriented_size[1],
+                plan.target_size[0],
+                plan.target_size[1],
+            )
+        return normalized, plan
+
     # -- reader -------------------------------------------------------
     def _reader_loop(self, cap: Any, stop: threading.Event, generation: int) -> None:
         negotiated = False
@@ -490,9 +742,9 @@ class OpenCVCapture(CaptureSource):
                         if generation == self._generation and not self._closed:
                             self._read_failures += 1
                     self._log_capture_transition(
-                        f"read-error:{type(exc).__name__}:{redact_sensitive_text(exc)}",
-                        "camera read failed; recovery will retry: %s",
-                        redact_sensitive_text(exc),
+                        f"read-error:{type(exc).__name__}",
+                        "camera read failed; recovery will retry (%s)",
+                        type(exc).__name__,
                     )
                     return
                 finished = time.monotonic()
@@ -505,14 +757,14 @@ class OpenCVCapture(CaptureSource):
                         self._read_failures += 1
                     stop.wait(0.01)
                     continue
-                if not isinstance(frame, np.ndarray) or frame.ndim < 2:
-                    with self._lock:
-                        self._read_failures += 1
-                    stop.wait(0.01)
-                    continue
+                try:
+                    frame = validate_bgr_frame(frame, name="camera frame")
+                except FrameValidationError as exc:
+                    self._set_fatal(CaptureError(str(exc)))
+                    return
 
                 if not negotiated:
-                    mode_error = self._record_negotiated_mode(cap, frame)
+                    mode_error = self._record_negotiated_mode(cap, frame, generation)
                     negotiated = True
                     if isinstance(mode_error, _CaptureNegotiationRetry):
                         with self._lock:
@@ -524,13 +776,10 @@ class OpenCVCapture(CaptureSource):
                         return
 
                 try:
-                    if (
-                        frame.shape[1] != self.cfg.width
-                        or frame.shape[0] != self.cfg.height
-                    ):
-                        frame = cv2.resize(frame, (self.cfg.width, self.cfg.height))
-                    if self.cfg.mirror:
-                        frame = cv2.flip(frame, 1)
+                    frame, plan = self._normalize_delivered_frame(frame, generation)
+                except CaptureModeError as exc:
+                    self._set_fatal(exc)
+                    return
                 except BaseException as exc:
                     self._set_fatal(
                         CaptureError(f"camera frame conversion failed: {exc}")
@@ -550,6 +799,34 @@ class OpenCVCapture(CaptureSource):
                         self._dropped_frames += 1
                     self._slot = frame
                     self._slot_sequence += 1
+                    self._slot_generation = generation
+                    self._slot_geometry_generation = self._geometry_transitions
+                    content = plan.content_rect
+                    self._slot_content_rect = (
+                        content.left,
+                        content.top,
+                        content.right,
+                        content.bottom,
+                    )
+                    self._slot_identity = CaptureHealth(
+                        generation=generation,
+                        geometry_generation=self._geometry_transitions,
+                        content_rect=self._slot_content_rect,
+                        backend=self._backend,
+                        fourcc=self._fourcc,
+                        width=self._width,
+                        height=self._height,
+                        delivered_width=plan.source_size[0],
+                        delivered_height=plan.source_size[1],
+                        oriented_width=plan.oriented_size[0],
+                        oriented_height=plan.oriented_size[1],
+                        normalized_width=plan.target_size[0],
+                        normalized_height=plan.target_size[1],
+                        geometry_transitions=self._geometry_transitions,
+                        fps_reported=self._fps_reported,
+                        target_met=self._target_met,
+                        camera_controls=self._camera_controls,
+                    )
                     self._frames_read += 1
                     self._generation_has_frame = True
                     self._last_frame_at = finished
@@ -688,8 +965,11 @@ class OpenCVCapture(CaptureSource):
         if cap is not None:
             try:
                 cap.release()
-            except Exception:
-                log.debug("cannot release stalled camera", exc_info=True)
+            except Exception as exc:
+                log.debug(
+                    "cannot release stalled camera (%s)",
+                    type(exc).__name__,
+                )
         if thread is not None and thread is not threading.current_thread():
             thread.join(self._READER_JOIN_TIMEOUT_S)
         alive = bool(thread is not None and thread.is_alive())
@@ -813,11 +1093,13 @@ class OpenCVCapture(CaptureSource):
                     return
                 self._read_failures += 1
                 self._schedule_reopen_locked(time.monotonic())
-            safe_error = redact_sensitive_text(exc)
+            _candidates, explicit = self._open_candidates()
+            hint = f"; {camera_open_hint()}" if explicit else ""
             self._log_capture_transition(
-                f"reopen-error:{type(exc).__name__}:{safe_error}",
-                "camera reopen failed: %s",
-                safe_error,
+                f"reopen-error:{type(exc).__name__}",
+                "camera reopen failed (%s%s)",
+                type(exc).__name__,
+                hint,
             )
 
     def _controller_loop(self) -> None:
@@ -829,9 +1111,7 @@ class OpenCVCapture(CaptureSource):
                 self._controller_stop.wait(0.01)
         except BaseException as exc:
             self._set_fatal(
-                CaptureWorkerError(
-                    f"camera controller failed: {redact_sensitive_text(exc)}"
-                )
+                CaptureWorkerError(f"camera controller failed ({type(exc).__name__})")
             )
         finally:
             self._stop_current_worker()
@@ -854,6 +1134,10 @@ class OpenCVCapture(CaptureSource):
             if self._slot is None or self._slot_sequence == self._delivered_sequence:
                 return None
             self._delivered_sequence = self._slot_sequence
+            self._delivered_generation = self._slot_generation
+            self._delivered_geometry_generation = self._slot_geometry_generation
+            self._delivered_content_rect = self._slot_content_rect
+            self._delivered_identity = self._slot_identity
             return self._slot
 
     def health_snapshot(self) -> CaptureHealth:
@@ -878,12 +1162,23 @@ class OpenCVCapture(CaptureSource):
                 or now - self._first_frame_at < self._RATE_WINDOW_S
                 else measured_fps >= self.cfg.fps * 0.9
             )
+            identity = self._delivered_identity
             return CaptureHealth(
-                backend=self._backend,
-                fourcc=self._fourcc,
-                width=self._width,
-                height=self._height,
-                fps_reported=self._fps_reported,
+                generation=identity.generation,
+                geometry_generation=identity.geometry_generation,
+                content_rect=identity.content_rect,
+                backend=identity.backend,
+                fourcc=identity.fourcc,
+                width=identity.width,
+                height=identity.height,
+                delivered_width=identity.delivered_width,
+                delivered_height=identity.delivered_height,
+                oriented_width=identity.oriented_width,
+                oriented_height=identity.oriented_height,
+                normalized_width=identity.normalized_width,
+                normalized_height=identity.normalized_height,
+                geometry_transitions=identity.geometry_transitions,
+                fps_reported=identity.fps_reported,
                 capture_fps=measured_fps,
                 target_met=actual_target_met,
                 frames_read=self._frames_read,
@@ -895,6 +1190,7 @@ class OpenCVCapture(CaptureSource):
                 read_ms=self._read_ms,
                 fatal_error=str(self._fatal_error) if self._fatal_error else "",
                 worker_alive=bool(thread is not None and thread.is_alive()),
+                camera_controls=identity.camera_controls,
             )
 
     def close(self) -> None:
@@ -920,8 +1216,17 @@ class OpenCVCapture(CaptureSource):
 class SyntheticCapture(CaptureSource):
     """Test pattern: moving bright ellipse ("person") over a dark gradient."""
 
-    def __init__(self, cfg: CameraConfig):
+    def __init__(self, cfg: CameraConfig, canvas_size: Size | None = None):
         self.cfg = cfg
+        self.canvas_size = canvas_size or (cfg.width, cfg.height)
+        self._plan = plan_transform(
+            (cfg.width, cfg.height),
+            self.canvas_size,
+            cfg.rotation,
+            cfg.mirror,
+            cfg.fit_mode,
+            (cfg.anchor_x, cfg.anchor_y),
+        )
         self.t0 = time.monotonic()
         h, w = cfg.height, cfg.width
         gradient = np.linspace(20, 70, w, dtype=np.uint8)
@@ -947,8 +1252,7 @@ class SyntheticCapture(CaptureSource):
         yy, xx = np.ogrid[:h, :w]
         ellipse = ((xx - cx) / (w * 0.14)) ** 2 + ((yy - cy) / (h * 0.3)) ** 2 <= 1.0
         frame[ellipse] = (200, 190, 210)
-        if self.cfg.mirror:
-            frame = frame[:, ::-1].copy()
+        frame = apply_transform(frame, self._plan)
         finished = time.monotonic()
         with self._lock:
             self._frames_read += 1
@@ -980,9 +1284,24 @@ class SyntheticCapture(CaptureSource):
                 else capture_fps >= self.cfg.fps * 0.9
             )
             return CaptureHealth(
+                generation=1 if self._frames_read else 0,
+                geometry_generation=1 if self._frames_read else 0,
+                content_rect=(
+                    self._plan.content_rect.left,
+                    self._plan.content_rect.top,
+                    self._plan.content_rect.right,
+                    self._plan.content_rect.bottom,
+                ),
                 backend="synthetic",
                 width=self.cfg.width,
                 height=self.cfg.height,
+                delivered_width=self.cfg.width,
+                delivered_height=self.cfg.height,
+                oriented_width=self._plan.oriented_size[0],
+                oriented_height=self._plan.oriented_size[1],
+                normalized_width=self._plan.target_size[0],
+                normalized_height=self._plan.target_size[1],
+                geometry_transitions=1 if self._frames_read else 0,
                 fps_reported=float(self.cfg.fps),
                 capture_fps=capture_fps,
                 target_met=target_met,
@@ -993,6 +1312,11 @@ class SyntheticCapture(CaptureSource):
                     else max(0.0, (now - self._last_frame_at) * 1000.0)
                 ),
                 read_ms=self._read_ms,
+                camera_controls=CameraControlReport(
+                    backend_family="synthetic",
+                    qualification="not-applicable",
+                    generation=1 if self._frames_read else 0,
+                ),
             )
 
     def close(self) -> None:
@@ -1000,7 +1324,7 @@ class SyntheticCapture(CaptureSource):
             self._closed = True
 
 
-def open_capture(cfg: CameraConfig) -> CaptureSource:
+def open_capture(cfg: CameraConfig, canvas_size: Size | None = None) -> CaptureSource:
     if cfg.synthetic:
-        return SyntheticCapture(cfg)
-    return OpenCVCapture(cfg)
+        return SyntheticCapture(cfg, canvas_size)
+    return OpenCVCapture(cfg, canvas_size)

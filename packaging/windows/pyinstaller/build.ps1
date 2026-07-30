@@ -158,6 +158,14 @@ try {
     & $exe --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "frozen --help failed ($LASTEXITCODE)" }
 
+    # Core background-video decoding now uses PyAV.  Exercise the exact frozen
+    # PyAV/Cython/FFmpeg payload and custback's tagged normalization contract
+    # entirely in memory; no file, device, or network access is needed.
+    & $exe --frozen-video-color-smoke | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "frozen tagged video normalization smoke failed ($LASTEXITCODE)"
+    }
+
     # A short synthetic run with no camera, no vcam, and no API proves the
     # segmentation/compositor path imports and runs end to end while frozen.
     $proc = Start-Process -FilePath $exe `
@@ -175,7 +183,7 @@ try {
     # in the same scrubbed environment.
     & $avatarExe --smoke | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "frozen avatar smoke failed ($LASTEXITCODE)" }
-    Write-Host "==> smoke tests passed (engine + avatar)"
+    Write-Host "==> smoke tests passed (engine + tagged video color + avatar)"
 }
 finally {
     foreach ($k in $prior.Keys) {

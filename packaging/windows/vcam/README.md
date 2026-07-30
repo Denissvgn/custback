@@ -4,10 +4,10 @@ A Windows 11 virtual camera that presents the engine's processed frames to
 meeting apps **without OBS**: a C++/WinRT custom media source, activated by the
 Windows Frame Server, fed by the engine over a shared-memory frame ring.
 
-This directory is complete, reviewable source. Like the rest of
-`packaging/windows/`, it is *built* on `windows-latest`; the byte-static parts
-(protocol constants, CLSID consistency, project structure) are verified on any
-platform by `tests/test_windows_vcam.py`.
+This directory is complete, reviewable source. CI compiles the x64 project and
+checks its COM exports on the pinned `windows-2022` runner; the byte-static
+parts (protocol constants, CLSID consistency, project structure) are verified
+on any platform by `tests/test_windows_vcam.py`.
 
 ## Architecture
 
@@ -34,8 +34,22 @@ Custback.Shell.exe
 - **Media source** — `Activator` (IMFActivate) is the COM class the Frame
   Server CoCreates in its service process; `MediaSource`/`MediaStream`
   implement the software-camera contract (IMFMediaSourceEx, IMFMediaStream2,
-  IKsControl) with one always-selected RGB32 stream at 1280×720\@30 and
-  1920×1080\@30.
+  IKsControl) with one always-selected RGB32 stream. The source knows
+  1280×720\@30 and 1920×1080\@30, reads the valid ring geometry during
+  initialization, and advertises only the matching exact type.
+- **Exact-mode geometry constraint** — the Phase-1 native path intentionally
+  has no scaler. Python accepts explicit native output only at
+  1280×720\@30 or 1920×1080\@30 and rejects every other canvas/FPS before
+  probing the component or opening a ring. The writer publishes its valid
+  inactive header before its first frame, so a normally initialized media
+  source exposes no alternate size for the consumer to select. Initialization
+  waits for a bounded in-progress write and rejects a present malformed or
+  unsupported ring instead of silently selecting 720p. If the ring is absent
+  or later changes geometry, `MediaStream` emits the fixed placeholder; it
+  never overlap-copies, crops, pads, or stretches source pixels.
+  A sample request that overlaps a valid writer update reuses only the last
+  complete exact-size frame; inactive, invalid, or mismatched state clears
+  that cache and cannot expose stale pixels.
 - **Loop prevention** — the friendly name "Custback Camera" matches the
   existing `custback` marker in `camera_devices.py`, so enumeration never
   offers the output camera back as an input (WIN-3.4).
@@ -60,10 +74,11 @@ pwsh packaging/windows/vcam/build.ps1 -Arch arm64  # WIN-6.3
 pwsh packaging/windows/vcam/build.ps1 -GateDiagnostics  # MIT-C1 gate payload
 ```
 
-Requires VS 2022 build tools and Windows 11 SDK 10.0.22000+ (the first SDK
-carrying `MFCreateVirtualCamera`). The produced `CustbackVCam.dll` is placed by
-the installer next to the shell and registered per-user (HKCU only, no
-elevation, matching the per-user install of D5).
+Requires VS 2022 build tools and Windows 11 SDK 10.0.22621.0. The project keeps
+Windows 11 build 22000 as its runtime floor (the first release carrying
+`MFCreateVirtualCamera`). The produced `CustbackVCam.dll` is placed by the
+installer next to the shell and registered per-user (HKCU only, no elevation,
+matching the per-user install of D5).
 
 `-GateDiagnostics` adds a gate-build-only `OutputDebugStringW` trace. Capture
 Win32 debug output from the Frame Server process while opening the camera. If

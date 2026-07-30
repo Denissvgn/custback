@@ -38,7 +38,8 @@ import yaml
 from yaml.events import AliasEvent
 
 from .. import _platform as platform_fs
-from ..backgrounds import IMAGE_EXTS, VIDEO_EXTS
+from ..backgrounds import DEFAULT_IMAGE_MAX_PIXELS, IMAGE_EXTS, VIDEO_EXTS
+from ..color import ColorError, decode_image_to_srgb_bgr
 from ..storage_tx import (
     OwnedPath,
     OwnershipLedger,
@@ -623,13 +624,39 @@ def render_avatar_thumbnail(
 
 
 def render_media_thumbnail(
-    path: Path, kind: str, *, size: tuple[int, int] = THUMBNAIL_SIZE
+    path: Path,
+    kind: str,
+    *,
+    size: tuple[int, int] = THUMBNAIL_SIZE,
+    max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS,
 ) -> bytes:
     """First frame (video) or downscaled image as JPEG bytes."""
     if cv2 is None:
         raise RuntimeError("opencv-python is required for thumbnails")
     if kind == "image":
-        frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        expected_format = _IMAGE_FORMATS.get(path.suffix.lower())
+        if expected_format is None:
+            raise StoreError(422, "invalid_media", "stored media cannot be decoded")
+        try:
+            frame = decode_image_to_srgb_bgr(path, expected_format, max_pixels)
+        except ColorError as exc:
+            if str(exc) == f"image exceeds {max_pixels} pixels":
+                raise StoreError(
+                    413,
+                    "media_too_large",
+                    f"image exceeds {max_pixels} pixels",
+                ) from exc
+            raise StoreError(
+                422,
+                "invalid_media",
+                "stored media cannot be decoded",
+            ) from exc
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise StoreError(
+                422,
+                "invalid_media",
+                "stored media cannot be decoded",
+            ) from exc
     else:
         capture = cv2.VideoCapture(str(path))
         try:
@@ -1407,6 +1434,12 @@ class MediaStore:
         self._active_uploads: dict[Path, UploadReservation] = {}
         self._retry_pending_cleanup()
 
+    @property
+    def image_max_pixels(self) -> int:
+        """Configured decoded-pixel ceiling shared with image thumbnails."""
+
+        return self._cfg.image_max_pixels
+
     def _sync_reservations_locked(self) -> None:
         self._reserved_bytes = self._ledger.reserved_bytes
         self._reserved_files = self._ledger.reserved_slots
@@ -1650,51 +1683,36 @@ class MediaStore:
                 503, "decoder_unavailable", "Pillow is required to validate images"
             )
         expected_format = _IMAGE_FORMATS.get(suffix)
+        if expected_format is None:
+            raise StoreError(
+                422,
+                "invalid_media",
+                "image upload cannot be decoded",
+            )
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")
-                with Image.open(path) as image:
-                    if image.format != expected_format:
-                        raise ValueError("image header does not match its filename")
-                    width, height = image.size
-                    if width <= 0 or height <= 0:
-                        raise ValueError("invalid image dimensions")
-                    if width * height > self._cfg.image_max_pixels:
-                        raise StoreError(
-                            413,
-                            "media_too_large",
-                            f"image exceeds {self._cfg.image_max_pixels} pixels",
-                        )
-                    image.verify()
-                with Image.open(path) as decoded:
-                    decoded.load()
+            decode_image_to_srgb_bgr(
+                path,
+                expected_format,
+                self._cfg.image_max_pixels,
+            )
+        except ColorError as exc:
+            if str(exc) == f"image exceeds {self._cfg.image_max_pixels} pixels":
+                raise StoreError(
+                    413,
+                    "media_too_large",
+                    f"image exceeds {self._cfg.image_max_pixels} pixels",
+                ) from exc
+            raise StoreError(
+                422,
+                "invalid_media",
+                "image upload cannot be decoded",
+            ) from exc
         except StoreError:
             raise
-        except (
-            Image.DecompressionBombError,
-            Image.DecompressionBombWarning,
-            UnidentifiedImageError,
-            OSError,
-            ValueError,
-            Warning,
-        ) as exc:
+        except (FileNotFoundError, OSError, ValueError) as exc:
             raise StoreError(
                 422, "invalid_media", "image upload cannot be decoded"
             ) from exc
-        if cv2 is not None:
-            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-            if (
-                frame is None
-                or frame.dtype != np.uint8
-                or frame.ndim != 3
-                or frame.shape[2] != 3
-            ):
-                raise StoreError(422, "invalid_media", "image upload cannot be decoded")
-            actual_height, actual_width = frame.shape[:2]
-            if (actual_width, actual_height) != (width, height):
-                raise StoreError(
-                    422, "invalid_media", "image decoders disagree on dimensions"
-                )
 
     def _validate_video(self, path: Path, suffix: str) -> None:
         if cv2 is None:  # pragma: no cover - required by the package

@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -29,9 +30,410 @@ test('release metadata versions and required compatibility bounds agree', () => 
   assert.doesNotThrow(() => release.verifyNpmMetadata(root));
   assert.doesNotThrow(() => release.verifyDependencies(root));
   assert.doesNotThrow(() => release.verifyLicenseMetadata(root));
+  assert.doesNotThrow(() => release.verifyCoreConfigTemplate(root));
   assert.doesNotThrow(() => release.verifyDocs(root));
+  assert.doesNotThrow(() => release.verifyVisualPolicyRollout(root));
   assert.doesNotThrow(() => release.verifyCiWorkflow(root));
   assert.doesNotThrow(() => release.verifyPlatformScope(root));
+});
+
+test('CI vision compatibility profiles retain integrated qualification coverage', () => {
+  const workflow = fs.readFileSync(
+    path.join(root, '.github', 'workflows', 'ci.yml'),
+    'utf8',
+  );
+  const jobBlock = (id) => {
+    const marker = `  ${id}:\n`;
+    const start = workflow.indexOf(marker);
+    assert.notEqual(start, -1, `missing CI job ${id}`);
+    const remainder = workflow.slice(start + marker.length);
+    const next = remainder.search(/\n  [a-z0-9]+(?:-[a-z0-9]+)*:\n/);
+    return workflow.slice(
+      start,
+      next < 0 ? workflow.length : start + marker.length + next,
+    );
+  };
+  const opencv = jobBlock('opencv-compatibility');
+  for (const filename of [
+    'tests/test_geometry.py',
+    'tests/test_background_geometry.py',
+    'tests/test_capture.py',
+    'tests/test_capture_geometry.py',
+    'tests/test_color.py',
+    'tests/test_video_color.py',
+    'tests/test_processing.py',
+    'tests/test_pipeline.py',
+    'tests/test_canonical_canvas.py',
+    'tests/test_output_geometry.py',
+    'tests/test_visual_consistency_e2e.py',
+    'tests/test_visual_consistency_qualification.py',
+  ]) {
+    assert.match(opencv, new RegExp(filename), filename);
+  }
+  const optional = jobBlock('optional-backends');
+  assert.match(optional, /timeout 180s python -m pytest -q/);
+  assert.doesNotMatch(optional, /--ignore|--deselect/);
+});
+
+test('visual defaults cannot advance without a distinct commit and approval record', (t) => {
+  const verifier = fs.readFileSync(
+    path.join(root, 'scripts', 'release', 'verify-release.js'),
+    'utf8',
+  );
+  assert.match(verifier, /visual_consistency_qualification\.py/);
+  assert.match(verifier, /'--claim', 'release'/);
+  assert.match(verifier, /'--expected-commit', expectedCommit/);
+  assert.match(verifier, /'--evidence-root', path\.dirname\(reportPath\)/);
+
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-rollout-test-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(fixture, 'config'), { recursive: true });
+  fs.mkdirSync(path.join(fixture, 'docs'), { recursive: true });
+  fs.mkdirSync(path.join(fixture, 'scripts', 'release'), { recursive: true });
+  const sourceManifest = JSON.parse(fs.readFileSync(
+    path.join(root, 'scripts', 'release', 'visual-policy-rollout.json'),
+    'utf8',
+  ));
+  const manifestPath = path.join(
+    fixture, 'scripts', 'release', 'visual-policy-rollout.json',
+  );
+  const configPath = path.join(fixture, 'config', 'default.yaml');
+  const writeManifest = (manifest) => {
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  };
+  fs.writeFileSync(
+    configPath,
+    'schema_version: 1\ncamera:\n  fit_mode: stretch\n' +
+      'compositing:\n  blend_space: srgb_legacy\n' +
+      '  color_correction:\n    mode: "off"\n',
+  );
+  writeManifest(sourceManifest);
+  assert.doesNotThrow(() => release.verifyVisualPolicyRollout(fixture));
+
+  const unapproved = structuredClone(sourceManifest);
+  unapproved.active_stage = 'camera-cover';
+  unapproved.stages[0].status = 'complete';
+  unapproved.stages[1].status = 'active';
+  fs.writeFileSync(
+    configPath,
+    'schema_version: 2\ncamera:\n  fit_mode: cover\n' +
+      'compositing:\n  blend_space: srgb_legacy\n' +
+      '  color_correction:\n    mode: "off"\n',
+  );
+  writeManifest(unapproved);
+  assert.throws(
+    () => release.verifyVisualPolicyRollout(fixture),
+    /distinct commit-bound evidence/,
+  );
+
+  const commit = 'a'.repeat(40);
+  const evidence = 'docs/camera-cover-approval.json';
+  unapproved.stages[1].change_commit = commit;
+  unapproved.stages[1].evidence = [evidence];
+  fs.writeFileSync(
+    path.join(fixture, evidence),
+    `${JSON.stringify({
+      release_qualified: true,
+      source: { commit, clean: true },
+    })}\n`,
+  );
+  writeManifest(unapproved);
+  let strictValidationCalls = 0;
+  const qualificationValidator = (reportPath, validation) => {
+    strictValidationCalls += 1;
+    assert.equal(validation.expectedCommit, commit);
+    assert.equal(validation.evidenceRoot, path.dirname(reportPath));
+    return JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  };
+  fs.writeFileSync(
+    path.join(fixture, evidence),
+    `${JSON.stringify({
+      release_qualified: true,
+      source: { commit: 'b'.repeat(40), clean: true },
+    })}\n`,
+  );
+  assert.throws(
+    () => release.verifyVisualPolicyRollout(
+      fixture,
+      { qualificationValidator },
+    ),
+    /not bound to its clean change commit/,
+  );
+  fs.writeFileSync(
+    path.join(fixture, evidence),
+    `${JSON.stringify({
+      release_qualified: true,
+      source: { commit, clean: true },
+    })}\n`,
+  );
+  assert.doesNotThrow(() => release.verifyVisualPolicyRollout(
+    fixture,
+    { qualificationValidator },
+  ));
+  assert.equal(strictValidationCalls, 2);
+
+  const linearCommit = 'c'.repeat(40);
+  const linearEvidence = 'docs/linear-compositing-approval.json';
+  const linear = structuredClone(unapproved);
+  linear.active_stage = 'linear-compositing';
+  linear.stages[1].status = 'complete';
+  linear.stages[2].status = 'active';
+  linear.stages[2].change_commit = linearCommit;
+  linear.stages[2].evidence = [linearEvidence];
+  fs.writeFileSync(
+    path.join(fixture, linearEvidence),
+    `${JSON.stringify({
+      release_qualified: true,
+      source: { commit: linearCommit, clean: true },
+    })}\n`,
+  );
+  fs.writeFileSync(
+    configPath,
+    'schema_version: 3\ncamera:\n  fit_mode: cover\n' +
+      'compositing:\n  blend_space: linear_srgb\n' +
+      '  color_correction:\n    mode: "off"\n',
+  );
+  writeManifest(linear);
+  const validatedCommits = [];
+  const historicalValidator = (reportPath, validation) => {
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    validatedCommits.push(validation.expectedCommit);
+    assert.equal(validation.expectedCommit, report.source.commit);
+    assert.equal(validation.evidenceRoot, path.dirname(reportPath));
+    return report;
+  };
+  assert.doesNotThrow(() => release.verifyVisualPolicyRollout(
+    fixture,
+    { qualificationValidator: historicalValidator },
+  ));
+  assert.deepEqual(validatedCommits, [commit, linearCommit]);
+
+  const automaticCommit = 'd'.repeat(40);
+  const automaticEvidence = 'docs/automatic-correction-approval.json';
+  const automatic = structuredClone(linear);
+  automatic.active_stage = 'automatic-correction';
+  automatic.stages[2].status = 'complete';
+  automatic.stages[3].status = 'active';
+  automatic.stages[3].change_commit = automaticCommit;
+  automatic.stages[3].evidence = [automaticEvidence];
+  fs.writeFileSync(
+    path.join(fixture, automaticEvidence),
+    `${JSON.stringify({
+      release_qualified: true,
+      source: { commit: automaticCommit, clean: true },
+    })}\n`,
+  );
+  fs.writeFileSync(
+    configPath,
+    'schema_version: 4\ncamera:\n  fit_mode: cover\n' +
+      'compositing:\n  blend_space: linear_srgb\n' +
+      '  color_correction:\n    mode: auto\n',
+  );
+  writeManifest(automatic);
+  validatedCommits.length = 0;
+  assert.doesNotThrow(() => release.verifyVisualPolicyRollout(
+    fixture,
+    { qualificationValidator: historicalValidator },
+  ));
+  assert.deepEqual(
+    validatedCommits,
+    [commit, linearCommit, automaticCommit],
+  );
+
+  fs.writeFileSync(
+    configPath,
+    'schema_version: 2\ncamera:\n  fit_mode: stretch\n' +
+      'compositing:\n  blend_space: srgb_legacy\n' +
+      '  color_correction:\n    mode: "off"\n',
+  );
+  writeManifest(unapproved);
+  assert.throws(
+    () => release.verifyVisualPolicyRollout(fixture, { qualificationValidator }),
+    /does not match the active rollout stage/,
+  );
+});
+
+test('staged prepack binds approval files to a clean trusted Git source', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-rollout-bridge-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const trusted = path.join(fixture, 'trusted');
+  const staged = path.join(fixture, 'staged');
+  fs.mkdirSync(trusted);
+  fs.mkdirSync(staged);
+
+  const git = (args) => {
+    const result = spawnSync('git', ['-C', trusted, ...args], {
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git(['init', '--quiet']);
+  git(['config', 'user.name', 'Custback Release Test']);
+  git(['config', 'user.email', 'release-test@invalid.example']);
+
+  const write = (relative, contents) => {
+    const target = path.join(trusted, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, contents);
+  };
+  const compatibilityConfig =
+    'schema_version: 1\ncamera:\n  fit_mode: stretch\n' +
+    'compositing:\n  blend_space: srgb_legacy\n' +
+    '  color_correction:\n    mode: "off"\n';
+  const coverConfig =
+    'schema_version: 2\ncamera:\n  fit_mode: cover\n' +
+    'compositing:\n  blend_space: srgb_legacy\n' +
+    '  color_correction:\n    mode: "off"\n';
+  const rollout = JSON.parse(fs.readFileSync(
+    path.join(root, 'scripts', 'release', 'visual-policy-rollout.json'),
+    'utf8',
+  ));
+  write('config/default.yaml', compatibilityConfig);
+  write('src/custback/default.yaml', compatibilityConfig);
+  write(
+    'scripts/release/visual-policy-rollout.json',
+    `${JSON.stringify(rollout, null, 2)}\n`,
+  );
+  write('scripts/release/visual-qualification-manifest.json', '{}\n');
+  write('scripts/release/visual_consistency_qualification.py', '# test fixture\n');
+  git(['add', '.']);
+  git(['commit', '--quiet', '-m', 'compatibility policy']);
+
+  // The isolated visual-default commit exists before its evidence, avoiding a
+  // self-referential commit hash in the report or ledger.
+  write('config/default.yaml', coverConfig);
+  write('src/custback/default.yaml', coverConfig);
+  git(['add', 'config/default.yaml', 'src/custback/default.yaml']);
+  git(['commit', '--quiet', '-m', 'enable camera cover default']);
+  const changeCommit = git(['rev-parse', '--verify', 'HEAD']);
+
+  const evidence = 'docs/camera-cover-approval.json';
+  const approved = structuredClone(rollout);
+  approved.active_stage = 'camera-cover';
+  approved.stages[0].status = 'complete';
+  approved.stages[1].status = 'active';
+  approved.stages[1].change_commit = changeCommit;
+  approved.stages[1].evidence = [evidence];
+  write(
+    'scripts/release/visual-policy-rollout.json',
+    `${JSON.stringify(approved, null, 2)}\n`,
+  );
+  write(
+    evidence,
+    `${JSON.stringify({
+      release_qualified: true,
+      source: { commit: changeCommit, clean: true },
+    })}\n`,
+  );
+  git(['add', 'scripts/release/visual-policy-rollout.json', evidence]);
+  git(['commit', '--quiet', '-m', 'attach camera cover approval']);
+  const approvalCommit = git(['rev-parse', '--verify', 'HEAD']);
+  const approvalTree = git(['rev-parse', '--verify', 'HEAD^{tree}']);
+  assert.notEqual(approvalCommit, changeCommit);
+
+  const stagedPaths = [
+    'config/default.yaml',
+    evidence,
+    'scripts/release/visual-policy-rollout.json',
+    'scripts/release/visual-qualification-manifest.json',
+    'scripts/release/visual_consistency_qualification.py',
+    'src/custback/default.yaml',
+  ];
+  const syncStage = () => {
+    for (const relative of stagedPaths) {
+      const target = path.join(staged, relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(path.join(trusted, relative), target);
+    }
+  };
+  syncStage();
+  const bridgeEnv = {
+    CUSTBACK_RELEASE_GIT_ROOT: fs.realpathSync(trusted),
+    CUSTBACK_RELEASE_SOURCE_COMMIT: approvalCommit,
+    CUSTBACK_RELEASE_SOURCE_TREE: approvalTree,
+  };
+  const committedFiles = Object.fromEntries(
+    stagedPaths.map((relative) => [
+      relative,
+      fs.readFileSync(path.join(trusted, relative)),
+    ]),
+  );
+  const gitRunner = (_command, args, options) => {
+    const commandArgs = args.slice(2);
+    let stdout;
+    if (commandArgs[0] === 'rev-parse' &&
+        commandArgs[1] === '--show-toplevel') {
+      stdout = `${fs.realpathSync(trusted)}\n`;
+    } else if (commandArgs.join(' ') === 'rev-parse --verify HEAD') {
+      stdout = `${approvalCommit}\n`;
+    } else if (commandArgs.join(' ') === 'rev-parse --verify HEAD^{tree}') {
+      stdout = `${approvalTree}\n`;
+    } else if (commandArgs[0] === 'status') {
+      stdout = fs.existsSync(path.join(trusted, 'untracked'))
+        ? '?? untracked\n'
+        : '';
+    } else if (commandArgs[0] === 'show') {
+      const separator = commandArgs[1].indexOf(':');
+      const commit = commandArgs[1].slice(0, separator);
+      const relative = commandArgs[1].slice(separator + 1);
+      if (commit !== approvalCommit || !committedFiles[relative]) {
+        return { status: 1, stdout: '', stderr: 'unknown object' };
+      }
+      stdout = Buffer.from(committedFiles[relative]);
+    } else {
+      return { status: 1, stdout: '', stderr: 'unexpected git command' };
+    }
+    if (options.encoding === null) {
+      stdout = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+    }
+    return { status: 0, stdout, stderr: options.encoding === null ? Buffer.alloc(0) : '' };
+  };
+  let validationCalls = 0;
+  const qualificationValidator = (reportPath, validation) => {
+    validationCalls += 1;
+    assert.equal(validation.expectedCommit, changeCommit);
+    return JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  };
+  assert.doesNotThrow(() => release.verifyVisualPolicyRollout(staged, {
+    env: bridgeEnv,
+    gitRunner,
+    qualificationValidator,
+  }));
+  assert.equal(validationCalls, 1);
+
+  fs.appendFileSync(path.join(staged, evidence), ' \n');
+  assert.throws(
+    () => release.verifyVisualPolicyRollout(staged, {
+      env: bridgeEnv,
+      gitRunner,
+      qualificationValidator,
+    }),
+    /differs from trusted commit/,
+  );
+  syncStage();
+
+  fs.writeFileSync(path.join(trusted, 'untracked'), 'dirty');
+  assert.throws(
+    () => release.verifyVisualPolicyRollout(staged, {
+      env: bridgeEnv,
+      gitRunner,
+      qualificationValidator,
+    }),
+    /not the exact clean source commit/,
+  );
+  fs.rmSync(path.join(trusted, 'untracked'));
+  assert.throws(
+    () => release.verifyVisualPolicyRollout(staged, {
+      env: {
+        ...bridgeEnv,
+        CUSTBACK_RELEASE_SOURCE_TREE: 'f'.repeat(40),
+      },
+      gitRunner,
+      qualificationValidator,
+    }),
+    /not the exact clean source commit/,
+  );
 });
 
 test('prepack verifies the non-recursive packlist and reserves artifact installs', () => {

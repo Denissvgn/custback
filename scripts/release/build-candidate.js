@@ -15,6 +15,11 @@ const cleanTree = require('./verify-clean-tree');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
+const RELEASE_SOURCE_BRIDGE_ENV = Object.freeze([
+  'CUSTBACK_RELEASE_GIT_ROOT',
+  'CUSTBACK_RELEASE_SOURCE_COMMIT',
+  'CUSTBACK_RELEASE_SOURCE_TREE',
+]);
 
 function fail(message) {
   throw new Error(message);
@@ -41,6 +46,28 @@ function run(command, args, options = {}) {
 
 function gitOutput(root, args) {
   return run('git', ['-C', root, ...args]).stdout.trim();
+}
+
+function withoutReleaseSourceBridge(env = process.env) {
+  const sanitized = { ...env };
+  for (const name of RELEASE_SOURCE_BRIDGE_ENV) delete sanitized[name];
+  return sanitized;
+}
+
+function trustedPrepackEnvironment(root, source, env = process.env) {
+  if (!source ||
+      !/^[0-9a-f]{40}$/.test(source.commit) ||
+      !/^[0-9a-f]{40}$/.test(source.tree)) {
+    fail('trusted prepack environment requires exact source commit metadata');
+  }
+  const sourceRoot = fs.realpathSync(root);
+  return {
+    ...withoutReleaseSourceBridge(env),
+    CUSTBACK_SKIP_INSTALL: '1',
+    CUSTBACK_RELEASE_GIT_ROOT: sourceRoot,
+    CUSTBACK_RELEASE_SOURCE_COMMIT: source.commit,
+    CUSTBACK_RELEASE_SOURCE_TREE: source.tree,
+  };
 }
 
 function cleanCommit(root = ROOT) {
@@ -192,12 +219,16 @@ function buildCandidate(options = {}) {
   const root = path.resolve(options.root || ROOT);
   const output = prepareOutput(options.output);
   const diagnostic = options.diagnostic === true;
+  const buildEnv = options.env || process.env;
   const source = cleanCommit(root);
   cleanTree.verifyCleanTree(root);
   if (!diagnostic) release.verifyNoReleaseBlockers(root);
   const version = release.verifyVersions(root);
   release.verifyNpmMetadata(root);
   release.verifyDependencies(root);
+  release.verifyVisualPolicyRollout(root, {
+    env: withoutReleaseSourceBridge(buildEnv),
+  });
   const manifest = evidence.loadManifest(options.manifest);
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-candidate-'));
   try {
@@ -209,7 +240,7 @@ function buildCandidate(options = {}) {
     if (diagnostic) npmArguments.push('--ignore-scripts');
     run('npm', npmArguments, {
       cwd: staged,
-      env: { ...process.env, CUSTBACK_SKIP_INSTALL: '1' },
+      env: trustedPrepackEnvironment(root, source, buildEnv),
     });
     const artifacts = artifactRecords(output, manifest);
     const candidate = {
@@ -219,7 +250,7 @@ function buildCandidate(options = {}) {
       manifest_sha256: evidence.manifestDigest(manifest),
       generated_at: new Date().toISOString(),
       source: { commit: source.commit, tree: source.tree, version },
-      provenance: githubProvenance(source.commit, options.env || process.env),
+      provenance: githubProvenance(source.commit, buildEnv),
       artifacts,
     };
     const candidatePath = path.join(output, 'candidate-manifest.json');
@@ -262,6 +293,8 @@ module.exports = {
   main,
   prepareOutput,
   sha256File,
+  trustedPrepackEnvironment,
+  withoutReleaseSourceBridge,
 };
 
 if (require.main === module) process.exit(main());

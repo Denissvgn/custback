@@ -10,12 +10,12 @@ installer (`../installer/`, WIN-5.6) wraps the whole `dist/custback/` tree.
 
 | File | Purpose |
 | --- | --- |
-| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects OpenCV/ONNX Runtime/MediaPipe natives plus pyvirtualcam where supported, `custback` package data (`avatar.yaml`), and pywin32; excludes model weights and GUI toolkits. Windows ARM64 omits pyvirtualcam collection/hidden import to match its PEP 508 dependency marker. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face swaps stacks — protobuf conflict makes them one-per-payload). |
+| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects PyAV and its sibling `av.libs` FFmpeg bundle, OpenCV/ONNX Runtime/MediaPipe natives plus pyvirtualcam where supported, `custback` package data (`default.yaml` and `avatar.yaml`), and pywin32; excludes model weights and GUI toolkits. Windows ARM64 omits pyvirtualcam collection/hidden import to match its PEP 508 dependency marker. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face swaps stacks — protobuf conflict makes them one-per-payload). |
 | `entry_custback.py` | Frozen entry script → `custback.__main__:main` with `multiprocessing.freeze_support()`. |
 | `entry_custback_avatar.py` | Frozen entry script → `custback.avatar.__main__:main` (WIN-6.4). |
 | `hooks/hook-custback.py` | Analysis hook: hidden imports for `custback._platform.*` and segmentation delegates; packaged YAML data. |
 | `rthooks/pyi_rth_custback.py` | Runtime hook: makes bundled native DLLs discoverable and sets `CUSTBACK_FROZEN=1`. |
-| `build.ps1` | Build + clean-environment smoke driver for `windows-latest` (engine synthetic run + avatar `--smoke`). |
+| `build.ps1` | Build + clean-environment smoke driver used by the `windows-2022` CI job (offline in-memory tagged PyAV normalization + engine synthetic run + avatar `--smoke`). |
 
 ## Build
 
@@ -49,6 +49,10 @@ plus their shared onedir payload.
   installer (WIN-5.6) places the exact pinned components; at runtime
   `custback.acceleration.preload_acceleration_dlls` adds them to the DLL search
   path (non-fatal — a clean CPU-only VM still runs and reports CPU).
+* **System FFmpeg.** PyAV's wheel-private FFmpeg DLLs are preserved under
+  `av.libs` in the onedir payload and are exercised by the scrubbed-environment
+  in-memory color-normalization smoke; no `ffmpeg.exe`, file, or network source
+  is used by that probe.
 * **pyvirtualcam on Windows ARM64.** PyPI publishes no compatible wheel, so the
   core dependency marker excludes it and the spec omits its collection, hidden
   import, and static analysis. `WINDOWS_ARM64.md` records the current
@@ -70,7 +74,9 @@ plus their shared onedir payload.
 
 ## Status
 
-`IMPL*` — spec and hooks are complete and reviewable; the freeze itself and the
-clean-VM artifact smoke run on the `windows-latest` CI job (WIN-1.8 / WIN-5.8),
-which is where WIN-5.1 flips to `DONE`. The spec/hooks are byte-static Python
-and are syntax-checked in the Linux suite (`tests/test_windows_packaging.py`).
+`IMPL*` — spec and hooks are complete and reviewable. The bounded
+`windows-frozen-engine` job freezes the payload and runs its tagged-video,
+synthetic-engine, and avatar smokes in a scrubbed environment on
+`windows-2022` (WIN-1.8 / WIN-5.8); this is a CI coverage commitment until
+that external job reports green. The spec/hooks are byte-static Python and
+are syntax-checked in the Linux suite (`tests/test_windows_packaging.py`).

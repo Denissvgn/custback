@@ -1,1 +1,9 @@
+include config/default.yaml
+include docs/visual-consistency-phase4-qualification-runbook.md
+include docs/visual-consistency-phase4-qualification-template.json
+include docs/visual-consistency-rollout.md
+include scripts/release/visual-qualification-manifest.json
+include scripts/release/visual-policy-rollout.json
+include scripts/release/visual_consistency_qualification.py
+include tests/visual_consistency_evidence.py
 recursive-include tests/fixtures/migration *.json *.yaml

@@ -275,10 +275,19 @@ void FillPlaceholder(std::vector<uint8_t>& out, uint32_t width,
 void MediaStream::ComposeFrame(std::vector<uint8_t>& out) {
     uint32_t ringWidth = 0;
     uint32_t ringHeight = 0;
-    const bool haveFrame =
-        (m_ring.IsOpen() || m_ring.Open()) &&
-        m_ring.CopyLatest(m_ringFrame, ringWidth, ringHeight);
-    if (!haveFrame) {
+    FrameReadStatus readStatus = FrameReadStatus::Unavailable;
+    if (m_ring.IsOpen() || m_ring.Open()) {
+        readStatus = m_ring.CopyLatest(m_ringFrame, ringWidth, ringHeight);
+    }
+    if (readStatus != FrameReadStatus::Complete) {
+        const size_t expected =
+            size_t{m_width} * m_height * kBytesPerPixel;
+        if (readStatus == FrameReadStatus::Transient &&
+            m_ringFrame.size() == expected) {
+            out = m_ringFrame;
+            return;
+        }
+        m_ringFrame.clear();
         FillPlaceholder(out, m_width, m_height);
         return;
     }
@@ -286,23 +295,13 @@ void MediaStream::ComposeFrame(std::vector<uint8_t>& out) {
         out = m_ringFrame;
         return;
     }
-    // Geometry mismatch (the engine reconfigured mid-session): center the
-    // overlapping region rather than stretch; the border stays black until the
-    // consumer renegotiates or the engine matches the negotiated size.
-    out.assign(size_t{m_width} * m_height * kBytesPerPixel, 0);
-    const uint32_t copyWidth = std::min(ringWidth, m_width);
-    const uint32_t copyHeight = std::min(ringHeight, m_height);
-    const uint32_t srcLeft = (ringWidth - copyWidth) / 2;
-    const uint32_t srcTop = (ringHeight - copyHeight) / 2;
-    const uint32_t dstLeft = (m_width - copyWidth) / 2;
-    const uint32_t dstTop = (m_height - copyHeight) / 2;
-    for (uint32_t y = 0; y < copyHeight; ++y) {
-        const uint8_t* src = m_ringFrame.data() +
-            (size_t{srcTop + y} * ringWidth + srcLeft) * kBytesPerPixel;
-        uint8_t* dst = out.data() +
-            (size_t{dstTop + y} * m_width + dstLeft) * kBytesPerPixel;
-        std::memcpy(dst, src, size_t{copyWidth} * kBytesPerPixel);
-    }
+    // The Python writer and consumer selected different advertised exact
+    // modes.  Overlap-copying would silently crop or letterbox the scene, and
+    // this constrained Phase-1 path deliberately implements no native scaler.
+    // Publish only the input-independent placeholder until the consumer
+    // negotiates the active ring geometry.
+    m_ringFrame.clear();
+    FillPlaceholder(out, m_width, m_height);
 }
 
 }  // namespace custback::vcam

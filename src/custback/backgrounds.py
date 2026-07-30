@@ -11,15 +11,36 @@ import contextlib
 import logging
 import math
 import time
-import warnings
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TypeGuard
+from typing import Any, Callable, TypeGuard, cast
 
 import numpy as np
 
+from .color import ColorError, decode_image_to_srgb_bgr
 from .config import BackgroundConfig, ResolvedBackdropTarget
-from .diagnostics import sanitized_source
+from .geometry import (
+    FitMode,
+    FrameValidationError,
+    Rect,
+    RightAngleRotation,
+    TransformPlan,
+    apply_transform,
+    orient_frame,
+    plan_transform,
+    validate_bgr_frame,
+)
+from .video_decoder import (
+    ResolvedVideoColor,
+    VideoColorMatrix,
+    VideoColorOverrides,
+    VideoColorPrimaries,
+    VideoColorRange,
+    VideoColorTransfer,
+    VideoDecoderError,
+    open_metadata_video,
+)
 
 try:
     import cv2 as _cv2
@@ -29,12 +50,9 @@ except ImportError:  # pragma: no cover
 # OpenCV is a compiled optional boundary. Keep its runtime ``None`` fallback
 # while treating the dynamically exposed API as opaque to static analysis.
 cv2: Any = _cv2
-
-try:
-    from PIL import Image, UnidentifiedImageError
-except ImportError:  # pragma: no cover - Pillow is a required dependency
-    Image = None
-    UnidentifiedImageError = OSError
+_ORIGINAL_OPENCV_VIDEO_CAPTURE = (
+    getattr(_cv2, "VideoCapture", None) if _cv2 is not None else None
+)
 
 log = logging.getLogger(__name__)
 
@@ -63,28 +81,258 @@ def list_background_files(directory: Path) -> list[Path]:
     )
 
 
-def _fit(frame: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Resize with aspect-fill (center crop) to exactly width x height."""
-    h, w = frame.shape[:2]
-    if (w, h) == (width, height):
-        return frame
-    scale = max(width / w, height / h)
-    nw, nh = int(round(w * scale)), int(round(h * scale))
-    if cv2 is not None:
-        frame = cv2.resize(frame, (nw, nh))
-    else:  # nearest-neighbour fallback
-        ys = (np.arange(nh) * h / nh).astype(int)
-        xs = (np.arange(nw) * w / nw).astype(int)
-        frame = frame[ys][:, xs]
-    x0 = (frame.shape[1] - width) // 2
-    y0 = (frame.shape[0] - height) // 2
-    return frame[y0 : y0 + height, x0 : x0 + width]
+@dataclass(frozen=True)
+class BackdropGeometry:
+    """Hot-swappable backdrop presentation policy."""
+
+    fit_mode: FitMode = "cover"
+    anchor_x: float = 0.5
+    anchor_y: float = 0.5
+
+    def __post_init__(self) -> None:
+        # Reuse the canonical planner's deterministic validation.
+        plan_transform(
+            (1, 1),
+            (1, 1),
+            fit=self.fit_mode,
+            anchors=(self.anchor_x, self.anchor_y),
+        )
+
+
+@dataclass(frozen=True)
+class VideoOrientationPolicy:
+    """Observable result of OpenCV container-orientation negotiation."""
+
+    rotation: RightAngleRotation
+    metadata_rotation: int | None
+    auto_rotation_disabled: bool
+    status: str
+    ambiguous: bool
+
+
+_QUALIFIED_VIDEO_ORIENTATION_BACKENDS = frozenset(
+    {"FFMPEG", "AVFOUNDATION", "PYAV_FFMPEG"}
+)
+
+
+def _open_video_capture(
+    path: str,
+    *,
+    overrides: VideoColorOverrides,
+    max_width: int,
+    max_height: int,
+) -> Any:
+    """Open the production metadata-aware decoder.
+
+    A replaced OpenCV constructor remains an intentional dependency-injection
+    seam for deterministic scheduler/backend tests.  The unmodified runtime
+    always uses PyAV and never asks OpenCV to infer video color.
+    """
+
+    current = getattr(cv2, "VideoCapture", None)
+    if current is not None and current is not _ORIGINAL_OPENCV_VIDEO_CAPTURE:
+        return current(path)
+    return open_metadata_video(
+        path,
+        overrides=overrides,
+        max_width=max_width,
+        max_height=max_height,
+    )
+
+
+def _capture_property(cap: Any, prop: int | None) -> float | None:
+    if prop is None:
+        return None
+    try:
+        value = float(cap.get(prop))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _capture_backend_name(cap: Any) -> str | None:
+    getter = getattr(cap, "getBackendName", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except Exception:
+        return None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    return normalized or None
+
+
+def _configure_video_orientation(
+    cap: Any,
+) -> VideoOrientationPolicy:
+    """Disable OpenCV auto-rotation and select only provable metadata rotation."""
+
+    backend_name = _capture_backend_name(cap)
+    if backend_name not in _QUALIFIED_VIDEO_ORIENTATION_BACKENDS:
+        policy = VideoOrientationPolicy(
+            rotation=0,
+            metadata_rotation=None,
+            auto_rotation_disabled=False,
+            status="manual-only-unsupported-backend",
+            ambiguous=True,
+        )
+        log.warning(
+            "video orientation is ambiguous; backend %s has no "
+            "qualified OpenCV orientation contract, using manual-only policy",
+            backend_name or "unknown",
+        )
+        return policy
+
+    metadata_prop = getattr(cv2, "CAP_PROP_ORIENTATION_META", None)
+    auto_prop = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+    if metadata_prop is None or auto_prop is None:
+        policy = VideoOrientationPolicy(
+            rotation=0,
+            metadata_rotation=None,
+            auto_rotation_disabled=False,
+            status="manual-only-unsupported",
+            ambiguous=True,
+        )
+        log.warning(
+            "video orientation is ambiguous; backend exposes no "
+            "controllable orientation metadata, using manual-only policy",
+        )
+        return policy
+
+    raw_metadata = _capture_property(cap, metadata_prop)
+    metadata_rotation: int | None = None
+    if raw_metadata is not None:
+        rounded = int(round(raw_metadata))
+        if abs(raw_metadata - rounded) <= 1e-6 and rounded in (0, 90, 180, 270):
+            metadata_rotation = rounded
+
+    try:
+        control_accepted = bool(cap.set(auto_prop, 0.0))
+    except Exception:
+        control_accepted = False
+    auto_readback = _capture_property(cap, auto_prop)
+    auto_disabled = bool(
+        control_accepted and auto_readback is not None and abs(auto_readback) <= 1e-6
+    )
+    if metadata_rotation is not None and auto_disabled:
+        policy = VideoOrientationPolicy(
+            rotation=cast(RightAngleRotation, metadata_rotation),
+            metadata_rotation=metadata_rotation,
+            auto_rotation_disabled=True,
+            status="qualified-manual-metadata",
+            ambiguous=False,
+        )
+        log.info(
+            "video orientation qualified: metadata=%d auto-rotation=disabled",
+            metadata_rotation,
+        )
+        return policy
+
+    status = (
+        "manual-only-invalid-metadata"
+        if raw_metadata is not None and metadata_rotation is None
+        else "manual-only-ambiguous-auto"
+    )
+    policy = VideoOrientationPolicy(
+        rotation=0,
+        metadata_rotation=metadata_rotation,
+        auto_rotation_disabled=auto_disabled,
+        status=status,
+        ambiguous=True,
+    )
+    log.warning(
+        "video orientation is ambiguous "
+        "(metadata=%s auto-rotation-disabled=%s); using manual-only policy",
+        "unknown" if metadata_rotation is None else metadata_rotation,
+        auto_disabled,
+    )
+    return policy
 
 
 class BackdropProvider(ABC):
+    def __init__(
+        self,
+        *,
+        fit_mode: FitMode = "cover",
+        anchor_x: float = 0.5,
+        anchor_y: float = 0.5,
+    ) -> None:
+        self._geometry = BackdropGeometry(fit_mode, anchor_x, anchor_y)
+        # Scalar-only record of the pixels returned most recently.  The color
+        # estimator uses this rectangle to exclude synthetic contain padding;
+        # providers never retain an additional frame for that purpose.
+        self._last_transform_plan: TransformPlan | None = None
+
     @abstractmethod
     def frame(self, width: int, height: int) -> np.ndarray:
         """Return the current backdrop as a BGR frame of the given size."""
+
+    @property
+    def geometry(self) -> BackdropGeometry:
+        return self._geometry
+
+    def set_geometry(
+        self,
+        fit_mode: FitMode,
+        anchor_x: float,
+        anchor_y: float,
+    ) -> None:
+        """Install validated policy and invalidate fitted pixels, not source state."""
+
+        candidate = BackdropGeometry(fit_mode, anchor_x, anchor_y)
+        if candidate != self._geometry:
+            self._geometry = candidate
+            self._last_transform_plan = None
+            self._invalidate_geometry_cache()
+
+    def _invalidate_geometry_cache(self) -> None:
+        pass
+
+    def _plan(self, frame: np.ndarray, width: int, height: int) -> TransformPlan:
+        source = validate_bgr_frame(frame, name="backdrop frame")
+        return plan_transform(
+            (source.shape[1], source.shape[0]),
+            (width, height),
+            fit=self._geometry.fit_mode,
+            anchors=(self._geometry.anchor_x, self._geometry.anchor_y),
+        )
+
+    def _fit_frame(self, frame: np.ndarray, width: int, height: int) -> np.ndarray:
+        plan = self._plan(frame, width, height)
+        fitted = apply_transform(frame, plan)
+        self._last_transform_plan = plan
+        return fitted
+
+    @staticmethod
+    def _full_content_rect(width: int, height: int) -> Rect:
+        # Reuse the canonical size validator instead of maintaining a weaker
+        # private interpretation of canvas dimensions.
+        return plan_transform((1, 1), (width, height), fit="stretch").content_rect
+
+    def transform_plan(self, width: int, height: int) -> TransformPlan:
+        """Return the immutable plan for the most recently rendered canvas.
+
+        Fitted providers must render the requested dimensions first.  Returning
+        guessed geometry could let contain-mode padding influence illumination
+        estimates or let correction survive a live source-size change, so a
+        stale or missing plan fails deterministically.
+        """
+
+        self._full_content_rect(width, height)
+        plan = self._last_transform_plan
+        if plan is None or plan.target_size != (width, height):
+            raise RuntimeError(
+                "backdrop content rectangle is unavailable; transform plan "
+                "does not match the requested canvas"
+            )
+        return plan
+
+    def content_rect(self, width: int, height: int) -> Rect:
+        """Return valid source content in the most recently rendered canvas."""
+
+        return self.transform_plan(width, height).content_rect
 
     def close(self) -> None:
         pass
@@ -109,11 +357,32 @@ class BackdropProvider(ABC):
             "background_video_skip_ratio": 0.0,
             "background_video_seek_count": 0,
             "background_video_decode_failures": 0,
+            "background_video_orientation_status": None,
+            "background_video_metadata_rotation": None,
+            "background_video_auto_rotation_disabled": None,
+            "background_video_decoder_backend": None,
+            "background_video_color_status": None,
+            "background_video_input_color": None,
+            "background_video_output_color": None,
+            "background_video_color_assumed_fields": [],
+            "background_video_color_overridden_fields": [],
         }
 
 
 class ColorBackdrop(BackdropProvider):
-    def __init__(self, color_bgr: tuple[int, int, int]):
+    def __init__(
+        self,
+        color_bgr: tuple[int, int, int],
+        *,
+        fit_mode: FitMode = "cover",
+        anchor_x: float = 0.5,
+        anchor_y: float = 0.5,
+    ):
+        super().__init__(
+            fit_mode=fit_mode,
+            anchor_x=anchor_x,
+            anchor_y=anchor_y,
+        )
         self.color = tuple(int(c) for c in color_bgr)
         self._cache: np.ndarray | None = None
 
@@ -121,6 +390,9 @@ class ColorBackdrop(BackdropProvider):
         if self._cache is None or self._cache.shape[:2] != (height, width):
             self._cache = np.full((height, width, 3), self.color, dtype=np.uint8)
         return self._cache
+
+    def content_rect(self, width: int, height: int) -> Rect:
+        return self._full_content_rect(width, height)
 
 
 class ImageBackdrop(BackdropProvider):
@@ -131,81 +403,69 @@ class ImageBackdrop(BackdropProvider):
         path: str,
         *,
         max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS,
+        fit_mode: FitMode = "cover",
+        anchor_x: float = 0.5,
+        anchor_y: float = 0.5,
     ):
+        super().__init__(
+            fit_mode=fit_mode,
+            anchor_x=anchor_x,
+            anchor_y=anchor_y,
+        )
         if cv2 is None:
             raise RuntimeError("opencv-python is required for image backdrops")
-        if Image is None:
-            raise RuntimeError("Pillow is required for image backdrops")
         if max_pixels <= 0:
             raise ValueError("image backdrop pixel limit must be positive")
 
         expected_format = _IMAGE_FORMATS.get(Path(path).suffix.lower())
         if expected_format is None:
-            raise ValueError(
-                f"unsupported background image format: {sanitized_source(path)}"
-            )
+            raise ValueError("unsupported background image format")
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")
-                with Image.open(path) as candidate:
-                    if candidate.format != expected_format:
-                        raise ValueError(
-                            "background image header does not match its filename"
-                        )
-                    width, height = candidate.size
-                    if width <= 0 or height <= 0:
-                        raise ValueError("invalid background image dimensions")
-                    if width * height > max_pixels:
-                        raise ValueError(
-                            f"background image exceeds {max_pixels} pixels"
-                        )
-                    candidate.verify()
+            self._image = decode_image_to_srgb_bgr(
+                path,
+                expected_format,
+                max_pixels,
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError("cannot read background image") from None
+        except ColorError as exc:
+            if str(exc) == f"image exceeds {max_pixels} pixels":
+                raise ValueError(
+                    f"background image exceeds {max_pixels} pixels"
+                ) from None
+            raise ValueError("invalid background image") from None
+        except (OSError, ValueError):
+            raise ValueError("invalid background image") from None
 
-                # verify() validates the container without decoding pixels.
-                # Reopen and force decompression before OpenCV sees the path.
-                with Image.open(path) as decoded:
-                    if decoded.format != expected_format or decoded.size != (
-                        width,
-                        height,
-                    ):
-                        raise ValueError("background image changed during validation")
-                    decoded.load()
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                f"cannot read background image: {sanitized_source(path)}"
-            ) from exc
-        except (
-            Image.DecompressionBombError,
-            Image.DecompressionBombWarning,
-            UnidentifiedImageError,
-            OSError,
-            ValueError,
-            Warning,
-        ) as exc:
-            if isinstance(exc, ValueError) and str(exc).startswith(
-                "background image exceeds "
-            ):
-                raise
-            raise ValueError(
-                f"invalid background image: {sanitized_source(path)}"
-            ) from exc
-
-        image = cv2.imread(path, cv2.IMREAD_COLOR)
-        if (
-            image is None
-            or image.dtype != np.uint8
-            or image.ndim != 3
-            or image.shape[2] != 3
-            or image.shape[:2] != (height, width)
-        ):
-            raise ValueError(f"invalid background image: {sanitized_source(path)}")
-        self._image = image
+        self._image = validate_bgr_frame(
+            self._image,
+            name="background image",
+            require_contiguous=True,
+        )
+        oriented_height, oriented_width = self._image.shape[:2]
+        if oriented_width <= 0 or oriented_height <= 0:
+            raise ValueError("invalid background image dimensions")
+        if oriented_width * oriented_height > max_pixels:
+            raise ValueError(f"background image exceeds {max_pixels} pixels")
         self._cache: np.ndarray | None = None
+        self._cache_key: tuple[object, ...] | None = None
 
     def frame(self, width: int, height: int) -> np.ndarray:
-        if self._cache is None or self._cache.shape[:2] != (height, width):
-            self._cache = _fit(self._image, width, height)
+        key = (
+            id(self._image),
+            (self._image.shape[1], self._image.shape[0]),
+            (width, height),
+            self._geometry,
+            (0, 0, 0),
+        )
+        if self._cache is None or self._cache_key != key:
+            self._cache = self._fit_frame(self._image, width, height)
+            self._cache_key = key
         return self._cache
+
+    def _invalidate_geometry_cache(self) -> None:
+        self._cache = None
+        self._cache_key = None
 
 
 class VideoBackdrop(BackdropProvider):
@@ -229,18 +489,47 @@ class VideoBackdrop(BackdropProvider):
         clock: Callable[[], float] | None = None,
         max_width: int = 3840,
         max_height: int = 2160,
+        fit_mode: FitMode = "cover",
+        anchor_x: float = 0.5,
+        anchor_y: float = 0.5,
+        color_matrix: VideoColorMatrix = "auto",
+        color_range: VideoColorRange = "auto",
+        color_primaries: VideoColorPrimaries = "auto",
+        color_transfer: VideoColorTransfer = "auto",
     ):
+        super().__init__(
+            fit_mode=fit_mode,
+            anchor_x=anchor_x,
+            anchor_y=anchor_y,
+        )
         if cv2 is None:
             raise RuntimeError("opencv-python is required for video backdrops")
         self.path = path
         self._max_width = max_width
         self._max_height = max_height
-        self.cap = cv2.VideoCapture(path)
+        self._color_overrides = VideoColorOverrides(
+            matrix=color_matrix,
+            range=color_range,
+            primaries=color_primaries,
+            transfer=color_transfer,
+        )
+        try:
+            self.cap = _open_video_capture(
+                path,
+                overrides=self._color_overrides,
+                max_width=max_width,
+                max_height=max_height,
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError("cannot open background video") from None
+        except VideoDecoderError as exc:
+            raise VideoDecoderError(str(exc)) from None
+        except RuntimeError:
+            raise RuntimeError("cannot open background video") from None
         if not self.cap.isOpened():
             self.cap.release()
-            raise FileNotFoundError(
-                f"cannot open background video: {sanitized_source(path)}"
-            )
+            raise FileNotFoundError("cannot open background video")
+        self._orientation = _configure_video_orientation(self.cap)
         try:
             metadata_width = float(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             metadata_height = float(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -261,8 +550,7 @@ class VideoBackdrop(BackdropProvider):
             or source_fps > self._MAX_FPS
         ):
             log.warning(
-                "video %s has implausible FPS metadata (%r); assuming 30 FPS",
-                sanitized_source(path),
+                "background video has implausible FPS metadata (%r); assuming 30 FPS",
                 source_fps,
             )
             source_fps = self._DEFAULT_FPS
@@ -289,11 +577,20 @@ class VideoBackdrop(BackdropProvider):
         self._container_timing = False
         self._last_pts_step_s = 1.0 / self._fps
         self._duration_s = self._frame_count / self._fps if self._frame_count else 0.0
-        self._pending: tuple[np.ndarray, int, int, float | None] | None = None
+        self._pending: (
+            tuple[
+                np.ndarray,
+                int,
+                int,
+                float | None,
+                ResolvedVideoColor | None,
+            ]
+            | None
+        ) = None
         self._retry_not_before_s = 0.0
         self._last_raw: np.ndarray | None = None
         self._last_fit: np.ndarray | None = None
-        self._last_size: tuple[int, int] | None = None
+        self._last_fit_key: tuple[object, ...] | None = None
         self._fatal_decode_error = False
         self._frames_displayed = 0
         self._frames_skipped = 0
@@ -302,16 +599,18 @@ class VideoBackdrop(BackdropProvider):
         self._decode_failures = 0
         self._last_returned_logical_index: int | None = None
         self._skip_warning_emitted = False
+        self._displayed_color_contract: ResolvedVideoColor | None = None
 
     def _valid_decoded_frame(self, frame: object) -> TypeGuard[np.ndarray]:
-        valid = bool(
-            isinstance(frame, np.ndarray)
-            and frame.dtype == np.uint8
-            and frame.ndim == 3
-            and frame.shape[2] == 3
-            and 0 < frame.shape[1] <= self._max_width
-            and 0 < frame.shape[0] <= self._max_height
-        )
+        try:
+            decoded = validate_bgr_frame(frame, name="background video frame")
+        except FrameValidationError:
+            valid = False
+        else:
+            valid = bool(
+                decoded.shape[1] <= self._max_width
+                and decoded.shape[0] <= self._max_height
+            )
         if not valid and frame is not None:
             if (
                 isinstance(frame, np.ndarray)
@@ -325,8 +624,7 @@ class VideoBackdrop(BackdropProvider):
                 # retain the last good frame and quarantine further reads.
                 self._fatal_decode_error = True
             log.warning(
-                "ignoring invalid or oversized frame from background video %s",
-                sanitized_source(self.path),
+                "ignoring invalid or oversized background video frame",
             )
         return valid
 
@@ -355,14 +653,16 @@ class VideoBackdrop(BackdropProvider):
         logical_index: int,
         pts_s: float | None,
         deadline_s: float,
+        color_contract: ResolvedVideoColor | None,
     ) -> None:
-        self._last_raw = frame
+        self._last_raw = orient_frame(frame, self._orientation.rotation, False)
         self._source_index = source_index
         self._logical_index = logical_index
         self._current_pts_s = pts_s
         self._current_deadline_s = deadline_s
+        self._displayed_color_contract = color_contract
         self._last_fit = None
-        self._last_size = None
+        self._last_fit_key = None
 
     def _store_pending(
         self,
@@ -453,7 +753,14 @@ class VideoBackdrop(BackdropProvider):
             self._last_reliable_pts_s = pts_s
             self._last_reliable_source_index = source_index
 
-        self._pending = (frame, source_index, logical_index, pts_s)
+        color_contract = getattr(self.cap, "color_contract", None)
+        self._pending = (
+            frame,
+            source_index,
+            logical_index,
+            pts_s,
+            color_contract if isinstance(color_contract, ResolvedVideoColor) else None,
+        )
 
     def _prefetch_next(self) -> bool:
         logical_index = self._logical_index + 1
@@ -515,10 +822,17 @@ class VideoBackdrop(BackdropProvider):
 
     def _promote_pending(self) -> None:
         assert self._pending is not None
-        frame, source_index, logical_index, pts_s = self._pending
+        frame, source_index, logical_index, pts_s, color_contract = self._pending
         deadline_s = self._deadline_s(source_index, logical_index, pts_s)
         self._pending = None
-        self._remember(frame, source_index, logical_index, pts_s, deadline_s)
+        self._remember(
+            frame,
+            source_index,
+            logical_index,
+            pts_s,
+            deadline_s,
+            color_contract,
+        )
 
     def _skip_stale_nominal(self, steps: int) -> bool:
         """Skip 2..8 CFR frames while decoding only the final image."""
@@ -536,7 +850,7 @@ class VideoBackdrop(BackdropProvider):
         # so grab begins with offset two. Keep the currently displayed frame
         # untouched until retrieve() succeeds.
         def restore_after_pending() -> None:
-            _, pending_source_index, _, _ = pending
+            _, pending_source_index, _, _, _ = pending
             resume_index = (
                 (pending_source_index + 1) % self._frame_count
                 if self._frame_count
@@ -574,6 +888,14 @@ class VideoBackdrop(BackdropProvider):
             target_logical_index,
             pts_s,
             target_logical_index / self._fps,
+            (
+                color
+                if isinstance(
+                    (color := getattr(self.cap, "color_contract", None)),
+                    ResolvedVideoColor,
+                )
+                else None
+            ),
         )
         if pts_s is not None:
             self._last_reliable_pts_s = pts_s
@@ -638,7 +960,15 @@ class VideoBackdrop(BackdropProvider):
             else target_index
         )
         self._pending = None
-        self._remember(frame, source_index, logical_index, pts_s, elapsed_s)
+        color = getattr(self.cap, "color_contract", None)
+        self._remember(
+            frame,
+            source_index,
+            logical_index,
+            pts_s,
+            elapsed_s,
+            color if isinstance(color, ResolvedVideoColor) else None,
+        )
         if pts_s is not None:
             self._last_reliable_pts_s = pts_s
             self._last_reliable_source_index = source_index
@@ -660,7 +990,15 @@ class VideoBackdrop(BackdropProvider):
             self._last_reliable_source_index = (
                 source_index if pts_s is not None else None
             )
-            self._remember(frame, source_index, 0, pts_s, 0.0)
+            color = getattr(self.cap, "color_contract", None)
+            self._remember(
+                frame,
+                source_index,
+                0,
+                pts_s,
+                0.0,
+                color if isinstance(color, ResolvedVideoColor) else None,
+            )
             self._epoch = now
             # One-frame look-ahead is what makes an actual container timestamp
             # usable as a deadline instead of merely diagnostic metadata.
@@ -686,13 +1024,12 @@ class VideoBackdrop(BackdropProvider):
             self._retry_not_before_s = elapsed_s + 1.0 / self._fps
             self._decode_failures += 1
             log.warning(
-                "cannot decode timed frame from background video %s",
-                sanitized_source(self.path),
+                "cannot decode timed background video frame",
             )
             return
 
         assert self._pending is not None
-        _, source_index, logical_index, pts_s = self._pending
+        _, source_index, logical_index, pts_s, _color_contract = self._pending
         deadline_s = self._deadline_s(source_index, logical_index, pts_s)
         if elapsed_s + 1e-9 < deadline_s:
             return
@@ -713,8 +1050,7 @@ class VideoBackdrop(BackdropProvider):
                 self._retry_not_before_s = elapsed_s + 1.0 / self._fps
                 self._decode_failures += 1
                 log.warning(
-                    "cannot decode timed frame from background video %s",
-                    sanitized_source(self.path),
+                    "cannot decode timed background video frame",
                 )
             return
         if not self._container_timing and estimated_stale > 1 and self._frame_count:
@@ -722,14 +1058,13 @@ class VideoBackdrop(BackdropProvider):
                 self._retry_not_before_s = elapsed_s + 1.0 / self._fps
                 self._decode_failures += 1
                 log.warning(
-                    "cannot decode timed frame from background video %s",
-                    sanitized_source(self.path),
+                    "cannot decode timed background video frame",
                 )
             return
 
         advanced = 0
         while self._pending is not None and advanced < self._MAX_SEQUENTIAL_SKIP:
-            _, source_index, logical_index, pts_s = self._pending
+            _, source_index, logical_index, pts_s, _color_contract = self._pending
             deadline_s = self._deadline_s(source_index, logical_index, pts_s)
             if elapsed_s + 1e-9 < deadline_s:
                 break
@@ -740,7 +1075,7 @@ class VideoBackdrop(BackdropProvider):
                 break
 
         if self._pending is not None:
-            _, source_index, logical_index, pts_s = self._pending
+            _, source_index, logical_index, pts_s, _color_contract = self._pending
             if elapsed_s + 1e-9 >= self._deadline_s(source_index, logical_index, pts_s):
                 # A phase-preserving seek requires a duration. For containers
                 # with unknown length, make bounded sequential progress until
@@ -751,17 +1086,13 @@ class VideoBackdrop(BackdropProvider):
                     self._retry_not_before_s = elapsed_s + 1.0 / self._fps
                     self._decode_failures += 1
                     log.warning(
-                        "cannot decode timed frame from background video %s",
-                        sanitized_source(self.path),
+                        "cannot decode timed background video frame",
                     )
 
     def frame(self, width: int, height: int) -> np.ndarray:
         self._advance_to_time(self._clock())
         if self._last_raw is None:
-            raise RuntimeError(
-                "background video has no decodable frame: "
-                f"{sanitized_source(self.path)}"
-            )
+            raise RuntimeError("background video has no decodable frame")
         previous = self._last_returned_logical_index
         current = self._logical_index
         if previous is None or current != previous:
@@ -783,14 +1114,24 @@ class VideoBackdrop(BackdropProvider):
                 "background video is skipping %.1f%% of source frames to retain phase",
                 skip_ratio * 100.0,
             )
-        size = (width, height)
-        if self._last_fit is None or self._last_size != size:
-            self._last_fit = _fit(self._last_raw, width, height)
-            self._last_size = size
+        key = (
+            self._logical_index,
+            id(self._last_raw),
+            (self._last_raw.shape[1], self._last_raw.shape[0]),
+            self._orientation.rotation,
+            self._orientation.status,
+            (width, height),
+            self._geometry,
+            (0, 0, 0),
+        )
+        if self._last_fit is None or self._last_fit_key != key:
+            self._last_fit = self._fit_frame(self._last_raw, width, height)
+            self._last_fit_key = key
         return self._last_fit
 
     def stats_dict(self) -> dict[str, object]:
         opportunities = self._frames_displayed + self._frames_skipped
+        color = self._displayed_color_contract
         return {
             "background_video_source_fps": self._fps,
             "background_video_timing_mode": (
@@ -804,6 +1145,29 @@ class VideoBackdrop(BackdropProvider):
             ),
             "background_video_seek_count": self._seek_count,
             "background_video_decode_failures": self._decode_failures,
+            "background_video_orientation_status": self._orientation.status,
+            "background_video_metadata_rotation": self._orientation.metadata_rotation,
+            "background_video_auto_rotation_disabled": (
+                self._orientation.auto_rotation_disabled
+            ),
+            "background_video_decoder_backend": _capture_backend_name(self.cap),
+            "background_video_color_status": (
+                color.status if color is not None else "legacy-opencv-assumption"
+            ),
+            "background_video_input_color": (
+                color.declared_input
+                if color is not None
+                else "opencv-opaque/assumed-srgb-full"
+            ),
+            "background_video_output_color": (
+                color.output if color is not None else "srgb-full-bgr"
+            ),
+            "background_video_color_assumed_fields": (
+                list(color.assumed_fields) if color is not None else ["all"]
+            ),
+            "background_video_color_overridden_fields": (
+                list(color.overridden_fields) if color is not None else []
+            ),
         }
 
     def reset_stats(self) -> None:
@@ -817,6 +1181,10 @@ class VideoBackdrop(BackdropProvider):
         self._last_returned_logical_index = None
         self._skip_warning_emitted = False
 
+    def _invalidate_geometry_cache(self) -> None:
+        self._last_fit = None
+        self._last_fit_key = None
+
     def close(self) -> None:
         self.cap.release()
 
@@ -824,7 +1192,19 @@ class VideoBackdrop(BackdropProvider):
 class CameraBackdrop(BackdropProvider):
     """Live backdrop from one validated, operator-owned local target."""
 
-    def __init__(self, target: ResolvedBackdropTarget | int | str):
+    def __init__(
+        self,
+        target: ResolvedBackdropTarget | int | str,
+        *,
+        fit_mode: FitMode = "cover",
+        anchor_x: float = 0.5,
+        anchor_y: float = 0.5,
+    ):
+        super().__init__(
+            fit_mode=fit_mode,
+            anchor_x=anchor_x,
+            anchor_y=anchor_y,
+        )
         if cv2 is None:
             raise RuntimeError("opencv-python is required for camera backdrops")
         if isinstance(target, ResolvedBackdropTarget):
@@ -840,25 +1220,47 @@ class CameraBackdrop(BackdropProvider):
         self.cap = cv2.VideoCapture(device)
         try:
             opened = self.cap.isOpened()
-        except BaseException:
+        except BaseException as exc:
             with contextlib.suppress(Exception):
                 self.cap.release()
-            raise
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RuntimeError("cannot inspect backdrop source") from None
         if not opened:
             with contextlib.suppress(Exception):
                 self.cap.release()
-            raise RuntimeError(
-                f"cannot open backdrop source: {sanitized_source(device)!r}"
-            )
-        self._last: np.ndarray | None = None
+            raise RuntimeError("cannot open backdrop source")
+        self._last_raw: np.ndarray | None = None
+        self._last_fit: np.ndarray | None = None
+        self._last_fit_key: tuple[object, ...] | None = None
+        self._raw_generation = 0
 
     def frame(self, width: int, height: int) -> np.ndarray:
         ok, frame = self.cap.read()
         if ok and frame is not None:
-            self._last = _fit(frame, width, height)
-        if self._last is None:
+            source = validate_bgr_frame(frame, name="backdrop camera frame")
+            self._last_raw = np.ascontiguousarray(source)
+            self._raw_generation += 1
+            self._last_fit = None
+            self._last_fit_key = None
+        if self._last_raw is None:
             raise RuntimeError("backdrop camera returned no frame")
-        return self._last
+        key = (
+            self._raw_generation,
+            id(self._last_raw),
+            (self._last_raw.shape[1], self._last_raw.shape[0]),
+            (width, height),
+            self._geometry,
+            (0, 0, 0),
+        )
+        if self._last_fit is None or self._last_fit_key != key:
+            self._last_fit = self._fit_frame(self._last_raw, width, height)
+            self._last_fit_key = key
+        return self._last_fit
+
+    def _invalidate_geometry_cache(self) -> None:
+        self._last_fit = None
+        self._last_fit_key = None
 
     def close(self) -> None:
         self.cap.release()
@@ -872,13 +1274,26 @@ class BlurBackdrop(BackdropProvider):
     blur (normalized masked convolution) so their colors don't smear into the
     background as a ghost halo around the silhouette."""
 
-    def __init__(self, strength: int):
+    def __init__(
+        self,
+        strength: int,
+        *,
+        fit_mode: FitMode = "cover",
+        anchor_x: float = 0.5,
+        anchor_y: float = 0.5,
+    ):
+        super().__init__(
+            fit_mode=fit_mode,
+            anchor_x=anchor_x,
+            anchor_y=anchor_y,
+        )
         self.strength = strength if strength % 2 == 1 else strength + 1
         self._frame: np.ndarray | None = None
 
     def set_source_frame(
         self, frame: np.ndarray, mask: np.ndarray | None = None
     ) -> None:
+        frame = validate_bgr_frame(frame, name="blur source frame")
         if cv2 is None:  # box-blur-ish fallback: downscale/upscale by striding
             small = frame[:: self.strength, :: self.strength]
             self._frame = np.repeat(
@@ -916,7 +1331,16 @@ class BlurBackdrop(BackdropProvider):
     def frame(self, width: int, height: int) -> np.ndarray:
         if self._frame is None:
             return np.zeros((height, width, 3), dtype=np.uint8)
-        return _fit(self._frame, width, height)
+        frame = validate_bgr_frame(self._frame, name="blurred backdrop frame")
+        if frame.shape != (height, width, 3):
+            raise ValueError(
+                "blurred backdrop must already match the canonical canvas: "
+                f"expected {(height, width, 3)}, got {frame.shape}"
+            )
+        return np.ascontiguousarray(frame)
+
+    def content_rect(self, width: int, height: int) -> Rect:
+        return self._full_content_rect(width, height)
 
 
 def create_backdrop(
@@ -933,17 +1357,31 @@ def create_backdrop(
         return None
     if mode == "remote":
         mode = cfg.remote_fallback_mode
+    geometry = {
+        "fit_mode": cfg.fit_mode,
+        "anchor_x": cfg.anchor_x,
+        "anchor_y": cfg.anchor_y,
+    }
     if mode == "blur":
-        return BlurBackdrop(cfg.blur_strength)
+        return BlurBackdrop(cfg.blur_strength, **geometry)
     if mode == "color":
-        return ColorBackdrop(cfg.color)
+        return ColorBackdrop(cfg.color, **geometry)
     if mode == "image":
-        return ImageBackdrop(cfg.image_path, max_pixels=image_max_pixels)
+        return ImageBackdrop(
+            cfg.image_path,
+            max_pixels=image_max_pixels,
+            **geometry,
+        )
     if mode == "video":
         return VideoBackdrop(
             cfg.video_path,
             max_width=video_max_width,
             max_height=video_max_height,
+            color_matrix=cfg.video_color_matrix,
+            color_range=cfg.video_color_range,
+            color_primaries=cfg.video_color_primaries,
+            color_transfer=cfg.video_color_transfer,
+            **geometry,
         )
     if mode == "camera":
         if camera_target is None:
@@ -954,5 +1392,5 @@ def create_backdrop(
             if cfg.camera_device == "":
                 raise ValueError("camera backdrop source is not configured")
             camera_target = ResolvedBackdropTarget("", cfg.camera_device)
-        return CameraBackdrop(camera_target)
+        return CameraBackdrop(camera_target, **geometry)
     raise ValueError(f"unknown background mode: {mode!r}")

@@ -145,7 +145,7 @@ test('the Phase 6 manifest is finite and enumerates every required contract fami
       'macos-migration-python-3.12-node-20',
     ],
   );
-  assert.equal(manifest.stress_families.length, 6);
+  assert.equal(manifest.stress_families.length, 7);
   assert.ok(manifest.stress_families.every((entry) => entry.minimum_iterations >= 100));
   assert.ok(manifest.tls_scenarios.includes('failed-tls-handshake-no-payload'));
   assert.ok(manifest.workflow.required_job_ids.includes('phase6-evidence'));

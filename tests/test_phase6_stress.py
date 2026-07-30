@@ -18,16 +18,27 @@ import numpy as np
 from fastapi import HTTPException
 
 import custback.avatar.audio2face as audio2face_mod
+import custback.pipeline as pipeline_mod
 from custback.api.server import _UploadLimits, _UploadStore
 from custback.api.streaming import ConnectionLimiter
 from custback.avatar.audio2face import Audio2FaceDriver
 from custback.avatar.config import Audio2FaceConfig, AvatarConfig, AvatarRuntime
 from custback.avatar.service import AvatarService, _RenderPublication
+from custback.capture import CaptureHealth
+from custback.color import (
+    ColorBehavior,
+    ColorEstimate,
+    ColorReason,
+    ColorSceneSignature,
+    ColorTransform,
+)
 from custback.config import (
     AppConfig,
     ConfigVersionConflictError,
     RuntimeConfig,
 )
+from custback.hub import FrameHub
+from custback.pipeline import Pipeline
 from custback.storage_tx import OwnershipLedger
 
 
@@ -38,6 +49,7 @@ STRESS_FAMILY_IDS = (
     "upload-reservations",
     "cleanup-retries",
     "audio2face-shutdown",
+    "visual-generation-hot-changes",
 )
 DEFAULT_STRESS_ITERATIONS = 100
 DEFAULT_STRESS_SEED = 0xC057BAC6
@@ -563,3 +575,308 @@ def test_stress_audio2face_shutdown(monkeypatch) -> None:
             assert driver._owned_generation is None
             assert driver._interruptions == []
             assert driver._survivors == []
+
+
+class _VisualStressCapture:
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.generation = 1
+        self.closed = False
+
+    def health_snapshot(self) -> CaptureHealth:
+        return CaptureHealth(
+            generation=self.generation,
+            geometry_generation=self.generation,
+            content_rect=(0, 0, self.width, self.height),
+            backend="visual-generation-stress",
+            width=self.width,
+            height=self.height,
+            delivered_width=self.width,
+            delivered_height=self.height,
+            oriented_width=self.width,
+            oriented_height=self.height,
+            normalized_width=self.width,
+            normalized_height=self.height,
+            geometry_transitions=self.generation,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _VisualStressSegmenter:
+    device = "cpu"
+    produces_matte = False
+    last_foreground = None
+
+    def __init__(self, width: int, height: int) -> None:
+        self.mask = np.full((height, width), 0.5, dtype=np.float32)
+        self.closed = False
+
+    def segment(self, _frame: np.ndarray) -> np.ndarray:
+        return self.mask.copy()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _VisualStressRefiner:
+    def refine(self, mask: np.ndarray, _frame: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(mask, dtype=np.float32)
+
+
+class _VisualStressBackdrop:
+    def __init__(self, tag: str, width: int, height: int) -> None:
+        self.tag = tag
+        self.pixels = np.full(
+            (height, width, 3),
+            (31 + len(tag)) % 251,
+            dtype=np.uint8,
+        )
+        self.close_calls = 0
+        self.trial_resets = 0
+
+    def frame(self, width: int, height: int) -> np.ndarray:
+        assert self.pixels.shape == (height, width, 3)
+        return self.pixels
+
+    def content_rect(self, width: int, height: int) -> tuple[int, int, int, int]:
+        return (0, 0, width, height)
+
+    def transform_plan(self, width: int, height: int) -> tuple[str, int, int]:
+        return (self.tag, width, height)
+
+    def reset_stats(self) -> None:
+        self.trial_resets += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _visual_stress_config(asset: str) -> AppConfig:
+    return AppConfig.from_dict(
+        {
+            "camera": {
+                "width": 24,
+                "height": 16,
+                "fps": 30,
+                "fit_mode": "cover",
+            },
+            "background": {
+                "mode": "image",
+                "image_path": f"/generated/{asset}.png",
+            },
+            "segmentation": {
+                "backend": "heuristic",
+                "temporal_smoothing": 0.0,
+                "edge_refine": False,
+                "mask_blur": 0,
+            },
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "light_wrap": 0.0,
+                "color_correction": {
+                    "mode": "auto",
+                    "adaptation_time_s": 0.8,
+                },
+            },
+            "output": {
+                "backend": "null",
+                "width": 24,
+                "height": 16,
+                "fps": 30,
+            },
+            "api": {"enabled": False},
+        }
+    )
+
+
+def _visual_stress_estimate() -> ColorEstimate:
+    return ColorEstimate(
+        transform=ColorTransform(exposure_ev=0.4),
+        behavior=ColorBehavior.EXPOSURE_ONLY,
+        reason=ColorReason.OK,
+        confidence=0.9,
+        exposure_confidence=0.9,
+        white_balance_confidence=0.0,
+        usable_source=256,
+        usable_target=256,
+        neutral_source=0,
+        neutral_target=0,
+        target_is_local=True,
+        reliable=True,
+        signature=ColorSceneSignature(
+            source_log_luminance=-2.0,
+            target_log_luminance=-1.5,
+            source_chroma_log2=(0.0, 0.0, 0.0),
+            target_chroma_log2=(0.0, 0.0, 0.0),
+        ),
+    )
+
+
+def test_stress_visual_generation_hot_changes(monkeypatch) -> None:
+    """visual-generation-hot-changes: hot state never crosses generations."""
+
+    family_id = STRESS_FAMILY_IDS[-1]
+    width, height = 24, 16
+    frame = np.full((height, width, 3), 96, dtype=np.uint8)
+    mask = np.full((height, width), 0.5, dtype=np.float32)
+    cfg = _visual_stress_config("initial")
+    runtime = RuntimeConfig(cfg)
+    pipeline = Pipeline(runtime, FrameHub())
+    capture = _VisualStressCapture(width, height)
+    segmenter = _VisualStressSegmenter(width, height)
+    initial_backdrop = _VisualStressBackdrop("initial", width, height)
+    created_backdrops = [initial_backdrop]
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        capture,
+        segmenter,
+        _VisualStressRefiner(),
+        initial_backdrop,
+        None,
+    )
+    estimate = _visual_stress_estimate()
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        lambda *_args, **_kwargs: estimate,
+    )
+
+    def build_backdrop(candidate: AppConfig) -> _VisualStressBackdrop:
+        backdrop = _VisualStressBackdrop(
+            candidate.background.image_path,
+            width,
+            height,
+        )
+        created_backdrops.append(backdrop)
+        return backdrop
+
+    monkeypatch.setattr(pipeline_mod, "_build_backdrop", build_backdrop)
+    retired_harmonizers = []
+
+    def commit(candidate: AppConfig) -> None:
+        request = pipeline_mod._PatchRequest(
+            candidate,
+            resources.version,
+            prepared_activation=pipeline._prepare_activation_off_lane(
+                resources.cfg,
+                candidate,
+            ),
+        )
+        pipeline._handle_patch_request(resources, request, frame)
+        assert request.error is None
+        assert request.result is not None
+        assert request.result.version == resources.version == runtime.version
+        assert resources.cfg == candidate
+
+    try:
+        for iteration in range(STRESS_ITERATIONS):
+            with _stress_iteration(family_id, iteration):
+                visual_generation_before = resources.visual_generation
+
+                old_harmonizer = resources.harmonizer
+                assert old_harmonizer is not None
+                old_snapshot = old_harmonizer.snapshot()
+                disabled = resources.cfg.patched(
+                    {"compositing": {"color_correction": {"mode": "off"}}}
+                )
+                commit(disabled)
+                retired_harmonizers.append((old_harmonizer, old_snapshot))
+                assert resources.harmonizer is not old_harmonizer
+                assert resources.harmonizer is not None
+                assert resources.harmonizer.snapshot().transform.is_identity
+                assert old_harmonizer.snapshot() == old_snapshot
+
+                disabled_harmonizer = resources.harmonizer
+                disabled_snapshot = disabled_harmonizer.snapshot()
+                enabled = resources.cfg.patched(
+                    {"compositing": {"color_correction": {"mode": "auto"}}}
+                )
+                commit(enabled)
+                retired_harmonizers.append((disabled_harmonizer, disabled_snapshot))
+                assert resources.harmonizer is not disabled_harmonizer
+                assert disabled_harmonizer.snapshot() == disabled_snapshot
+
+                enabled_harmonizer = resources.harmonizer
+                assert enabled_harmonizer is not None
+                enabled_snapshot = enabled_harmonizer.snapshot()
+                asset = f"asset-{iteration % 2}"
+                switched = resources.cfg.patched(
+                    {"background": {"image_path": f"/generated/{asset}.png"}}
+                )
+                previous_backdrop = resources.backdrop
+                commit(switched)
+                retired_harmonizers.append((enabled_harmonizer, enabled_snapshot))
+                assert resources.backdrop is not previous_backdrop
+                assert resources.harmonizer is not enabled_harmonizer
+                assert enabled_harmonizer.snapshot() == enabled_snapshot
+                assert resources.visual_generation == visual_generation_before + 3
+
+                # Seed this committed backdrop/policy generation, then prove a
+                # capture reconnect resets the active transform at the exact
+                # source-generation boundary before warming again.
+                assert resources.harmonizer is not None
+                now = float(iteration * 10)
+                first = pipeline._prepare_color_frame(
+                    resources,
+                    frame,
+                    resources.backdrop.frame(width, height),
+                    mask,
+                    None,
+                    now_s=now,
+                )
+                second = pipeline._prepare_color_frame(
+                    resources,
+                    frame,
+                    resources.backdrop.frame(width, height),
+                    mask,
+                    None,
+                    now_s=now + 0.2,
+                )
+                assert first.transform.is_identity
+                assert not second.transform.is_identity
+                token_before_reconnect = resources.color_reset_token
+
+                capture.generation += 1
+                reset = pipeline._prepare_color_frame(
+                    resources,
+                    frame,
+                    resources.backdrop.frame(width, height),
+                    mask,
+                    None,
+                    now_s=now + 0.4,
+                )
+                assert reset.transform.is_identity
+                assert resources.color_reset_token != token_before_reconnect
+                assert (
+                    resources.harmonizer.snapshot().source_generation
+                    == capture.generation
+                )
+                warmed = pipeline._prepare_color_frame(
+                    resources,
+                    frame,
+                    resources.backdrop.frame(width, height),
+                    mask,
+                    None,
+                    now_s=now + 0.6,
+                )
+                assert not warmed.transform.is_identity
+                assert runtime.version == (iteration + 1) * 3
+
+                # Later cycles must not mutate any retired EMA.
+                assert all(
+                    harmonizer.snapshot() == snapshot
+                    for harmonizer, snapshot in retired_harmonizers
+                )
+    finally:
+        resources.close()
+        pipeline.stop(timeout=3.0)
+
+    assert capture.closed
+    assert segmenter.closed
+    assert all(backdrop.close_calls == 1 for backdrop in created_backdrops)
+    with pipeline._teardown_lock:
+        assert not pipeline._teardown_threads

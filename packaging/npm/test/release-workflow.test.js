@@ -66,6 +66,14 @@ function matrixIds(block) {
     .map((match) => match[1]);
 }
 
+function matrixEntryBlock(block, id) {
+  const marker = `          - id: ${id}`;
+  const start = block.indexOf(marker);
+  assert.notEqual(start, -1, `missing matrix entry ${id}`);
+  const next = block.indexOf('\n          - id:', start + marker.length);
+  return block.slice(start, next < 0 ? block.length : next);
+}
+
 const jobs = jobBlocks(source);
 
 test('release qualification triggers only manually or from version tags', () => {
@@ -168,6 +176,53 @@ test('runtime and scenario matrices exactly match required-gates.json', () => {
     matrixIds(jobs.get('two-clean-hosts')),
     ['clean-host-repeat-a', 'clean-host-repeat-b'],
   );
+});
+
+test('vision optional profiles exercise every visual-consistency contract', () => {
+  const block = jobs.get('optional-backends');
+  const requiredTests = [
+    'tests/test_geometry.py',
+    'tests/test_background_geometry.py',
+    'tests/test_capture.py',
+    'tests/test_capture_geometry.py',
+    'tests/test_color.py',
+    'tests/test_video_color.py',
+    'tests/test_processing.py',
+    'tests/test_pipeline.py',
+    'tests/test_canonical_canvas.py',
+    'tests/test_output_geometry.py',
+    'tests/test_visual_consistency_e2e.py',
+    'tests/test_visual_consistency_qualification.py',
+  ];
+  for (const id of [
+    'mediapipe-python-3.11-wheel',
+    'mediapipe-python-3.12-wheel',
+    'rvm-python-3.11-wheel',
+    'rvm-python-3.12-wheel',
+  ]) {
+    const entry = matrixEntryBlock(block, id);
+    for (const filename of requiredTests) assert.match(entry, new RegExp(filename), id);
+  }
+});
+
+test('OpenCV compatibility profiles exercise every visual-consistency contract', () => {
+  const block = jobs.get('opencv-compatibility');
+  for (const filename of [
+    'tests/test_geometry.py',
+    'tests/test_background_geometry.py',
+    'tests/test_capture.py',
+    'tests/test_capture_geometry.py',
+    'tests/test_color.py',
+    'tests/test_video_color.py',
+    'tests/test_processing.py',
+    'tests/test_pipeline.py',
+    'tests/test_canonical_canvas.py',
+    'tests/test_output_geometry.py',
+    'tests/test_visual_consistency_e2e.py',
+    'tests/test_visual_consistency_qualification.py',
+  ]) {
+    assert.match(block, new RegExp(filename), filename);
+  }
 });
 
 test('migration qualification consumes exact candidate and unpublished reference artifacts', () => {

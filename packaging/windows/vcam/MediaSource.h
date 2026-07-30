@@ -20,9 +20,10 @@
 
 namespace custback::vcam {
 
-// Media types offered on the single stream, in preference order.  720p first:
-// it matches the engine's default camera geometry, so the common negotiation
-// needs no centering pass.
+// Exact media types known to the single stream, in fallback preference order.
+// At initialization the source reads the ring header and advertises only its
+// matching type, so a consumer cannot select another size.  The source
+// deliberately does not crop, pad, or scale a malformed or changed ring.
 struct StreamFormat {
     uint32_t width;
     uint32_t height;

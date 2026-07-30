@@ -583,7 +583,12 @@ def create_avatar_app(
         key = ("media", str(path), stat.st_mtime_ns, stat.st_size)
         cached = thumbnails.get(key)
         if cached is None:
-            cached = await asyncio.to_thread(render_media_thumbnail, path, kind)
+            cached = await asyncio.to_thread(
+                render_media_thumbnail,
+                path,
+                kind,
+                max_pixels=media_store.image_max_pixels,
+            )
             thumbnails.put(key, cached)
         return Response(content=cached, media_type="image/jpeg")
 

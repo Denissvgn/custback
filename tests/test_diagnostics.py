@@ -226,24 +226,43 @@ def test_log_formatter_redacts_urls_inside_messages_and_tracebacks(tmp_path):
 
 def test_config_summary_whitelists_safe_values_and_redacts_sources():
     config = {
+        "schema_version": 1,
         "background": {
             "mode": "video",
             "video_path": "/private/beach.mp4",
             "blur_strength": 41,
+            "fit_mode": "cover",
+        },
+        "camera": {"fit_mode": "stretch"},
+        "compositing": {
+            "blend_space": "srgb_legacy",
+            "color_correction": {"mode": "off", "strength": 0.5},
         },
         "api": {"allowed_origins": ["https://alice:secret@example.test/app"]},
     }
     summary = sanitized_config_summary(
         config,
         [
+            "schema_version",
             "background.mode",
             "background.video_path",
             "background.blur_strength",
+            "background.fit_mode",
+            "camera.fit_mode",
+            "compositing.blend_space",
+            "compositing.color_correction.mode",
+            "compositing.color_correction.strength",
             "api.allowed_origins",
         ],
     )
+    assert "schema_version=1" in summary
     assert "background.mode=video" in summary
     assert "background.blur_strength=41" in summary
+    assert "background.fit_mode=cover" in summary
+    assert "camera.fit_mode=stretch" in summary
+    assert "compositing.blend_space=srgb_legacy" in summary
+    assert "compositing.color_correction.mode=off" in summary
+    assert "compositing.color_correction.strength=0.5" in summary
     assert "background.video_path=<redacted>" in summary
     assert "api.allowed_origins=<redacted>" in summary
     assert "beach.mp4" not in summary

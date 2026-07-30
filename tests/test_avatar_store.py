@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image, ImageCms
 
 cv2 = pytest.importorskip("cv2")
 
@@ -29,6 +30,7 @@ from custback.avatar.store import (
     resolve_rig_selector,
     sanitize_media_name,
 )
+from custback.backgrounds import ImageBackdrop
 
 
 def storage(tmp_path: Path, **overrides) -> StorageConfig:
@@ -515,6 +517,35 @@ def image_bytes(width: int = 320, height: int = 200) -> bytes:
     return data.tobytes()
 
 
+def profiled_oriented_image_bytes() -> bytes:
+    rgb = np.empty((80, 120, 3), dtype=np.uint8)
+    rgb[:40, :60] = (220, 40, 30)
+    rgb[:40, 60:] = (20, 190, 60)
+    rgb[40:, :60] = (30, 60, 220)
+    rgb[40:, 60:] = (180, 170, 35)
+    exif = Image.Exif()
+    exif[274] = 6
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    payload = io.BytesIO()
+    Image.fromarray(rgb).save(
+        payload,
+        format="PNG",
+        exif=exif,
+        icc_profile=profile,
+    )
+    return payload.getvalue()
+
+
+def malformed_profile_image_bytes() -> bytes:
+    payload = io.BytesIO()
+    Image.new("RGB", (32, 24), (40, 90, 160)).save(
+        payload,
+        format="PNG",
+        icc_profile=b"not-an-icc-profile",
+    )
+    return payload.getvalue()
+
+
 def staged(store: MediaStore, payload: bytes) -> UploadReservation:
     path = store.open_staging()
     path.write_bytes(payload)
@@ -573,6 +604,39 @@ def test_media_header_mismatch_is_rejected_before_opencv(tmp_path, monkeypatch):
     )
     with pytest.raises(StoreError) as excinfo:
         store.commit(staged(store, jpeg.tobytes()), "forged.png", "image")
+    assert excinfo.value.code == "invalid_media"
+    assert store.list() == []
+
+
+def test_media_image_validation_uses_only_shared_color_decoder(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = MediaStore(storage(tmp_path))
+    monkeypatch.setattr(
+        store_mod.cv2,
+        "imread",
+        lambda *_args, **_kwargs: pytest.fail(
+            "MediaStore must not decode a Pillow-validated path through OpenCV"
+        ),
+    )
+
+    saved = store.commit(staged(store, image_bytes()), "shared.png", "image")
+
+    assert saved.name == "shared.png"
+    assert store.image_max_pixels == 16_777_216
+
+
+def test_media_store_rejects_malformed_embedded_icc(tmp_path) -> None:
+    store = MediaStore(storage(tmp_path))
+
+    with pytest.raises(StoreError) as excinfo:
+        store.commit(
+            staged(store, malformed_profile_image_bytes()),
+            "malformed-profile.png",
+            "image",
+        )
+
     assert excinfo.value.code == "invalid_media"
     assert store.list() == []
 
@@ -932,6 +996,42 @@ def test_render_media_thumbnail_downscales(tmp_path):
     data = render_media_thumbnail(Path(saved.path), "image")
     width, height = jpeg_size(data)
     assert (width, height) == (256, 144)
+
+
+def test_color_managed_thumbnail_matches_full_oriented_backdrop(tmp_path) -> None:
+    path = tmp_path / "profiled-oriented.png"
+    path.write_bytes(profiled_oriented_image_bytes())
+
+    full = ImageBackdrop(str(path)).frame(80, 120)
+    thumbnail_jpeg = render_media_thumbnail(
+        path,
+        "image",
+        max_pixels=80 * 120,
+    )
+    thumbnail = cv2.imdecode(
+        np.frombuffer(thumbnail_jpeg, dtype=np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+
+    assert thumbnail is not None
+    assert thumbnail.shape == full.shape == (120, 80, 3)
+    difference = np.abs(thumbnail.astype(np.int16) - full.astype(np.int16))
+    assert float(np.mean(difference)) < 3.0
+    assert float(np.quantile(difference, 0.95)) < 8.0
+
+
+def test_thumbnail_rejects_malformed_icc_and_enforces_pixel_limit(tmp_path) -> None:
+    malformed = tmp_path / "malformed.png"
+    malformed.write_bytes(malformed_profile_image_bytes())
+    with pytest.raises(StoreError) as excinfo:
+        render_media_thumbnail(malformed, "image")
+    assert excinfo.value.code == "invalid_media"
+
+    valid = tmp_path / "oversized.png"
+    valid.write_bytes(image_bytes(40, 30))
+    with pytest.raises(StoreError) as excinfo:
+        render_media_thumbnail(valid, "image", max_pixels=1000)
+    assert excinfo.value.code == "media_too_large"
 
 
 def test_thumbnail_cache_evicts_oldest():

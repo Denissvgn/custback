@@ -3,8 +3,8 @@
   Custback native Media Foundation virtual camera (WIN-6.1).
 
   A C++/WinRT in-proc COM server hosting the custom media source.  Built on
-  windows-latest with the Windows 11 SDK (build 22000+, the first with
-  mfvirtualcamera.h); x64 and ARM64 platforms are first-class so the WIN-6.3
+  the pinned windows-2022 runner with its Windows 11 SDK 22621; x64 and ARM64
+  platforms are first-class so the WIN-6.3
   build reuses this project unchanged.
 
   C++/WinRT is consumed header-only from the Windows SDK (no NuGet restore):
@@ -35,8 +35,8 @@
     <ProjectGuid>{E1D4B9C7-6F2A-4A83-92D5-3B8E0C7F5A21}</ProjectGuid>
     <RootNamespace>CustbackVCam</RootNamespace>
     <ProjectName>CustbackVCam</ProjectName>
-    <!-- Win11 21H2 (22000): first SDK/OS with MFCreateVirtualCamera (D1). -->
-    <WindowsTargetPlatformVersion>10.0.22000.0</WindowsTargetPlatformVersion>
+    <!-- SDK 22621 is installed on windows-2022; runtime floor remains 22000. -->
+    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformMinVersion>10.0.22000.0</WindowsTargetPlatformMinVersion>
   </PropertyGroup>
 

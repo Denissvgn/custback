@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -19,17 +20,36 @@ from typing import Any, Callable
 import numpy as np
 import cv2
 
-from .backgrounds import BlurBackdrop, create_backdrop
+from .backgrounds import BlurBackdrop, ImageBackdrop, create_backdrop
 from .capture import open_capture
-from .compositor import composite
+from .color import (
+    ANALYSIS_LONG_EDGE,
+    ColorError,
+    ColorHarmonizer,
+    ColorReason,
+    ColorTransform,
+    HarmonizerPhase,
+    HarmonizerSnapshot,
+    IDENTITY_TRANSFORM,
+    _bgr_u8_to_linear_bgr_prevalidated as bgr_u8_to_linear_rgb,
+    _estimate_color_transform_linear_bgr_prevalidated as estimate_color_transform_linear,
+    _linear_bgr_analysis_raster_prevalidated,
+)
+from .compositor import (
+    _composite_linear_bgr_prevalidated as composite_linear_predecoded,
+    composite,
+    composite_legacy_predecoded,
+)
 from .config import (
     AVATAR_PROXY_RESTART_ONLY_FIELDS,
     AppConfig,
     ConfigState,
     ConfigVersionConflictError,
     RuntimeConfig,
+    resolved_output_size,
 )
 from .diagnostics import sanitized_config_summary
+from .geometry import Size, apply_transform, plan_transform, validate_bgr_frame
 from .hub import FrameHub
 from .segmentation import (
     HeuristicSegmenter,
@@ -51,6 +71,15 @@ _VIDEO_STATS_DEFAULTS: dict[str, object] = {
     "background_video_skip_ratio": 0.0,
     "background_video_seek_count": 0,
     "background_video_decode_failures": 0,
+    "background_video_orientation_status": None,
+    "background_video_metadata_rotation": None,
+    "background_video_auto_rotation_disabled": None,
+    "background_video_decoder_backend": None,
+    "background_video_color_status": None,
+    "background_video_input_color": None,
+    "background_video_output_color": None,
+    "background_video_color_assumed_fields": [],
+    "background_video_color_overridden_fields": [],
 }
 
 _ACCELERATION_STATS_DEFAULTS: dict[str, object] = {
@@ -64,6 +93,8 @@ _ACCELERATION_STATS_DEFAULTS: dict[str, object] = {
     "acceleration_fallback_count": 0,
     "acceleration_last_transition_ms": None,
 }
+
+_COLOR_ELIGIBLE_MODES = frozenset({"image", "video", "camera"})
 
 
 def _acceleration_stats(segmenter: Any) -> dict[str, object]:
@@ -118,8 +149,12 @@ def _segmenter_key(cfg: AppConfig) -> tuple[object, ...]:
     )
 
 
-def _backdrop_key(cfg: AppConfig) -> tuple[object, ...]:
-    """Only inputs consumed by the currently selected backdrop resource."""
+def _backdrop_provider_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Only inputs that require constructing a different backdrop provider.
+
+    Presentation-only geometry is deliberately excluded: changing fit or anchor
+    must not rewind a live video or reopen a camera backdrop.
+    """
 
     background = cfg.background
     mode = (
@@ -141,6 +176,10 @@ def _backdrop_key(cfg: AppConfig) -> tuple[object, ...]:
             background.video_path,
             cfg.api.uploads.video_max_width,
             cfg.api.uploads.video_max_height,
+            background.video_color_matrix,
+            background.video_color_range,
+            background.video_color_primaries,
+            background.video_color_transfer,
         )
     if mode == "camera":
         target = cfg.resolved_backdrop_target()
@@ -150,13 +189,296 @@ def _backdrop_key(cfg: AppConfig) -> tuple[object, ...]:
     raise ValueError(f"unknown background mode: {mode!r}")
 
 
+def _backdrop_visual_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Backdrop identity plus presentation policy for fitted-cache generations."""
+
+    background = cfg.background
+    return (
+        background.mode,
+        _backdrop_provider_key(cfg),
+        background.fit_mode,
+        background.anchor_x,
+        background.anchor_y,
+    )
+
+
+def _visual_state_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Inputs that invalidate future geometry and color temporal state."""
+
+    camera = cfg.camera
+    correction = cfg.compositing.color_correction
+    return (
+        camera.width,
+        camera.height,
+        camera.fit_mode,
+        camera.anchor_x,
+        camera.anchor_y,
+        camera.rotation,
+        camera.mirror,
+        resolved_output_size(cfg),
+        _backdrop_visual_key(cfg),
+        cfg.compositing.blend_space,
+        correction.mode,
+        correction.strength,
+        correction.exposure_limit_ev,
+        correction.white_balance_strength,
+        correction.adaptation_time_s,
+    )
+
+
+def _color_state_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Every policy/model input whose change invalidates temporal color state."""
+
+    return (_visual_state_key(cfg), _segmenter_key(cfg))
+
+
+def _new_color_harmonizer(cfg: AppConfig) -> ColorHarmonizer:
+    correction = cfg.compositing.color_correction
+    return ColorHarmonizer(
+        correction.adaptation_time_s,
+        mode=cfg.background.mode,
+    )
+
+
+def _plan_stats(prefix: str, plan: Any) -> dict[str, object]:
+    """Flatten one immutable geometry plan into the public status contract."""
+
+    crop = plan.crop_rect
+    padding = plan.padding
+    return {
+        f"{prefix}_fit": plan.fit,
+        f"{prefix}_rotation": plan.rotation,
+        f"{prefix}_mirror": plan.mirror,
+        f"{prefix}_scale_x": plan.scale_x,
+        f"{prefix}_scale_y": plan.scale_y,
+        f"{prefix}_crop_left": crop.left,
+        f"{prefix}_crop_top": crop.top,
+        f"{prefix}_crop_right": crop.right,
+        f"{prefix}_crop_bottom": crop.bottom,
+        f"{prefix}_pad_left": padding.left,
+        f"{prefix}_pad_top": padding.top,
+        f"{prefix}_pad_right": padding.right,
+        f"{prefix}_pad_bottom": padding.bottom,
+    }
+
+
+def _empty_plan_stats(
+    prefix: str,
+    *,
+    fit: str,
+    rotation: int = 0,
+    mirror: bool = False,
+) -> dict[str, object]:
+    """Return an explicit unknown-plan state without inventing geometry."""
+
+    return {
+        f"{prefix}_fit": fit,
+        f"{prefix}_rotation": rotation,
+        f"{prefix}_mirror": mirror,
+        f"{prefix}_scale_x": None,
+        f"{prefix}_scale_y": None,
+        f"{prefix}_crop_left": None,
+        f"{prefix}_crop_top": None,
+        f"{prefix}_crop_right": None,
+        f"{prefix}_crop_bottom": None,
+        f"{prefix}_pad_left": 0,
+        f"{prefix}_pad_top": 0,
+        f"{prefix}_pad_right": 0,
+        f"{prefix}_pad_bottom": 0,
+    }
+
+
+def _camera_plan_stats(
+    cfg: AppConfig,
+    canvas_size: Size,
+    capture_health: Any,
+) -> dict[str, object]:
+    """Reconstruct the exact delivered-camera plan from scalar health state."""
+
+    delivered_width = getattr(capture_health, "delivered_width", None)
+    delivered_height = getattr(capture_health, "delivered_height", None)
+    if not delivered_width or not delivered_height:
+        return _empty_plan_stats(
+            "camera",
+            fit=cfg.camera.fit_mode,
+            rotation=cfg.camera.rotation,
+            mirror=cfg.camera.mirror,
+        )
+    try:
+        plan = plan_transform(
+            (int(delivered_width), int(delivered_height)),
+            canvas_size,
+            rotation=cfg.camera.rotation,
+            mirror=cfg.camera.mirror,
+            fit=cfg.camera.fit_mode,
+            anchors=(cfg.camera.anchor_x, cfg.camera.anchor_y),
+        )
+    except (TypeError, ValueError):
+        return _empty_plan_stats(
+            "camera",
+            fit=cfg.camera.fit_mode,
+            rotation=cfg.camera.rotation,
+            mirror=cfg.camera.mirror,
+        )
+    return _plan_stats("camera", plan)
+
+
+def _camera_controls_stats(capture_health: Any) -> dict[str, object]:
+    """Serialize the side-effect-free capture snapshot without native handles."""
+
+    controls = getattr(capture_health, "camera_controls", None)
+    serializer = getattr(controls, "as_dict", None)
+    if callable(serializer):
+        controls = serializer()
+    if not isinstance(controls, dict):
+        return {}
+    return dict(controls)
+
+
+def _background_plan_stats(resources: "_Resources") -> dict[str, object]:
+    """Read only the plan that produced the current provider pixels."""
+
+    cfg = resources.cfg
+    provider = resources.backdrop
+    effective_mode = (
+        cfg.background.remote_fallback_mode
+        if cfg.background.mode == "remote"
+        else cfg.background.mode
+    )
+    if provider is None:
+        return _empty_plan_stats(
+            "background",
+            fit=cfg.background.fit_mode,
+        )
+    getter = getattr(provider, "transform_plan", None)
+    if not callable(getter):
+        plan = None
+    else:
+        try:
+            plan = getter(resources.canvas_size[0], resources.canvas_size[1])
+        except (RuntimeError, TypeError, ValueError):
+            plan = None
+    if plan is None and effective_mode in {"blur", "color"}:
+        plan = plan_transform(
+            resources.canvas_size,
+            resources.canvas_size,
+            fit=cfg.background.fit_mode,
+            anchors=(cfg.background.anchor_x, cfg.background.anchor_y),
+        )
+    if plan is None:
+        return _empty_plan_stats("background", fit=cfg.background.fit_mode)
+    values = _plan_stats("background", plan)
+    # Qualified video orientation is applied before the fit plan. Include it
+    # in the total source-to-canvas rotation instead of reporting a false zero.
+    stats_getter = getattr(provider, "stats_dict", None)
+    if callable(stats_getter):
+        provider_stats = stats_getter()
+        if isinstance(provider_stats, Mapping):
+            orientation_status = provider_stats.get(
+                "background_video_orientation_status"
+            )
+            metadata_rotation = provider_stats.get("background_video_metadata_rotation")
+        else:
+            orientation_status = metadata_rotation = None
+        if (
+            orientation_status == "qualified-manual-metadata"
+            and type(metadata_rotation) is int
+        ):
+            values["background_rotation"] = metadata_rotation
+    return values
+
+
+def _effective_color_mode(transform: ColorTransform) -> str:
+    exposure = abs(transform.exposure_ev) > 1e-9
+    white_balance = any(abs(gain - 1.0) > 1e-9 for gain in transform.wb_gains)
+    if exposure and white_balance:
+        return "exposure-white-balance"
+    if exposure:
+        return "exposure"
+    if white_balance:
+        return "white-balance"
+    return "identity"
+
+
+def _color_stats(
+    cfg: AppConfig,
+    snapshot: HarmonizerSnapshot | None,
+    *,
+    applied_transform: ColorTransform | None = None,
+    application_failed: bool = False,
+) -> dict[str, object]:
+    """Map configured, temporal, and actually applied correction state."""
+
+    configured_mode = cfg.compositing.color_correction.mode
+    eligible = (
+        configured_mode == "auto" and cfg.background.mode in _COLOR_ELIGIBLE_MODES
+    )
+    if configured_mode != "auto":
+        state = "disabled"
+        reason = "disabled"
+        transform = IDENTITY_TRANSFORM
+        effective_mode = "off"
+    elif not eligible:
+        state = "mode-excluded"
+        reason = ColorReason.MODE_EXCLUDED.value
+        transform = IDENTITY_TRANSFORM
+        effective_mode = "bypass"
+    else:
+        transform = (
+            applied_transform
+            if applied_transform is not None
+            else snapshot.transform
+            if snapshot is not None
+            else IDENTITY_TRANSFORM
+        )
+        if snapshot is None:
+            state = "warming"
+            reason = "initializing"
+        else:
+            state = {
+                HarmonizerPhase.IDENTITY: "low-confidence",
+                HarmonizerPhase.WARMING: "warming",
+                HarmonizerPhase.ACTIVE: "active",
+                HarmonizerPhase.FROZEN: "low-confidence",
+                HarmonizerPhase.STALE_DECAY: "stale-decay",
+                HarmonizerPhase.SCENE_CUT: "scene-cut",
+            }[snapshot.phase]
+            reason = snapshot.reason.value
+        effective_mode = (
+            "bypass" if application_failed else _effective_color_mode(transform)
+        )
+        if application_failed:
+            transform = IDENTITY_TRANSFORM
+            reason = "application-error"
+
+    confidence = snapshot.confidence if snapshot is not None and eligible else 0.0
+    gains = transform.wb_gains
+    active = eligible and not application_failed and not transform.is_identity
+    return {
+        "color_correction_mode": configured_mode,
+        "color_correction_active": active,
+        "color_correction_effective_mode": effective_mode,
+        "color_correction_state": state,
+        "color_correction_reason": reason,
+        "color_correction_confidence": confidence,
+        "color_correction_exposure_ev": transform.exposure_ev,
+        "color_correction_wb_gain_r": gains[0],
+        "color_correction_wb_gain_g": gains[1],
+        "color_correction_wb_gain_b": gains[2],
+        "color_correction_wb_active": any(abs(gain - 1.0) > 1e-9 for gain in gains),
+        "color_correction_warming": state in {"warming", "scene-cut"},
+        "color_correction_stale": state == "stale-decay",
+        "color_input_assumption": "display-referred-srgb-bt709-full-range",
+    }
+
+
 def _build_backdrop(cfg: AppConfig) -> Any:
     kwargs: dict[str, Any] = {
         "image_max_pixels": cfg.api.uploads.image_max_pixels,
         "video_max_width": cfg.api.uploads.video_max_width,
         "video_max_height": cfg.api.uploads.video_max_height,
     }
-    if _backdrop_key(cfg)[0] == "camera":
+    if _backdrop_provider_key(cfg)[0] == "camera":
         kwargs["camera_target"] = cfg.resolved_backdrop_target()
     return create_backdrop(cfg.background, **kwargs)
 
@@ -322,9 +644,86 @@ class _Resources:
     refiner: Any
     backdrop: Any
     output: Any
+    visual_generation: int = 0
+    harmonizer: ColorHarmonizer | None = None
+    color_reset_token: tuple[object, ...] | None = None
+    background_geometry_token: tuple[object, ...] | None = None
+    background_geometry_transitions: int = 0
+    color_correction_applied_frames: int = 0
+    color_correction_bypassed_frames: int = 0
+    color_correction_scene_cuts: int = 0
+    color_correction_transitions: int = 0
+    canvas_size: Size = field(init=False)
+    color_analysis_executor: ThreadPoolExecutor = field(init=False, repr=False)
+    color_backdrop_analysis_token: tuple[object, ...] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    color_backdrop_analysis_linear_bgr: np.ndarray | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        self.canvas_size = resolved_output_size(self.cfg)
+        # The three independent linear-light analysis resizes release the GIL.
+        # A resource-owned pool runs them concurrently and is closed with the
+        # pipeline generation, avoiding process-global worker lifetime.
+        self.color_analysis_executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="custback-color-analysis",
+        )
+        if self.harmonizer is None:
+            self.harmonizer = _new_color_harmonizer(self.cfg)
+
+    @property
+    def canvas_shape(self) -> tuple[int, int, int]:
+        return (self.canvas_size[1], self.canvas_size[0], 3)
+
+    def image_backdrop_analysis(
+        self,
+        backdrop_frame: np.ndarray,
+        backdrop_linear_bgr: np.ndarray,
+    ) -> np.ndarray | None:
+        """Return one generation-scoped bounded raster for immutable images."""
+
+        provider = self.backdrop
+        if (
+            not isinstance(provider, ImageBackdrop)
+            or getattr(provider, "_cache", None) is not backdrop_frame
+        ):
+            return None
+        token = (
+            self.visual_generation,
+            id(provider),
+            getattr(provider, "_cache_key", None),
+            id(backdrop_frame),
+            backdrop_frame.shape,
+        )
+        if (
+            self.color_backdrop_analysis_token != token
+            or self.color_backdrop_analysis_linear_bgr is None
+        ):
+            analysis = _linear_bgr_analysis_raster_prevalidated(backdrop_linear_bgr)
+            if max(analysis.shape[:2]) > ANALYSIS_LONG_EDGE:
+                raise ColorError("cached backdrop analysis exceeds its bound")
+            self.color_backdrop_analysis_token = token
+            self.color_backdrop_analysis_linear_bgr = analysis
+        return self.color_backdrop_analysis_linear_bgr
+
+    def invalidate_color_backdrop_analysis(self) -> None:
+        self.color_backdrop_analysis_token = None
+        self.color_backdrop_analysis_linear_bgr = None
 
     def close(self) -> None:
         # Close independently so one faulty backend cannot strand the others.
+        self.invalidate_color_backdrop_analysis()
+        try:
+            self.color_analysis_executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            log.exception("cannot close color analysis workers")
         _safe_close(self.output, "video output")
         _safe_close(self.backdrop, "backdrop")
         _safe_close(self.segmenter, "segmenter")
@@ -339,12 +738,26 @@ class _Activation:
     refiner: Any = None
     replace_backdrop: bool = False
     backdrop: Any = None
+    visual_state_changed: bool = False
+    replace_harmonizer: bool = False
+    harmonizer: ColorHarmonizer | None = None
 
     def discard(self) -> None:
         if self.replace_backdrop:
             _safe_close(self.backdrop, "staged backdrop")
         if self.replace_segmenter:
             _safe_close(self.segmenter, "staged segmenter")
+
+
+@dataclass(frozen=True)
+class _PreparedColorFrame:
+    """Frame-local decoded inputs and one bounded foreground transform."""
+
+    transform: ColorTransform = IDENTITY_TRANSFORM
+    foreground_linear_bgr: np.ndarray | None = None
+    backdrop_linear_bgr: np.ndarray | None = None
+    edge_foreground_linear_bgr: np.ndarray | None = None
+    snapshot: HarmonizerSnapshot | None = None
 
 
 @dataclass
@@ -428,7 +841,8 @@ def _restart_only_changes(old: AppConfig, new: AppConfig) -> list[str]:
     return [
         path
         for path in changed
-        if path.startswith("camera.")
+        if path == "schema_version"
+        or path.startswith("camera.")
         or path.startswith("output.")
         or (path.startswith("api.") and path != "api.remote_timeout_ms")
         or path == "background.camera_device"
@@ -480,6 +894,8 @@ class Pipeline:
         self._runtime_writer = runtime._coordinator_writer()
         self._model_preparation = model_preparation
         self._fallback_log_states: dict[str, tuple[bool, str]] = {}
+        self._geometry_log_states: dict[str, tuple[object, ...]] = {}
+        self._color_log_state: tuple[object, ...] | None = None
         self._raw_fingerprint_capacity = raw_fingerprint_capacity
         self._recent_raw_fingerprints = _RawReplayHistory(raw_fingerprint_capacity)
         self._privacy_history_exhausted = False
@@ -501,6 +917,8 @@ class Pipeline:
             self._error = None
             self._active_state = None
             self._fallback_log_states.clear()
+            self._geometry_log_states.clear()
+            self._color_log_state = None
             with self._preparation_lock:
                 if self._preparation_executor is not None:
                     raise ReconfigurationUnavailable(
@@ -594,6 +1012,8 @@ class Pipeline:
         """Validate, activate, commit, and acknowledge a hot configuration patch."""
         if isinstance(patch, dict):
             restart_fields = []
+            if "schema_version" in patch:
+                restart_fields.append("schema_version")
             background_patch = patch.get("background")
             if (
                 isinstance(background_patch, dict)
@@ -916,10 +1336,11 @@ class Pipeline:
     # -- lifecycle -----------------------------------------------------
     def _open_resources(self, state: ConfigState) -> _Resources:
         cfg = state.config
+        canvas_size = resolved_output_size(cfg)
         # ExitStack protects every successfully opened backend if a later
         # constructor fails. Once complete, _Resources owns deterministic close.
         with ExitStack() as startup:
-            capture = open_capture(cfg.camera)
+            capture = open_capture(cfg.camera, canvas_size)
             startup.callback(_safe_close, capture, "capture")
             if self._model_preparation is not None:
                 segmenter = create_segmenter(
@@ -936,11 +1357,26 @@ class Pipeline:
             backdrop = _build_backdrop(cfg)
             if backdrop is not None:
                 startup.callback(_safe_close, backdrop, "backdrop")
-            output = open_output(cfg.output, cfg.camera.width, cfg.camera.height)
+            output = open_output(cfg.output, canvas_size[0], canvas_size[1])
             startup.callback(_safe_close, output, "video output")
             resources = _Resources(
                 cfg, state.version, capture, segmenter, refiner, backdrop, output
             )
+            # Backend callbacks above already own their individual teardown.
+            # Register only the executor created by _Resources so a later
+            # construction/configuration failure cannot leak its worker pool or
+            # close any backend twice.
+            startup.callback(
+                resources.color_analysis_executor.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
+            if (
+                resources.canvas_size != canvas_size
+            ):  # pragma: no cover - resolver invariant
+                raise RuntimeError("resource canvas changed during construction")
+            if hasattr(self.hub, "configure_canvas"):
+                self.hub.configure_canvas(canvas_size)
             startup.pop_all()
             return resources
 
@@ -954,7 +1390,6 @@ class Pipeline:
             resources = self._open_resources(state)
             self._active_state = state
             initial_output = self._preflight(resources)
-            self._update_identity_stats(resources)
             self._startup_done.set()
             self._loop(resources, initial_output=initial_output)
         except BaseException as exc:
@@ -1009,9 +1444,17 @@ class Pipeline:
                 activation.refiner = refiner_for(
                     candidate.segmentation, activation.segmenter
                 )
-            if _backdrop_key(candidate) != _backdrop_key(current):
+            if _backdrop_provider_key(candidate) != _backdrop_provider_key(current):
                 activation.backdrop = _build_backdrop(candidate)
                 activation.replace_backdrop = True
+            activation.visual_state_changed = _visual_state_key(
+                candidate
+            ) != _visual_state_key(current)
+            activation.replace_harmonizer = _color_state_key(
+                candidate
+            ) != _color_state_key(current)
+            if activation.replace_harmonizer:
+                activation.harmonizer = _new_color_harmonizer(candidate)
         except Exception as exc:
             activation.discard()
             raise ActivationError(str(exc)) from exc
@@ -1031,15 +1474,29 @@ class Pipeline:
         activation = prepared
         activation.candidate = candidate
         segmentation_changed = _segmenter_key(candidate) != _segmenter_key(old_cfg)
-        background_changed = _backdrop_key(candidate) != _backdrop_key(old_cfg)
+        background_changed = _backdrop_provider_key(
+            candidate
+        ) != _backdrop_provider_key(old_cfg)
+        visual_state_changed = _visual_state_key(candidate) != _visual_state_key(
+            old_cfg
+        )
+        color_state_changed = _color_state_key(candidate) != _color_state_key(old_cfg)
         if segmentation_changed != activation.replace_segmenter:
             raise ActivationError("prepared segmentation candidate is stale")
         if background_changed != activation.replace_backdrop:
             raise ActivationError("prepared background candidate is stale")
+        if visual_state_changed != activation.visual_state_changed:
+            raise ActivationError("prepared visual-state candidate is stale")
+        if color_state_changed != activation.replace_harmonizer:
+            raise ActivationError("prepared color-state candidate is stale")
         if not segmentation_changed:
             activation.refiner = resources.refiner
         if not background_changed:
             activation.backdrop = resources.backdrop
+        if not color_state_changed:
+            activation.harmonizer = resources.harmonizer
+        elif activation.harmonizer is None:
+            raise ActivationError("prepared color harmonizer is missing")
         return activation
 
     def _trial_activation(
@@ -1056,13 +1513,51 @@ class Pipeline:
         """
         old_cfg = resources.cfg
         segmentation_changed = activation.candidate.segmentation != old_cfg.segmentation
-        background_changed = _backdrop_key(activation.candidate) != _backdrop_key(
-            old_cfg
+        background_changed = _backdrop_provider_key(
+            activation.candidate
+        ) != _backdrop_provider_key(old_cfg)
+        background_geometry_changed = (
+            activation.candidate.background.fit_mode,
+            activation.candidate.background.anchor_x,
+            activation.candidate.background.anchor_y,
+        ) != (
+            old_cfg.background.fit_mode,
+            old_cfg.background.anchor_x,
+            old_cfg.background.anchor_y,
         )
         compositing_changed = activation.candidate.compositing != old_cfg.compositing
-        if not (segmentation_changed or background_changed or compositing_changed):
+        if not (
+            segmentation_changed
+            or background_changed
+            or background_geometry_changed
+            or compositing_changed
+        ):
             return
         try:
+            if background_geometry_changed:
+                # Exercise the candidate planner and pixel path on detached,
+                # asymmetric pixels.  Never call a reused live video/camera
+                # provider during a geometry-only trial.
+                synthetic = np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3)
+                trial_size = (
+                    min(resources.canvas_size[0], 64),
+                    min(resources.canvas_size[1], 64),
+                )
+                geometry_plan = plan_transform(
+                    (7, 5),
+                    trial_size,
+                    fit=activation.candidate.background.fit_mode,
+                    anchors=(
+                        activation.candidate.background.anchor_x,
+                        activation.candidate.background.anchor_y,
+                    ),
+                )
+                fitted = apply_transform(synthetic, geometry_plan)
+                self._validate_canvas_frame(
+                    fitted,
+                    trial_size,
+                    boundary="candidate backdrop geometry",
+                )
             if segmentation_changed:
                 mask = self._segment_and_refine_mask(
                     activation.segmenter,
@@ -1078,7 +1573,15 @@ class Pipeline:
             if background_changed and activation.backdrop is not None:
                 if isinstance(activation.backdrop, BlurBackdrop):
                     activation.backdrop.set_source_frame(frame, mask)
-                bg = activation.backdrop.frame(frame.shape[1], frame.shape[0])
+                bg = activation.backdrop.frame(
+                    resources.canvas_size[0],
+                    resources.canvas_size[1],
+                )
+                self._validate_canvas_frame(
+                    bg,
+                    resources.canvas_size,
+                    boundary="candidate backdrop",
+                )
             else:
                 bg = np.zeros_like(frame)
 
@@ -1088,14 +1591,40 @@ class Pipeline:
                 and activation.candidate.compositing.use_model_foreground
                 else None
             )
-            out = composite(
+            if edge_fg is not None:
+                edge_fg = self._validate_canvas_frame(
+                    edge_fg,
+                    resources.canvas_size,
+                    boundary="candidate model foreground",
+                )
+            base_harmonizer = activation.harmonizer or resources.harmonizer
+            if base_harmonizer is None:
+                raise ActivationError("candidate color harmonizer is missing")
+            trial_harmonizer = base_harmonizer.clone()
+            trial_last_time = trial_harmonizer.snapshot().last_timestamp_s
+            trial_now = (
+                0.0 if trial_last_time is None else trial_last_time + (1.0 / 30.0)
+            )
+            prepared_color = self._prepare_color_frame(
+                resources,
                 frame,
                 bg,
                 mask,
-                light_wrap=activation.candidate.compositing.light_wrap,
-                edge_foreground=edge_fg,
+                edge_fg,
+                now_s=trial_now,
+                cfg=activation.candidate,
+                harmonizer=trial_harmonizer,
+                track_live_state=False,
             )
-            self._validate_output_frame(out, frame)
+            out = self._composite_prepared_color(
+                activation.candidate,
+                frame,
+                bg,
+                mask,
+                edge_fg,
+                prepared_color,
+            )
+            self._validate_output_frame(out, resources.canvas_size)
         except Exception as exc:
             raise ActivationError(str(exc)) from exc
 
@@ -1110,8 +1639,37 @@ class Pipeline:
         old_segmenter = resources.segmenter
         old_refiner = resources.refiner
         old_backdrop = resources.backdrop
+        old_harmonizer = getattr(resources, "harmonizer", None)
+        old_color_reset_token = getattr(resources, "color_reset_token", None)
+        old_backdrop_analysis_token = getattr(
+            resources,
+            "color_backdrop_analysis_token",
+            None,
+        )
+        old_backdrop_analysis = getattr(
+            resources,
+            "color_backdrop_analysis_linear_bgr",
+            None,
+        )
         old_version = resources.version
+        old_visual_generation = resources.visual_generation
         old_active_state = self._active_state
+        old_backdrop_geometry = (
+            resources.backdrop.geometry
+            if not activation.replace_backdrop
+            and resources.backdrop is not None
+            and hasattr(resources.backdrop, "geometry")
+            else None
+        )
+        background_geometry_changed = (
+            activation.candidate.background.fit_mode,
+            activation.candidate.background.anchor_x,
+            activation.candidate.background.anchor_y,
+        ) != (
+            old_cfg.background.fit_mode,
+            old_cfg.background.anchor_x,
+            old_cfg.background.anchor_y,
+        )
         # Allocate/copy before the first effective pointer changes. The actual
         # swap below is assignment-only and has an explicit rollback guard.
         new_active_state = ConfigState(
@@ -1123,16 +1681,58 @@ class Pipeline:
             resources.refiner = activation.refiner
             if activation.replace_backdrop:
                 resources.backdrop = activation.backdrop
+            if activation.replace_harmonizer:
+                if activation.harmonizer is None:
+                    raise ActivationError("staged color harmonizer is missing")
+                resources.harmonizer = activation.harmonizer
+                resources.color_reset_token = None
+            if activation.visual_state_changed:
+                resources.visual_generation += 1
+                invalidate_analysis = getattr(
+                    resources,
+                    "invalidate_color_backdrop_analysis",
+                    None,
+                )
+                if callable(invalidate_analysis):
+                    invalidate_analysis()
             resources.cfg = activation.candidate
             resources.version = version
             self._active_state = new_active_state
+            if (
+                background_geometry_changed
+                and not activation.replace_backdrop
+                and resources.backdrop is not None
+                and hasattr(resources.backdrop, "set_geometry")
+            ):
+                resources.backdrop.set_geometry(
+                    activation.candidate.background.fit_mode,
+                    activation.candidate.background.anchor_x,
+                    activation.candidate.background.anchor_y,
+                )
         except BaseException:
             resources.segmenter = old_segmenter
             resources.refiner = old_refiner
             resources.backdrop = old_backdrop
+            resources.harmonizer = old_harmonizer
+            resources.color_reset_token = old_color_reset_token
+            if hasattr(resources, "color_backdrop_analysis_token"):
+                resources.color_backdrop_analysis_token = old_backdrop_analysis_token
+            if hasattr(resources, "color_backdrop_analysis_linear_bgr"):
+                resources.color_backdrop_analysis_linear_bgr = old_backdrop_analysis
             resources.cfg = old_cfg
             resources.version = old_version
+            resources.visual_generation = old_visual_generation
             self._active_state = old_active_state
+            if (
+                old_backdrop_geometry is not None
+                and resources.backdrop is old_backdrop
+                and hasattr(resources.backdrop, "set_geometry")
+            ):
+                resources.backdrop.set_geometry(
+                    old_backdrop_geometry.fit_mode,
+                    old_backdrop_geometry.anchor_x,
+                    old_backdrop_geometry.anchor_y,
+                )
             raise
         return (
             old_backdrop if activation.replace_backdrop else None,
@@ -1150,10 +1750,6 @@ class Pipeline:
             except Exception:
                 log.exception("cannot invalidate remote session after mode switch")
                 self._privacy_history_exhausted = True
-        try:
-            self._update_identity_stats(resources)
-        except Exception:
-            log.exception("cannot update pipeline identity statistics")
 
     def _handle_patch_request(
         self,
@@ -1339,13 +1935,18 @@ class Pipeline:
         for resource, label in deferred:
             _safe_close(resource, f"deferred {label}")
 
-    def _update_identity_stats(self, resources: _Resources) -> None:
+    def _identity_stats(
+        self,
+        resources: _Resources,
+        *,
+        capture_health: Any = None,
+        color_status: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Build path-free identity state for one matching output boundary."""
+
         cfg = resources.cfg
-        capture_health = (
-            resources.capture.health_snapshot()
-            if hasattr(resources.capture, "health_snapshot")
-            else None
-        )
+        if capture_health is None and hasattr(resources.capture, "health_snapshot"):
+            capture_health = resources.capture.health_snapshot()
         output_fallback = bool(getattr(resources.output, "fallback_active", False))
         segmentation_fallback = cfg.segmentation.backend == "auto" and isinstance(
             resources.segmenter, HeuristicSegmenter
@@ -1356,41 +1957,26 @@ class Pipeline:
             and hasattr(resources.backdrop, "stats_dict")
             else dict(_VIDEO_STATS_DEFAULTS)
         )
-        self.hub.update_stats(
-            mode=cfg.background.mode,
-            segmentation_backend=type(resources.segmenter).__name__,
-            segmentation_device=resources.segmenter.device,
-            output_backend=type(resources.output).__name__,
-            output_target_fps=cfg.output.fps,
-            output_fallback_active=output_fallback,
-            output_fallback_reason=(
-                getattr(resources.output, "fallback_reason", "")
-                if output_fallback
-                else ""
-            ),
-            segmentation_fallback_active=segmentation_fallback,
-            segmentation_fallback_reason=(
-                "ml-backend-unavailable" if segmentation_fallback else ""
-            ),
-            capture_backend=(
-                getattr(capture_health, "backend", type(resources.capture).__name__)
-                if capture_health is not None
-                else type(resources.capture).__name__
-            ),
-            capture_fourcc=getattr(capture_health, "fourcc", None),
-            capture_width=getattr(capture_health, "width", cfg.camera.width),
-            capture_height=getattr(capture_health, "height", cfg.camera.height),
-            capture_fps_reported=getattr(
-                capture_health, "fps_reported", float(cfg.camera.fps)
-            ),
-            capture_target_fps=cfg.camera.fps,
-            remote_fallback_mode=(
-                "privacy-slate" if cfg.background.mode == "remote" else ""
-            ),
-            config_version=resources.version,
-            **_acceleration_stats(resources.segmenter),
-            **video_stats,
+        camera_geometry = _camera_plan_stats(
+            cfg,
+            resources.canvas_size,
+            capture_health,
         )
+        background_geometry = _background_plan_stats(resources)
+        self._log_geometry_transitions(
+            resources,
+            capture_health,
+            camera_geometry,
+            background_geometry,
+        )
+        if color_status is None:
+            snapshot = (
+                resources.harmonizer.snapshot()
+                if resources.harmonizer is not None
+                else None
+            )
+            color_status = _color_stats(cfg, snapshot)
+        self._log_color_transition(resources, color_status)
         self._log_fallback_transition(
             "output",
             output_fallback,
@@ -1401,6 +1987,235 @@ class Pipeline:
             segmentation_fallback,
             "ml-backend-unavailable" if segmentation_fallback else "",
         )
+        return {
+            "mode": cfg.background.mode,
+            "segmentation_backend": type(resources.segmenter).__name__,
+            "segmentation_device": resources.segmenter.device,
+            "output_backend": type(resources.output).__name__,
+            "output_target_fps": cfg.output.fps,
+            "output_width": getattr(
+                resources.output,
+                "width",
+                resources.canvas_size[0],
+            ),
+            "output_height": getattr(
+                resources.output,
+                "height",
+                resources.canvas_size[1],
+            ),
+            "output_fps": getattr(resources.output, "fps", cfg.output.fps),
+            "output_fallback_active": output_fallback,
+            "output_fallback_reason": (
+                getattr(resources.output, "fallback_reason", "")
+                if output_fallback
+                else ""
+            ),
+            "segmentation_fallback_active": segmentation_fallback,
+            "segmentation_fallback_reason": (
+                "ml-backend-unavailable" if segmentation_fallback else ""
+            ),
+            "capture_backend": (
+                getattr(capture_health, "backend", type(resources.capture).__name__)
+                if capture_health is not None
+                else type(resources.capture).__name__
+            ),
+            "capture_fourcc": getattr(capture_health, "fourcc", None),
+            # width/height retain their original negotiated-mode meaning.
+            "capture_width": getattr(capture_health, "width", cfg.camera.width),
+            "capture_height": getattr(capture_health, "height", cfg.camera.height),
+            "capture_delivered_width": getattr(capture_health, "delivered_width", None),
+            "capture_delivered_height": getattr(
+                capture_health, "delivered_height", None
+            ),
+            "capture_oriented_width": getattr(capture_health, "oriented_width", None),
+            "capture_oriented_height": getattr(capture_health, "oriented_height", None),
+            "capture_normalized_width": getattr(
+                capture_health, "normalized_width", resources.canvas_size[0]
+            ),
+            "capture_normalized_height": getattr(
+                capture_health, "normalized_height", resources.canvas_size[1]
+            ),
+            "capture_generation": getattr(capture_health, "generation", 0),
+            "capture_geometry_transitions": getattr(
+                capture_health, "geometry_transitions", 0
+            ),
+            "camera_controls": _camera_controls_stats(capture_health),
+            "capture_fps_reported": getattr(
+                capture_health, "fps_reported", float(cfg.camera.fps)
+            ),
+            "capture_target_fps": cfg.camera.fps,
+            "remote_fallback_mode": (
+                "privacy-slate" if cfg.background.mode == "remote" else ""
+            ),
+            "background_geometry_transitions": (
+                resources.background_geometry_transitions
+            ),
+            "color_correction_applied_frames": (
+                resources.color_correction_applied_frames
+            ),
+            "color_correction_bypassed_frames": (
+                resources.color_correction_bypassed_frames
+            ),
+            "color_correction_scene_cuts": resources.color_correction_scene_cuts,
+            "color_correction_transitions": resources.color_correction_transitions,
+            "config_version": resources.version,
+            **_acceleration_stats(resources.segmenter),
+            **video_stats,
+            **camera_geometry,
+            **background_geometry,
+            **color_status,
+        }
+
+    def _update_identity_stats(self, resources: _Resources) -> None:
+        cfg = resources.cfg
+        output_fallback = bool(getattr(resources.output, "fallback_active", False))
+        segmentation_fallback = cfg.segmentation.backend == "auto" and isinstance(
+            resources.segmenter, HeuristicSegmenter
+        )
+        self.hub.update_stats(**self._identity_stats(resources))
+        self._log_fallback_transition(
+            "output",
+            output_fallback,
+            getattr(resources.output, "fallback_reason", "") if output_fallback else "",
+        )
+        self._log_fallback_transition(
+            "segmentation",
+            segmentation_fallback,
+            "ml-backend-unavailable" if segmentation_fallback else "",
+        )
+
+    def _log_geometry_transitions(
+        self,
+        resources: _Resources,
+        capture_health: Any,
+        camera: dict[str, object],
+        background: dict[str, object],
+    ) -> None:
+        """Log the first complete plan and later scalar-only plan changes."""
+
+        camera_state = (
+            getattr(capture_health, "generation", 0),
+            getattr(capture_health, "delivered_width", None),
+            getattr(capture_health, "delivered_height", None),
+            getattr(capture_health, "oriented_width", None),
+            getattr(capture_health, "oriented_height", None),
+            *camera.values(),
+        )
+        if self._geometry_log_states.get("camera") != camera_state:
+            self._geometry_log_states["camera"] = camera_state
+            log.info(
+                "camera transform generation=%d delivered=%sx%s oriented=%sx%s "
+                "output=%dx%d fit=%s rotation=%d mirror=%s "
+                "scale=%s,%s crop=%s,%s,%s,%s pad=%d,%d,%d,%d",
+                getattr(capture_health, "generation", 0),
+                getattr(capture_health, "delivered_width", None),
+                getattr(capture_health, "delivered_height", None),
+                getattr(capture_health, "oriented_width", None),
+                getattr(capture_health, "oriented_height", None),
+                resources.canvas_size[0],
+                resources.canvas_size[1],
+                camera["camera_fit"],
+                camera["camera_rotation"],
+                camera["camera_mirror"],
+                camera["camera_scale_x"],
+                camera["camera_scale_y"],
+                camera["camera_crop_left"],
+                camera["camera_crop_top"],
+                camera["camera_crop_right"],
+                camera["camera_crop_bottom"],
+                camera["camera_pad_left"],
+                camera["camera_pad_top"],
+                camera["camera_pad_right"],
+                camera["camera_pad_bottom"],
+            )
+
+        effective_mode = (
+            resources.cfg.background.remote_fallback_mode
+            if resources.cfg.background.mode == "remote"
+            else resources.cfg.background.mode
+        )
+        background_state = (
+            effective_mode,
+            id(resources.backdrop),
+            *background.values(),
+        )
+        # Fitted providers have no truthful plan between a geometry change and
+        # their next rendered frame. Do not log/count that temporary unknown.
+        plan_available = background["background_scale_x"] is not None
+        if (
+            plan_available
+            and self._geometry_log_states.get("background") != background_state
+        ):
+            self._geometry_log_states["background"] = background_state
+            resources.background_geometry_token = background_state
+            resources.background_geometry_transitions += 1
+            log.info(
+                "background transform mode=%s output=%dx%d fit=%s rotation=%d "
+                "mirror=%s scale=%s,%s crop=%s,%s,%s,%s pad=%d,%d,%d,%d",
+                effective_mode,
+                resources.canvas_size[0],
+                resources.canvas_size[1],
+                background["background_fit"],
+                background["background_rotation"],
+                background["background_mirror"],
+                background["background_scale_x"],
+                background["background_scale_y"],
+                background["background_crop_left"],
+                background["background_crop_top"],
+                background["background_crop_right"],
+                background["background_crop_bottom"],
+                background["background_pad_left"],
+                background["background_pad_top"],
+                background["background_pad_right"],
+                background["background_pad_bottom"],
+            )
+
+    def _log_color_transition(
+        self,
+        resources: _Resources,
+        status: dict[str, object],
+    ) -> None:
+        """Log only first correction state and meaningful later transitions."""
+
+        state = (
+            status["color_correction_mode"],
+            status["color_correction_active"],
+            status["color_correction_effective_mode"],
+            status["color_correction_state"],
+            status["color_correction_reason"],
+        )
+        if self._color_log_state == state:
+            return
+        self._color_log_state = state
+        resources.color_correction_transitions += 1
+        log.info(
+            "color correction state=%s configured=%s effective=%s active=%s "
+            "reason=%s confidence=%.3f exposure_ev=%+.3f wb=%.4f,%.4f,%.4f",
+            status["color_correction_state"],
+            status["color_correction_mode"],
+            status["color_correction_effective_mode"],
+            status["color_correction_active"],
+            status["color_correction_reason"],
+            status["color_correction_confidence"],
+            status["color_correction_exposure_ev"],
+            status["color_correction_wb_gain_r"],
+            status["color_correction_wb_gain_g"],
+            status["color_correction_wb_gain_b"],
+        )
+
+    @staticmethod
+    def _record_color_output(
+        resources: _Resources,
+        status: dict[str, object],
+        *,
+        processed: bool,
+    ) -> None:
+        if status["color_correction_active"]:
+            resources.color_correction_applied_frames += 1
+        else:
+            resources.color_correction_bypassed_frames += 1
+        if processed and status["color_correction_state"] == "scene-cut":
+            resources.color_correction_scene_cuts += 1
 
     def _log_fallback_transition(self, kind: str, active: bool, reason: str) -> None:
         """Emit one record only when a fallback state or reason changes."""
@@ -1428,18 +2243,35 @@ class Pipeline:
 
     # -- frame processing ---------------------------------------------
     @staticmethod
-    def _validate_output_frame(out: np.ndarray, source: np.ndarray) -> None:
-        if (
-            not isinstance(out, np.ndarray)
-            or out.dtype != np.uint8
-            or out.ndim != 3
-            or out.shape != source.shape
-            or out.shape[2] != 3
-        ):
-            raise ValueError(
-                f"processed frame must be uint8 BGR {source.shape}, got "
-                f"{getattr(out, 'dtype', None)} {getattr(out, 'shape', None)}"
+    def _validate_canvas_frame(
+        frame: np.ndarray,
+        canvas_size: Size,
+        *,
+        boundary: str,
+    ) -> np.ndarray:
+        try:
+            validated = validate_bgr_frame(
+                frame,
+                name=f"{boundary} frame",
+                require_contiguous=True,
             )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        expected_shape = (canvas_size[1], canvas_size[0], 3)
+        if validated.shape != expected_shape:
+            raise ValueError(
+                f"{boundary} frame must match canonical canvas {expected_shape}, "
+                f"got {validated.shape}"
+            )
+        return validated
+
+    @classmethod
+    def _validate_output_frame(cls, out: np.ndarray, canvas_size: Size) -> None:
+        cls._validate_canvas_frame(
+            out,
+            canvas_size,
+            boundary="processed output",
+        )
 
     @staticmethod
     def _privacy_slate(shape: tuple[int, ...]) -> np.ndarray:
@@ -1670,7 +2502,7 @@ class Pipeline:
         if self._privacy_history_exhausted:
             return self._privacy_slate(raw.shape), "privacy-history-exhausted"
         try:
-            self._validate_output_frame(candidate, raw)
+            self._validate_output_frame(candidate, (raw.shape[1], raw.shape[0]))
         except Exception:
             return self._privacy_slate(raw.shape), "privacy-invalid-output"
         if self._is_near_raw(candidate, raw):
@@ -1680,7 +2512,11 @@ class Pipeline:
         return candidate, ""
 
     def _render_local_mode(
-        self, resources: _Resources, frame: np.ndarray
+        self,
+        resources: _Resources,
+        frame: np.ndarray,
+        *,
+        color_outcome: dict[str, object] | None = None,
     ) -> np.ndarray:
         mode = resources.cfg.background.mode
         if mode == "passthrough":
@@ -1691,8 +2527,229 @@ class Pipeline:
             resources,
             frame,
             privacy_safe=mode == "remote",
+            color_outcome=color_outcome,
         )
         return out
+
+    @staticmethod
+    def _composite_prepared_color(
+        cfg: AppConfig,
+        frame: np.ndarray,
+        backdrop_frame: np.ndarray,
+        mask: np.ndarray,
+        edge_foreground: np.ndarray | None,
+        prepared: _PreparedColorFrame,
+    ) -> np.ndarray:
+        """Render with shared decoded inputs when correction prepared them."""
+
+        compositing = cfg.compositing
+        foreground_linear = prepared.foreground_linear_bgr
+        backdrop_linear = prepared.backdrop_linear_bgr
+        edge_linear = prepared.edge_foreground_linear_bgr
+        edge_pair_ready = edge_foreground is None or edge_linear is not None
+        if compositing.blend_space == "linear_srgb":
+            if foreground_linear is None:
+                foreground_linear = bgr_u8_to_linear_rgb(frame)
+            if backdrop_linear is None:
+                backdrop_linear = bgr_u8_to_linear_rgb(backdrop_frame)
+            if edge_foreground is not None and edge_linear is None:
+                edge_linear = bgr_u8_to_linear_rgb(edge_foreground)
+            return composite_linear_predecoded(
+                frame,
+                backdrop_frame,
+                mask,
+                foreground_linear_bgr=foreground_linear,
+                backdrop_linear_bgr=backdrop_linear,
+                light_wrap=compositing.light_wrap,
+                edge_foreground_bgr=edge_foreground,
+                edge_foreground_linear_bgr=edge_linear,
+                color_transform=prepared.transform,
+            )
+        if (
+            compositing.blend_space == "srgb_legacy"
+            and foreground_linear is not None
+            and edge_pair_ready
+        ):
+            return composite_legacy_predecoded(
+                frame,
+                backdrop_frame,
+                mask,
+                foreground_linear_rgb=np.ascontiguousarray(
+                    foreground_linear[..., ::-1]
+                ),
+                light_wrap=compositing.light_wrap,
+                edge_foreground_bgr=edge_foreground,
+                edge_foreground_linear_rgb=(
+                    None
+                    if edge_linear is None
+                    else np.ascontiguousarray(edge_linear[..., ::-1])
+                ),
+                color_transform=prepared.transform,
+            )
+        return composite(
+            frame,
+            backdrop_frame,
+            mask,
+            light_wrap=compositing.light_wrap,
+            edge_foreground=edge_foreground,
+            blend_space=compositing.blend_space,
+            color_transform=prepared.transform,
+        )
+
+    def _prepare_color_frame(
+        self,
+        resources: _Resources,
+        frame: np.ndarray,
+        backdrop_frame: np.ndarray,
+        mask: np.ndarray,
+        edge_foreground: np.ndarray | None,
+        *,
+        now_s: float,
+        cfg: AppConfig | None = None,
+        harmonizer: ColorHarmonizer | None = None,
+        track_live_state: bool = True,
+    ) -> _PreparedColorFrame:
+        """Estimate one transform and retain decoded inputs for the compositor.
+
+        Expected low-confidence estimates are state-machine inputs, not errors.
+        Unexpected estimator failures are isolated here so structural
+        compositor/output validation remains strict.
+        """
+
+        effective_cfg = resources.cfg if cfg is None else cfg
+        correction = effective_cfg.compositing.color_correction
+        if correction.mode != "auto" or effective_cfg.background.mode not in {
+            "image",
+            "video",
+            "camera",
+        }:
+            return _PreparedColorFrame()
+
+        active_harmonizer = harmonizer or resources.harmonizer
+        if active_harmonizer is None:  # defensive resource invariant
+            raise RuntimeError("active color harmonizer is missing")
+
+        foreground_linear_bgr: np.ndarray | None = None
+        backdrop_linear_bgr: np.ndarray | None = None
+        backdrop_analysis_linear_bgr: np.ndarray | None = None
+        edge_linear_bgr: np.ndarray | None = None
+        source_generation: int | None = None
+        pending_reset_token: tuple[object, ...] | None = None
+        reset_required = False
+        try:
+            foreground_content_rect: tuple[int, int, int, int] | None = None
+            backdrop_content_rect: Any = None
+            backdrop_geometry_token: object = None
+            if track_live_state:
+                health = (
+                    resources.capture.health_snapshot()
+                    if hasattr(resources.capture, "health_snapshot")
+                    else None
+                )
+                generation_value = getattr(health, "generation", None)
+                if type(generation_value) is int and generation_value >= 0:
+                    source_generation = generation_value
+                foreground_content_rect = getattr(health, "content_rect", None)
+                geometry_generation = getattr(
+                    health,
+                    "geometry_generation",
+                    getattr(health, "geometry_transitions", 0),
+                )
+                provider = resources.backdrop
+                if provider is not None and hasattr(provider, "content_rect"):
+                    backdrop_content_rect = provider.content_rect(
+                        resources.canvas_size[0],
+                        resources.canvas_size[1],
+                    )
+                    transform_plan = getattr(provider, "transform_plan", None)
+                    backdrop_geometry_token = (
+                        transform_plan(
+                            resources.canvas_size[0],
+                            resources.canvas_size[1],
+                        )
+                        if callable(transform_plan)
+                        else backdrop_content_rect
+                    )
+                pending_reset_token = (
+                    resources.visual_generation,
+                    source_generation,
+                    geometry_generation,
+                    foreground_content_rect,
+                    id(provider),
+                    backdrop_geometry_token,
+                    resources.canvas_size,
+                )
+                reset_required = pending_reset_token != resources.color_reset_token
+
+            foreground_linear_bgr = bgr_u8_to_linear_rgb(frame)
+            backdrop_linear_bgr = bgr_u8_to_linear_rgb(backdrop_frame)
+            if cfg is None and harmonizer is None and track_live_state:
+                backdrop_analysis_linear_bgr = resources.image_backdrop_analysis(
+                    backdrop_frame,
+                    backdrop_linear_bgr,
+                )
+            if edge_foreground is not None:
+                edge_linear_bgr = bgr_u8_to_linear_rgb(edge_foreground)
+            estimate = estimate_color_transform_linear(
+                foreground_linear_bgr,
+                backdrop_linear_bgr,
+                mask,
+                mode=effective_cfg.background.mode,
+                strength=correction.strength,
+                exposure_limit_ev=correction.exposure_limit_ev,
+                white_balance_strength=correction.white_balance_strength,
+                foreground_content_rect=foreground_content_rect,
+                backdrop_content_rect=backdrop_content_rect,
+                resize_executor=resources.color_analysis_executor,
+                backdrop_analysis_linear_bgr=backdrop_analysis_linear_bgr,
+            )
+            if reset_required:
+                transform = active_harmonizer.reset_and_update(
+                    estimate,
+                    now_s,
+                    source_generation=source_generation,
+                )
+                resources.color_reset_token = pending_reset_token
+            else:
+                transform = active_harmonizer.update(
+                    estimate,
+                    now_s,
+                    source_generation=source_generation,
+                )
+            if track_live_state:
+                self._log_fallback_transition(
+                    "color-correction",
+                    False,
+                    "",
+                )
+        except Exception as exc:
+            try:
+                if reset_required:
+                    active_harmonizer.reset(
+                        now_s,
+                        reason=ColorReason.INVALID,
+                        source_generation=source_generation,
+                    )
+                    resources.color_reset_token = pending_reset_token
+                transform = active_harmonizer.on_error(
+                    now_s,
+                    source_generation=source_generation,
+                )
+            except Exception:
+                transform = IDENTITY_TRANSFORM
+            if track_live_state:
+                self._log_fallback_transition(
+                    "color-correction",
+                    True,
+                    type(exc).__name__,
+                )
+        return _PreparedColorFrame(
+            transform=transform,
+            foreground_linear_bgr=foreground_linear_bgr,
+            backdrop_linear_bgr=backdrop_linear_bgr,
+            edge_foreground_linear_bgr=edge_linear_bgr,
+            snapshot=active_harmonizer.snapshot(),
+        )
 
     def _preflight(self, resources: _Resources) -> np.ndarray:
         """Read and process a real frame before reporting startup readiness."""
@@ -1709,8 +2766,17 @@ class Pipeline:
                 self._stop.wait(0.05)
         if frame is None:
             raise ActivationError("capture returned no frame during startup preflight")
+        try:
+            frame = self._validate_canvas_frame(
+                frame,
+                resources.canvas_size,
+                boundary="capture",
+            )
+        except ValueError as exc:
+            raise ActivationError(str(exc)) from exc
         remote_mode = resources.cfg.background.mode == "remote"
         privacy_reason = ""
+        color_outcome: dict[str, object] = {}
         try:
             if resources.cfg.background.mode == "passthrough":
                 # Passthrough does not need a mask to render, but the segmenter
@@ -1732,13 +2798,18 @@ class Pipeline:
                     resources,
                     frame,
                     privacy_safe=True,
+                    color_outcome=color_outcome,
                 )
                 out = self._privacy_slate(frame.shape)
                 privacy_reason = privacy_reason or "startup-slate"
             else:
                 self._latest_raw_frame = frame.copy()
-                out = self._render_local_mode(resources, frame)
-            self._validate_output_frame(out, frame)
+                out = self._render_local_mode(
+                    resources,
+                    frame,
+                    color_outcome=color_outcome,
+                )
+            self._validate_output_frame(out, resources.canvas_size)
         except _PrivacyViolation as exc:
             raise ActivationError(f"invalid mask: {exc}") from exc
         # The privacy gate sits at the final publication boundary. Startup uses
@@ -1751,27 +2822,14 @@ class Pipeline:
         )
         privacy_reason = gate_reason or privacy_reason
         resources.output.send(out.copy() if remote_mode else out)
-        health = (
-            resources.capture.health_snapshot()
-            if hasattr(resources.capture, "health_snapshot")
-            else None
-        )
-        self.hub.update_stats(
-            frames_in=1,
-            frames_out=1,
-            capture_frames_read=getattr(health, "frames_read", 1),
-            capture_dropped_frames=getattr(health, "dropped_frames", 0),
-            capture_read_failures=getattr(health, "read_failures", 0),
-            capture_restarts=getattr(health, "restarts", 0),
-            capture_stalled=getattr(health, "stalled", False),
-            capture_frame_age_ms=getattr(health, "frame_age_ms", None),
-            capture_read_ms=getattr(health, "read_ms", None),
-            capture_fps=getattr(health, "capture_fps", 0.0),
-            capture_target_met=getattr(health, "target_met", None),
-            remote_fallback_active=bool(privacy_reason),
-            remote_fallback_count=1 if privacy_reason else 0,
-            remote_fallback_reason=privacy_reason,
-        )
+        if not color_outcome:
+            snapshot = (
+                resources.harmonizer.snapshot()
+                if resources.harmonizer is not None
+                else None
+            )
+            color_outcome.update(_color_stats(resources.cfg, snapshot))
+        self._record_color_output(resources, color_outcome, processed=True)
         if privacy_reason:
             log.warning("remote privacy fallback active reason=%s", privacy_reason)
         return out
@@ -1783,6 +2841,7 @@ class Pipeline:
         *,
         privacy_safe: bool,
         timings: dict[str, float] | None = None,
+        color_outcome: dict[str, object] | None = None,
     ) -> tuple[np.ndarray, str]:
         cfg = resources.cfg
         backdrop = resources.backdrop
@@ -1812,7 +2871,15 @@ class Pipeline:
                 if privacy_safe:
                     return self._emergency_blur(frame), "local-failure"
                 return frame, ""
-            bg = backdrop.frame(frame.shape[1], frame.shape[0])
+            bg = backdrop.frame(
+                resources.canvas_size[0],
+                resources.canvas_size[1],
+            )
+            self._validate_canvas_frame(
+                bg,
+                resources.canvas_size,
+                boundary="backdrop",
+            )
             if timings is not None:
                 timings["background_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
             edge_fg = (
@@ -1820,15 +2887,83 @@ class Pipeline:
                 if cfg.compositing.use_model_foreground
                 else None
             )
+            if edge_fg is not None:
+                edge_fg = self._validate_canvas_frame(
+                    edge_fg,
+                    resources.canvas_size,
+                    boundary="model foreground",
+                )
+            correction = cfg.compositing.color_correction
+            color_eligible = correction.mode == "auto" and cfg.background.mode in {
+                "image",
+                "video",
+                "camera",
+            }
+            if color_eligible:
+                started = time.monotonic_ns()
+                prepared_color = self._prepare_color_frame(
+                    resources,
+                    frame,
+                    bg,
+                    mask,
+                    edge_fg,
+                    now_s=time.monotonic(),
+                )
+                if timings is not None:
+                    timings["color_correction_ms"] = (
+                        time.monotonic_ns() - started
+                    ) / 1_000_000.0
+            else:
+                prepared_color = _PreparedColorFrame()
+                if timings is not None:
+                    timings["color_correction_ms"] = 0.0
             started = time.monotonic_ns()
-            rendered = composite(
-                frame,
-                bg,
-                mask,
-                light_wrap=cfg.compositing.light_wrap,
-                edge_foreground=edge_fg,
-            )
-            self._validate_output_frame(rendered, frame)
+            try:
+                rendered = self._composite_prepared_color(
+                    cfg,
+                    frame,
+                    bg,
+                    mask,
+                    edge_fg,
+                    prepared_color,
+                )
+            except ColorError as exc:
+                # A photometric transform/conversion failure follows the same
+                # bounded correction fallback, while structural ValueError
+                # contracts remain strict and are never swallowed here.
+                self._log_fallback_transition(
+                    "color-correction",
+                    True,
+                    type(exc).__name__,
+                )
+                rendered = composite(
+                    frame,
+                    bg,
+                    mask,
+                    light_wrap=cfg.compositing.light_wrap,
+                    edge_foreground=edge_fg,
+                    blend_space=cfg.compositing.blend_space,
+                    color_transform=IDENTITY_TRANSFORM,
+                )
+                if color_outcome is not None:
+                    color_outcome.update(
+                        _color_stats(
+                            cfg,
+                            prepared_color.snapshot,
+                            applied_transform=IDENTITY_TRANSFORM,
+                            application_failed=True,
+                        )
+                    )
+            else:
+                if color_outcome is not None:
+                    color_outcome.update(
+                        _color_stats(
+                            cfg,
+                            prepared_color.snapshot,
+                            applied_transform=prepared_color.transform,
+                        )
+                    )
+            self._validate_output_frame(rendered, resources.canvas_size)
             if timings is not None:
                 timings["composite_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
             return (
@@ -1875,9 +3010,16 @@ class Pipeline:
         fallback_active = initial_remote_slate
         fallback_reason = "startup-slate" if initial_remote_slate else ""
         previous_remote_fallback: tuple[bool, str] = (False, "")
+        last_color_status = _color_stats(
+            resources.cfg,
+            resources.harmonizer.snapshot()
+            if resources.harmonizer is not None
+            else None,
+        )
         stage_ewma: dict[str, float | None] = {
             "segmentation_ms": None,
             "background_ms": None,
+            "color_correction_ms": None,
             "composite_ms": None,
             "output_send_ms": None,
             "frame_processing_ms": None,
@@ -1890,11 +3032,17 @@ class Pipeline:
             timings = {
                 "segmentation_ms": 0.0,
                 "background_ms": 0.0,
+                "color_correction_ms": 0.0,
                 "composite_ms": 0.0,
             }
             processed = frame is not None
             if processed:
                 assert frame is not None
+                frame = self._validate_canvas_frame(
+                    frame,
+                    resources.canvas_size,
+                    boundary="capture",
+                )
                 frames_in += 1
                 self.hub.publish_raw(frame)
 
@@ -1913,6 +3061,7 @@ class Pipeline:
                 process_started = time.monotonic_ns()
                 cfg = resources.cfg
                 mode = cfg.background.mode
+                color_outcome: dict[str, object] = {}
                 fallback_active = False
                 fallback_reason = ""
                 if mode == "remote":
@@ -1932,7 +3081,7 @@ class Pipeline:
                         ):
                             remote = None
                             fallback_reason = "invalid"
-                        elif remote.shape != frame.shape:
+                        elif remote.shape != resources.canvas_shape:
                             remote = None
                             fallback_reason = "wrong-size"
                     if remote is not None:
@@ -1955,7 +3104,18 @@ class Pipeline:
                         frame,
                         privacy_safe=False,
                         timings=timings,
+                        color_outcome=color_outcome,
                     )
+                if not color_outcome:
+                    color_outcome.update(
+                        _color_stats(
+                            cfg,
+                            resources.harmonizer.snapshot()
+                            if resources.harmonizer is not None
+                            else None,
+                        )
+                    )
+                last_color_status = color_outcome
                 frame_processing_ms = (
                     time.monotonic_ns() - process_started
                 ) / 1_000_000.0
@@ -1995,6 +3155,7 @@ class Pipeline:
                 remote_used += 1
             # Repeats retain only the already-guarded output, so loss of camera
             # input cannot resurrect an unsafe pre-gate candidate.
+            self._validate_output_frame(out_frame, resources.canvas_size)
             last_output = out_frame
 
             send_started = time.monotonic_ns()
@@ -2024,12 +3185,6 @@ class Pipeline:
                 if hasattr(resources.capture, "health_snapshot")
                 else None
             )
-            video_stats = (
-                resources.backdrop.stats_dict()
-                if resources.backdrop is not None
-                and hasattr(resources.backdrop, "stats_dict")
-                else dict(_VIDEO_STATS_DEFAULTS)
-            )
             remote_state = (fallback_active, fallback_reason)
             if remote_state != previous_remote_fallback:
                 if fallback_active:
@@ -2041,45 +3196,55 @@ class Pipeline:
                 elif previous_remote_fallback[0]:
                     log.info("remote renderer recovered; privacy fallback inactive")
                 previous_remote_fallback = remote_state
-            self.hub.update_stats(
-                frames_in=frames_in,
-                frames_out=frames_out,
-                remote_frames_used=remote_used,
-                remote_fallback_active=fallback_active,
-                remote_fallback_count=fallback_count,
-                remote_fallback_reason=fallback_reason,
-                fps=measured_fps,
-                fps_attainment_pct=attainment,
-                output_repeated_frames=repeated_frames,
-                processing_deadline_misses=deadline_misses,
-                capture_fps=getattr(capture_health, "capture_fps", 0.0),
-                capture_target_met=getattr(capture_health, "target_met", None),
-                capture_backend=getattr(
-                    capture_health, "backend", type(resources.capture).__name__
-                ),
-                capture_fourcc=getattr(capture_health, "fourcc", None),
-                capture_width=getattr(capture_health, "width", None),
-                capture_height=getattr(capture_health, "height", None),
-                capture_fps_reported=getattr(capture_health, "fps_reported", None),
-                capture_frames_read=getattr(capture_health, "frames_read", frames_in),
-                capture_dropped_frames=getattr(capture_health, "dropped_frames", 0),
-                capture_read_failures=getattr(capture_health, "read_failures", 0),
-                capture_restarts=getattr(capture_health, "restarts", 0),
-                capture_stalled=getattr(capture_health, "stalled", False),
-                capture_frame_age_ms=getattr(capture_health, "frame_age_ms", None),
-                capture_read_ms=getattr(capture_health, "read_ms", None),
-                segmentation_ms=stage_ewma["segmentation_ms"],
-                background_ms=stage_ewma["background_ms"],
-                composite_ms=stage_ewma["composite_ms"],
-                output_send_ms=stage_ewma["output_send_ms"],
-                frame_processing_ms=stage_ewma["frame_processing_ms"],
-                config_version=resources.version,
-                **_acceleration_stats(resources.segmenter),
-                **video_stats,
+            self._record_color_output(
+                resources,
+                last_color_status,
+                processed=processed,
             )
-            # Publish only after the matching counters/fallback state are
-            # visible, so consumers never observe a frame with stale status.
-            self.hub.publish_output(out_frame)
+            frame_stats = self._identity_stats(
+                resources,
+                capture_health=capture_health,
+                color_status=last_color_status,
+            )
+            frame_stats.update(
+                {
+                    "frames_in": frames_in,
+                    "frames_out": frames_out,
+                    "remote_frames_used": remote_used,
+                    "remote_fallback_active": fallback_active,
+                    "remote_fallback_count": fallback_count,
+                    "remote_fallback_reason": fallback_reason,
+                    "fps": measured_fps,
+                    "output_effective_fps": measured_fps,
+                    "fps_attainment_pct": attainment,
+                    "output_repeated_frames": repeated_frames,
+                    "processing_deadline_misses": deadline_misses,
+                    "capture_fps": getattr(capture_health, "capture_fps", 0.0),
+                    "capture_target_met": getattr(capture_health, "target_met", None),
+                    "capture_frames_read": getattr(
+                        capture_health, "frames_read", frames_in
+                    ),
+                    "capture_dropped_frames": getattr(
+                        capture_health, "dropped_frames", 0
+                    ),
+                    "capture_read_failures": getattr(
+                        capture_health, "read_failures", 0
+                    ),
+                    "capture_restarts": getattr(capture_health, "restarts", 0),
+                    "capture_stalled": getattr(capture_health, "stalled", False),
+                    "capture_frame_age_ms": getattr(
+                        capture_health, "frame_age_ms", None
+                    ),
+                    "capture_read_ms": getattr(capture_health, "read_ms", None),
+                    "segmentation_ms": stage_ewma["segmentation_ms"],
+                    "background_ms": stage_ewma["background_ms"],
+                    "color_correction_ms": stage_ewma["color_correction_ms"],
+                    "composite_ms": stage_ewma["composite_ms"],
+                    "output_send_ms": stage_ewma["output_send_ms"],
+                    "frame_processing_ms": stage_ewma["frame_processing_ms"],
+                }
+            )
+            self.hub.publish_output(out_frame, stats=frame_stats)
 
             if not resources.output.paces:
                 elapsed = time.monotonic() - loop_start

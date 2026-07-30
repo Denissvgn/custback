@@ -62,6 +62,12 @@ background:
   color: [60, 46, 32]   # BGR
   image_path: ""
   video_path: ""
+  # Tagged video is normalized to full-range sRGB. Overrides are YAML-only and
+  # permitted only for reproducible local assets; histogram guessing is banned.
+  video_color_matrix: auto    # auto | bt601 | bt709
+  video_color_range: auto     # auto | limited | full
+  video_color_primaries: auto # auto | bt709 | bt470bg | smpte170m
+  video_color_transfer: auto  # auto | srgb | bt709
   blur_strength: 31
 
 render:
