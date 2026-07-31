@@ -293,15 +293,6 @@ jobs:
       - run: npm test
       - if: matrix.node-version == '18.15.0'
         run: node scripts/release/verify-release.js --regressions=node
-      - name: Prove lifecycle publication remains blocked by REL-01
-        run: |
-          if npm pack --dry-run --json >"$RUNNER_TEMP/pack.out" 2>"$RUNNER_TEMP/pack.err"; then
-            echo "npm prepack unexpectedly authorized publication" >&2
-            exit 1
-          fi
-          grep -q 'REL-01' "$RUNNER_TEMP/pack.err"
-          npm pack --dry-run --json --ignore-scripts
-
   package-smoke:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35

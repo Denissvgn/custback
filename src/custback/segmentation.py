@@ -557,6 +557,7 @@ class RVMSegmenter(Segmenter):
         self.accel = AccelerationState(self._accel_cfg)
         self._session: Any = self._build_session()
         self._downsample = cfg.rvm_downsample
+        self.last_downsample_ratio: float | None = None
         self._rec: list[np.ndarray] | None = None
         self._size: tuple[int, int] | None = None
 
@@ -677,6 +678,7 @@ class RVMSegmenter(Segmenter):
         # reduced size and refine at full size; ~512 px on the long side is
         # the quality/speed sweet spot for webcam framing.
         ratio = self._downsample or min(1.0, max(0.125, 512.0 / max(h, w)))
+        self.last_downsample_ratio = float(ratio)
         try:
             fgr, pha, *self._rec = self._session.run(
                 None, self._feeds(frame_bgr, ratio)

@@ -342,6 +342,11 @@ class BackdropProvider(ABC):
 
         pass
 
+    def diagnostic_frame_identity(self) -> dict[str, object]:
+        """Return path-free scalar identity for the most recently used frame."""
+
+        return {"provider": type(self).__name__}
+
     def stats_dict(self) -> dict[str, object]:
         """Return current-provider playback telemetry.
 
@@ -1170,6 +1175,17 @@ class VideoBackdrop(BackdropProvider):
             ),
         }
 
+    def diagnostic_frame_identity(self) -> dict[str, object]:
+        """Identify the exact decoded video frame without exposing its path."""
+
+        return {
+            "provider": type(self).__name__,
+            "source_index": self._source_index,
+            "logical_index": self._logical_index,
+            "pts_s": self._current_pts_s,
+            "timing_mode": "container" if self._container_timing else "nominal",
+        }
+
     def reset_stats(self) -> None:
         """Exclude activation trials from counters of the installed provider."""
 
@@ -1234,6 +1250,7 @@ class CameraBackdrop(BackdropProvider):
         self._last_fit: np.ndarray | None = None
         self._last_fit_key: tuple[object, ...] | None = None
         self._raw_generation = 0
+        self._last_capture_monotonic_ns: int | None = None
 
     def frame(self, width: int, height: int) -> np.ndarray:
         ok, frame = self.cap.read()
@@ -1241,6 +1258,7 @@ class CameraBackdrop(BackdropProvider):
             source = validate_bgr_frame(frame, name="backdrop camera frame")
             self._last_raw = np.ascontiguousarray(source)
             self._raw_generation += 1
+            self._last_capture_monotonic_ns = time.monotonic_ns()
             self._last_fit = None
             self._last_fit_key = None
         if self._last_raw is None:
@@ -1257,6 +1275,13 @@ class CameraBackdrop(BackdropProvider):
             self._last_fit = self._fit_frame(self._last_raw, width, height)
             self._last_fit_key = key
         return self._last_fit
+
+    def diagnostic_frame_identity(self) -> dict[str, object]:
+        return {
+            "provider": type(self).__name__,
+            "generation": self._raw_generation,
+            "capture_monotonic_ns": self._last_capture_monotonic_ns,
+        }
 
     def _invalidate_geometry_cache(self) -> None:
         self._last_fit = None

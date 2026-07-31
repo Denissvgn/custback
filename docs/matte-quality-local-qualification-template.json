@@ -1,0 +1,33 @@
+{
+  "schema": "custback.matte-quality-local-qualification-reference",
+  "version": 1,
+  "status": "awaiting-local-evidence",
+  "qualification_id": "",
+  "provenance": {
+    "kind": "consented-local-or-licensed-local",
+    "license_or_consent_reference": "",
+    "contains_private_footage_in_repository": false
+  },
+  "artifacts": {
+    "replay_manifest_sha256": "",
+    "annotation_manifest_sha256": "",
+    "model_artifact_sha256": "",
+    "quality_evidence_sha256": ""
+  },
+  "runtime": {
+    "hardware": "",
+    "dependency_versions": {},
+    "backend": "",
+    "device": "",
+    "effective_detail": "",
+    "resampling": "",
+    "input_cadence": "",
+    "effective_configuration": {}
+  },
+  "review": {
+    "reviewer": "",
+    "reviewed_at": "",
+    "status": "not-reviewed",
+    "notes": ""
+  }
+}

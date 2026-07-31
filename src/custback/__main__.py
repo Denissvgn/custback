@@ -171,6 +171,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="list detected input cameras (friendly name + stable id) and exit",
     )
+    parser.add_argument(
+        "--matte-diagnostics-dir",
+        metavar="NEW_DIR",
+        help=(
+            "opt in to a private replay bundle containing identifiable pixels "
+            "and silhouettes"
+        ),
+    )
+    parser.add_argument(
+        "--matte-diagnostics-mode",
+        choices=("full", "composite-only"),
+        default="full",
+        help="record full matte evidence or downstream final composites only",
+    )
+    parser.add_argument(
+        "--matte-diagnostics-duration",
+        type=float,
+        metavar="SECONDS",
+        help="stop the opt-in recording after this duration (default 20)",
+    )
+    parser.add_argument(
+        "--matte-diagnostics-max-bytes",
+        type=int,
+        metavar="BYTES",
+        help="hard byte bound for the opt-in bundle (default 536870912)",
+    )
     return parser
 
 
@@ -524,7 +550,12 @@ def _security_policy(cfg: AppConfig):
     )
 
 
-def run(cfg: AppConfig, *, run_id: str = "") -> int:
+def run(
+    cfg: AppConfig,
+    *,
+    run_id: str = "",
+    matte_recorder: Any = None,
+) -> int:
     hub = FrameHub(run_id=run_id)
     stop = threading.Event()
     shutdown_reason = "normal"
@@ -578,6 +609,7 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
                 runtime,
                 hub,
                 model_preparation=model_preparation,
+                matte_recorder=matte_recorder,
             )
             try:
                 pipeline.start()
@@ -715,6 +747,8 @@ def run(cfg: AppConfig, *, run_id: str = "") -> int:
                 if exit_code == 0:
                     exit_code = EXIT_RUNTIME
                     shutdown_reason = "pipeline-failure"
+        elif matte_recorder is not None:
+            matte_recorder.close()
         if api_runner is not None and getattr(api_runner, "failed", False):
             exit_code = EXIT_API
             shutdown_reason = "api-failure"
@@ -742,6 +776,39 @@ def main(argv: list[str] | None = None) -> int:
         from .avatar.__main__ import main as avatar_main
 
         return avatar_main(effective_argv[1:], prog="custback avatar")
+    if effective_argv[:1] == ["matte-replay"]:
+        # Replay is intentionally independent of normal config, camera, API,
+        # virtual output, and durable runtime logs.
+        from .matte_diagnostics import main as replay_main
+
+        return replay_main(effective_argv[1:], prog="custback matte-replay")
+    if effective_argv[:1] == ["matte-evaluate"]:
+        # Evaluation reads an already-consented private bundle and never opens
+        # live capture, models, network services, or virtual output.
+        from .matte_quality import main as matte_quality_main
+
+        return matte_quality_main(
+            effective_argv[1:],
+            prog="custback matte-evaluate",
+        )
+    if effective_argv[:1] == ["matte-diagnose"]:
+        # Attribution is an offline, digest-bound extension of matte-evaluate;
+        # it writes only to a new private directory and opens no model/device.
+        from .matte_attribution import main as matte_attribution_main
+
+        return matte_attribution_main(
+            effective_argv[1:],
+            prog="custback matte-diagnose",
+        )
+    if effective_argv[:1] == ["matte-ablate"]:
+        # Matrix execution is offline and accepts model-backed rows only as
+        # separately recorded, source-identity-checked private bundles.
+        from .matte_ablation import main as matte_ablation_main
+
+        return matte_ablation_main(
+            effective_argv[1:],
+            prog="custback matte-ablate",
+        )
 
     args = build_parser().parse_args(effective_argv)
     from .diagnostics import LoggingConfigurationError, configure_logging
@@ -795,9 +862,57 @@ def main(argv: list[str] | None = None) -> int:
                     format_config_error(exc),
                 )
                 return EXIT_CONFIG
+        matte_recorder = None
         try:
-            return run(cfg, run_id=logging_session.run_id)
+            diagnostic_overrides = (
+                args.matte_diagnostics_duration is not None
+                or args.matte_diagnostics_max_bytes is not None
+                or args.matte_diagnostics_mode != "full"
+            )
+            if args.matte_diagnostics_dir is None and diagnostic_overrides:
+                raise ValueError(
+                    "matte diagnostic options require --matte-diagnostics-dir"
+                )
+            if args.matte_diagnostics_dir is not None:
+                from .matte_diagnostics import (
+                    DEFAULT_DURATION_S,
+                    DEFAULT_MAX_BYTES,
+                    MatteDiagnosticRecorder,
+                )
+
+                matte_recorder = MatteDiagnosticRecorder(
+                    args.matte_diagnostics_dir,
+                    duration_s=(
+                        DEFAULT_DURATION_S
+                        if args.matte_diagnostics_duration is None
+                        else args.matte_diagnostics_duration
+                    ),
+                    max_bytes=(
+                        DEFAULT_MAX_BYTES
+                        if args.matte_diagnostics_max_bytes is None
+                        else args.matte_diagnostics_max_bytes
+                    ),
+                    capture_mode=(
+                        "composite_only"
+                        if args.matte_diagnostics_mode == "composite-only"
+                        else "full"
+                    ),
+                )
+                log.warning(
+                    "private matte diagnostic recording enabled mode=%s "
+                    "duration_s=%g max_bytes=%d",
+                    args.matte_diagnostics_mode,
+                    matte_recorder.duration_s,
+                    matte_recorder.max_bytes,
+                )
+            return run(
+                cfg,
+                run_id=logging_session.run_id,
+                matte_recorder=matte_recorder,
+            )
         except (OSError, ValueError) as exc:
+            if matte_recorder is not None:
+                matte_recorder.close()
             log.error(
                 "startup configuration error: %s",
                 format_config_error(exc),

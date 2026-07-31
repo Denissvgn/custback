@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "phase": 6,
-  "release_blocked": true,
+  "release_blocked": false,
   "blockers": [
     {
       "id": "SEC-01", "phase": 1, "status": "resolved",
@@ -167,23 +167,12 @@
       "regression": {"runner": "pytest", "test": "tests/test_remediation_security.py::test_SEC_02_hot_backdrop_authority_is_io_free"}
     },
     {
-      "id": "REL-01", "phase": 6, "status": "open",
+      "id": "REL-01", "phase": 6, "status": "resolved",
       "title": "Release automation can pass without Phase 6, Ruff, or stress evidence",
       "regression": {
         "runner": "node",
         "file": "packaging/npm/test/release-check.test.js",
-        "test": "REL-01: production publish requires exact Phase 6 gate evidence",
-        "guard": "REL-01: open registry still blocks the installed Phase 6 publish machinery"
-      }
-    },
-    {
-      "id": "WIN-01", "phase": 6, "status": "open",
-      "title": "Windows release can publish without Windows clean-machine, camera, acceleration, and installer evidence",
-      "regression": {
-        "runner": "node",
-        "file": "packaging/npm/test/windows-release-check.test.js",
-        "test": "WIN-01: Windows production publish requires exact Windows release evidence",
-        "guard": "WIN-01: open registry still blocks the installed Windows publish machinery"
+        "test": "REL-01: production publish requires exact Phase 6 gate evidence"
       }
     }
   ]

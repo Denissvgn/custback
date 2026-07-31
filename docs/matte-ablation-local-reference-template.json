@@ -1,0 +1,44 @@
+{
+  "schema": "custback.matte-ablation-local-reference",
+  "version": 1,
+  "status": "awaiting-consented-model-backed-evidence",
+  "qualification_id": "",
+  "provenance": {
+    "kind": "consented-local-or-licensed-local",
+    "license_or_consent_reference": "",
+    "contains_private_footage_in_repository": false,
+    "one_host_screening": true,
+    "production_preset_selected": false
+  },
+  "artifacts": {
+    "source_replay_manifest_sha256": "",
+    "annotation_manifest_sha256": "",
+    "ablation_plan_sha256": "",
+    "ablation_evidence_sha256": ""
+  },
+  "coverage": {
+    "required_axes": [],
+    "completed_axes": [],
+    "uncompleted_required_axes": [],
+    "rvm_cuda": "not-reviewed",
+    "rvm_cpu_spot": "not-reviewed",
+    "mediapipe_cpu": "not-reviewed",
+    "compositor_factorial_complete": false,
+    "model_backed_cadence_rows_complete": false
+  },
+  "decisions": {
+    "mediapipe_watershed": "not-decided",
+    "alpha_motion_vs_edge_color_motion": {},
+    "matte_2_5_rvm_candidates": [],
+    "matte_3_4_cost_candidates": [],
+    "rvm_active_lane_first_fix": "",
+    "mediapipe_fallback_lane_first_fix": "",
+    "rejected_candidates": []
+  },
+  "review": {
+    "reviewer": "",
+    "reviewed_at": "",
+    "status": "not-reviewed",
+    "notes": ""
+  }
+}

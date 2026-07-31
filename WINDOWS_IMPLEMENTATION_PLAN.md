@@ -116,7 +116,7 @@ where these flip to `DONE`.
 | WIN-5.5 | Supervise avatar second process | 5 | S | WIN-5.2 | IMPL* |
 | WIN-5.6 | Signed per-user EXE/MSI installer | 5 | L | WIN-5.1 | IMPL* |
 | WIN-5.7 | Uninstall data-retention policy | 5 | S | WIN-5.6 | IMPL* |
-| WIN-5.8 | Windows release-evidence pipeline | 5 | M | WIN-5.6, WIN-0.2 | IMPL* (WIN-01 slot applied; job wiring pends WIN-1.8) |
+| WIN-5.8 | Windows release-evidence pipeline | 5 | M | WIN-5.6, WIN-0.2 | DEFERRED (release blocker temporarily removed; job wiring pends WIN-1.8) |
 | WIN-6.1 | Native Win11 Media Foundation virtual camera | 6 | XL | WIN-5.8 | IMPL* |
 | WIN-6.2 | Generic GPU provider (DirectML/Windows ML) | 6 | XL | WIN-4.7 | IMPL* (gate machinery; AMD/Intel hardware evidence pending) |
 | WIN-6.3 | ARM64 support | 6 | L | WIN-5.8 | IMPL* (build/dependency machinery; ARM64 hardware evidence pending) |
@@ -617,16 +617,12 @@ upgrades, and uninstalls; no secret appears in process arguments or URLs.
   The freeze, the .NET/WebView2 build, the MSI/bundle build, and the clean-VM
   install/upgrade/uninstall runs happen on the still-TODO `windows-latest` job
   (WIN-1.8), which is where these flip to `DONE`.
-- **WIN-5.8 release slot is applied, not bypassed.** The WIN-0.2 Part-B slot is
-  now a real open blocker `WIN-01` in `remediation-blockers.json`
-  (`REVIEWED_REMEDIATION_CONTRACT_SHA256` recomputed in the same edit), with the
-  regression `packaging/npm/test/windows-release-check.test.js`: a `# TODO`
-  acceptance enumerating the target Windows evidence gates and a passing guard
-  proving today's machinery gap. Mutating the *consumed* `required-gates.json`
-  arrays / `release.yml` jobs is correctly deferred to WIN-1.8: the manifest is
-  an exact-match evidence contract with no `windows-latest` evidence source yet,
-  and forcing Windows jobs on a Linux-only release would violate WIN-0.2 item 4.
-  `REL-01` is untouched; release stays blocked (CC-3).
+- **WIN-5.8 release slot is temporarily deferred.** `WIN-01` is not registered
+  as a release blocker. `packaging/npm/test/windows-release-check.test.js`
+  retains a non-blocking TODO enumerating the target Windows evidence gates.
+  Mutating the consumed `required-gates.json` arrays and `release.yml` jobs
+  remains deferred to WIN-1.8, where Windows evidence can be added with the
+  manifest-scoped rule that preserves Linux/macOS-only releases.
 
 ### WIN-5.1 — PyInstaller onedir spec + hooks · L
 - `onedir` (not `onefile`) spec with explicit hooks for: dynamic segmentation

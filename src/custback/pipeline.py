@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -51,6 +52,11 @@ from .config import (
 from .diagnostics import sanitized_config_summary
 from .geometry import Size, apply_transform, plan_transform, validate_bgr_frame
 from .hub import FrameHub
+from .matte_diagnostics import (
+    MatteCaptureMetadata,
+    MatteDiagnosticRecorder,
+    MatteFrameEvidence,
+)
 from .segmentation import (
     HeuristicSegmenter,
     NullSegmenter,
@@ -859,6 +865,7 @@ class Pipeline:
         *,
         model_preparation: SegmenterPreparation | None = None,
         raw_fingerprint_capacity: int = _RAW_FINGERPRINT_HISTORY,
+        matte_recorder: MatteDiagnosticRecorder | None = None,
     ):
         if (
             not isinstance(raw_fingerprint_capacity, int)
@@ -893,6 +900,9 @@ class Pipeline:
         self._deferred_closes: list[tuple[Any, str]] = []
         self._runtime_writer = runtime._coordinator_writer()
         self._model_preparation = model_preparation
+        self._matte_recorder = matte_recorder
+        self._matte_bundle_sequence = 0
+        self._matte_last_source_sequence: int | None = None
         self._fallback_log_states: dict[str, tuple[bool, str]] = {}
         self._geometry_log_states: dict[str, tuple[object, ...]] = {}
         self._color_log_state: tuple[object, ...] | None = None
@@ -919,6 +929,8 @@ class Pipeline:
             self._fallback_log_states.clear()
             self._geometry_log_states.clear()
             self._color_log_state = None
+            self._matte_bundle_sequence = 0
+            self._matte_last_source_sequence = None
             with self._preparation_lock:
                 if self._preparation_executor is not None:
                     raise ReconfigurationUnavailable(
@@ -1403,6 +1415,8 @@ class Pipeline:
                 )
             if resources is not None:
                 resources.close()
+            if self._matte_recorder is not None:
+                self._matte_recorder.close()
             self._drain_deferred_closes()
             # On startup failure, readiness is not published until teardown
             # finishes. A blocked close is therefore observed as a surviving
@@ -2341,6 +2355,41 @@ class Pipeline:
         return validated
 
     @classmethod
+    def _segment_and_refine_masks(
+        cls,
+        segmenter: Any,
+        refiner: Any,
+        frame: np.ndarray,
+        *,
+        privacy_safe: bool,
+        stage_timings: dict[str, float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Validate and retain both backend and post-refiner alpha stages."""
+
+        started = time.monotonic_ns() if stage_timings is not None else 0
+        raw = cls._validate_mask(
+            segmenter.segment(frame),
+            frame,
+            privacy_safe=False,
+        )
+        if stage_timings is not None:
+            stage_timings["backend_inference_ms"] = (
+                time.monotonic_ns() - started
+            ) / 1_000_000.0
+        started = time.monotonic_ns() if stage_timings is not None else 0
+        refined = refiner.refine(raw, frame)
+        validated = cls._validate_mask(
+            refined,
+            frame,
+            privacy_safe=privacy_safe,
+        )
+        if stage_timings is not None:
+            stage_timings["refinement_ms"] = (
+                time.monotonic_ns() - started
+            ) / 1_000_000.0
+        return raw, validated
+
+    @classmethod
     def _segment_and_refine_mask(
         cls,
         segmenter: Any,
@@ -2349,19 +2398,124 @@ class Pipeline:
         *,
         privacy_safe: bool,
     ) -> np.ndarray:
-        """Validate the backend contract both before and after refinement."""
+        """Compatibility wrapper for callers that need only final alpha."""
 
-        raw = cls._validate_mask(
-            segmenter.segment(frame),
-            frame,
-            privacy_safe=False,
-        )
-        refined = refiner.refine(raw, frame)
-        return cls._validate_mask(
-            refined,
+        _raw, refined = cls._segment_and_refine_masks(
+            segmenter,
+            refiner,
             frame,
             privacy_safe=privacy_safe,
         )
+        return refined
+
+    def _new_matte_evidence(
+        self,
+        resources: _Resources,
+        frame: np.ndarray,
+        *,
+        dequeued_monotonic_ns: int,
+    ) -> MatteFrameEvidence | None:
+        recorder = self._matte_recorder
+        if recorder is None or not recorder.accepting:
+            return None
+        health = (
+            resources.capture.health_snapshot()
+            if hasattr(resources.capture, "health_snapshot")
+            else None
+        )
+        capture_timestamp = getattr(health, "captured_monotonic_ns", None)
+        if type(capture_timestamp) is int and capture_timestamp >= 0:
+            timestamp_ns = capture_timestamp
+            timestamp_source = "capture-completion"
+        else:
+            timestamp_ns = dequeued_monotonic_ns
+            timestamp_source = "unique-frame-dequeue"
+        capture_sequence = getattr(health, "sequence", None)
+        if type(capture_sequence) is not int or capture_sequence <= 0:
+            capture_sequence = self._matte_bundle_sequence
+        metadata = MatteCaptureMetadata(
+            bundle_sequence=self._matte_bundle_sequence,
+            capture_sequence=capture_sequence,
+            capture_monotonic_ns=timestamp_ns,
+            timestamp_source=timestamp_source,
+            capture_generation=int(getattr(health, "generation", 0) or 0),
+            geometry_generation=int(
+                getattr(
+                    health,
+                    "geometry_generation",
+                    getattr(health, "geometry_transitions", 0),
+                )
+                or 0
+            ),
+        )
+        self._matte_bundle_sequence += 1
+        cfg = resources.cfg
+        return MatteFrameEvidence(
+            metadata=metadata,
+            raw_frame=frame,
+            configured_controls={
+                "segmentation": cfg.segmentation.model_dump(mode="json"),
+                "acceleration": cfg.acceleration.model_dump(mode="json"),
+                "compositing": cfg.compositing.model_dump(mode="json"),
+                "background": {
+                    "mode": cfg.background.mode,
+                    "fit_mode": cfg.background.fit_mode,
+                    "anchor_x": cfg.background.anchor_x,
+                    "anchor_y": cfg.background.anchor_y,
+                },
+            },
+            matte_authoritative=False,
+            insufficiency_reason="no matte/composite path was recorded",
+        )
+
+    @staticmethod
+    def _effective_matte_controls(resources: _Resources) -> dict[str, object]:
+        segmenter = resources.segmenter
+        refiner_cfg = getattr(resources.refiner, "cfg", None)
+        ratio = getattr(segmenter, "last_downsample_ratio", None)
+        return {
+            "segmentation_backend": type(segmenter).__name__,
+            "segmentation_device": str(getattr(segmenter, "device", "unknown")),
+            "produces_matte": bool(getattr(segmenter, "produces_matte", False)),
+            "rvm_downsample_ratio": (
+                float(ratio)
+                if isinstance(ratio, (int, float)) and math.isfinite(float(ratio))
+                else None
+            ),
+            "refiner": (
+                refiner_cfg.model_dump(mode="json")
+                if refiner_cfg is not None and hasattr(refiner_cfg, "model_dump")
+                else {}
+            ),
+            "mask_shift": int(getattr(refiner_cfg, "mask_shift", 0) or 0),
+            "use_model_foreground": bool(
+                resources.cfg.compositing.use_model_foreground
+            ),
+            "light_wrap": float(resources.cfg.compositing.light_wrap),
+            "blend_space": resources.cfg.compositing.blend_space,
+        }
+
+    @staticmethod
+    def _backdrop_diagnostic_identity(resources: _Resources) -> dict[str, object]:
+        backdrop = resources.backdrop
+        if backdrop is None:
+            return {"provider": "none"}
+        identity = getattr(backdrop, "diagnostic_frame_identity", None)
+        if callable(identity):
+            value = identity()
+            if isinstance(value, dict):
+                return value
+        return {"provider": type(backdrop).__name__}
+
+    def _submit_matte_evidence(
+        self,
+        evidence: MatteFrameEvidence | None,
+        final_composite: np.ndarray,
+    ) -> bool:
+        recorder = self._matte_recorder
+        if recorder is not None and evidence is not None:
+            return recorder.submit(evidence, final_composite)
+        return False
 
     @staticmethod
     def _raw_fingerprint(frame: np.ndarray) -> _RawFingerprint:
@@ -2517,6 +2671,8 @@ class Pipeline:
         frame: np.ndarray,
         *,
         color_outcome: dict[str, object] | None = None,
+        matte_evidence: MatteFrameEvidence | None = None,
+        timings: dict[str, float] | None = None,
     ) -> np.ndarray:
         mode = resources.cfg.background.mode
         if mode == "passthrough":
@@ -2528,6 +2684,8 @@ class Pipeline:
             frame,
             privacy_safe=mode == "remote",
             color_outcome=color_outcome,
+            matte_evidence=matte_evidence,
+            timings=timings,
         )
         return out
 
@@ -2760,8 +2918,11 @@ class Pipeline:
         )
         deadline = time.monotonic() + camera_wait
         frame: np.ndarray | None = None
+        dequeued_monotonic_ns = 0
         while frame is None and time.monotonic() < deadline and not self._stop.is_set():
             frame = resources.capture.read()
+            if frame is not None:
+                dequeued_monotonic_ns = time.monotonic_ns()
             if frame is None:
                 self._stop.wait(0.05)
         if frame is None:
@@ -2775,8 +2936,16 @@ class Pipeline:
         except ValueError as exc:
             raise ActivationError(str(exc)) from exc
         remote_mode = resources.cfg.background.mode == "remote"
+        matte_evidence = self._new_matte_evidence(
+            resources,
+            frame,
+            dequeued_monotonic_ns=dequeued_monotonic_ns,
+        )
         privacy_reason = ""
         color_outcome: dict[str, object] = {}
+        matte_timings: dict[str, float] | None = (
+            {} if matte_evidence is not None else None
+        )
         try:
             if resources.cfg.background.mode == "passthrough":
                 # Passthrough does not need a mask to render, but the segmenter
@@ -2808,6 +2977,8 @@ class Pipeline:
                     resources,
                     frame,
                     color_outcome=color_outcome,
+                    matte_evidence=matte_evidence,
+                    timings=matte_timings,
                 )
             self._validate_output_frame(out, resources.canvas_size)
         except _PrivacyViolation as exc:
@@ -2821,7 +2992,24 @@ class Pipeline:
             privacy_safe=remote_mode,
         )
         privacy_reason = gate_reason or privacy_reason
+        send_started = time.monotonic_ns()
         resources.output.send(out.copy() if remote_mode else out)
+        sent_monotonic_ns = time.monotonic_ns()
+        if matte_evidence is not None:
+            matte_evidence.timings_ms["output_send_ms"] = (
+                sent_monotonic_ns - send_started
+            ) / 1_000_000.0
+        if self._submit_matte_evidence(matte_evidence, out):
+            assert matte_evidence is not None
+            self._matte_last_source_sequence = matte_evidence.metadata.bundle_sequence
+            recorder = self._matte_recorder
+            assert recorder is not None
+            recorder.submit_output_event(
+                sent_monotonic_ns=sent_monotonic_ns,
+                source_bundle_sequence=self._matte_last_source_sequence,
+                base_updated=True,
+                exact_final_repeat=False,
+            )
         if not color_outcome:
             snapshot = (
                 resources.harmonizer.snapshot()
@@ -2842,6 +3030,7 @@ class Pipeline:
         privacy_safe: bool,
         timings: dict[str, float] | None = None,
         color_outcome: dict[str, object] | None = None,
+        matte_evidence: MatteFrameEvidence | None = None,
     ) -> tuple[np.ndarray, str]:
         cfg = resources.cfg
         backdrop = resources.backdrop
@@ -2850,11 +3039,15 @@ class Pipeline:
 
         try:
             started = time.monotonic_ns()
-            mask = self._segment_and_refine_mask(
+            diagnostic_stage_timings: dict[str, float] | None = (
+                {} if matte_evidence is not None else None
+            )
+            raw_mask, mask = self._segment_and_refine_masks(
                 resources.segmenter,
                 resources.refiner,
                 frame,
                 privacy_safe=privacy_safe,
+                stage_timings=diagnostic_stage_timings,
             )
             if timings is not None:
                 timings["segmentation_ms"] = (
@@ -2882,8 +3075,9 @@ class Pipeline:
             )
             if timings is not None:
                 timings["background_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
+            backend_clean_foreground = resources.segmenter.last_foreground
             edge_fg = (
-                resources.segmenter.last_foreground
+                backend_clean_foreground
                 if cfg.compositing.use_model_foreground
                 else None
             )
@@ -2966,6 +3160,25 @@ class Pipeline:
             self._validate_output_frame(rendered, resources.canvas_size)
             if timings is not None:
                 timings["composite_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
+            if matte_evidence is not None and not privacy_safe:
+                matte_evidence.raw_mask = raw_mask
+                matte_evidence.refined_mask = mask
+                matte_evidence.clean_foreground = backend_clean_foreground
+                matte_evidence.backdrop_frame = bg
+                matte_evidence.base_composite = rendered
+                matte_evidence.effective_controls = self._effective_matte_controls(
+                    resources
+                )
+                if diagnostic_stage_timings is not None:
+                    matte_evidence.timings_ms.update(diagnostic_stage_timings)
+                if timings is not None:
+                    matte_evidence.timings_ms.update(timings)
+                matte_evidence.backdrop_identity = self._backdrop_diagnostic_identity(
+                    resources
+                )
+                matte_evidence.color_transform = prepared_color.transform
+                matte_evidence.matte_authoritative = True
+                matte_evidence.insufficiency_reason = ""
             return (
                 rendered,
                 "",
@@ -3028,6 +3241,8 @@ class Pipeline:
         while not self._stop.is_set():
             loop_start = time.monotonic()
             frame = resources.capture.read()
+            dequeued_monotonic_ns = time.monotonic_ns() if frame is not None else 0
+            matte_evidence: MatteFrameEvidence | None = None
             used_remote_candidate = False
             timings = {
                 "segmentation_ms": 0.0,
@@ -3058,6 +3273,11 @@ class Pipeline:
                     else:
                         self._handle_mutation_request(resources, request)
 
+                matte_evidence = self._new_matte_evidence(
+                    resources,
+                    frame,
+                    dequeued_monotonic_ns=dequeued_monotonic_ns,
+                )
                 process_started = time.monotonic_ns()
                 cfg = resources.cfg
                 mode = cfg.background.mode
@@ -3105,6 +3325,7 @@ class Pipeline:
                         privacy_safe=False,
                         timings=timings,
                         color_outcome=color_outcome,
+                        matte_evidence=matte_evidence,
                     )
                 if not color_outcome:
                     color_outcome.update(
@@ -3119,6 +3340,10 @@ class Pipeline:
                 frame_processing_ms = (
                     time.monotonic_ns() - process_started
                 ) / 1_000_000.0
+                if matte_evidence is not None:
+                    matte_evidence.timings_ms["frame_processing_ms"] = (
+                        frame_processing_ms
+                    )
                 if frame_processing_ms / 1000.0 > frame_interval:
                     deadline_misses += 1
                 samples = (
@@ -3160,7 +3385,22 @@ class Pipeline:
 
             send_started = time.monotonic_ns()
             resources.output.send(out_frame.copy() if mode == "remote" else out_frame)
-            output_send_ms = (time.monotonic_ns() - send_started) / 1_000_000.0
+            sent_monotonic_ns = time.monotonic_ns()
+            output_send_ms = (sent_monotonic_ns - send_started) / 1_000_000.0
+            if matte_evidence is not None:
+                matte_evidence.timings_ms["output_send_ms"] = output_send_ms
+                if self._submit_matte_evidence(matte_evidence, out_frame):
+                    self._matte_last_source_sequence = (
+                        matte_evidence.metadata.bundle_sequence
+                    )
+            recorder = self._matte_recorder
+            if recorder is not None and self._matte_last_source_sequence is not None:
+                recorder.submit_output_event(
+                    sent_monotonic_ns=sent_monotonic_ns,
+                    source_bundle_sequence=self._matte_last_source_sequence,
+                    base_updated=processed and matte_evidence is not None,
+                    exact_final_repeat=not processed,
+                )
             stage_ewma["output_send_ms"] = _ewma(
                 stage_ewma["output_send_ms"], output_send_ms
             )

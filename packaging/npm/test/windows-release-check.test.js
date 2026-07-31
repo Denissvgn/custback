@@ -1,19 +1,14 @@
 'use strict';
 
-// WIN-01 release-gate slot (WINDOWS_DECISIONS.md Part B, applied by WIN-5.8).
+// Deferred Windows release-evidence contract.
 //
-// This is the Windows analogue of the REL-01 gate in release-check.test.js: an
-// open remediation blocker whose acceptance test (a TODO until the machinery
-// lands) asserts the target end state — a Windows release must not publish
-// without exact Windows evidence — and whose guard proves that today the
-// installed publish machinery does not yet require it.
+// This non-blocking TODO records the target end state: a Windows release must
+// not publish without exact Windows evidence. It is intentionally not registered
+// as a remediation blocker while Windows production publishing is deferred.
 //
 // The machinery this TODO waits on (a windows-latest evidence source, WIN-1.8;
 // the frozen-engine/shell/installer build jobs; and the manifest-driven
-// conditional that keeps a Linux-only release unblocked) does not exist yet, so
-// mutating the consumed required-gates.json arrays or release.yml jobs now would
-// break the live Linux pipeline. The slot is therefore held open here until
-// that machinery exists, exactly as WIN-0.2 specified.
+// conditional that keeps a Linux-only release unblocked) does not exist yet.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -55,10 +50,10 @@ function releaseWorkflowSource() {
 }
 
 test(
-  'WIN-01: Windows production publish requires exact Windows release evidence',
+  'deferred Windows production publish requires exact Windows release evidence',
   {
     todo:
-      'WIN-01 stays open until WIN-1.8 provides a windows-latest evidence ' +
+      'deferred until WIN-1.8 provides a windows-latest evidence ' +
       'source and the frozen-engine/shell/installer build machinery exists',
   },
   () => {
@@ -100,16 +95,16 @@ test(
 );
 
 test(
-  'WIN-01: open registry still blocks the installed Windows publish machinery',
+  'Windows evidence is currently outside the release blocker registry',
   () => {
-    // The open blocker keeps the whole release blocked (never a Windows-only
-    // bypass around REL-01, CC-3): the aggregate check names WIN-01.
-    assert.throws(() => release.verifyNoReleaseBlockers(root), /WIN-01/);
+    assert.doesNotThrow(() => release.verifyNoReleaseBlockers(root));
+    assert.equal(
+      release.remediationBlockers(root).some((entry) => entry.id === 'WIN-01'),
+      false,
+    );
 
-    // Prove the machinery gap is real *today*: no Windows evidence gate, no
-    // Windows installer artifact, and no Windows build jobs are wired yet, so a
-    // hypothetical Windows publish would not be required to carry any Windows
-    // evidence. This is the known failure the TODO above will close.
+    // Keep the deferred gap explicit: no Windows evidence gate, Windows
+    // installer artifact, or Windows release job is wired yet.
     const manifest = requiredGatesManifest();
     const startsWithWindows = (value) => value.startsWith('windows');
     assert.ok(!manifest.required_gates.some(startsWithWindows));

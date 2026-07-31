@@ -202,6 +202,16 @@ fallback transitions, capture recovery, readiness, and the shutdown summary
 are recorded with credential-free summaries and without paths, URLs, or API
 tokens.
 
+Identifiable matte evidence is separate and off by default. An explicit
+`--matte-diagnostics-dir NEW_DIR` records a duration/size-bounded private
+raw/mask/backdrop/composite bundle; `--matte-diagnostics-mode composite-only`
+records downstream output without claiming matte authority. Replay and
+single-variant compositor attribution run offline with `custback matte-replay`;
+the four-boundary RVM diagnosis is `custback matte-diagnose`, and bounded
+same-source screening is `custback matte-ablate`. See
+[docs/matte-replay-bundle.md](docs/matte-replay-bundle.md) for the privacy,
+format, and command contract.
+
 ## Rendering quality & GPU acceleration
 
 The person/background boundary is where composites live or die, so several
@@ -632,6 +642,8 @@ This release intentionally breaks the old unauthenticated control plane:
 | `backgrounds.py` | backdrop providers: image, video loop, approved local camera target, person-free blur, color |
 | `compositor.py` | alpha blending of person over backdrop; light wrap + color-spill removal |
 | `diagnostics.py` | secure rotating logs, run correlation, and safe config audit records |
+| `matte_diagnostics.py` | opt-in private bounded matte recorder and offline frozen/model replay |
+| `matte_quality.py` / `matte_attribution.py` / `matte_ablation.py` | digest-bound metrics, four-boundary RVM attribution, and bounded same-source screening |
 | `gpu_probe.py` | real CUDA inference/profile capability probe for installer and doctor |
 | `vcam.py` | virtual camera output (pyvirtualcam → v4l2loopback / OBS extension) |
 | `hub.py` | thread-safe frame exchange between pipeline and API |
@@ -647,7 +659,7 @@ The whole pipeline is testable without a camera, virtual camera, or mediapipe:
 ```bash
 pytest
 npm test
-npm run release:check -- --quick  # intentionally fails closed while REL-01 is open
+npm run release:check -- --quick
 ```
 
 Geometry and color contracts run in every supported Python version, minimum
@@ -658,10 +670,9 @@ engine and exercise tagged-video normalization. Workflow definitions are
 coverage commitments until their exact external runs are attached as
 evidence—local green tests are not represented as physical-device approval.
 
-While `REL-01` is open, use the exact diagnostic regressions and CI's
-non-authorizing package-smoke job for development evidence. All ordinary
-`prepack` and `release:check` modes remain publication gates and therefore
-exit nonzero before packaging.
+No remediation blocker currently prevents `prepack` or `release:check` from
+proceeding to their normal qualification checks. Windows production evidence is
+deferred and is not required by the current release manifest.
 
 The full artifact gate creates and installs several isolated Python environments.
 Point it at a pre-existing disk-backed directory so those environments do not
@@ -700,10 +711,10 @@ once from reviewed commit `f01baadfa3b1e2a1ef19eceda315eedf06fbe883` and labels
 them as source reconstructions. It does not represent them as previously
 published bytes.
 
-`REL-01` deliberately remains open in this implementation revision. The final
-release-candidate revision must close that registry entry and update its
-fail-closed contract in the same commit, then obtain a fresh successful Phase 6
-run. The aggregate gate and publish job reverify the exact GitHub run context,
-commit, artifact digests, report bindings, candidate attestations, and the
-attestation on the evidence document itself;
-the publish job uploads those qualified files without rebuilding them.
+`REL-01` is resolved: the production workflow and reviewed gate manifest enforce
+the exact Phase 6 evidence contract. Windows production evidence remains
+deferred and is temporarily outside the blocker registry and required-gate
+manifest. The aggregate gate and publish job reverify the exact GitHub run
+context, commit, artifact digests, report bindings, candidate attestations, and
+the attestation on the evidence document itself; the publish job uploads those
+qualified files without rebuilding them.

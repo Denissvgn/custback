@@ -1,6 +1,6 @@
 # Custback remediation plan
 
-Status: **RELEASE BLOCKED — Phase 6 enforcement implemented; exact release-candidate qualification pending**
+Status: **ELIGIBLE FOR QUALIFICATION — no open remediation blockers**
 
 This plan converts the findings from the July 2026 repository review into an
 implementation sequence. A completeness re-audit on 2026-07-16 found that six
@@ -11,11 +11,9 @@ authorize a release. Phase 5 closes the corrective backlog; Phase 6 performs
 migration, artifact, stress, and two-host TLS validation.
 
 The machine-readable registry now reports phase 6 with
-`release_blocked=true`. All seven Phase 5 blockers are resolved by exact
-executable regressions; `REL-01` is the only open entry. Ordinary `prepack` and
-release-check commands fail closed before publication. The final release-
-candidate commit must close `REL-01`, then pass the installed exact-commit Phase
-6 workflow; this implementation revision is not pre-qualified evidence.
+`release_blocked=false`. All 28 registered blockers are resolved. Windows
+production evidence is deferred and temporarily excluded from the blocker
+registry and required-gate manifest.
 
 ## Target invariants
 
@@ -47,7 +45,7 @@ The remediated system must guarantee that:
 | 2 | Transactional avatar engine and worker lifecycle | Config/resources activate atomically; no worker survives teardown |
 | 3 | Storage, merge semantics, segmentation, rendering, streaming | Concurrency, quota, media, and correctness gates pass |
 | 4 | Audio2Face, npm, release, docs, and compliance | All extras install from artifacts; npm upgrades preserve state |
-| 5 | Corrective security, lifecycle, storage, and packaging | Seven Phase 5 blockers pass; only `REL-01` remains open |
+| 5 | Corrective security, lifecycle, storage, and packaging | Seven Phase 5 blockers pass |
 | 6 | Migration and end-to-end validation | Clean artifacts, stress, upgrade, and two-host TLS gates pass |
 
 The original Phase 0–4 sequence is retained below for traceability. Current
@@ -74,7 +72,7 @@ its dynamic release-candidate gates cannot authorize this dirty parent revision.
 The machine-readable source of truth is
 `scripts/release/remediation-blockers.json`. `release:check` and `prepack`
 must fail while any entry remains open. The registry is aligned with the
-corrective implementation: 27 entries are resolved and `REL-01` remains open.
+corrective implementation: all 28 registered entries are resolved.
 A blocker is closed only in the same change that removes its strict
 expected-failure marker and makes its acceptance test pass. Merely checking that
 a regression file contains the blocker ID is not evidence that the acceptance
@@ -712,19 +710,17 @@ or handles, leaked reservations, lost cleanup owners, or privacy violations.
 - Keep `prepack` non-recursive and fast, but make it fail whenever the blocker
   registry is open or required release metadata is inconsistent.
 - Provide a non-authorizing qualification/test entry point so Phase 6 jobs can
-  exercise their runners while `REL-01` is open. Its evidence is diagnostic only
-  and cannot satisfy the publish workflow or bypass registry checks. It may build
-  an npm candidate with lifecycle scripts disabled, but final qualification must
-  use the normal prepack path after `REL-01` closes.
+  exercise their runners while the registry is open. Its evidence is diagnostic
+  only and cannot satisfy the publish workflow or bypass registry checks. It may
+  build an npm candidate with lifecycle scripts disabled, but final qualification
+  must use the normal prepack path after every blocker closes.
 - Make full `release:check` run the locally executable gates and verify
   commit-bound CI evidence for any true two-host/platform matrix that cannot run
   locally.
-- Close `REL-01` and set `release_blocked=false` only in the final release-candidate
-  change after every other blocker is closed and the enforcement machinery plus
-  its fail-closed regressions are mandatory. That commit becomes eligible to run
-  dynamic qualification; it is not pre-qualified by results from its parent.
-  Any later source, dependency, workflow, or artifact change requires a fresh
-  qualification run and new artifacts.
+- Close `REL-01` only after the enforcement machinery and its fail-closed
+  regressions are mandatory. Keep `release_blocked=true` while any registered
+  entry remains open. Any later source, dependency, workflow, or artifact
+  change requires a fresh qualification run and new artifacts.
 
 `release_blocked=false` means that a revision is eligible to attempt final
 qualification; it is not itself evidence that any artifact passed. Dynamic
@@ -773,9 +769,10 @@ full release check fail. Only the exact fully validated commit can publish.
   the enforcement machinery. The true multi-platform, CUDA, two-clean-host,
   real-container, and signed-provenance gates remain dynamic release-candidate
   work; no success is claimed for them in this implementation record.
-- `REL-01` intentionally remains open and `release_blocked` remains true. Its
-  final atomic close and the corresponding fail-closed contract digest/test
-  update belong only in the clean release-candidate revision.
+- `REL-01` is resolved and its acceptance regression now passes normally.
+  No remediation blocker is currently open, so `release_blocked=false`.
+- Windows production evidence remains deferred outside the blocker registry and
+  required-gate manifest.
 
 ## Corrective PR sequence
 
@@ -789,11 +786,12 @@ full release check fail. Only the exact fully validated commit can publish.
 8. `PKG-02`: stdout-clean prepack and real command-substitution regression.
 9. Migration fixtures, Ruff, stress, clean-tree, and artifact gates.
 10. Packaged two-host WSS/HTTPS system test and required CI integration.
-11. `REL-01`: exact-commit release candidate, registry close, and publish gate.
+11. `REL-01`: exact-commit release candidate, registry close, and publish gate
+    (**complete**).
 
 Security/privacy, lifecycle, storage, and packaging PRs may proceed in parallel
 after the registry freeze. Do not combine `LIFE-01`/`LIFE-02` ownership changes
-with `STOR-02`, and do not close `REL-01` in an implementation PR.
+with `STOR-02`.
 
 ## Final release gate
 

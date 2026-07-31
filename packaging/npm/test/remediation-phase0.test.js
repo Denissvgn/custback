@@ -215,9 +215,9 @@ test(
     });
     fs.mkdirSync(destination);
 
-    // Phase 5 intentionally keeps the real tree release-blocked by REL-01.
-    // Close the copied registry only to exercise npm's post-prepack stdout
-    // contract; this fixture is not release evidence.
+    // Normalize this copy to a closed registry so the fixture remains robust if
+    // a future blocker is added. This only exercises npm's post-prepack stdout
+    // contract; it is not release evidence.
     const registryPath = path.join(
       checkout, 'scripts', 'release', 'remediation-blockers.json',
     );

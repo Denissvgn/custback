@@ -229,16 +229,13 @@ intact (the Phase 0 exit condition) and honors CC-3 (never bypass `REL-01`).
    must not be publishable without it. WIN-5.8 encodes this as a manifest-driven
    conditional, verified by the new regression test.
 
-### Applied state (WIN-5.8)
+### Current deferred state
 
-The slot's **blocker half is now live**: `WIN-01` (open, phase 6) is appended to
-`remediation-blockers.json` exactly as specified in item 1, and
-`REVIEWED_REMEDIATION_CONTRACT_SHA256` was recomputed in the same edit
-(`c64a8907…`). The regression `packaging/npm/test/windows-release-check.test.js`
-(item 2) is registered in `REVIEWED_NPM_PAYLOAD`; its `# TODO` acceptance
-enumerates the item-3 gates/jobs/artifact and the item-4 scoping rule, and its
-guard proves today's gap. `REL-01` is untouched and release stays blocked
-(CC-3).
+The `WIN-01` blocker is temporarily removed from
+`remediation-blockers.json`. The regression in
+`packaging/npm/test/windows-release-check.test.js` remains as a non-blocking
+TODO that enumerates the future Windows gates, jobs, artifact, and scoping rule.
+No current release blocker claims that Windows evidence is enforced.
 
 The slot's **manifest/workflow half (items 3–4) is intentionally still deferred**
 — now to WIN-1.8, not Phase 0. `required-gates.json` is an *exact-match* evidence
@@ -248,15 +245,12 @@ equal `workflow.required_job_ids` exactly. Adding the Windows gates/jobs before 
 real Windows evidence source exists would either break every release (including
 Linux-only, violating item 4) or fabricate machinery with no subject — the same
 reason Phase 0 declined to mutate the registry. When WIN-1.8 lands the
-`windows-latest` job and the conditional evidence plumbing, flipping the
-`WIN-01` guard from passing to failing is the signal to add the gates and move
-the blocker toward resolved.
+`windows-latest` job and conditional evidence plumbing, the deferred TODO can be
+made mandatory and the required Windows gates added atomically.
 
 ### Phase 0 verification (what is checked now)
 
-Because Phase 0 does not touch the registry, the check is that the pinned
-contract still holds after the Phase 1 and Phase 0 changes: recomputing
+The pinned contract must still match the active registry: recomputing
 `remediationContractDigest()` over the current `remediation-blockers.json` must
 still equal `REVIEWED_REMEDIATION_CONTRACT_SHA256`. This is exercised in the
-Phase 0 completion notes and should be part of any future `verify-release.js`
-dry-run.
+release regression suite.

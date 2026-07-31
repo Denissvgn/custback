@@ -110,6 +110,11 @@ class CaptureHealth:
     # ``generation`` and ``geometry_generation`` describe the last frame
     # returned by ``read()``, not a newer frame waiting in the reader slot.
     # This lets downstream temporal state reset at the exact frame boundary.
+    # ``sequence`` and ``captured_monotonic_ns`` are the matching recorder-only
+    # identity.  They are intentionally absent from public status; MATTE-1.1
+    # will later carry typed timing through the processing contract itself.
+    sequence: int = 0
+    captured_monotonic_ns: int | None = None
     generation: int = 0
     geometry_generation: int = 0
     content_rect: tuple[int, int, int, int] | None = None
@@ -809,6 +814,8 @@ class OpenCVCapture(CaptureSource):
                         content.bottom,
                     )
                     self._slot_identity = CaptureHealth(
+                        sequence=self._slot_sequence,
+                        captured_monotonic_ns=int(round(finished * 1_000_000_000)),
                         generation=generation,
                         geometry_generation=self._geometry_transitions,
                         content_rect=self._slot_content_rect,
@@ -1164,6 +1171,8 @@ class OpenCVCapture(CaptureSource):
             )
             identity = self._delivered_identity
             return CaptureHealth(
+                sequence=identity.sequence,
+                captured_monotonic_ns=identity.captured_monotonic_ns,
                 generation=identity.generation,
                 geometry_generation=identity.geometry_generation,
                 content_rect=identity.content_rect,
@@ -1284,6 +1293,12 @@ class SyntheticCapture(CaptureSource):
                 else capture_fps >= self.cfg.fps * 0.9
             )
             return CaptureHealth(
+                sequence=self._frames_read,
+                captured_monotonic_ns=(
+                    None
+                    if self._last_frame_at is None
+                    else int(round(self._last_frame_at * 1_000_000_000))
+                ),
                 generation=1 if self._frames_read else 0,
                 geometry_generation=1 if self._frames_read else 0,
                 content_rect=(

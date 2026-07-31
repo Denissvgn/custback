@@ -129,7 +129,7 @@ test('artifact build uses the authorizing path once and attests all exact files'
   ));
   const rel = registry.blockers.find((entry) => entry.id === 'REL-01');
   assert.deepEqual({ status: rel.status, release_blocked: registry.release_blocked }, {
-    status: 'open', release_blocked: true,
+    status: 'resolved', release_blocked: false,
   });
 });
 

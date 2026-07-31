@@ -1,0 +1,39 @@
+{
+  "schema": "custback.matte-alpha-attribution-local-reference",
+  "version": 1,
+  "status": "awaiting-consented-local-evidence",
+  "qualification_id": "",
+  "provenance": {
+    "kind": "consented-local-or-licensed-local",
+    "license_or_consent_reference": "",
+    "contains_private_footage_in_repository": false
+  },
+  "artifacts": {
+    "replay_manifest_sha256": "",
+    "annotation_manifest_sha256": "",
+    "quality_evidence_sha256": "",
+    "alpha_attribution_evidence_sha256": ""
+  },
+  "coverage": {
+    "frame_count": 0,
+    "region_names": [],
+    "configured_rvm_downsample": null,
+    "effective_rvm_downsample_ratio": null,
+    "configured_mask_shift": null,
+    "effective_mask_shift": null
+  },
+  "decision": {
+    "qualification_status": "not-reviewed",
+    "primary_stage": "",
+    "stable_opaque_core_failure_regions": [],
+    "global_hard_threshold_status": "",
+    "next_experiment": "",
+    "rejected_alternatives": [],
+    "temporal_conclusion": "not inferred from still-frame attribution"
+  },
+  "review": {
+    "reviewer": "",
+    "reviewed_at": "",
+    "notes": ""
+  }
+}

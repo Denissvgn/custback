@@ -68,6 +68,10 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/geometry.py',
   'custback/gpu_probe.py',
   'custback/hub.py',
+  'custback/matte_ablation.py',
+  'custback/matte_attribution.py',
+  'custback/matte_diagnostics.py',
+  'custback/matte_quality.py',
   'custback/migration.py',
   'custback/pipeline.py',
   'custback/preview.py',
@@ -101,6 +105,10 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_diagnostics.py',
   'tests/test_geometry.py',
   'tests/test_gpu_probe.py',
+  'tests/test_matte_ablation.py',
+  'tests/test_matte_attribution.py',
+  'tests/test_matte_diagnostics.py',
+  'tests/test_matte_quality.py',
   'tests/test_model_acquisition.py',
   'tests/test_observability.py',
   'tests/test_output_geometry.py',
@@ -126,6 +134,8 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_windows_acceleration_gate.py',
   'tests/test_windows_packaging.py',
   'tests/test_windows_vcam.py',
+  'tests/matte_ablation_evidence.py',
+  'tests/matte_quality_evidence.py',
   'tests/visual_consistency_evidence.py',
   'tests/fixtures/migration/expected-0.4.0-local-camera.yaml',
   'tests/fixtures/migration/legacy-0.3.0-default.yaml',
@@ -134,6 +144,14 @@ const REVIEWED_PYTHON_TESTS = [
 ];
 const REVIEWED_PYTHON_SDIST_DATA = [
   'config/default.yaml',
+  'docs/matte-ablation.md',
+  'docs/matte-ablation-local-reference-template.json',
+  'docs/matte-alpha-attribution.md',
+  'docs/matte-alpha-attribution-local-template.json',
+  'docs/matte-quality-baseline.md',
+  'docs/matte-quality-local-qualification-template.json',
+  'docs/matte-quality-metrics.md',
+  'docs/matte-replay-bundle.md',
   'docs/visual-consistency-phase4-qualification-runbook.md',
   'docs/visual-consistency-phase4-qualification-template.json',
   'docs/visual-consistency-rollout.md',
@@ -152,6 +170,14 @@ const REVIEWED_NPM_PAYLOAD = [
   'config/default.yaml',
   'docs/adr/0001-visual-consistency-contract.md',
   'docs/camera-control-characterization.md',
+  'docs/matte-ablation.md',
+  'docs/matte-ablation-local-reference-template.json',
+  'docs/matte-alpha-attribution.md',
+  'docs/matte-alpha-attribution-local-template.json',
+  'docs/matte-quality-baseline.md',
+  'docs/matte-quality-local-qualification-template.json',
+  'docs/matte-quality-metrics.md',
+  'docs/matte-replay-bundle.md',
   'docs/remote-deployment.md',
   'docs/visual-consistency-phase0-baseline.json',
   'docs/visual-consistency-phase0-contact-sheet.png',
@@ -268,7 +294,7 @@ const REVIEWED_ACTIONS = new Set([
 ]);
 const REVIEWED_LICENSE_COPYRIGHT = 'Copyright (c) 2026 Bramen';
 const REVIEWED_REMEDIATION_CONTRACT_SHA256 =
-  'c64a8907141e5f5c6ad883384936ddd92673a3e1c2e4f290a296125a0ce6446b';
+  'daf3165058e28fbbd91a7d90aac8804cd67fa2a9e8af2e1b69fa67d5a8a91db0';
 const REVIEWED_NPM_METADATA = {
   name: 'custback',
   description: 'Virtual camera with background replacement for meeting apps (Ubuntu / Debian / macOS)',
@@ -2207,8 +2233,8 @@ function releasePlan(argv) {
 }
 
 function verifyPackageSmoke(root = ROOT) {
-  // Installed-artifact acceptance remains runnable while REL-01 is open, but
-  // this function never authorizes or publishes a release candidate.
+  // Installed-artifact acceptance remains runnable while the registry is open,
+  // but this function never authorizes or publishes a release candidate.
   const version = verifyVersions(root);
   verifyDependencies(root);
   verifyLicenseMetadata(root);
