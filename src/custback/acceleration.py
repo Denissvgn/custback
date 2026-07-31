@@ -369,8 +369,10 @@ def prove_rvm_provider(
     A short-lived profiling session runs one synthetic RVM frame and the ORT
     profile is inspected for a node executed on the candidate provider.  This
     is discarded afterwards; the production session is built separately without
-    profiling overhead.  Registration-without-execution and initialization
-    fallback are both caught because the evidence is a real executed node.
+    profiling overhead.  The proof mirrors the production provider order,
+    including its explicit CPU safety provider.  Registration-without-execution
+    and initialization fallback are still caught because the evidence is a real
+    executed node, not merely the provider list.
     """
 
     session = None
@@ -379,10 +381,12 @@ def prove_rvm_provider(
         options = ort.SessionOptions()
         options.enable_profiling = True
         options.log_severity_level = 3
-        try:
-            options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        except Exception:  # pragma: no cover - older ORT without this knob
-            pass
+        # Do not set session.disable_cpu_ep_fallback here.  The proof explicitly
+        # registers CPUExecutionProvider to match the production session, and
+        # newer ONNX Runtime releases reject that provider list when CPU fallback
+        # is simultaneously disabled.  The profile below is the authoritative
+        # guard against a registered CUDA/DirectML provider that executes no RVM
+        # nodes.
         session = ort.InferenceSession(
             str(model_path),
             sess_options=options,

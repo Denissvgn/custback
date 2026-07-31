@@ -161,6 +161,8 @@ def test_fallback_reason_is_bounded():
 
 def _fake_ort(*, active_provider_in_profile):
     mod: Any = types.ModuleType("onnxruntime")
+    mod.proof_session_options = None
+    mod.proof_session_providers = None
 
     class SessionOptions:
         def __init__(self):
@@ -173,6 +175,19 @@ def _fake_ort(*, active_provider_in_profile):
     class InferenceSession:
         def __init__(self, path, sess_options=None, providers=None):
             names = [p[0] if isinstance(p, tuple) else p for p in providers or []]
+            if bool(getattr(sess_options, "enable_profiling", False)):
+                mod.proof_session_options = sess_options
+                mod.proof_session_providers = names
+                if (
+                    getattr(sess_options, "_entries", {}).get(
+                        "session.disable_cpu_ep_fallback"
+                    )
+                    == "1"
+                    and "CPUExecutionProvider" in names
+                ):
+                    raise ValueError(
+                        "explicit CPU EP conflicts with disabled CPU EP fallback"
+                    )
             self._providers = names or ["CPUExecutionProvider"]
             self._profiling = bool(getattr(sess_options, "enable_profiling", False))
 
@@ -208,6 +223,12 @@ def test_prove_rvm_provider_confirms_gpu_execution():
     result = prove_rvm_provider(ort, "/fake/model.onnx", candidate)
     assert result.proven is True
     assert "CUDAExecutionProvider" in result.active_providers
+    assert ort.proof_session_providers == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert ort.proof_session_options is not None
+    assert "session.disable_cpu_ep_fallback" not in ort.proof_session_options._entries
 
 
 def test_prove_rvm_provider_rejects_registered_but_cpu_executed():
