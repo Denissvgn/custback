@@ -25,7 +25,7 @@ import custback.capture as capture_mod
 import custback.pipeline as pipeline_mod
 from custback.api.server import _encode_jpeg
 from custback.backgrounds import ImageBackdrop
-from custback.capture import CaptureHealth, OpenCVCapture
+from custback.capture import CapturedFrame, CaptureHealth, OpenCVCapture
 from custback.color import ColorBehavior, ColorReason
 from custback.config import AppConfig, CameraConfig, RuntimeConfig
 from custback.geometry import (
@@ -92,18 +92,35 @@ class _GeometryCapture:
         )
         self._available = True
         self.frames_read = 0
+        self.captured_at_ns: int | None = None
 
-    def read(self) -> np.ndarray | None:
+    def read(self) -> CapturedFrame | None:
         if not self._available:
             return None
         self._available = False
         self.frames_read = 1
-        return self.frame
+        self.captured_at_ns = int(time.monotonic() * 1_000_000_000)
+        content = self.plan.content_rect
+        return CapturedFrame(
+            pixels=self.frame,
+            sequence=self.frames_read,
+            captured_at_ns=self.captured_at_ns,
+            generation=1,
+            geometry_generation=1,
+            content_rect=(
+                content.left,
+                content.top,
+                content.right,
+                content.bottom,
+            ),
+        )
 
     def health_snapshot(self) -> CaptureHealth:
         content = self.plan.content_rect
         oriented_width, oriented_height = self.plan.oriented_size
         return CaptureHealth(
+            sequence=self.frames_read,
+            captured_monotonic_ns=self.captured_at_ns,
             generation=1,
             geometry_generation=1,
             content_rect=(
@@ -143,15 +160,26 @@ class _SequenceCapture:
         self.height = self.frames[0].shape[0]
         self.generation = generation
         self.frames_read = 0
+        self.captured_at_ns: int | None = None
 
-    def read(self) -> np.ndarray | None:
+    def read(self) -> CapturedFrame | None:
         if not self.frames:
             return None
         self.frames_read += 1
-        return self.frames.pop(0)
+        self.captured_at_ns = int(time.monotonic() * 1_000_000_000)
+        return CapturedFrame(
+            pixels=self.frames.pop(0),
+            sequence=self.frames_read,
+            captured_at_ns=self.captured_at_ns,
+            generation=self.generation,
+            geometry_generation=self.generation,
+            content_rect=(0, 0, self.width, self.height),
+        )
 
     def health_snapshot(self) -> CaptureHealth:
         return CaptureHealth(
+            sequence=self.frames_read,
+            captured_monotonic_ns=self.captured_at_ns,
             generation=self.generation,
             geometry_generation=self.generation,
             content_rect=(0, 0, self.width, self.height),

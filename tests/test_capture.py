@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
+from dataclasses import FrozenInstanceError
 
 import numpy as np
 import pytest
 
 import custback.capture as capture_mod
 from custback.capture import (
+    CapturedFrame,
     CaptureError,
     CaptureModeError,
     CaptureWorkerError,
@@ -83,6 +86,39 @@ class FakeCap:
 
     def release(self):
         self.released = True
+
+
+_MANUAL_RELEASED = object()
+
+
+class ManualCap(FakeCap):
+    """A fake camera whose successful reads are supplied explicitly."""
+
+    def __init__(self):
+        super().__init__(delay=0.0)
+        self.frames: queue.Queue[object] = queue.Queue()
+        self.success_completed_at_ns: list[int] = []
+
+    def push(self, frame):
+        self.frames.put(frame)
+
+    def read(self):
+        self.read_calls += 1
+        while not self.released:
+            try:
+                frame = self.frames.get(timeout=0.01)
+            except queue.Empty:
+                continue
+            if frame is _MANUAL_RELEASED:
+                return False, None
+            assert isinstance(frame, np.ndarray)
+            self.success_completed_at_ns.append(time.monotonic_ns())
+            return True, frame.copy()
+        return False, None
+
+    def release(self):
+        self.released = True
+        self.frames.put(_MANUAL_RELEASED)
 
 
 class BlockingCap(FakeCap):
@@ -190,7 +226,7 @@ class BlockingOpenCV2(FakeCV2):
         return super().VideoCapture(device)
 
 
-def wait_for_frame(capture, timeout=1.0):
+def wait_for_frame(capture, timeout=1.0) -> CapturedFrame:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         frame = capture.read()
@@ -219,7 +255,7 @@ def test_v4l2_auto_requests_mjpg_before_dimensions_and_reads_back_mode(monkeypat
     capture = OpenCVCapture(CameraConfig(device="0", width=128, height=72, fps=30))
     try:
         frame = wait_for_frame(capture)
-        assert frame.shape == (72, 128, 3)
+        assert frame.pixels.shape == (72, 128, 3)
         assert fake_cv2.opened[0][0] == 0
         assert [prop for prop, _ in cap.set_calls] == [
             FakeCV2.CAP_PROP_FOURCC,
@@ -293,7 +329,7 @@ def test_initial_open_failure_retries_with_backoff_and_recovers(monkeypatch):
     capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
     try:
         frame = wait_for_frame(capture, timeout=0.5)
-        assert frame.shape == (72, 128, 3)
+        assert frame.pixels.shape == (72, 128, 3)
         health = capture.health_snapshot()
         assert health.restarts == 1
         assert health.read_failures == 1
@@ -372,7 +408,7 @@ def test_negotiated_resolution_uses_post_frame_property_readback(monkeypatch, ca
     capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
     try:
         frame = wait_for_frame(capture)
-        assert frame.shape == (72, 128, 3)
+        assert frame.pixels.shape == (72, 128, 3)
         health = capture.health_snapshot()
         assert (health.width, health.height) == (64, 48)
         assert "negotiated MJPG 64x48" in caplog.text
@@ -406,7 +442,7 @@ def test_warn_mode_reports_negotiated_mismatch_and_resizes(monkeypatch, caplog):
     try:
         frame = wait_for_frame(capture)
         health = capture.health_snapshot()
-        assert frame.shape == (72, 128, 3)
+        assert frame.pixels.shape == (72, 128, 3)
         assert (health.width, health.height, health.fps_reported) == (64, 48, 10.0)
         # Negotiated mismatch is reported separately; this field represents
         # measured runtime rate and remains unknown during warm-up.
@@ -450,24 +486,86 @@ def test_explicit_mjpeg_must_be_verified_after_first_frame(monkeypatch):
         capture.close()
 
 
-def test_latest_frame_slot_counts_overwrites_without_backlog(monkeypatch):
-    cap = FakeCap(delay=0.001)
+def test_latest_frame_slot_exposes_sequence_gap_without_backlog_or_reorder(monkeypatch):
+    cap = ManualCap()
     monkeypatch.setattr(capture_mod, "cv2", FakeCV2([cap]))
     capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
     try:
+        cap.push(np.full((72, 128, 3), 1, np.uint8))
+        first = wait_for_frame(capture)
+        assert first.sequence == 1
+        assert capture.read() is None
+
+        for value in (2, 3, 4):
+            cap.push(np.full((72, 128, 3), value, np.uint8))
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
             health = capture.health_snapshot()
-            if health.frames_read >= 8:
+            if health.frames_read >= 4:
                 break
             time.sleep(0.003)
         else:
             raise AssertionError("reader did not fill latest-frame slot")
-        assert health.dropped_frames >= 7
-        assert capture.read() is not None
+
+        latest = capture.read()
+        assert latest is not None
+        assert latest.sequence == 4
+        assert latest.sequence - first.sequence - 1 == 2
+        assert health.dropped_frames == 2
+        assert int(latest.pixels[0, 0, 0]) == 4
         assert capture.read() is None
+
+        cap.push(np.full((72, 128, 3), 5, np.uint8))
+        after_gap = wait_for_frame(capture)
+        assert after_gap.sequence == 5
+        assert after_gap.captured_at_ns >= latest.captured_at_ns
     finally:
         capture.close()
+
+
+def test_pixel_identical_successes_get_new_atomic_capture_identity(monkeypatch):
+    cap = ManualCap()
+    monkeypatch.setattr(capture_mod, "cv2", FakeCV2([cap]))
+    capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
+    pixels = np.full((72, 128, 3), 31, np.uint8)
+    try:
+        cap.push(pixels)
+        first = wait_for_frame(capture)
+        cap.push(pixels)
+        second = wait_for_frame(capture)
+        observed_at_ns = time.monotonic_ns()
+
+        np.testing.assert_array_equal(first.pixels, second.pixels)
+        assert (first.sequence, second.sequence) == (1, 2)
+        assert first.captured_at_ns >= cap.success_completed_at_ns[0]
+        assert second.captured_at_ns >= cap.success_completed_at_ns[1]
+        assert first.captured_at_ns <= second.captured_at_ns <= observed_at_ns
+        assert first.generation == second.generation == 1
+        assert first.geometry_generation == second.geometry_generation == 1
+        assert first.content_rect == second.content_rect == (0, 0, 128, 72)
+
+        health = capture.health_snapshot()
+        assert health.sequence == second.sequence
+        assert health.captured_monotonic_ns == second.captured_at_ns
+        assert health.generation == second.generation
+        assert health.geometry_generation == second.geometry_generation
+        assert health.content_rect == second.content_rect
+    finally:
+        capture.close()
+
+
+def test_captured_frame_envelope_fields_are_frozen():
+    captured = CapturedFrame(
+        pixels=np.zeros((2, 3, 3), dtype=np.uint8),
+        sequence=7,
+        captured_at_ns=11,
+        generation=2,
+        geometry_generation=3,
+        content_rect=(0, 0, 3, 2),
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        captured.sequence = 8  # type: ignore[misc]
 
 
 def test_stalled_capture_reopens_once_and_recovers(monkeypatch):
@@ -481,7 +579,7 @@ def test_stalled_capture_reopens_once_and_recovers(monkeypatch):
     capture._backoffs = (0.01, 0.02, 0.04, 0.08)
     try:
         frame = wait_for_frame(capture, timeout=0.5)
-        assert frame.shape == (72, 128, 3)
+        assert frame.pixels.shape == (72, 128, 3)
         health = capture.health_snapshot()
         assert health.restarts == 1
         assert health.read_failures > 0
@@ -675,7 +773,7 @@ def test_windows_capture_selects_msmf_then_dshow(monkeypatch):
     capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
     try:
         frame = wait_for_frame(capture, timeout=0.5)
-        assert frame.shape == (72, 128, 3)
+        assert frame.pixels.shape == (72, 128, 3)
         assert msmf_closed.released
         # Both backends were opened explicitly, in order, with apiPreference set.
         assert fake_cv2.opened[0][3] == FakeCV2.CAP_MSMF
@@ -713,11 +811,26 @@ def test_synthetic_capture_exposes_compatible_health_and_mirror():
     try:
         frame = capture.read()
         assert frame is not None
-        assert frame.shape == (32, 64, 3)
+        assert frame.pixels.shape == (32, 64, 3)
+        assert frame.sequence == 1
+        assert frame.captured_at_ns > 0
+        assert frame.generation == 1
+        assert frame.geometry_generation == 1
+        assert frame.content_rect == (0, 0, 64, 32)
+
+        second = capture.read()
+        assert second is not None
+        assert second.sequence == 2
+        assert second.captured_at_ns >= frame.captured_at_ns
+        assert second.generation == frame.generation
+        assert second.geometry_generation == frame.geometry_generation
+        assert second.content_rect == frame.content_rect
         health = capture.health_snapshot()
         assert health.backend == "synthetic"
         assert health.target_met is None
-        assert health.frames_read == 1
+        assert health.frames_read == 2
+        assert health.sequence == second.sequence
+        assert health.captured_monotonic_ns == second.captured_at_ns
         assert health.frame_age_ms is not None
     finally:
         capture.close()

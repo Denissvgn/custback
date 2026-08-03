@@ -163,6 +163,7 @@ def generate_bundle(
     ratio: float,
     dynamic_backdrop: bool = True,
     source_offset: int = 0,
+    device_sequence: Sequence[str] | None = None,
 ) -> tuple[Path, Path]:
     source, truth, foreground, regions = _scene()
     if source_offset:
@@ -173,6 +174,8 @@ def generate_bundle(
     annotations = root / f"{name}-annotations"
     controls = _controls(backend=backend, ratio=ratio, light_wrap=0.8)
     annotation_frames: list[QualityFrameAnnotations] = []
+    if device_sequence is not None and len(device_sequence) != FRAME_COUNT:
+        raise ValueError("device sequence must match generated frame count")
     with MatteDiagnosticRecorder(bundle, max_bytes=32 * 1024 * 1024) as recorder:
         for sequence in range(FRAME_COUNT):
             prediction = np.ascontiguousarray(
@@ -207,7 +210,11 @@ def generate_bundle(
                     "segmentation_backend": (
                         "RVMSegmenter" if backend == "rvm" else "MediaPipeSegmenter"
                     ),
-                    "segmentation_device": "generated-proxy",
+                    "segmentation_device": (
+                        "generated-proxy"
+                        if device_sequence is None
+                        else device_sequence[sequence]
+                    ),
                     "produces_matte": backend == "rvm",
                     "rvm_downsample_ratio": ratio if backend == "rvm" else None,
                     "mask_shift": 0,
@@ -233,6 +240,7 @@ def generate_bundle(
                         if dynamic_backdrop
                         else "generated-constant"
                     ),
+                    "visual_generation": 0,
                     "logical_index": sequence if dynamic_backdrop else 0,
                     "pts_s": sequence / 24.0 if dynamic_backdrop else 0.0,
                 },
@@ -374,21 +382,26 @@ def generated_plan(
         ("compositor_wrap_only", False, 0.8),
         ("compositor_both", True, 0.8),
     ):
-        variants.append(
-            {
-                "id": variant_id,
-                "kind": "frozen",
-                "lane": "compositor",
-                "group": "compositor_factorial",
-                "covers": [f"compositor.{variant_id.removeprefix('compositor_')}"],
-                "compositing": {
-                    "use_model_foreground": foreground_enabled,
-                    "light_wrap": wrap,
-                },
-                "evidence_kind": "recorded-intermediate",
-                "reference_in_group": variant_id == "compositor_both",
-            }
-        )
+        variant = {
+            "id": variant_id,
+            "kind": "frozen",
+            "lane": "compositor",
+            "group": "compositor_factorial",
+            "covers": [f"compositor.{variant_id.removeprefix('compositor_')}"],
+            "compositing": {
+                "use_model_foreground": foreground_enabled,
+                "light_wrap": wrap,
+            },
+            "evidence_kind": "recorded-intermediate",
+            "reference_in_group": variant_id == "compositor_both",
+        }
+        if wrap > 0.0:
+            variant["paired_no_wrap_id"] = (
+                "compositor_foreground_only"
+                if foreground_enabled
+                else "compositor_plain"
+            )
+        variants.append(variant)
     variants.extend(
         [
             {

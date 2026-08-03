@@ -163,6 +163,7 @@ def _fake_ort(*, active_provider_in_profile):
     mod: Any = types.ModuleType("onnxruntime")
     mod.proof_session_options = None
     mod.proof_session_providers = None
+    mod.proof_model_source = None
 
     class SessionOptions:
         def __init__(self):
@@ -174,6 +175,7 @@ def _fake_ort(*, active_provider_in_profile):
 
     class InferenceSession:
         def __init__(self, path, sess_options=None, providers=None):
+            mod.proof_model_source = path
             names = [p[0] if isinstance(p, tuple) else p for p in providers or []]
             if bool(getattr(sess_options, "enable_profiling", False)):
                 mod.proof_session_options = sess_options
@@ -220,8 +222,10 @@ def _fake_ort(*, active_provider_in_profile):
 def test_prove_rvm_provider_confirms_gpu_execution():
     ort = _fake_ort(active_provider_in_profile=True)
     candidate = ProviderCandidate("CUDAExecutionProvider", {"device_id": 0})
-    result = prove_rvm_provider(ort, "/fake/model.onnx", candidate)
+    model_payload = b"immutable-model"
+    result = prove_rvm_provider(ort, model_payload, candidate)
     assert result.proven is True
+    assert ort.proof_model_source is model_payload
     assert "CUDAExecutionProvider" in result.active_providers
     assert ort.proof_session_providers == [
         "CUDAExecutionProvider",

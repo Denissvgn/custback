@@ -20,7 +20,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket
@@ -42,6 +42,7 @@ from ..color import ColorError, decode_image_to_srgb_bgr
 from ..config import (
     MODES,
     Anchor,
+    BoundaryStabilizationMode,
     CameraConfig,
     CompositingConfig,
     FitMode,
@@ -410,6 +411,29 @@ class _StatusResponse(BaseModel):
     mode: str
     segmentation_backend: str
     segmentation_device: str
+    segmentation_generation: int
+    capture_sequence: int
+    capture_sequence_gap_count: int
+    capture_missing_input_count: int
+    matte_reset_count: int
+    matte_last_reset_reason: str
+    segmentation_produces_matte: bool
+    effective_rvm_downsample_ratio: float | None
+    effective_mask_blur: int
+    effective_edge_refine: bool
+    effective_edge_refinement_mode: Literal[
+        "off",
+        "legacy_watershed",
+        "stable_guided",
+    ]
+    effective_edge_refinement_radius_px: int
+    effective_mask_shift: int
+    effective_temporal_smoothing: float
+    effective_boundary_stabilization_mode: BoundaryStabilizationMode
+    effective_boundary_stabilization_time_constant_s: float
+    effective_boundary_stabilization_max_motion_px_per_s: float
+    effective_use_model_foreground: bool
+    effective_light_wrap: float
     output_backend: str
     native_ring: str
     remote_connected: bool

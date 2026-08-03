@@ -46,6 +46,7 @@ from custback.avatar.service import (
 )
 from custback.avatar.state import FaceState
 from custback.avatar.store import MediaStore, RigStore, StoreError
+from custback.capture import CapturedFrame
 from custback.config import AppConfig, RuntimeConfig, SegmentationConfig
 from custback.hub import FrameHub
 from custback.pipeline import ActivationError, Pipeline, _Activation, _Resources
@@ -1167,9 +1168,20 @@ def test_SEG_01_segmenter_preparation_does_not_run_on_frame_worker(monkeypatch):
 class _SingleFrameCapture:
     def __init__(self, frame: np.ndarray):
         self.frame = frame
+        self.sequence = 0
 
-    def read(self):
-        return self.frame.copy()
+    def read(self) -> CapturedFrame:
+        self.sequence += 1
+        frame = self.frame.copy()
+        height, width = frame.shape[:2]
+        return CapturedFrame(
+            pixels=frame,
+            sequence=self.sequence,
+            captured_at_ns=self.sequence * 1_000_000,
+            generation=1,
+            geometry_generation=1,
+            content_rect=(0, 0, width, height),
+        )
 
 
 class _FixedMaskSegmenter:
@@ -1276,16 +1288,34 @@ def test_SEG_03_trial_rejects_invalid_raw_mask_before_refine(invalid_mask):
         frame,
         np.zeros(frame.shape[:2], dtype=np.float32),
     )
+    candidate_segmenter = _FixedMaskSegmenter(invalid_mask)
+    candidate_refiner = segmentation_mod.MaskRefiner(candidate.segmentation)
     activation = _Activation(
         candidate=candidate,
-        segmenter=_FixedMaskSegmenter(invalid_mask),
-        refiner=segmentation_mod.MaskRefiner(candidate.segmentation),
+        replace_segmenter=True,
+        segmenter=candidate_segmenter,
+        refiner=candidate_refiner,
+        temporal_state_owner=pipeline_mod._TemporalStateOwner(
+            policy=pipeline_mod._segmenter_key(candidate),
+            generation=current.segmentation_generation + 1,
+            segmenter=candidate_segmenter,
+            refiner=candidate_refiner,
+        ),
         backdrop=current.backdrop,
     )
 
     with pytest.raises(ActivationError, match="invalid mask|segmenter returned"):
         Pipeline(RuntimeConfig(cfg), FrameHub())._trial_activation(
-            current, activation, frame
+            current,
+            activation,
+            CapturedFrame(
+                pixels=frame,
+                sequence=1,
+                captured_at_ns=1_000_000,
+                generation=1,
+                geometry_generation=1,
+                content_rect=(0, 0, frame.shape[1], frame.shape[0]),
+            ),
         )
 
 

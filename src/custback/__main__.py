@@ -809,6 +809,16 @@ def main(argv: list[str] | None = None) -> int:
             effective_argv[1:],
             prog="custback matte-ablate",
         )
+    if effective_argv[:1] == ["matte-rvm-qualify"]:
+        # Formal RVM qualification joins screened candidates with direct
+        # private replay evidence and path-free runtime attestations. It opens
+        # no live model, capture, output, or network resource.
+        from .matte_rvm_qualification import main as matte_rvm_qualification_main
+
+        return matte_rvm_qualification_main(
+            effective_argv[1:],
+            prog="custback matte-rvm-qualify",
+        )
 
     args = build_parser().parse_args(effective_argv)
     from .diagnostics import LoggingConfigurationError, configure_logging

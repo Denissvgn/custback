@@ -41,10 +41,23 @@ segmentation:
   edge_refine: true
   mask_shift: 0
   temporal_smoothing: 0.35
+  boundary_stabilization:
+    mode: 'off'
+    time_constant_s: 0.1
+    max_motion_px_per_s: 720.0
+  spatial_edge_refinement:
+    mode: legacy_watershed
+    reference_short_edge_px: 720
+    radius_at_reference_px: 8
+    min_radius_px: 2
+    max_radius_px: 12
 compositing:
   light_wrap: 0.25
   use_model_foreground: true
   blend_space: srgb_legacy
+  light_wrap_stabilization:
+    mode: 'off'
+    time_constant_s: 0.12
   color_correction:
     mode: 'off'
     strength: 0.5

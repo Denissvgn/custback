@@ -34,8 +34,18 @@ import numpy as np
 from . import _platform as platform_fs
 from .color import ColorTransform, IDENTITY_TRANSFORM
 from .compositor import composite
-from .config import AccelerationConfig, BlendSpace, SegmentationConfig
-from .segmentation import create_segmenter, refiner_for
+from .config import (
+    AccelerationConfig,
+    BlendSpace,
+    SegmentationConfig,
+)
+from .segmentation import (
+    SegmentationFrameContext,
+    SegmentationTimeline,
+    TemporalResetReason,
+    create_segmenter,
+    refiner_for,
+)
 
 BUNDLE_SCHEMA = "custback.matte-replay"
 BUNDLE_VERSION = 1
@@ -85,6 +95,7 @@ class MatteFrameEvidence:
     timings_ms: dict[str, float] = field(default_factory=dict)
     compositor_substages_ms: dict[str, float] = field(default_factory=dict)
     resource_samples: dict[str, int] = field(default_factory=dict)
+    segmentation_diagnostics: dict[str, Any] = field(default_factory=dict)
     backdrop_identity: dict[str, Any] = field(default_factory=dict)
     color_transform: ColorTransform = IDENTITY_TRANSFORM
     matte_authoritative: bool = True
@@ -242,19 +253,208 @@ def _finite_timings(values: dict[str, float]) -> dict[str, float]:
     return result
 
 
+def process_rss_bytes() -> int | None:
+    """Return process RSS using only operating-system/Python facilities.
+
+    Linux exposes a current resident-page count through ``/proc``.  Other
+    POSIX platforms fall back to ``getrusage``; that value is a peak rather
+    than an instantaneous sample, but remains a truthful conservative RSS
+    observation.  Unsupported platforms return ``None`` instead of inventing
+    a zero.
+    """
+
+    if sys.platform.startswith("linux"):
+        try:
+            fields = Path("/proc/self/statm").read_text(encoding="ascii").split()
+            return int(fields[1]) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError):
+            return None
+    try:
+        import resource
+
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError):
+        return None
+    return value if sys.platform == "darwin" else value * 1024
+
+
 def _resource_samples(values: dict[str, int]) -> dict[str, int]:
     result: dict[str, int] = {}
     for name, value in values.items():
         if (
-            name not in ("allocation_bytes", "memory_bytes")
+            name
+            not in (
+                "allocation_bytes",
+                "memory_bytes",
+                "rss_bytes",
+                "vram_bytes",
+            )
             or type(value) is not int
             or value < 0
         ):
             raise MatteDiagnosticsError(
-                "resource samples must be non-negative allocation/memory bytes"
+                "resource samples must be supported non-negative byte counts"
             )
         result[name] = value
     return result
+
+
+_SEGMENTATION_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "backend",
+        "input_frame_shape",
+        "model_mask_shape",
+        "output_mask_shape",
+        "effective_timestamp_delta_ms",
+        "timestamp_adjustment_count",
+        "timestamp_adjustment_ms",
+        "last_timestamp_adjusted",
+        "resize_interpolation",
+    }
+)
+_MASK_RESIZE_INTERPOLATIONS = frozenset({"none", "area", "linear", "area+linear"})
+
+
+def _diagnostic_shape(value: object, *, name: str) -> list[int]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(type(dimension) is not int or dimension <= 0 for dimension in value)
+    ):
+        raise MatteDiagnosticsError(
+            f"segmentation diagnostic {name} must be a positive HxW shape"
+        )
+    return [int(value[0]), int(value[1])]
+
+
+def _segmentation_diagnostics(value: object) -> dict[str, Any]:
+    """Validate and canonicalize optional, content-free segmenter evidence."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise MatteDiagnosticsError(
+            "segmentation diagnostics must be an object when present"
+        )
+    if not value:
+        return {}
+    keys = set(value)
+    if keys != _SEGMENTATION_DIAGNOSTIC_KEYS:
+        raise MatteDiagnosticsError(
+            "segmentation diagnostics have missing or unsupported fields"
+        )
+    if value.get("backend") != "mediapipe":
+        raise MatteDiagnosticsError(
+            "segmentation diagnostics identify an unsupported backend"
+        )
+
+    input_shape = _diagnostic_shape(
+        value.get("input_frame_shape"),
+        name="input_frame_shape",
+    )
+    model_shape = _diagnostic_shape(
+        value.get("model_mask_shape"),
+        name="model_mask_shape",
+    )
+    output_shape = _diagnostic_shape(
+        value.get("output_mask_shape"),
+        name="output_mask_shape",
+    )
+    if output_shape != input_shape:
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic output mask shape must match the input frame"
+        )
+
+    delta_ms = value.get("effective_timestamp_delta_ms")
+    if delta_ms is not None and (type(delta_ms) is not int or delta_ms <= 0):
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic timestamp delta must be positive or null"
+        )
+    adjustment_count = value.get("timestamp_adjustment_count")
+    adjustment_ms = value.get("timestamp_adjustment_ms")
+    adjusted = value.get("last_timestamp_adjusted")
+    if type(adjustment_count) is not int or adjustment_count < 0:
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic adjustment count must be non-negative"
+        )
+    if type(adjustment_ms) is not int or adjustment_ms < 0:
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic adjustment must be non-negative"
+        )
+    if type(adjusted) is not bool or adjusted is not (adjustment_ms > 0):
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic adjustment flag is inconsistent"
+        )
+    if adjusted and adjustment_count == 0:
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic adjusted frame requires a counted adjustment"
+        )
+
+    interpolation = value.get("resize_interpolation")
+    if interpolation not in _MASK_RESIZE_INTERPOLATIONS:
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic resize interpolation is invalid"
+        )
+    shrinking = any(
+        source > target for source, target in zip(model_shape, output_shape)
+    )
+    growing = any(source < target for source, target in zip(model_shape, output_shape))
+    expected_interpolation = (
+        "area+linear"
+        if shrinking and growing
+        else "area"
+        if shrinking
+        else "linear"
+        if growing
+        else "none"
+    )
+    if interpolation != expected_interpolation:
+        raise MatteDiagnosticsError(
+            "segmentation diagnostic resize interpolation contradicts mask shapes"
+        )
+
+    return {
+        "backend": "mediapipe",
+        "input_frame_shape": input_shape,
+        "model_mask_shape": model_shape,
+        "output_mask_shape": output_shape,
+        "effective_timestamp_delta_ms": delta_ms,
+        "timestamp_adjustment_count": adjustment_count,
+        "timestamp_adjustment_ms": adjustment_ms,
+        "last_timestamp_adjusted": adjusted,
+        "resize_interpolation": interpolation,
+    }
+
+
+def segmenter_diagnostics_snapshot(segmenter: object) -> dict[str, Any]:
+    """Read one successful MediaPipe snapshot without persisting its clock epoch."""
+
+    snapshotter = getattr(segmenter, "telemetry_snapshot", None)
+    if not callable(snapshotter):
+        return {}
+    snapshot = snapshotter()
+
+    def read(name: str) -> object:
+        if isinstance(snapshot, dict):
+            return snapshot.get(name)
+        return getattr(snapshot, name, None)
+
+    # ``effective_timestamp_ms`` is intentionally not selected: the private
+    # bundle already records the capture clock, while this object only needs
+    # its content-free delta and quantization observability.
+    return _segmentation_diagnostics(
+        {
+            "backend": "mediapipe",
+            "input_frame_shape": read("input_frame_shape"),
+            "model_mask_shape": read("model_mask_shape"),
+            "output_mask_shape": read("output_mask_shape"),
+            "effective_timestamp_delta_ms": read("effective_timestamp_delta_ms"),
+            "timestamp_adjustment_count": read("timestamp_adjustment_count"),
+            "timestamp_adjustment_ms": read("timestamp_adjustment_ms"),
+            "last_timestamp_adjusted": read("last_timestamp_adjusted"),
+            "resize_interpolation": read("resize_interpolation"),
+        }
+    )
 
 
 def _freeze_evidence(
@@ -334,6 +534,9 @@ def _freeze_evidence(
         timings_ms=_finite_timings(evidence.timings_ms),
         compositor_substages_ms=_finite_timings(evidence.compositor_substages_ms),
         resource_samples=_resource_samples(evidence.resource_samples),
+        segmentation_diagnostics=_segmentation_diagnostics(
+            evidence.segmentation_diagnostics
+        ),
         backdrop_identity=dict(evidence.backdrop_identity),
         color_transform=evidence.color_transform,
         matte_authoritative=(
@@ -638,7 +841,7 @@ class MatteDiagnosticRecorder:
     ) -> dict[str, Any]:
         metadata = evidence.metadata
         transform = evidence.color_transform
-        return {
+        entry: dict[str, Any] = {
             "sequence": metadata.bundle_sequence,
             "capture_sequence": metadata.capture_sequence,
             "capture_monotonic_ns": metadata.capture_monotonic_ns,
@@ -660,6 +863,9 @@ class MatteDiagnosticRecorder:
             "artifacts": artifacts,
             "post_base_final_output_provenance": None,
         }
+        if evidence.segmentation_diagnostics:
+            entry["segmentation_diagnostics"] = evidence.segmentation_diagnostics
+        return entry
 
     def _write_artifact(self, path: Path, payload: bytes) -> None:
         """Test seam for one private, lossless artifact write."""
@@ -1074,6 +1280,7 @@ class MatteReplayBundle:
         if not isinstance(resources, dict):
             raise MatteDiagnosticsError("bundle resource samples are invalid")
         _resource_samples(cast(dict[str, int], resources))
+        _segmentation_diagnostics(value.get("segmentation_diagnostics"))
         artifacts = value.get("artifacts")
         if not isinstance(artifacts, dict) or "final_composite" not in artifacts:
             raise MatteDiagnosticsError("bundle frame artifacts are incomplete")
@@ -1264,6 +1471,7 @@ def replay_bundle(
     )
     segmenter: Any = None
     refiner: Any = None
+    segmentation_timeline: SegmentationTimeline | None = None
     segmenter_controls_key = b""
     first_timestamp: int | None = None
     replay_started = time.monotonic_ns()
@@ -1285,6 +1493,10 @@ def replay_bundle(
             reference_tolerance: int | None = None
             raw_mask: np.ndarray | None = None
             refined_mask: np.ndarray | None = None
+            recorded_segmentation_diagnostics = _segmentation_diagnostics(
+                frame.get("segmentation_diagnostics")
+            )
+            rerun_segmentation_diagnostics: dict[str, Any] = {}
             if selected.mode == "reference":
                 rendered = reference.copy()
             else:
@@ -1300,6 +1512,13 @@ def replay_bundle(
                     )
                     reference_tolerance = 0 if correction_mode == "off" else 1
                 if selected.mode == "rerun":
+                    context = SegmentationFrameContext(
+                        sequence=int(frame["capture_sequence"]),
+                        timestamp_ns=timestamp,
+                        generation=int(frame["capture_generation"]),
+                        geometry_generation=int(frame["geometry_generation"]),
+                        shape=raw.shape[:2],
+                    )
                     configured_values = frame.get("configured_controls")
                     if not isinstance(configured_values, dict):
                         raise MatteDiagnosticsError(
@@ -1313,6 +1532,7 @@ def replay_bundle(
                         }
                     )
                     if segmenter is None or controls_key != segmenter_controls_key:
+                        replacing_segmenter = segmenter is not None
                         if segmenter is not None:
                             segmenter.close()
                         segmentation_cfg = SegmentationConfig.model_validate(
@@ -1327,11 +1547,56 @@ def replay_bundle(
                         )
                         refiner = refiner_for(segmentation_cfg, segmenter)
                         segmenter_controls_key = controls_key
-                    raw_mask = np.ascontiguousarray(
-                        segmenter.segment(raw), dtype=np.float32
+                        if segmentation_timeline is None:
+                            segmentation_timeline = SegmentationTimeline()
+                        elif replacing_segmenter:
+                            segmentation_timeline.request_reset(
+                                TemporalResetReason.SEGMENTATION_CONFIG
+                            )
+                    assert segmentation_timeline is not None
+                    boundary = segmentation_timeline.observe(context)
+                    if boundary.reset_reason is not None:
+                        segmenter.reset_temporal_state(
+                            boundary.reset_reason,
+                            context.timestamp_ns,
+                        )
+                        refiner.reset_temporal_state(
+                            boundary.reset_reason,
+                            context.timestamp_ns,
+                        )
+                    reset_count_before = int(
+                        getattr(segmenter, "temporal_reset_count", 0) or 0
+                    )
+                    raw_result = segmenter.segment(raw, context=context)
+                    raw_mask = _mask_copy(
+                        raw_result,
+                        name="rerun raw mask",
+                        shape=raw.shape[:2],
+                    )
+                    assert raw_mask is not None
+                    reset_count_after = int(
+                        getattr(segmenter, "temporal_reset_count", 0) or 0
+                    )
+                    reset_reason = getattr(
+                        segmenter, "last_temporal_reset_reason", None
+                    )
+                    if reset_count_after > reset_count_before and isinstance(
+                        reset_reason, TemporalResetReason
+                    ):
+                        refiner.reset_temporal_state(
+                            reset_reason,
+                            context.timestamp_ns,
+                        )
+                        if reset_reason is TemporalResetReason.BACKEND_RECOVERY:
+                            segmentation_timeline.record_reset(
+                                TemporalResetReason.BACKEND_RECOVERY
+                            )
+                    rerun_segmentation_diagnostics = segmenter_diagnostics_snapshot(
+                        segmenter
                     )
                     refined_mask = np.ascontiguousarray(
-                        refiner.refine(raw_mask, raw), dtype=np.float32
+                        refiner.refine(raw_mask, raw, context=context),
+                        dtype=np.float32,
                     )
                     clean_foreground = getattr(segmenter, "last_foreground", None)
                 else:
@@ -1388,23 +1653,27 @@ def replay_bundle(
             _private_write(frame_dir / "composite.npy", output_payload)
             delta = np.abs(rendered.astype(np.int16) - reference.astype(np.int16))
             maximum_delta = int(delta.max(initial=0))
-            results.append(
-                {
-                    "sequence": index,
-                    "capture_sequence": frame.get("capture_sequence"),
-                    "capture_monotonic_ns": timestamp,
-                    "output": f"frames/{index:08d}/composite.npy",
-                    "output_sha256": hashlib.sha256(output_payload).hexdigest(),
-                    "reference_exact": bool(np.array_equal(rendered, reference)),
-                    "reference_max_channel_delta": maximum_delta,
-                    "reference_tolerance": reference_tolerance,
-                    "reference_within_tolerance": (
-                        None
-                        if reference_tolerance is None
-                        else maximum_delta <= reference_tolerance
-                    ),
+            replay_frame: dict[str, Any] = {
+                "sequence": index,
+                "capture_sequence": frame.get("capture_sequence"),
+                "capture_monotonic_ns": timestamp,
+                "output": f"frames/{index:08d}/composite.npy",
+                "output_sha256": hashlib.sha256(output_payload).hexdigest(),
+                "reference_exact": bool(np.array_equal(rendered, reference)),
+                "reference_max_channel_delta": maximum_delta,
+                "reference_tolerance": reference_tolerance,
+                "reference_within_tolerance": (
+                    None
+                    if reference_tolerance is None
+                    else maximum_delta <= reference_tolerance
+                ),
+            }
+            if recorded_segmentation_diagnostics or rerun_segmentation_diagnostics:
+                replay_frame["segmentation_diagnostics"] = {
+                    "recorded": recorded_segmentation_diagnostics or None,
+                    "rerun": rerun_segmentation_diagnostics or None,
                 }
-            )
+            results.append(replay_frame)
     finally:
         if segmenter is not None:
             segmenter.close()

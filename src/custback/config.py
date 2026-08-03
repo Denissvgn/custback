@@ -32,6 +32,8 @@ BackgroundMode = Literal[
 LocalBackgroundMode = Literal["blur", "image", "video", "color", "camera"]
 SegmentationBackend = Literal["auto", "rvm", "mediapipe", "heuristic", "none"]
 SegmentationDelegate = Literal["cpu", "gpu"]
+BoundaryStabilizationMode = Literal["off", "motion_aware"]
+SpatialEdgeRefinementMode = Literal["legacy_watershed", "stable_guided"]
 AccelerationMode = Literal["auto", "cpu", "gpu_required"]
 AccelerationProvider = Literal["auto", "cuda", "directml"]
 OutputBackend = Literal["auto", "pyvirtualcam", "native", "null"]
@@ -41,6 +43,7 @@ FitMode = Literal["cover", "contain", "stretch"]
 RightAngleRotation = Literal[0, 90, 180, 270]
 BlendSpace = Literal["srgb_legacy", "linear_srgb"]
 ColorCorrectionMode = Literal["off", "auto"]
+LightWrapStabilizationMode = Literal["off", "temporal_bounded"]
 VideoColorMatrix = Literal["auto", "bt601", "bt709"]
 VideoColorRange = Literal["auto", "limited", "full"]
 VideoColorPrimaries = Literal["auto", "bt709", "bt470bg", "smpte170m"]
@@ -53,6 +56,10 @@ Anchor = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 UnitStrength = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 ExposureLimitEv = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 AdaptationTimeSeconds = Annotated[float, Field(ge=0.05, le=10.0, allow_inf_nan=False)]
+LightWrapTimeConstantSeconds = Annotated[
+    float,
+    Field(ge=0.01, le=1.0, allow_inf_nan=False),
+]
 SchemaVersion = Annotated[
     int,
     Field(
@@ -117,7 +124,54 @@ def materialize_config_schema_defaults(data: dict[str, Any]) -> dict[str, Any]:
         },
     )
     bind_section("output", {"width": None, "height": None})
-    bind_section("compositing", {"blend_space": "srgb_legacy"})
+    bind_section(
+        "compositing",
+        {
+            "blend_space": "srgb_legacy",
+            "light_wrap_stabilization": {
+                "mode": "off",
+                "time_constant_s": 0.12,
+            },
+        },
+    )
+    bind_section(
+        "segmentation",
+        {
+            # Schema-v1 persisted configurations predate motion-aware
+            # stabilization. Bind them to the exact legacy EMA policy rather
+            # than letting a future new-install default reinterpret the file.
+            "boundary_stabilization": {
+                "mode": "off",
+                "time_constant_s": 0.1,
+                "max_motion_px_per_s": 720.0,
+            },
+            # Schema-v1 edge refinement is the fixed-radius watershed path.
+            # Persisted configurations must never inherit a later install
+            # default that would reinterpret ``edge_refine: true``.
+            "spatial_edge_refinement": {
+                "mode": "legacy_watershed",
+                "reference_short_edge_px": 720,
+                "radius_at_reference_px": 8,
+                "min_radius_px": 2,
+                "max_radius_px": 12,
+            },
+        },
+    )
+    segmentation = materialized.get("segmentation")
+    if isinstance(segmentation, dict):
+        spatial_defaults = {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12,
+        }
+        spatial = segmentation.get("spatial_edge_refinement")
+        if isinstance(spatial, dict):
+            bound_spatial = dict(spatial)
+            for field_name, value in spatial_defaults.items():
+                bound_spatial.setdefault(field_name, value)
+            segmentation["spatial_edge_refinement"] = bound_spatial
 
     compositing = materialized.get("compositing")
     if isinstance(compositing, dict):
@@ -402,16 +456,119 @@ class BackgroundConfig(_StrictModel):
         return self
 
 
+class BoundaryStabilizationConfig(_StrictModel):
+    """Opt-in, elapsed-time boundary stabilization policy.
+
+    ``off`` deliberately means only this new policy is disabled; the separate
+    ``temporal_smoothing`` compatibility EMA retains its historical meaning.
+    """
+
+    mode: BoundaryStabilizationMode = "off"
+    time_constant_s: float = Field(
+        default=0.1,
+        ge=0.01,
+        le=0.5,
+        allow_inf_nan=False,
+    )
+    max_motion_px_per_s: float = Field(
+        default=720.0,
+        ge=1.0,
+        le=30_720.0,
+        allow_inf_nan=False,
+    )
+
+
+class SpatialEdgeRefinementConfig(_StrictModel):
+    """Resolution-aware spatial edge refinement policy."""
+
+    mode: SpatialEdgeRefinementMode = "legacy_watershed"
+    reference_short_edge_px: int = Field(default=720, ge=16, le=7680)
+    radius_at_reference_px: int = Field(default=8, ge=1, le=32)
+    min_radius_px: int = Field(default=2, ge=1, le=32)
+    max_radius_px: int = Field(default=12, ge=1, le=32)
+
+    @model_validator(mode="after")
+    def _radius_bounds_include_reference(self) -> "SpatialEdgeRefinementConfig":
+        if not (
+            self.min_radius_px <= self.radius_at_reference_px <= self.max_radius_px
+        ):
+            raise ValueError(
+                "spatial edge refinement radius must satisfy "
+                "min_radius_px <= radius_at_reference_px <= max_radius_px"
+            )
+        return self
+
+
 class SegmentationConfig(_StrictModel):
     backend: SegmentationBackend = "auto"
     model_path: str = ""
     delegate: SegmentationDelegate = "cpu"
-    rvm_downsample: float = Field(default=0.0, ge=0.0, le=1.0)
-    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    mask_blur: int = Field(default=7, ge=0, le=151)
-    edge_refine: bool = True
-    mask_shift: int = Field(default=0, ge=-20, le=20)
-    temporal_smoothing: float = Field(default=0.35, ge=0.0, le=0.95)
+    rvm_downsample: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "RVM-only internal-resolution ratio; zero selects the runtime "
+            "automatic ratio."
+        ),
+    )
+    threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Heuristic-backend score threshold; inapplicable to RVM native "
+            "alpha and MediaPipe confidence masks."
+        ),
+    )
+    mask_blur: int = Field(
+        default=7,
+        ge=0,
+        le=151,
+        description=(
+            "Generic MediaPipe/heuristic mask blur; bypassed for RVM native alpha."
+        ),
+    )
+    edge_refine: bool = Field(
+        default=True,
+        description=(
+            "Generic MediaPipe/heuristic spatial-refinement gate; bypassed for "
+            "RVM native alpha."
+        ),
+    )
+    mask_shift: int = Field(
+        default=0,
+        ge=-20,
+        le=20,
+        description=(
+            "Explicit grow/shrink halo control for RVM, MediaPipe, and heuristic "
+            "mattes; inapplicable to null/passthrough."
+        ),
+    )
+    temporal_smoothing: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=0.95,
+        description=(
+            "Generic compatibility EMA for MediaPipe/heuristic masks; bypassed "
+            "by RVM recurrence and whenever motion-aware stabilization is active."
+        ),
+    )
+    boundary_stabilization: BoundaryStabilizationConfig = Field(
+        default_factory=BoundaryStabilizationConfig,
+        description=(
+            "Elapsed-time boundary policy for MediaPipe/heuristic masks and "
+            "explicit experimental RVM qualification; motion-aware mode "
+            "replaces the generic EMA."
+        ),
+    )
+    spatial_edge_refinement: SpatialEdgeRefinementConfig = Field(
+        default_factory=SpatialEdgeRefinementConfig,
+        description=(
+            "Resolution-aware MediaPipe/heuristic edge policy selected by "
+            "edge_refine; bypassed for RVM native alpha."
+        ),
+    )
 
     @field_validator("model_path")
     @classmethod
@@ -452,6 +609,27 @@ class SegmentationConfig(_StrictModel):
         if self.delegate == "gpu" and self.backend == "rvm":
             raise ValueError("the GPU delegate is only used by auto/mediapipe")
         return self
+
+
+def spatial_edge_refinement_radius(
+    config: SpatialEdgeRefinementConfig,
+    shape: tuple[int, int],
+) -> int:
+    """Resolve a search radius from a canonical ``(height, width)`` shape."""
+
+    height, width = shape
+    if type(height) is not int or type(width) is not int or height <= 0 or width <= 0:
+        raise ValueError("spatial edge refinement shape must contain positive integers")
+    if config.mode == "legacy_watershed":
+        # Compatibility mode preserves the historical fixed eight-pixel band
+        # (or its explicitly configured replacement) at every resolution.
+        return config.radius_at_reference_px
+    short_edge = min(height, width)
+    scaled = config.radius_at_reference_px * short_edge / config.reference_short_edge_px
+    # Round half up instead of relying on Python's ties-to-even ``round`` so
+    # the result is stable and unsurprising at exact half-pixel scale factors.
+    resolved = math.floor(scaled + 0.5)
+    return max(config.min_radius_px, min(config.max_radius_px, resolved))
 
 
 class AccelerationConfig(_StrictModel):
@@ -503,10 +681,42 @@ class ColorCorrectionConfig(_StrictModel):
     adaptation_time_s: AdaptationTimeSeconds = 0.8
 
 
+class LightWrapStabilizationConfig(_StrictModel):
+    """Experimental dynamic-backdrop wrap-sample policy.
+
+    ``off`` is the schema-v1 compatibility path.  Numeric values are inert
+    until the explicit candidate mode is selected.
+    """
+
+    mode: LightWrapStabilizationMode = "off"
+    time_constant_s: LightWrapTimeConstantSeconds = 0.12
+
+
 class CompositingConfig(_StrictModel):
-    light_wrap: float = Field(default=0.25, ge=0.0, le=1.0)
-    use_model_foreground: bool = True
+    light_wrap: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Soft-edge backdrop light wrap for active matte compositing; "
+            "inapplicable to null/passthrough."
+        ),
+    )
+    use_model_foreground: bool = Field(
+        default=True,
+        description=(
+            "RVM-only clean-foreground edge substitution; other backends do "
+            "not produce model foreground."
+        ),
+    )
     blend_space: BlendSpace = "srgb_legacy"
+    light_wrap_stabilization: LightWrapStabilizationConfig = Field(
+        default_factory=LightWrapStabilizationConfig,
+        description=(
+            "Experimental video/camera light-wrap sample stabilization; off "
+            "preserves schema-v1 stateless compositing exactly."
+        ),
+    )
     color_correction: ColorCorrectionConfig = Field(
         default_factory=ColorCorrectionConfig
     )
@@ -903,6 +1113,14 @@ class RuntimeConfig:
         this critical section. If it raises, configuration remains unchanged.
         """
         validated = AppConfig.from_dict(candidate.to_dict())
+        # Build the caller-visible snapshot before activation. Once ``activate``
+        # returns, only non-failing pointer/integer assignments remain, so an
+        # installed resource generation can never be mistaken for a failed
+        # candidate and closed by the caller's rollback path.
+        committed = ConfigState(
+            validated.model_copy(deep=True),
+            expected_version + 1,
+        )
         with self._lock:
             if self._version != expected_version:
                 raise ConfigVersionConflictError(expected_version, self._version)
@@ -910,7 +1128,7 @@ class RuntimeConfig:
             activate(next_version)
             self._config = validated
             self._version = next_version
-            return ConfigState(self._config.model_copy(deep=True), self._version)
+            return committed
 
     def update(self, patch: dict[str, Any]) -> AppConfig:
         """Reject legacy config-first mutation that bypasses resource staging."""

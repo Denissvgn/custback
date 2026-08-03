@@ -8,6 +8,7 @@ import json
 import os
 import random
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -24,7 +25,7 @@ from custback.api.streaming import ConnectionLimiter
 from custback.avatar.audio2face import Audio2FaceDriver
 from custback.avatar.config import Audio2FaceConfig, AvatarConfig, AvatarRuntime
 from custback.avatar.service import AvatarService, _RenderPublication
-from custback.capture import CaptureHealth
+from custback.capture import CapturedFrame, CaptureHealth
 from custback.color import (
     ColorBehavior,
     ColorEstimate,
@@ -582,10 +583,26 @@ class _VisualStressCapture:
         self.width = width
         self.height = height
         self.generation = 1
+        self.sequence = 0
+        self.captured_at_ns: int | None = None
         self.closed = False
+
+    def next_frame(self, pixels: np.ndarray) -> CapturedFrame:
+        self.sequence += 1
+        self.captured_at_ns = time.monotonic_ns()
+        return CapturedFrame(
+            pixels=pixels,
+            sequence=self.sequence,
+            captured_at_ns=self.captured_at_ns,
+            generation=self.generation,
+            geometry_generation=self.generation,
+            content_rect=(0, 0, self.width, self.height),
+        )
 
     def health_snapshot(self) -> CaptureHealth:
         return CaptureHealth(
+            sequence=self.sequence,
+            captured_monotonic_ns=self.captured_at_ns,
             generation=self.generation,
             geometry_generation=self.generation,
             content_rect=(0, 0, self.width, self.height),
@@ -766,7 +783,7 @@ def test_stress_visual_generation_hot_changes(monkeypatch) -> None:
                 candidate,
             ),
         )
-        pipeline._handle_patch_request(resources, request, frame)
+        pipeline._handle_patch_request(resources, request, capture.next_frame(frame))
         assert request.error is None
         assert request.result is not None
         assert request.result.version == resources.version == runtime.version
@@ -827,6 +844,7 @@ def test_stress_visual_generation_hot_changes(monkeypatch) -> None:
                     mask,
                     None,
                     now_s=now,
+                    captured=capture.next_frame(frame),
                 )
                 second = pipeline._prepare_color_frame(
                     resources,
@@ -835,6 +853,7 @@ def test_stress_visual_generation_hot_changes(monkeypatch) -> None:
                     mask,
                     None,
                     now_s=now + 0.2,
+                    captured=capture.next_frame(frame),
                 )
                 assert first.transform.is_identity
                 assert not second.transform.is_identity
@@ -848,6 +867,7 @@ def test_stress_visual_generation_hot_changes(monkeypatch) -> None:
                     mask,
                     None,
                     now_s=now + 0.4,
+                    captured=capture.next_frame(frame),
                 )
                 assert reset.transform.is_identity
                 assert resources.color_reset_token != token_before_reconnect
@@ -862,6 +882,7 @@ def test_stress_visual_generation_hot_changes(monkeypatch) -> None:
                     mask,
                     None,
                     now_s=now + 0.6,
+                    captured=capture.next_frame(frame),
                 )
                 assert not warmed.transform.is_identity
                 assert runtime.version == (iteration + 1) * 3

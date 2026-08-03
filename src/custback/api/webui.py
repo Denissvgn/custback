@@ -525,21 +525,21 @@ source:
             <small>Automatic uses the best installed option.</small></div>
           <div class="field"><label for="quality-delegate">Processor</label>
             <select id="quality-delegate"><option value="cpu">CPU</option><option value="gpu">GPU</option></select>
-            <small>GPU is available only for automatic or MediaPipe detection.</small></div>
-          <div class="field"><label for="quality-threshold">Subject threshold</label><div class="range-line"><input type="range" id="quality-threshold" min="0" max="1" step="0.01"><span class="value" id="quality-threshold-value"></span></div></div>
-          <div class="field"><label for="quality-rvm-downsample">RVM detail scale</label><div class="range-line"><input type="range" id="quality-rvm-downsample" min="0" max="1" step="0.05"><span class="value" id="quality-rvm-downsample-value"></span></div><small>Zero lets the model choose automatically.</small></div>
+            <small>MediaPipe only. Automatic uses this setting only if MediaPipe is selected.</small></div>
+          <div class="field"><label for="quality-threshold">Subject threshold</label><div class="range-line"><input type="range" id="quality-threshold" min="0" max="1" step="0.01"><span class="value" id="quality-threshold-value"></span></div><small>Basic heuristic only. RVM and MediaPipe preserve their soft alpha or confidence masks.</small></div>
+          <div class="field"><label for="quality-rvm-downsample">RVM detail scale</label><div class="range-line"><input type="range" id="quality-rvm-downsample" min="0" max="1" step="0.05"><span class="value" id="quality-rvm-downsample-value"></span></div><small>RVM only. Zero lets the model choose automatically.</small></div>
         </div>
       </section>
       <section class="control-section">
         <div class="section-copy"><h3>Edges and motion</h3><p>Use these controls when hair edges flicker, the mask trails, or the subject looks cut out.</p></div>
         <div class="field-grid two">
-          <div class="field"><label for="quality-mask-blur">Mask softness</label><div class="range-line"><input type="range" id="quality-mask-blur" min="0" max="151" step="1"><span class="value" id="quality-mask-blur-value"></span></div></div>
-          <div class="field"><label for="quality-mask-shift">Mask expansion</label><div class="range-line"><input type="range" id="quality-mask-shift" min="-20" max="20" step="1"><span class="value" id="quality-mask-shift-value"></span></div></div>
-          <div class="field"><label for="quality-smoothing">Temporal smoothing</label><div class="range-line"><input type="range" id="quality-smoothing" min="0" max="0.95" step="0.01"><span class="value" id="quality-smoothing-value"></span></div></div>
-          <div class="field"><label for="quality-light-wrap">Light wrap</label><div class="range-line"><input type="range" id="quality-light-wrap" min="0" max="1" step="0.01"><span class="value" id="quality-light-wrap-value"></span></div></div>
+          <div class="field"><label for="quality-mask-blur">Mask softness</label><div class="range-line"><input type="range" id="quality-mask-blur" min="0" max="151" step="1"><span class="value" id="quality-mask-blur-value"></span></div><small>MediaPipe and basic heuristic only. RVM preserves its native soft alpha.</small></div>
+          <div class="field"><label for="quality-mask-shift">Mask expansion</label><div class="range-line"><input type="range" id="quality-mask-shift" min="-20" max="20" step="1"><span class="value" id="quality-mask-shift-value"></span></div><small>Applies to RVM, MediaPipe, and basic heuristic; zero is an exact bypass.</small></div>
+          <div class="field"><label for="quality-smoothing">Temporal smoothing</label><div class="range-line"><input type="range" id="quality-smoothing" min="0" max="0.95" step="0.01"><span class="value" id="quality-smoothing-value"></span></div><small>Compatibility filter for MediaPipe and basic heuristic. RVM uses its own recurrent state.</small></div>
+          <div class="field"><label for="quality-light-wrap">Light wrap</label><div class="range-line"><input type="range" id="quality-light-wrap" min="0" max="1" step="0.01"><span class="value" id="quality-light-wrap-value"></span></div><small>Applies to local matte/segmentation composites; zero is an exact bypass.</small></div>
         </div>
-        <div class="inline-toggle"><label for="quality-edge-refine">Refine subject edges<small>Improves the boundary around hair and shoulders.</small></label><span class="switch"><input type="checkbox" id="quality-edge-refine"><span></span></span></div>
-        <div class="inline-toggle"><label for="quality-model-foreground">Use model foreground<small>Uses the model's colour output to reduce edge spill.</small></label><span class="switch"><input type="checkbox" id="quality-model-foreground"><span></span></span></div>
+        <div class="inline-toggle"><label for="quality-edge-refine">Refine subject edges<small>MediaPipe and basic heuristic only. RVM bypasses generic edge refinement.</small></label><span class="switch"><input type="checkbox" id="quality-edge-refine"><span></span></span></div>
+        <div class="inline-toggle"><label for="quality-model-foreground">Use model foreground<small>RVM only. Uses its clean-foreground prediction to reduce edge spill.</small></label><span class="switch"><input type="checkbox" id="quality-model-foreground"><span></span></span></div>
       </section>
       <section class="control-section">
         <details><summary>Advanced colour and canvas controls</summary>

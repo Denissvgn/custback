@@ -23,7 +23,7 @@ from custback.color import (
 )
 from custback.config import AppConfig, RuntimeConfig
 from custback.geometry import plan_transform
-from custback.hub import FrameHub
+from custback.hub import FrameHub, Stats
 from custback.pipeline import (
     Pipeline,
     _Resources,
@@ -449,10 +449,63 @@ def test_status_model_and_openapi_schema_have_exact_hub_key_parity():
     hub_keys = set(FrameHub().stats_dict())
     model_keys = set(_StatusResponse.model_fields)
     schema_keys = set(_StatusResponse.model_json_schema()["properties"])
+    assert {
+        "capture_sequence",
+        "capture_sequence_gap_count",
+        "capture_missing_input_count",
+        "matte_reset_count",
+        "matte_last_reset_reason",
+    } <= hub_keys
     assert model_keys == schema_keys == hub_keys | {"native_ring"}
     _StatusResponse.model_validate(
         {**FrameHub().stats_dict(), "native_ring": "unsupported"}
     )
+
+
+def test_temporal_status_defaults_and_assigned_values_round_trip():
+    defaults = {
+        "capture_sequence": 0,
+        "capture_sequence_gap_count": 0,
+        "capture_missing_input_count": 0,
+        "matte_reset_count": 0,
+        "matte_last_reset_reason": "",
+    }
+    stats = Stats()
+    assert {key: getattr(stats, key) for key in defaults} == defaults
+
+    hub = FrameHub()
+    assert {key: hub.stats_dict()[key] for key in defaults} == defaults
+
+    assigned = {
+        "capture_sequence": 17,
+        "capture_sequence_gap_count": 2,
+        "capture_missing_input_count": 5,
+        "matte_reset_count": 3,
+        "matte_last_reset_reason": "timestamp-gap",
+    }
+    hub.update_stats(**assigned)
+    public = hub.stats_dict()
+    assert {key: public[key] for key in assigned} == assigned
+
+
+def test_spatial_edge_refinement_status_defaults_and_values_round_trip():
+    defaults = {
+        "effective_edge_refinement_mode": "off",
+        "effective_edge_refinement_radius_px": 0,
+    }
+    stats = Stats()
+    assert {key: getattr(stats, key) for key in defaults} == defaults
+
+    hub = FrameHub()
+    assert {key: hub.stats_dict()[key] for key in defaults} == defaults
+
+    assigned = {
+        "effective_edge_refinement_mode": "stable_guided",
+        "effective_edge_refinement_radius_px": 12,
+    }
+    hub.update_stats(**assigned)
+    public = hub.stats_dict()
+    assert {key: public[key] for key in assigned} == assigned
 
 
 def test_preview_hud_renders_geometry_color_and_confidence_warnings():

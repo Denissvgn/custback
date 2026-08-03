@@ -113,6 +113,10 @@ def test_explicit_migration_materializes_versionless_visual_schema_v1(tmp_path):
         == raw["background"]
     )
     assert raw["compositing"]["blend_space"] == "srgb_legacy"
+    assert raw["compositing"]["light_wrap_stabilization"] == {
+        "mode": "off",
+        "time_constant_s": 0.12,
+    }
     assert raw["compositing"]["color_correction"] == {
         "mode": "off",
         "strength": 0.5,
@@ -140,7 +144,23 @@ def test_explicit_schema_v1_migration_materializes_absent_visual_policy(tmp_path
     assert raw["camera"]["fit_mode"] == "stretch"
     assert raw["background"]["fit_mode"] == "cover"
     assert raw["compositing"]["blend_space"] == "srgb_legacy"
+    assert raw["compositing"]["light_wrap_stabilization"] == {
+        "mode": "off",
+        "time_constant_s": 0.12,
+    }
     assert raw["compositing"]["color_correction"]["mode"] == "off"
+    assert raw["segmentation"]["boundary_stabilization"] == {
+        "mode": "off",
+        "time_constant_s": 0.1,
+        "max_motion_px_per_s": 720.0,
+    }
+    assert raw["segmentation"]["spatial_edge_refinement"] == {
+        "mode": "legacy_watershed",
+        "reference_short_edge_px": 720,
+        "radius_at_reference_px": 8,
+        "min_radius_px": 2,
+        "max_radius_px": 12,
+    }
     assert raw["output"] == {"width": None, "height": None}
     again = migration.migrate_config(config, "legacy-camera")
     assert again.status is migration.MigrationStatus.ALREADY_CURRENT

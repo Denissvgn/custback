@@ -518,17 +518,24 @@ def test_synthetic_source_normalizes_to_supported_native_canvas() -> None:
     try:
         frame = capture.read()
         assert frame is not None
-        output.send(frame)
+        output.send(frame.pixels)
         bgrx = vcam_native.read_latest_frame(buffer)
     finally:
         capture.close()
         output.close()
 
-    assert frame.shape == (720, 1280, 3)
-    assert frame.dtype == np.uint8
-    assert frame.flags.c_contiguous
+    assert frame.pixels.shape == (720, 1280, 3)
+    assert frame.pixels.dtype == np.uint8
+    assert frame.pixels.flags.c_contiguous
+    assert frame.sequence == 1
+    assert frame.generation == 1
+    assert frame.geometry_generation == 1
+    assert frame.content_rect == (0, 0, 1280, 720)
     assert bgrx is not None
     assert bgrx.shape == (720, 1280, 4)
-    np.testing.assert_array_equal(bgrx[::120, ::160, :3], frame[::120, ::160])
+    np.testing.assert_array_equal(
+        bgrx[::120, ::160, :3],
+        frame.pixels[::120, ::160],
+    )
     assert (bgrx[:, :, 3] == 255).all()
     assert vcam_native.unpack_header(buffer)["frame_counter"] == 1

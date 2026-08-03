@@ -24,8 +24,16 @@ from typing import Any, Literal, Mapping, Sequence, cast
 import cv2
 import numpy as np
 
-from .compositor import composite
-from .config import BlendSpace, SegmentationConfig
+from .compositor import composite, prepare_light_wrap
+from .config import (
+    BlendSpace,
+    CompositingConfig,
+    LightWrapStabilizationConfig,
+    SegmentationConfig,
+    SpatialEdgeRefinementConfig,
+    spatial_edge_refinement_radius,
+)
+from .light_wrap import LightWrapFrameContext, LightWrapStabilizer
 from .matte_diagnostics import (
     MAX_MANIFEST_BYTES,
     MIN_BUNDLE_BYTES,
@@ -41,6 +49,7 @@ from .matte_diagnostics import (
     _private_write,
     _read_private_file,
     _recorded_transform,
+    _segmentation_diagnostics,
 )
 from .matte_quality import (
     EvaluationMetadata,
@@ -50,10 +59,16 @@ from .matte_quality import (
     _metric_path,
     _round,
     _summary,
+    _warp,
     evaluate_bundle,
     write_quality_annotations,
 )
-from .segmentation import MaskRefiner
+from .matte_policy import MatteBackendKind, resolve_matte_policy
+from .segmentation import (
+    MaskRefiner,
+    SegmentationFrameContext,
+    SegmentationTimeline,
+)
 
 PLAN_SCHEMA = "custback.matte-ablation-plan"
 PLAN_VERSION = 1
@@ -69,15 +84,30 @@ VariantKind = Literal["frozen", "recorded", "cadence_projection", "unavailable"]
 Lane = Literal["rvm", "mediapipe", "compositor", "cadence"]
 
 _POSTPROCESS_FIELDS = {
+    "boundary_stabilization",
     "edge_refine",
     "mask_blur",
     "mask_shift",
+    "spatial_edge_refinement",
     "temporal_smoothing",
+}
+_BOUNDARY_STABILIZATION_FIELDS = {
+    "mode",
+    "time_constant_s",
+    "max_motion_px_per_s",
+}
+_SPATIAL_EDGE_REFINEMENT_FIELDS = {
+    "mode",
+    "reference_short_edge_px",
+    "radius_at_reference_px",
+    "min_radius_px",
+    "max_radius_px",
 }
 _COMPOSITOR_FIELDS = {
     "use_model_foreground",
     "light_wrap",
     "blend_space",
+    "light_wrap_stabilization",
 }
 _QUALITY_PATHS = {
     "opaque_core_alpha_p05": "aggregate.metrics.opaque_core_alpha_p05.p05",
@@ -121,6 +151,66 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _qualification_segmentation_sha256(
+    segmentation: Mapping[str, object],
+) -> str:
+    """Bind a shortlist row to its path-independent segmentation policy."""
+
+    normalized = copy.deepcopy(dict(segmentation))
+    normalized.pop("model_path", None)
+    return _sha256(_json_bytes(normalized))
+
+
+def _qualification_model_contract(
+    bundle: MatteReplayBundle,
+) -> dict[str, object]:
+    """Extract one stable, path-free RVM artifact identity from every frame."""
+
+    identity: tuple[str, str, int] | None = None
+    for frame in bundle.frames:
+        effective = frame.get("effective_controls")
+        telemetry = (
+            effective.get("rvm_telemetry") if isinstance(effective, Mapping) else None
+        )
+        if (
+            not isinstance(telemetry, Mapping)
+            or telemetry.get("applicable") is not True
+        ):
+            identity = None
+            break
+        model_id = telemetry.get("model_identity")
+        model_sha256 = telemetry.get("model_sha256")
+        model_bytes = telemetry.get("model_bytes")
+        if (
+            not isinstance(model_id, str)
+            or not 1 <= len(model_id) <= 128
+            or any(
+                not (
+                    character.isascii() and (character.isalnum() or character in "._-")
+                )
+                for character in model_id
+            )
+            or not isinstance(model_sha256, str)
+            or len(model_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in model_sha256)
+            or type(model_bytes) is not int
+            or model_bytes <= 0
+        ):
+            identity = None
+            break
+        current = (model_id, model_sha256, model_bytes)
+        if identity is None:
+            identity = current
+        elif current != identity:
+            identity = None
+            break
+    return {
+        "qualification_model_identity": (identity[0] if identity is not None else None),
+        "qualification_model_sha256": (identity[1] if identity is not None else None),
+        "qualification_model_bytes": (identity[2] if identity is not None else None),
+    }
+
+
 def _finite(value: object) -> float | None:
     if (
         isinstance(value, bool)
@@ -129,6 +219,52 @@ def _finite(value: object) -> float | None:
     ):
         return None
     return float(value)
+
+
+def _valid_spatial_edge_refinement_override(value: object) -> bool:
+    if (
+        not isinstance(value, dict)
+        or not value
+        or set(value) - _SPATIAL_EDGE_REFINEMENT_FIELDS
+    ):
+        return False
+    if "mode" in value and value["mode"] not in (
+        "legacy_watershed",
+        "stable_guided",
+    ):
+        return False
+    limits = {
+        "reference_short_edge_px": (16, 7680),
+        "radius_at_reference_px": (1, 32),
+        "min_radius_px": (1, 32),
+        "max_radius_px": (1, 32),
+    }
+    for field, (lower, upper) in limits.items():
+        if field not in value:
+            continue
+        item = value[field]
+        if type(item) is not int or not lower <= item <= upper:
+            return False
+    minimum = value.get("min_radius_px")
+    reference = value.get("radius_at_reference_px")
+    maximum = value.get("max_radius_px")
+    if type(minimum) is int and type(reference) is int and minimum > reference:
+        return False
+    if type(reference) is int and type(maximum) is int and reference > maximum:
+        return False
+    return not (type(minimum) is int and type(maximum) is int and minimum > maximum)
+
+
+def _valid_light_wrap_stabilization_override(value: object) -> bool:
+    """Validate a strict, non-empty partial nested compositor override."""
+
+    if not isinstance(value, dict) or not value:
+        return False
+    try:
+        LightWrapStabilizationConfig.model_validate(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _safe_id(value: object, *, field: str) -> str:
@@ -231,6 +367,7 @@ def load_plan(path: Path | str) -> tuple[dict[str, Any], str]:
             "blend_space",
             "backend",
             "model_profile",
+            "spatial_policy",
             "backdrop",
             "cadence",
         ):
@@ -284,14 +421,78 @@ def load_plan(path: Path | str) -> tuple[dict[str, Any], str]:
                 "evidence_kind": evidence_kind,
             }
         )
+        paired_no_wrap = raw.get("paired_no_wrap_id")
+        if paired_no_wrap is not None:
+            if kind not in ("frozen", "recorded") or lane != "compositor":
+                raise MatteQualityError(
+                    "light-wrap pairs require an image-producing compositor row"
+                )
+            paired_id = _safe_id(
+                paired_no_wrap,
+                field="paired no-wrap variant id",
+            )
+            if paired_id == variant_id:
+                raise MatteQualityError("light-wrap row cannot pair with itself")
+            normalized_row["paired_no_wrap_id"] = paired_id
         if kind == "frozen":
             postprocess = raw.get("postprocess", {})
             compositing = raw.get("compositing", {})
+            boundary_stabilization = (
+                postprocess.get("boundary_stabilization")
+                if isinstance(postprocess, dict)
+                else None
+            )
+            has_boundary_stabilization = (
+                isinstance(postprocess, dict)
+                and "boundary_stabilization" in postprocess
+            )
+            spatial_edge_refinement = (
+                postprocess.get("spatial_edge_refinement")
+                if isinstance(postprocess, dict)
+                else None
+            )
+            has_spatial_edge_refinement = (
+                isinstance(postprocess, dict)
+                and "spatial_edge_refinement" in postprocess
+            )
+            light_wrap_stabilization = (
+                compositing.get("light_wrap_stabilization")
+                if isinstance(compositing, dict)
+                else None
+            )
+            has_light_wrap_stabilization = (
+                isinstance(compositing, dict)
+                and "light_wrap_stabilization" in compositing
+            )
             if (
                 not isinstance(postprocess, dict)
                 or set(postprocess) - _POSTPROCESS_FIELDS
                 or not isinstance(compositing, dict)
                 or set(compositing) - _COMPOSITOR_FIELDS
+                or (
+                    has_boundary_stabilization
+                    and (
+                        not isinstance(boundary_stabilization, dict)
+                        or set(boundary_stabilization) - _BOUNDARY_STABILIZATION_FIELDS
+                        or boundary_stabilization.get("mode", "off")
+                        not in ("off", "motion_aware")
+                    )
+                )
+                or (
+                    has_spatial_edge_refinement
+                    and (
+                        postprocess.get("edge_refine") is not True
+                        or not _valid_spatial_edge_refinement_override(
+                            spatial_edge_refinement
+                        )
+                    )
+                )
+                or (
+                    has_light_wrap_stabilization
+                    and not _valid_light_wrap_stabilization_override(
+                        light_wrap_stabilization
+                    )
+                )
             ):
                 raise MatteQualityError("frozen variant overrides are invalid")
             changed = len(postprocess) + len(compositing)
@@ -306,14 +507,22 @@ def load_plan(path: Path | str) -> tuple[dict[str, Any], str]:
                 raise MatteQualityError(
                     "compositor factorial rows must set foreground and wrap"
                 )
-            if lane == "rvm" and not bool(raw.get("explicit_rvm_policy", False)):
+            if lane == "rvm" and raw.get("explicit_rvm_policy") is not True:
+                boundary_mode = (
+                    boundary_stabilization.get("mode", "off")
+                    if isinstance(boundary_stabilization, dict)
+                    else "off"
+                )
                 if (
                     bool(postprocess.get("edge_refine", False))
                     or int(postprocess.get("mask_blur", 0) or 0) != 0
                     or float(postprocess.get("temporal_smoothing", 0.0) or 0.0) != 0.0
+                    or boundary_mode != "off"
+                    or has_spatial_edge_refinement
                 ):
                     raise MatteQualityError(
-                        "generic edge/blur/EMA controls require an explicit RVM policy"
+                        "generic edge/spatial/blur/EMA/boundary stabilization "
+                        "controls require an explicit RVM policy"
                     )
         elif kind == "recorded":
             if not isinstance(raw.get("bundle"), str) or not isinstance(
@@ -352,6 +561,17 @@ def load_plan(path: Path | str) -> tuple[dict[str, Any], str]:
             if not isinstance(reason, str) or not reason.strip():
                 raise MatteQualityError("unavailable variant requires a reason")
         normalized.append(normalized_row)
+    image_row_ids = {
+        str(row["id"])
+        for row in normalized
+        if row["kind"] in ("frozen", "recorded") and row["lane"] == "compositor"
+    }
+    for row in normalized:
+        paired_id = row.get("paired_no_wrap_id")
+        if paired_id is not None and paired_id not in image_row_ids | {"baseline"}:
+            raise MatteQualityError(
+                "paired no-wrap variant must identify an image-producing row"
+            )
     result = dict(value)
     result["required_axes"] = list(required_axes)
     result["variants"] = normalized
@@ -498,6 +718,495 @@ def _clone_annotations(
     )
 
 
+def _merge_compositing_overrides(
+    recorded: Mapping[str, object],
+    overrides: Mapping[str, object],
+) -> tuple[dict[str, Any], CompositingConfig]:
+    """Apply frozen compositor overrides without replacing nested defaults."""
+
+    controls = copy.deepcopy(dict(recorded))
+    if "light_wrap_stabilization" in overrides:
+        nested_override = overrides["light_wrap_stabilization"]
+        if not _valid_light_wrap_stabilization_override(nested_override):
+            raise MatteQualityError("frozen compositor controls are invalid")
+        recorded_nested = controls.get("light_wrap_stabilization")
+        if recorded_nested is None:
+            merged_nested = LightWrapStabilizationConfig().model_dump(mode="json")
+        elif isinstance(recorded_nested, dict):
+            merged_nested = copy.deepcopy(recorded_nested)
+        else:
+            raise MatteQualityError("frozen compositor controls are invalid")
+        merged_nested.update(cast(dict[str, Any], nested_override))
+        controls["light_wrap_stabilization"] = merged_nested
+    controls.update(
+        {
+            field: copy.deepcopy(value)
+            for field, value in overrides.items()
+            if field != "light_wrap_stabilization"
+        }
+    )
+    try:
+        cfg = CompositingConfig.model_validate(controls)
+    except ValueError as exc:
+        raise MatteQualityError("frozen compositor controls are invalid") from exc
+    if "light_wrap_stabilization" in overrides:
+        controls["light_wrap_stabilization"] = cfg.light_wrap_stabilization.model_dump(
+            mode="json"
+        )
+    return controls, cfg
+
+
+def _frozen_light_wrap_context(
+    frame: Mapping[str, object],
+) -> LightWrapFrameContext:
+    """Rebuild temporal backdrop identity exclusively from recorded evidence."""
+
+    identity = frame.get("backdrop_identity", {})
+    if not isinstance(identity, Mapping):
+        raise MatteQualityError("recorded backdrop identity is invalid")
+
+    frame_id = identity.get("logical_index")
+    if frame_id is None:
+        frame_id = identity.get("generation")
+    if frame_id is None:
+        frame_id = frame.get("capture_sequence")
+    if type(frame_id) is not int or frame_id < 0:
+        raise MatteQualityError("recorded backdrop frame identity is invalid")
+
+    timeline_s = identity.get("timeline_s")
+    if timeline_s is None:
+        timestamp_ns = identity.get(
+            "capture_monotonic_ns",
+            frame.get("capture_monotonic_ns"),
+        )
+        if type(timestamp_ns) is not int or timestamp_ns < 0:
+            raise MatteQualityError("recorded backdrop timestamp is invalid")
+    else:
+        timeline_number = _finite(timeline_s)
+        if timeline_number is None or timeline_number < 0.0:
+            raise MatteQualityError("recorded backdrop timeline is invalid")
+        timestamp_ns = max(0, round(timeline_number * 1_000_000_000))
+
+    discontinuity_revision = identity.get("discontinuity_revision", 0)
+    if type(discontinuity_revision) is not int or discontinuity_revision < 0:
+        raise MatteQualityError("recorded backdrop discontinuity is invalid")
+    provider = identity.get("provider")
+    visual_generation = identity.get("visual_generation")
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or type(visual_generation) is not int
+        or visual_generation < 0
+    ):
+        raise MatteQualityError("recorded backdrop generation identity is invalid")
+
+    return LightWrapFrameContext(
+        frame_id=frame_id,
+        timestamp_ns=timestamp_ns,
+        source_token=(
+            "frozen-recorded-backdrop",
+            provider,
+            visual_generation,
+        ),
+        discontinuity_revision=discontinuity_revision,
+    )
+
+
+def _light_wrap_snapshot_metadata(
+    compositing: CompositingConfig,
+    stabilizer: LightWrapStabilizer | None,
+) -> dict[str, object]:
+    """Return the same content-free stabilization evidence as the live path."""
+
+    configured = compositing.light_wrap_stabilization
+    snapshot = None if stabilizer is None else stabilizer.snapshot()
+    effective_mode = (
+        configured.mode
+        if stabilizer is not None and compositing.light_wrap > 0.0
+        else "off"
+    )
+    return {
+        "configured_mode": configured.mode,
+        "effective_mode": effective_mode,
+        "time_constant_s": configured.time_constant_s,
+        "generation": 0,
+        "updates": 0 if snapshot is None else snapshot.updates,
+        "repeated_frames": 0 if snapshot is None else snapshot.repeated_frames,
+        "reset_count": 0 if snapshot is None else snapshot.reset_count,
+        "scene_cut_count": 0 if snapshot is None else snapshot.scene_cut_count,
+        "last_reset_reason": (
+            ""
+            if snapshot is None or snapshot.last_reset_reason is None
+            else snapshot.last_reset_reason.value
+        ),
+        "last_dt_s": None if snapshot is None else snapshot.last_dt_s,
+        "retained_bytes": 0 if snapshot is None else snapshot.retained_bytes,
+    }
+
+
+def _light_wrap_pair_failure(
+    reason: str,
+    identity_proof: Mapping[str, bool],
+) -> dict[str, object]:
+    return {
+        "status": "not_decidable",
+        "reason": reason,
+        "metric": "light_wrap_attributable_rgb_variation",
+        "summary": _summary(()),
+        "identity_proof": dict(identity_proof),
+        "per_frame": [],
+    }
+
+
+def _light_wrap_pair_result(
+    wrap_on: MatteReplayBundle,
+    wrap_on_annotations: MatteQualityAnnotations,
+    wrap_off: MatteReplayBundle,
+    wrap_off_annotations: MatteQualityAnnotations,
+) -> dict[str, object]:
+    """Measure temporal movement attributable only to matched light wrap.
+
+    Every identity condition is proved before output pixels are compared. A
+    missing or mismatched proof yields an explicit null result rather than an
+    aggregate subtraction that could mislabel ordinary backdrop motion.
+    """
+
+    proof = {
+        "frame_count": False,
+        "source_and_backdrop": False,
+        "timestamps": False,
+        "alpha": False,
+        "model_foreground": False,
+        "blend_space": False,
+        "color_transform": False,
+        "registration": False,
+        "wrap_on_off": False,
+    }
+    if len(wrap_on.frames) != len(wrap_off.frames) or len(wrap_on.frames) < 2:
+        return _light_wrap_pair_failure(
+            "paired rows require the same frame count and at least two frames",
+            proof,
+        )
+    proof["frame_count"] = True
+
+    raw_on_segmentation, raw_on_compositing = _frame_controls(wrap_on)
+    raw_off_segmentation, raw_off_compositing = _frame_controls(wrap_off)
+    try:
+        on_segmentation = SegmentationConfig.model_validate(
+            raw_on_segmentation
+        ).model_dump(mode="json")
+        off_segmentation = SegmentationConfig.model_validate(
+            raw_off_segmentation
+        ).model_dump(mode="json")
+        on_compositing = CompositingConfig.model_validate(
+            raw_on_compositing
+        ).model_dump(mode="json")
+        off_compositing = CompositingConfig.model_validate(
+            raw_off_compositing
+        ).model_dump(mode="json")
+    except ValueError:
+        return _light_wrap_pair_failure(
+            "paired rows contain invalid normalized controls",
+            proof,
+        )
+    on_wrap = on_compositing.get("light_wrap")
+    off_wrap = off_compositing.get("light_wrap")
+    if (
+        isinstance(on_wrap, bool)
+        or not isinstance(on_wrap, (int, float))
+        or not math.isfinite(float(on_wrap))
+        or float(on_wrap) <= 0.0
+        or isinstance(off_wrap, bool)
+        or not isinstance(off_wrap, (int, float))
+        or float(off_wrap) != 0.0
+    ):
+        return _light_wrap_pair_failure(
+            "paired rows must identify positive-wrap and exact no-wrap controls",
+            proof,
+        )
+    comparable_on = copy.deepcopy(on_compositing)
+    comparable_off = copy.deepcopy(off_compositing)
+    for controls in (comparable_on, comparable_off):
+        controls.pop("light_wrap", None)
+    if _json_bytes(on_segmentation) != _json_bytes(off_segmentation) or _json_bytes(
+        comparable_on
+    ) != _json_bytes(comparable_off):
+        return _light_wrap_pair_failure(
+            "paired rows differ outside light-wrap strength",
+            proof,
+        )
+    proof["wrap_on_off"] = True
+    proof["model_foreground"] = on_compositing.get(
+        "use_model_foreground"
+    ) == off_compositing.get("use_model_foreground")
+    proof["blend_space"] = on_compositing.get("blend_space") == off_compositing.get(
+        "blend_space"
+    )
+    if not proof["model_foreground"] or not proof["blend_space"]:
+        return _light_wrap_pair_failure(
+            "paired rows must share model-foreground and blend-space decisions",
+            proof,
+        )
+
+    if len(wrap_on_annotations.frames) != len(wrap_off_annotations.frames):
+        return _light_wrap_pair_failure(
+            "paired rows require matching annotation frame counts",
+            proof,
+        )
+    if _json_bytes(wrap_on_annotations.segments) != _json_bytes(
+        wrap_off_annotations.segments
+    ):
+        return _light_wrap_pair_failure(
+            "paired rows require matching annotation segments",
+            proof,
+        )
+
+    compared_artifacts = (
+        "raw_frame",
+        "raw_mask",
+        "refined_mask",
+        "backdrop_frame",
+    )
+    values: list[float] = []
+    per_frame: list[dict[str, object]] = []
+    identity_contract: list[dict[str, object]] = []
+    segment_values = {
+        str(segment["id"]): [] for segment in wrap_on_annotations.segments
+    }
+    previous_contribution: np.ndarray | None = None
+    previous_alpha: np.ndarray | None = None
+    for sequence, (on_frame, off_frame) in enumerate(
+        zip(wrap_on.frames, wrap_off.frames, strict=True)
+    ):
+        for field in (
+            "capture_sequence",
+            "capture_monotonic_ns",
+            "timestamp_source",
+            "capture_generation",
+            "geometry_generation",
+        ):
+            if on_frame.get(field) != off_frame.get(field):
+                return _light_wrap_pair_failure(
+                    "paired rows do not share exact capture identity and timestamps",
+                    proof,
+                )
+        if _json_bytes(on_frame.get("backdrop_identity", {})) != _json_bytes(
+            off_frame.get("backdrop_identity", {})
+        ):
+            return _light_wrap_pair_failure(
+                "paired rows do not share exact backdrop presentation identity",
+                proof,
+            )
+
+        on_artifacts = cast(dict[str, Any], on_frame["artifacts"])
+        off_artifacts = cast(dict[str, Any], off_frame["artifacts"])
+        on_has_foreground = "clean_foreground" in on_artifacts
+        off_has_foreground = "clean_foreground" in off_artifacts
+        if on_has_foreground != off_has_foreground:
+            return _light_wrap_pair_failure(
+                "paired rows do not share the clean-foreground track",
+                proof,
+            )
+        on_arrays: dict[str, np.ndarray] = {}
+        for artifact in (
+            *compared_artifacts,
+            *(("clean_foreground",) if on_has_foreground else ()),
+        ):
+            on_array = wrap_on.load_array(on_frame, artifact)
+            off_array = wrap_off.load_array(off_frame, artifact)
+            if not np.array_equal(on_array, off_array):
+                return _light_wrap_pair_failure(
+                    "paired rows do not share exact source, backdrop, and alpha tracks",
+                    proof,
+                )
+            on_arrays[artifact] = on_array
+
+        on_effective = on_frame.get("effective_controls", {})
+        off_effective = off_frame.get("effective_controls", {})
+        if not isinstance(on_effective, Mapping) or not isinstance(
+            off_effective, Mapping
+        ):
+            return _light_wrap_pair_failure(
+                "paired effective compositor controls are invalid",
+                proof,
+            )
+        on_effective_wrap = on_effective.get("light_wrap")
+        off_effective_wrap = off_effective.get("light_wrap")
+        if (
+            isinstance(on_effective_wrap, bool)
+            or not isinstance(on_effective_wrap, (int, float))
+            or not math.isfinite(float(on_effective_wrap))
+            or float(on_effective_wrap) <= 0.0
+            or isinstance(off_effective_wrap, bool)
+            or not isinstance(off_effective_wrap, (int, float))
+            or float(off_effective_wrap) != 0.0
+        ):
+            proof["wrap_on_off"] = False
+            return _light_wrap_pair_failure(
+                "paired rows did not exercise positive-wrap and exact no-wrap",
+                proof,
+            )
+        if on_effective.get("use_model_foreground") != off_effective.get(
+            "use_model_foreground"
+        ):
+            proof["model_foreground"] = False
+            return _light_wrap_pair_failure(
+                "paired rows exercised different model-foreground decisions",
+                proof,
+            )
+        if on_effective.get("blend_space") != off_effective.get("blend_space"):
+            proof["blend_space"] = False
+            return _light_wrap_pair_failure(
+                "paired rows exercised different blend spaces",
+                proof,
+            )
+
+        if _json_bytes(on_frame.get("color_transform")) != _json_bytes(
+            off_frame.get("color_transform")
+        ):
+            return _light_wrap_pair_failure(
+                "paired rows do not share the same color transform",
+                proof,
+            )
+        on_annotation = wrap_on_annotations.frames[sequence]
+        off_annotation = wrap_off_annotations.frames[sequence]
+        if (
+            on_annotation["segment"] != off_annotation["segment"]
+            or on_annotation["registration_from_previous"]
+            != off_annotation["registration_from_previous"]
+        ):
+            return _light_wrap_pair_failure(
+                "paired rows do not share registration and segment annotations",
+                proof,
+            )
+
+        segment_id = str(on_annotation["segment"])
+        alpha = on_arrays["refined_mask"].astype(
+            np.float32,
+            copy=False,
+        )
+        on_composite = wrap_on.load_array(on_frame, "base_composite")
+        off_composite = wrap_off.load_array(off_frame, "base_composite")
+        if (
+            on_composite.shape != off_composite.shape
+            or on_composite.shape[:2] != alpha.shape
+        ):
+            return _light_wrap_pair_failure(
+                "paired composite and alpha shapes do not align",
+                proof,
+            )
+        contribution = (
+            on_composite.astype(np.float32) - off_composite.astype(np.float32)
+        ) / np.float32(255.0)
+        value: float | None = None
+        if previous_contribution is not None and previous_alpha is not None:
+            registration = np.asarray(
+                on_annotation["registration_from_previous"],
+                dtype=np.float32,
+            ).reshape(2, 3)
+            warped_contribution = _warp(
+                previous_contribution,
+                registration,
+                alpha.shape,
+            )
+            warped_alpha = _warp(previous_alpha, registration, alpha.shape)
+            edge_band = (
+                (alpha > 0.05) & (alpha < 0.95) & (np.abs(alpha - warped_alpha) <= 0.01)
+            )
+            if bool(np.any(edge_band)):
+                value = _round(
+                    float(
+                        np.mean(
+                            np.abs(
+                                contribution[edge_band] - warped_contribution[edge_band]
+                            ),
+                            dtype=np.float64,
+                        )
+                    )
+                )
+                values.append(value)
+                segment_values.setdefault(segment_id, []).append(value)
+        per_frame.append(
+            {
+                "sequence": sequence,
+                "capture_sequence": on_frame["capture_sequence"],
+                "segment": segment_id,
+                "value": value,
+            }
+        )
+        identity_contract.append(
+            {
+                "capture_sequence": on_frame["capture_sequence"],
+                "capture_monotonic_ns": on_frame["capture_monotonic_ns"],
+                "timestamp_source": on_frame["timestamp_source"],
+                "capture_generation": on_frame["capture_generation"],
+                "geometry_generation": on_frame["geometry_generation"],
+                "backdrop_identity": on_frame.get("backdrop_identity", {}),
+                "segment": segment_id,
+                "registration_from_previous": on_annotation[
+                    "registration_from_previous"
+                ],
+                "use_model_foreground": on_effective.get("use_model_foreground"),
+                "blend_space": on_effective.get("blend_space"),
+                "color_transform": on_frame.get("color_transform"),
+                "artifacts": {
+                    name: {
+                        "sha256": hashlib.sha256(
+                            np.ascontiguousarray(array).tobytes()
+                        ).hexdigest(),
+                        "dtype": array.dtype.str,
+                        "shape": list(array.shape),
+                    }
+                    for name, array in sorted(on_arrays.items())
+                },
+            }
+        )
+        previous_contribution = np.ascontiguousarray(contribution)
+        previous_alpha = np.ascontiguousarray(alpha)
+
+    proof["source_and_backdrop"] = True
+    proof["timestamps"] = True
+    proof["alpha"] = True
+    proof["color_transform"] = True
+    proof["registration"] = True
+    segment_summaries = {
+        segment: _summary(segment_values[segment]) for segment in sorted(segment_values)
+    }
+    identity_digest = _sha256(_json_bytes(identity_contract))
+    empty_segments = [
+        segment
+        for segment, segment_summary in segment_summaries.items()
+        if segment_summary["count"] == 0
+    ]
+    if not values or empty_segments:
+        return {
+            "status": "not_decidable",
+            "reason": (
+                "paired rows contain no held-alpha soft-edge interval"
+                if not values
+                else "paired metric is null for one or more required segments"
+            ),
+            "metric": "light_wrap_attributable_rgb_variation",
+            "summary": _summary(values),
+            "segment_summaries": segment_summaries,
+            "empty_segments": empty_segments,
+            "identity_proof": proof,
+            "identity_contract_sha256": identity_digest,
+            "per_frame": per_frame,
+        }
+    return {
+        "status": "computed",
+        "reason": "",
+        "metric": "light_wrap_attributable_rgb_variation",
+        "summary": _summary(values),
+        "segment_summaries": segment_summaries,
+        "empty_segments": [],
+        "identity_proof": proof,
+        "identity_contract_sha256": identity_digest,
+        "per_frame": per_frame,
+    }
+
+
 def _frozen_variant(
     source_bundle: MatteReplayBundle,
     source_annotations: MatteQualityAnnotations,
@@ -509,18 +1218,47 @@ def _frozen_variant(
     segmentation, compositing_controls = _frame_controls(source_bundle)
     postprocess = cast(dict[str, Any], row.get("postprocess", {}))
     compositing_overrides = cast(dict[str, Any], row.get("compositing", {}))
-    segmentation.update(postprocess)
-    compositing_controls.update(compositing_overrides)
-    segmentation_cfg = SegmentationConfig.model_validate(segmentation)
-    if row["lane"] == "rvm" and not bool(row.get("explicit_rvm_policy", False)):
-        segmentation_cfg = segmentation_cfg.model_copy(
-            update={
-                "edge_refine": False,
-                "mask_blur": 0,
-                "temporal_smoothing": 0.0,
-            }
+    boundary_override = postprocess.get("boundary_stabilization")
+    if isinstance(boundary_override, dict):
+        recorded_boundary = segmentation.get("boundary_stabilization")
+        merged_boundary = (
+            dict(recorded_boundary) if isinstance(recorded_boundary, dict) else {}
         )
-    refiner = MaskRefiner(segmentation_cfg) if postprocess else None
+        merged_boundary.update(boundary_override)
+        segmentation["boundary_stabilization"] = merged_boundary
+    spatial_override = postprocess.get("spatial_edge_refinement")
+    if isinstance(spatial_override, dict):
+        recorded_spatial = segmentation.get("spatial_edge_refinement")
+        merged_spatial = (
+            dict(recorded_spatial) if isinstance(recorded_spatial, dict) else {}
+        )
+        merged_spatial.update(spatial_override)
+        segmentation["spatial_edge_refinement"] = merged_spatial
+    segmentation.update(
+        {
+            field: value
+            for field, value in postprocess.items()
+            if field not in {"boundary_stabilization", "spatial_edge_refinement"}
+        }
+    )
+    compositing_controls, compositing_cfg = _merge_compositing_overrides(
+        compositing_controls,
+        compositing_overrides,
+    )
+    explicit_rvm_row = row["lane"] == "rvm" and row.get("explicit_rvm_policy") is True
+    if explicit_rvm_row:
+        # An explicit candidate starts from the production RVM neutral values
+        # for generic operators. Otherwise a one-variable row could silently
+        # activate unrelated schema-v1 configured defaults that the recorded
+        # production RVM policy had bypassed.
+        for field, neutral in (
+            ("edge_refine", False),
+            ("mask_blur", 0),
+            ("temporal_smoothing", 0.0),
+        ):
+            if field not in postprocess:
+                segmentation[field] = neutral
+    segmentation_cfg = SegmentationConfig.model_validate(segmentation)
     raw_wrap = compositing_controls.get("light_wrap", 0.0)
     raw_foreground = compositing_controls.get("use_model_foreground", False)
     blend_value = compositing_controls.get("blend_space", "srgb_legacy")
@@ -534,6 +1272,69 @@ def _frozen_variant(
     ):
         raise MatteQualityError("frozen compositor controls are invalid")
     blend_space = cast(BlendSpace, blend_value)
+    first_effective = source_bundle.frames[0].get("effective_controls", {})
+    backend_kind = {
+        "rvm": MatteBackendKind.TRUE_ALPHA_RECURRENT,
+        "mediapipe": MatteBackendKind.CONFIDENCE_MASK_VIDEO,
+    }.get(str(row["lane"]))
+    if backend_kind is None:
+        recorded_backend = (
+            first_effective.get("segmentation_backend", "")
+            if isinstance(first_effective, dict)
+            else ""
+        )
+        normalized_backend = str(recorded_backend).lower()
+        if "rvm" in normalized_backend:
+            backend_kind = MatteBackendKind.TRUE_ALPHA_RECURRENT
+        elif "mediapipe" in normalized_backend:
+            backend_kind = MatteBackendKind.CONFIDENCE_MASK_VIDEO
+        elif "null" in normalized_backend:
+            backend_kind = MatteBackendKind.NULL_PASSTHROUGH
+        else:
+            backend_kind = MatteBackendKind.BINARY_COARSE
+    recorded_ratio_raw = (
+        first_effective.get("rvm_downsample_ratio")
+        if isinstance(first_effective, dict)
+        else None
+    )
+    recorded_ratio = (
+        float(recorded_ratio_raw)
+        if isinstance(recorded_ratio_raw, (int, float))
+        and not isinstance(recorded_ratio_raw, bool)
+        and math.isfinite(float(recorded_ratio_raw))
+        and 0.0 < float(recorded_ratio_raw) <= 1.0
+        else None
+    )
+    first_shape = source_bundle.load_array(
+        source_bundle.frames[0],
+        "raw_mask",
+    ).shape
+    matte_policy = resolve_matte_policy(
+        segmentation_cfg,
+        compositing_cfg,
+        backend_kind,
+        resolved_rvm_ratio=recorded_ratio,
+        canvas_shape=cast(tuple[int, int], first_shape),
+        experimental_rvm_generic=(
+            explicit_rvm_row
+            and (
+                postprocess.get("edge_refine") is True
+                or int(postprocess.get("mask_blur", 0) or 0) > 0
+                or float(postprocess.get("temporal_smoothing", 0.0) or 0.0) > 0.0
+            )
+        ),
+    )
+    effective_segmentation_cfg = matte_policy.effective_refiner_config(segmentation_cfg)
+    refiner = MaskRefiner(effective_segmentation_cfg) if postprocess else None
+    segmentation_timeline = SegmentationTimeline() if refiner is not None else None
+    light_wrap_stabilizer = (
+        LightWrapStabilizer(compositing_cfg.light_wrap_stabilization.time_constant_s)
+        if (
+            compositing_cfg.light_wrap_stabilization.mode == "temporal_bounded"
+            and matte_policy.effective.light_wrap > 0.0
+        )
+        else None
+    )
 
     bundle_root = row_root / "bundle"
     annotations_root = row_root / "annotations"
@@ -553,6 +1354,13 @@ def _frozen_variant(
     try:
         for sequence, frame in enumerate(source_bundle.frames):
             source = source_bundle.load_array(frame, "raw_frame")
+            context = SegmentationFrameContext(
+                sequence=int(frame["capture_sequence"]),
+                timestamp_ns=int(frame["capture_monotonic_ns"]),
+                generation=int(frame["capture_generation"]),
+                geometry_generation=int(frame["geometry_generation"]),
+                shape=source.shape[:2],
+            )
             raw_alpha = source_bundle.load_array(frame, "raw_mask").astype(
                 np.float32, copy=False
             )
@@ -564,29 +1372,48 @@ def _frozen_variant(
                 else None
             )
             refine_started = time.perf_counter_ns()
-            refined = (
-                np.ascontiguousarray(
-                    refiner.refine(raw_alpha, source), dtype=np.float32
+            if refiner is not None:
+                assert segmentation_timeline is not None
+                boundary = segmentation_timeline.observe(context)
+                if boundary.reset_reason is not None:
+                    refiner.reset_temporal_state(
+                        boundary.reset_reason,
+                        context.timestamp_ns,
+                    )
+                refined = np.ascontiguousarray(
+                    refiner.refine(raw_alpha, source, context=context),
+                    dtype=np.float32,
                 )
-                if refiner is not None
-                else source_bundle.load_array(frame, "refined_mask").astype(
+            else:
+                refined = source_bundle.load_array(frame, "refined_mask").astype(
                     np.float32, copy=False
                 )
-            )
             refinement_ms = (time.perf_counter_ns() - refine_started) / 1_000_000.0
             composite_started = time.perf_counter_ns()
+            prepared_light_wrap = (
+                prepare_light_wrap(
+                    backdrop,
+                    blend_space=blend_space,
+                    stabilizer=light_wrap_stabilizer,
+                    context=_frozen_light_wrap_context(cast(dict[str, object], frame)),
+                )
+                if light_wrap_stabilizer is not None
+                else None
+            )
             rendered = composite(
                 source,
                 backdrop,
                 np.ascontiguousarray(refined),
-                light_wrap=float(raw_wrap),
+                light_wrap=matte_policy.effective.light_wrap,
                 edge_foreground=(
                     foreground
-                    if bool(raw_foreground) and foreground is not None
+                    if matte_policy.effective.use_model_foreground
+                    and foreground is not None
                     else None
                 ),
                 blend_space=blend_space,
                 color_transform=_recorded_transform(cast(dict[str, Any], frame)),
+                prepared_light_wrap=prepared_light_wrap,
             )
             composite_ms = (time.perf_counter_ns() - composite_started) / 1_000_000.0
             configured = copy.deepcopy(
@@ -597,11 +1424,46 @@ def _frozen_variant(
             effective = copy.deepcopy(
                 cast(dict[str, Any], frame.get("effective_controls", {}))
             )
+            effective["matte_policy"] = matte_policy.to_dict()
+            effective["light_wrap_stabilization"] = _light_wrap_snapshot_metadata(
+                compositing_cfg,
+                light_wrap_stabilizer,
+            )
+            if refiner is not None:
+                # A frozen candidate replaces only postprocessing. Preserve
+                # recorded backend/device identity, but never retain the
+                # source bundle's refiner policy after exercising a different
+                # candidate on these exact inputs.
+                exercised_cfg = getattr(refiner, "cfg", segmentation_cfg)
+                dump_exercised_cfg = getattr(exercised_cfg, "model_dump", None)
+                effective["refiner"] = (
+                    dump_exercised_cfg(mode="json")
+                    if callable(dump_exercised_cfg)
+                    else segmentation_cfg.model_dump(mode="json")
+                )
+                effective_edge_refine = bool(
+                    getattr(exercised_cfg, "edge_refine", False)
+                )
+                effective["edge_refinement_mode"] = (
+                    exercised_cfg.spatial_edge_refinement.mode
+                    if effective_edge_refine
+                    else "off"
+                )
+                effective["edge_refinement_radius_px"] = (
+                    spatial_edge_refinement_radius(
+                        exercised_cfg.spatial_edge_refinement,
+                        source.shape[:2],
+                    )
+                    if effective_edge_refine
+                    else 0
+                )
             effective.update(
                 {
-                    "mask_shift": segmentation_cfg.mask_shift,
-                    "use_model_foreground": bool(raw_foreground),
-                    "light_wrap": float(raw_wrap),
+                    "mask_shift": matte_policy.effective.mask_shift,
+                    "use_model_foreground": (
+                        matte_policy.effective.use_model_foreground
+                    ),
+                    "light_wrap": matte_policy.effective.light_wrap,
                     "blend_space": blend_space,
                     "ablation_model_inference": "recorded-frozen",
                 }
@@ -628,6 +1490,9 @@ def _frozen_variant(
                     "composite_ms": composite_ms,
                     "frame_processing_ms": refinement_ms + composite_ms,
                 },
+                segmentation_diagnostics=_segmentation_diagnostics(
+                    frame.get("segmentation_diagnostics")
+                ),
                 backdrop_identity=copy.deepcopy(
                     cast(dict[str, Any], frame.get("backdrop_identity", {}))
                 ),
@@ -644,7 +1509,11 @@ def _frozen_variant(
             ):
                 raise MatteQualityError("frozen ablation output timeline failed")
     finally:
-        recorder.close()
+        try:
+            recorder.close()
+        finally:
+            if light_wrap_stabilizer is not None:
+                light_wrap_stabilizer.close()
     target_bundle = MatteReplayBundle(bundle_root)
     _clone_annotations(
         source_annotations,
@@ -883,34 +1752,75 @@ def _row_result(
     )
     effective = cast(dict[str, Any], bundle.frames[0].get("effective_controls", {}))
     if row["kind"] == "recorded" and row["id"] != "baseline":
-        if effective.get("segmentation_backend") != row.get("expected_backend"):
-            raise MatteQualityError(
-                f"variant {row['id']} effective backend does not match the plan"
-            )
-        if str(effective.get("segmentation_device", "")) != str(
-            row.get("expected_device")
-        ):
-            raise MatteQualityError(
-                f"variant {row['id']} effective device does not match the plan"
-            )
-        expected_ratio = row.get("expected_rvm_downsample_ratio")
-        if expected_ratio is not None:
-            actual_ratio = _finite(effective.get("rvm_downsample_ratio"))
-            expected_number = _finite(expected_ratio)
-            if (
-                actual_ratio is None
-                or expected_number is None
-                or not math.isclose(
-                    actual_ratio, expected_number, rel_tol=0.0, abs_tol=1e-6
-                )
-            ):
+        expected_backend = row.get("expected_backend")
+        expected_device = str(row.get("expected_device"))
+        expected_ratio = _finite(row.get("expected_rvm_downsample_ratio"))
+        for sequence, frame in enumerate(bundle.frames):
+            frame_effective = frame.get("effective_controls")
+            if not isinstance(frame_effective, Mapping):
                 raise MatteQualityError(
-                    f"variant {row['id']} effective RVM ratio does not match the plan"
+                    f"variant {row['id']} frame {sequence} has no effective controls"
+                )
+            if frame_effective.get("segmentation_backend") != expected_backend:
+                raise MatteQualityError(
+                    f"variant {row['id']} effective backend does not match the plan"
+                )
+            if str(frame_effective.get("segmentation_device", "")) != expected_device:
+                raise MatteQualityError(
+                    f"variant {row['id']} effective device does not match the plan"
+                )
+            if expected_ratio is not None:
+                actual_ratio = _finite(frame_effective.get("rvm_downsample_ratio"))
+                if actual_ratio is None or not math.isclose(
+                    actual_ratio,
+                    expected_ratio,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ):
+                    raise MatteQualityError(
+                        f"variant {row['id']} effective RVM ratio does not "
+                        "match the plan"
+                    )
+            elif frame_effective.get("rvm_downsample_ratio") is not None:
+                raise MatteQualityError(
+                    f"variant {row['id']} unexpectedly reports an RVM ratio"
                 )
     raw_foreground_retained = all(
         cast(dict[str, Any], frame["artifacts"]).get("clean_foreground") is not None
         for frame in bundle.frames
     )
+    effective_refiner = effective.get("refiner")
+    if not isinstance(effective_refiner, Mapping):
+        effective_refiner = {}
+    configured_spatial_values = configured_segmentation.get("spatial_edge_refinement")
+    effective_spatial_values = effective_refiner.get("spatial_edge_refinement")
+    if (
+        configured_spatial_values is not None
+        and not isinstance(configured_spatial_values, Mapping)
+    ) or (
+        effective_spatial_values is not None
+        and not isinstance(effective_spatial_values, Mapping)
+    ):
+        raise MatteQualityError("recorded spatial edge refinement controls are invalid")
+    try:
+        configured_spatial = SpatialEdgeRefinementConfig.model_validate(
+            (
+                dict(configured_spatial_values)
+                if isinstance(configured_spatial_values, Mapping)
+                else {}
+            )
+        ).model_dump(mode="json")
+        effective_spatial = SpatialEdgeRefinementConfig.model_validate(
+            (
+                dict(effective_spatial_values)
+                if isinstance(effective_spatial_values, Mapping)
+                else configured_spatial
+            )
+        ).model_dump(mode="json")
+    except ValueError as exc:
+        raise MatteQualityError(
+            "recorded spatial edge refinement controls are invalid"
+        ) from exc
     return {
         "id": row["id"],
         "kind": row["kind"],
@@ -950,6 +1860,10 @@ def _row_result(
         "contact_sheet": contact,
         "quality_gates": quality_report["gates"],
         "configuration": {
+            "qualification_segmentation_sha256": (
+                _qualification_segmentation_sha256(configured_segmentation)
+            ),
+            **_qualification_model_contract(bundle),
             "backend_label": str(
                 row.get(
                     "backend_label",
@@ -968,8 +1882,27 @@ def _row_result(
             "edge_refine": configured_segmentation.get("edge_refine"),
             "mask_blur": configured_segmentation.get("mask_blur"),
             "temporal_smoothing": configured_segmentation.get("temporal_smoothing"),
+            "boundary_stabilization": copy.deepcopy(
+                configured_segmentation.get("boundary_stabilization")
+            ),
+            "effective_boundary_stabilization": copy.deepcopy(
+                effective_refiner.get("boundary_stabilization")
+            ),
+            "configured_spatial_edge_refinement": configured_spatial,
+            "effective_spatial_edge_refinement": effective_spatial,
+            "effective_edge_refinement_mode": effective.get(
+                "edge_refinement_mode",
+                "off",
+            ),
+            "effective_edge_refinement_radius_px": effective.get(
+                "edge_refinement_radius_px",
+                0,
+            ),
             "use_model_foreground": configured_compositing.get("use_model_foreground"),
             "light_wrap": configured_compositing.get("light_wrap"),
+            "light_wrap_stabilization": copy.deepcopy(
+                configured_compositing.get("light_wrap_stabilization")
+            ),
             "blend_space": configured_compositing.get("blend_space"),
         },
         "model_inference": (
@@ -1077,6 +2010,110 @@ def _watershed_decision(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
     }
 
 
+def _spatial_edge_refinement_decision(
+    rows: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    axes = {
+        "legacy_watershed": ("mediapipe.spatial_edge_refinement.legacy_watershed"),
+        "stable_guided": "mediapipe.spatial_edge_refinement.stable_guided",
+    }
+    selected: dict[str, Mapping[str, object]] = {}
+    for mode, axis in axes.items():
+        candidate = next(
+            (
+                row
+                for row in rows
+                if axis in cast(Sequence[str], row.get("covers", []))
+                and row.get("status") == "completed"
+            ),
+            None,
+        )
+        if candidate is not None:
+            selected[mode] = candidate
+    if set(selected) != set(axes):
+        return {
+            "status": "not_decidable",
+            "reason": (
+                "completed same-source MediaPipe legacy_watershed and "
+                "stable_guided rows are required"
+            ),
+            "required_axes": list(axes.values()),
+        }
+
+    for mode, row in selected.items():
+        configuration = row.get("configuration")
+        if (
+            not isinstance(configuration, Mapping)
+            or configuration.get("edge_refine") is not True
+            or configuration.get("effective_edge_refinement_mode") != mode
+            or type(configuration.get("effective_edge_refinement_radius_px")) is not int
+            or int(configuration["effective_edge_refinement_radius_px"]) <= 0
+        ):
+            return {
+                "status": "not_decidable",
+                "reason": (
+                    "spatial edge refinement axes must match the effective "
+                    "policy and resolved radius actually exercised"
+                ),
+                "required_axes": list(axes.values()),
+            }
+
+    legacy = selected["legacy_watershed"]
+    stable = selected["stable_guided"]
+
+    def exact_same_source(row: Mapping[str, object]) -> bool:
+        same_source = row.get("same_source")
+        return bool(
+            isinstance(same_source, Mapping)
+            and same_source.get("pixels_and_order") is True
+            and same_source.get("timestamps") is True
+        )
+
+    same_source = exact_same_source(legacy) and exact_same_source(stable)
+    if not same_source:
+        return {
+            "status": "not_decidable",
+            "reason": (
+                "spatial edge refinement rows must preserve identical source "
+                "pixels, order, and timestamps"
+            ),
+            "required_axes": list(axes.values()),
+            "same_source": False,
+        }
+
+    legacy_contour = _value(legacy, "compensated_contour_displacement_p95_px")
+    stable_contour = _value(stable, "compensated_contour_displacement_p95_px")
+    if legacy_contour is None or stable_contour is None:
+        return {
+            "status": "not_decidable",
+            "reason": "both spatial refinement rows require contour p95 metrics",
+            "required_axes": list(axes.values()),
+            "same_source": True,
+        }
+    if stable_contour < legacy_contour:
+        outcome = "improves"
+    elif stable_contour > legacy_contour:
+        outcome = "worsens"
+    else:
+        outcome = "no_measured_change"
+    model_backed = (
+        legacy.get("evidence_kind") == "model-backed"
+        and stable.get("evidence_kind") == "model-backed"
+    )
+    return {
+        "status": "decided" if model_backed else "proxy_only_real_decision_pending",
+        "outcome": outcome,
+        "legacy_watershed_contour_p95_px": legacy_contour,
+        "stable_guided_contour_p95_px": stable_contour,
+        "same_source": True,
+        "model_backed": model_backed,
+        "evidence_kind": {
+            "legacy_watershed": legacy.get("evidence_kind"),
+            "stable_guided": stable.get("evidence_kind"),
+        },
+    }
+
+
 def _factorial_analysis(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     combinations: dict[tuple[bool, float], Mapping[str, object]] = {}
     for row in rows:
@@ -1099,6 +2136,10 @@ def _factorial_analysis(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
     results: list[dict[str, object]] = []
     for (foreground, wrap), row in sorted(combinations.items()):
         edge = _value(row, "edge_band_rgb_variation")
+        wrap_attributable = _value(
+            row,
+            "light_wrap_attributable_rgb_variation",
+        )
         leakage = _value(row, "opaque_backdrop_leakage_coefficient")
         composite_cost = _steady_p95(row, "composite_ms")
         results.append(
@@ -1107,6 +2148,7 @@ def _factorial_analysis(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
                 "use_model_foreground": foreground,
                 "light_wrap": wrap,
                 "edge_band_rgb_variation": edge,
+                "light_wrap_attributable_rgb_variation": wrap_attributable,
                 "opaque_backdrop_leakage_coefficient": leakage,
                 "composite_ms_p95": composite_cost,
                 "edge_delta_vs_plain": (
@@ -1132,6 +2174,63 @@ def _factorial_analysis(rows: Sequence[Mapping[str, object]]) -> dict[str, objec
         "combinations": results,
         "alpha_motion_held_by_recorded_mask": True,
         "quality_and_runtime_reported_separately": True,
+    }
+
+
+def _dynamic_light_wrap_decision(
+    rows: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Fail-closed qualification projection over explicitly paired rows."""
+
+    pairs: list[dict[str, object]] = []
+    for row in rows:
+        attribution = row.get("attribution")
+        pair = (
+            attribution.get("light_wrap_pair")
+            if isinstance(attribution, Mapping)
+            else None
+        )
+        if not isinstance(pair, Mapping):
+            continue
+        identity_proof = pair.get("identity_proof")
+        pairs.append(
+            {
+                "id": row.get("id"),
+                "paired_no_wrap_id": pair.get("paired_no_wrap_id"),
+                "status": pair.get("status"),
+                "metric_p95": _value(
+                    row,
+                    "light_wrap_attributable_rgb_variation",
+                ),
+                "alpha_identity": (
+                    isinstance(identity_proof, Mapping)
+                    and identity_proof.get("alpha") is True
+                ),
+                "evidence_kind": row.get("evidence_kind"),
+            }
+        )
+    computed = [pair for pair in pairs if pair["status"] == "computed"]
+    return {
+        "status": "not_decidable",
+        "reason": (
+            "qualification requires computed pairs for both foreground modes "
+            "across narrow/broad edges and fixed/moving backdrops, plus "
+            "static, cut/seek, bypass, and performance gates"
+        ),
+        "paired_rows": pairs,
+        "computed_pair_count": len(computed),
+        "required_matrix": {
+            "use_model_foreground": [False, True],
+            "edge_band": ["narrow", "broad"],
+            "backdrop": ["fixed", "moving"],
+        },
+        "separate_gates": [
+            "static_appearance",
+            "scene_cut_and_seek",
+            "exact_no_wrap_bypass",
+            "compositor_performance",
+        ],
+        "production_default_selected": False,
     }
 
 
@@ -1165,6 +2264,36 @@ def _rejection_reasons(
             ],
             improvements,
         )
+    configuration = row.get("configuration")
+    wrap_stabilization = (
+        configuration.get("light_wrap_stabilization")
+        if isinstance(configuration, Mapping)
+        else None
+    )
+    if (
+        isinstance(wrap_stabilization, Mapping)
+        and wrap_stabilization.get("mode") == "temporal_bounded"
+    ):
+        attribution = row.get("attribution")
+        light_wrap_pair = (
+            attribution.get("light_wrap_pair")
+            if isinstance(attribution, Mapping)
+            else None
+        )
+        if (
+            not isinstance(light_wrap_pair, Mapping)
+            or light_wrap_pair.get("status") != "computed"
+            or _value(row, "light_wrap_attributable_rgb_variation") is None
+        ):
+            reasons.append(
+                {
+                    "category": "evidence completeness",
+                    "detail": (
+                        "temporal light-wrap candidate lacks a computed "
+                        "same-frame no-wrap attribution pair"
+                    ),
+                }
+            )
     opaque = _value(row, "opaque_core_alpha_p05")
     if opaque is not None and opaque < policy.opaque_alpha_p05:
         reasons.append(
@@ -1498,6 +2627,10 @@ def run_ablation(
             metadata=metadata,
         )
     ]
+    image_bundles: dict[str, MatteReplayBundle] = {"baseline": source_bundle}
+    image_annotations: dict[str, MatteQualityAnnotations] = {
+        "baseline": source_annotations
+    }
     completed_axes: set[str] = set()
     attempted_axes: set[str] = set()
     for row in cast(list[dict[str, Any]], plan["variants"]):
@@ -1552,6 +2685,8 @@ def run_ablation(
                     notes="separately recorded same-source MATTE-0.3 row",
                 ),
             )
+            image_bundles[str(row["id"])] = candidate_bundle
+            image_annotations[str(row["id"])] = candidate_annotations
             completed_axes.update(cast(list[str], row["covers"]))
         else:
             row_root = variants_dir / str(row["id"])
@@ -1578,10 +2713,39 @@ def run_ablation(
                     notes="model inference not rerun; recorded intermediates frozen",
                 ),
             )
+            image_bundles[str(row["id"])] = candidate_bundle
+            image_annotations[str(row["id"])] = candidate_annotations
             completed_axes.update(cast(list[str], row["covers"]))
         rows.append(result)
         if _directory_bytes(output) > max_output_bytes:
             raise MatteQualityError("ablation output byte bound reached")
+
+    result_by_id = {str(row["id"]): row for row in rows}
+    for planned in cast(list[dict[str, Any]], plan["variants"]):
+        paired_id = planned.get("paired_no_wrap_id")
+        if paired_id is None:
+            continue
+        row_id = str(planned["id"])
+        pair = _light_wrap_pair_result(
+            image_bundles[row_id],
+            image_annotations[row_id],
+            image_bundles[str(paired_id)],
+            image_annotations[str(paired_id)],
+        )
+        pair["paired_no_wrap_id"] = paired_id
+        result = result_by_id[row_id]
+        attribution = cast(dict[str, Any], result["attribution"])
+        attribution["light_wrap_pair"] = pair
+        summary = pair.get("summary", {})
+        paired_p95 = (
+            summary.get("p95")
+            if pair.get("status") == "computed" and isinstance(summary, Mapping)
+            else None
+        )
+        attribution["light_wrap_attributable_rgb_variation"] = paired_p95
+        cast(dict[str, Any], result["quality"])[
+            "light_wrap_attributable_rgb_variation"
+        ] = paired_p95
 
     _segmentation, baseline_compositing = _frame_controls(source_bundle)
     baseline_wrap_value = baseline_compositing.get("light_wrap", 0.0)
@@ -1616,7 +2780,9 @@ def run_ablation(
         if cast(dict[str, Any], row["cadence_projection"])["output_multiplier"] == 2
     ]
     watershed = _watershed_decision(rows)
+    spatial_edge_refinement = _spatial_edge_refinement_decision(rows)
     compositor_factorial = _factorial_analysis(rows)
+    dynamic_light_wrap = _dynamic_light_wrap_decision(rows)
     baseline_alpha_motion = _value(rows[0], "compensated_alpha_temporal_abs_diff")
     baseline_edge_motion = _value(rows[0], "edge_band_rgb_variation")
     report: dict[str, Any] = {
@@ -1688,6 +2854,7 @@ def run_ablation(
         },
         "required_decisions": {
             "watershed_mediapipe": watershed,
+            "spatial_edge_refinement_mediapipe": spatial_edge_refinement,
             "alpha_motion_vs_edge_color_motion": {
                 "baseline_compensated_alpha_abs_diff": baseline_alpha_motion,
                 "baseline_edge_band_rgb_variation": baseline_edge_motion,
@@ -1708,6 +2875,7 @@ def run_ablation(
                 ],
             },
             "compositor_factorial": compositor_factorial,
+            "dynamic_light_wrap": dynamic_light_wrap,
             "rvm_cross_device_candidates": decisions["matte_2_5_rvm_candidates"],
             "default_compositor_cost_candidates": decisions[
                 "matte_3_4_cost_candidates"
@@ -1755,8 +2923,8 @@ def report_markdown(report: Mapping[str, object]) -> str:
         "",
         "## Rows",
         "",
-        "| Row | Lane | Kind | Status | Opaque p05 | Edge motion | Frame p95 |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: |",
+        "| Row | Lane | Kind | Status | Opaque p05 | Edge motion | Wrap attribution | Frame p95 |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         quality = cast(dict[str, Any], row.get("quality", {}))
@@ -1764,6 +2932,7 @@ def report_markdown(report: Mapping[str, object]) -> str:
             f"| `{row['id']}` | `{row['lane']}` | `{row['kind']}` | "
             f"`{row['status']}` | `{quality.get('opaque_core_alpha_p05')}` | "
             f"`{quality.get('edge_band_rgb_variation')}` | "
+            f"`{quality.get('light_wrap_attributable_rgb_variation')}` | "
             f"`{_steady_frame_p95(row)}` |"
         )
     lines.extend(

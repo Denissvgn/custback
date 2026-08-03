@@ -16,6 +16,7 @@ from pydantic import ValidationError
 import custback.backgrounds as backgrounds_mod
 from custback.api.avatar_proxy import register_avatar_proxy
 from custback.avatar.config import Audio2FaceConfig, AvatarConfig
+from custback.capture import CapturedFrame
 from custback.config import AppConfig, RuntimeConfig
 from custback.hub import FrameHub
 from custback.pipeline import Pipeline, RestartRequiredError, _Resources
@@ -123,9 +124,20 @@ def test_remote_audio2face_insecure_transport_is_rejected():
 class _Capture:
     def __init__(self, frame: np.ndarray):
         self._frame = frame
+        self._sequence = 0
 
-    def read(self) -> np.ndarray:
-        return self._frame.copy()
+    def read(self) -> CapturedFrame:
+        self._sequence += 1
+        frame = self._frame.copy()
+        height, width = frame.shape[:2]
+        return CapturedFrame(
+            pixels=frame,
+            sequence=self._sequence,
+            captured_at_ns=self._sequence * 1_000_000,
+            generation=1,
+            geometry_generation=1,
+            content_rect=(0, 0, width, height),
+        )
 
 
 class _AllForegroundSegmenter:

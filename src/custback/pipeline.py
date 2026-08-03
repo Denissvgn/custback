@@ -21,8 +21,13 @@ from typing import Any, Callable
 import numpy as np
 import cv2
 
-from .backgrounds import BlurBackdrop, ImageBackdrop, create_backdrop
-from .capture import open_capture
+from .backgrounds import (
+    BackdropFrameTiming,
+    BlurBackdrop,
+    ImageBackdrop,
+    create_backdrop,
+)
+from .capture import CapturedFrame, open_capture
 from .color import (
     ANALYSIS_LONG_EDGE,
     ColorError,
@@ -37,9 +42,11 @@ from .color import (
     _linear_bgr_analysis_raster_prevalidated,
 )
 from .compositor import (
+    PreparedLightWrap,
     _composite_linear_bgr_prevalidated as composite_linear_predecoded,
     composite,
     composite_legacy_predecoded,
+    prepare_light_wrap,
 )
 from .config import (
     AVATAR_PROXY_RESTART_ONLY_FIELDS,
@@ -56,13 +63,28 @@ from .matte_diagnostics import (
     MatteCaptureMetadata,
     MatteDiagnosticRecorder,
     MatteFrameEvidence,
+    process_rss_bytes,
+    segmenter_diagnostics_snapshot,
+)
+from .matte_policy import MattePolicySnapshot, resolve_matte_policy
+from .light_wrap import (
+    LightWrapFrameContext,
+    LightWrapSnapshot,
+    LightWrapStabilizer,
 )
 from .segmentation import (
     HeuristicSegmenter,
+    MaskRefiner,
     NullSegmenter,
+    SegmentationFrameContext,
+    SegmentationTimeline,
+    Segmenter,
     SegmenterPreparation,
+    RVMTelemetry,
+    TemporalResetReason,
     create_segmenter,
     refiner_for,
+    segmenter_matte_backend_kind,
 )
 from .vcam import open_output
 
@@ -126,6 +148,201 @@ def _acceleration_stats(segmenter: Any) -> dict[str, object]:
         "acceleration_fallback_reason": status.fallback_reason,
         "acceleration_fallback_count": status.fallback_count,
         "acceleration_last_transition_ms": status.last_transition_ms,
+    }
+
+
+def _acceleration_evidence(segmenter: Any) -> dict[str, object]:
+    """Return bounded, path-free provider evidence for a private frame.
+
+    Public status retains a short diagnostic reason for operators.  Replay
+    evidence instead records only the fact and count of fallback plus a stable
+    reason code, so an exception containing a model or user path cannot enter
+    an otherwise content-free qualification report.
+    """
+
+    accel = getattr(segmenter, "accel", None)
+    if accel is None:
+        return {
+            "applicable": False,
+            "requested_mode": "",
+            "requested_provider": "",
+            "device_id": 0,
+            "state": "",
+            "active_provider": "",
+            "fallback_active": False,
+            "fallback_count": 0,
+            "fallback_reason_code": "",
+        }
+    status = accel.status()
+    fallback_active = bool(status.fallback_active)
+    requested_mode = str(status.requested_mode)
+    requested_provider = str(status.requested_provider)
+    state = str(status.state)
+    active_provider = str(status.active_provider)
+    return {
+        "applicable": True,
+        "requested_mode": (
+            requested_mode
+            if requested_mode in {"auto", "cpu", "gpu_required"}
+            else "unknown"
+        ),
+        "requested_provider": (
+            requested_provider
+            if requested_provider in {"auto", "cuda", "directml"}
+            else "unknown"
+        ),
+        "device_id": int(status.device_id),
+        "state": (
+            state
+            if state in {"starting", "gpu_probing", "gpu_active", "cpu_fallback"}
+            else "unknown"
+        ),
+        "active_provider": (
+            active_provider
+            if active_provider in {"cpu", "cuda", "directml", "coreml"}
+            else "unknown"
+        ),
+        "fallback_active": fallback_active,
+        "fallback_count": int(status.fallback_count),
+        "fallback_reason_code": ("provider-fallback" if fallback_active else ""),
+    }
+
+
+def _rvm_telemetry_evidence(segmenter: Any) -> dict[str, object]:
+    """Return path-free model/detail/timing facts for the last valid RVM frame."""
+
+    snapshotter = getattr(segmenter, "rvm_telemetry_snapshot", None)
+    if not callable(snapshotter):
+        return {"applicable": False}
+    try:
+        snapshot = snapshotter()
+    except Exception:
+        return {"applicable": False}
+    if not isinstance(snapshot, RVMTelemetry):
+        return {"applicable": False}
+
+    def shape(value: object, dimensions: int) -> list[int] | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, tuple)
+            or len(value) != dimensions
+            or any(type(item) is not int or item <= 0 for item in value)
+        ):
+            raise ValueError
+        return list(value)
+
+    def optional_finite(value: object, *, maximum: float | None = None) -> float | None:
+        if value is None:
+            return None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            or (maximum is not None and float(value) > maximum)
+        ):
+            raise ValueError
+        return float(value)
+
+    try:
+        input_shape = shape(snapshot.input_frame_shape, 2)
+        alpha_shape = shape(snapshot.output_alpha_shape, 2)
+        foreground_shape = shape(snapshot.output_foreground_shape, 3)
+        configured_mode = snapshot.configured_downsample_mode
+        configured_ratio = optional_finite(
+            snapshot.configured_downsample_ratio,
+            maximum=1.0,
+        )
+        resolved_ratio = optional_finite(
+            snapshot.resolved_downsample_ratio,
+            maximum=1.0,
+        )
+        if (
+            configured_ratio is None
+            or configured_mode not in {"auto", "explicit"}
+            or (configured_mode == "auto" and configured_ratio != 0.0)
+            or (configured_mode == "explicit" and configured_ratio <= 0.0)
+            or type(snapshot.model_builtin) is not bool
+            or not isinstance(snapshot.model_identity, str)
+            or not 1 <= len(snapshot.model_identity) <= 128
+            or any(
+                not (
+                    character.isascii() and (character.isalnum() or character in "._-")
+                )
+                for character in snapshot.model_identity
+            )
+            or (
+                snapshot.model_sha256 is not None
+                and (
+                    not isinstance(snapshot.model_sha256, str)
+                    or len(snapshot.model_sha256) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in snapshot.model_sha256
+                    )
+                )
+            )
+            or (
+                snapshot.model_bytes is not None
+                and (type(snapshot.model_bytes) is not int or snapshot.model_bytes <= 0)
+            )
+            or snapshot.acceleration_state
+            not in {"starting", "gpu_probing", "gpu_active", "cpu_fallback"}
+            or snapshot.acceleration_active_provider
+            not in {"", "cpu", "cuda", "directml", "coreml"}
+            or type(snapshot.acceleration_fallback_active) is not bool
+            or type(snapshot.acceleration_fallback_count) is not int
+            or snapshot.acceleration_fallback_count < 0
+        ):
+            raise ValueError
+        preprocess_ms = optional_finite(snapshot.preprocess_ms)
+        session_run_ms = optional_finite(snapshot.session_run_ms)
+        postprocess_ms = optional_finite(snapshot.postprocess_ms)
+    except (TypeError, ValueError):
+        return {"applicable": False}
+
+    return {
+        "applicable": True,
+        "input_frame_shape": input_shape,
+        "output_alpha_shape": alpha_shape,
+        "output_foreground_shape": foreground_shape,
+        "configured_downsample_mode": configured_mode,
+        "configured_downsample_ratio": configured_ratio,
+        "resolved_downsample_ratio": resolved_ratio,
+        "preprocess_ms": preprocess_ms,
+        "session_run_ms": session_run_ms,
+        "postprocess_ms": postprocess_ms,
+        "model_builtin": snapshot.model_builtin,
+        "model_identity": snapshot.model_identity,
+        "model_sha256": snapshot.model_sha256,
+        "model_bytes": snapshot.model_bytes,
+        "acceleration_state": snapshot.acceleration_state,
+        "acceleration_active_provider": snapshot.acceleration_active_provider,
+        "acceleration_fallback_active": snapshot.acceleration_fallback_active,
+        "acceleration_fallback_count": snapshot.acceleration_fallback_count,
+    }
+
+
+def _output_sink_evidence(output: Any) -> dict[str, object]:
+    """Return the actual sink's path-free pacing contract for timing evidence."""
+
+    if output is None:
+        return {
+            "applicable": False,
+            "backend": "unknown",
+            "paces": None,
+        }
+    backend = {
+        "NullOutput": "null",
+        "PyVirtualCamOutput": "pyvirtualcam",
+        "NativeVirtualCameraOutput": "native",
+    }.get(type(output).__name__, "unknown")
+    paces = getattr(output, "paces", None)
+    return {
+        "applicable": True,
+        "backend": backend,
+        "paces": paces if type(paces) is bool else None,
     }
 
 
@@ -244,6 +461,33 @@ def _new_color_harmonizer(cfg: AppConfig) -> ColorHarmonizer:
         correction.adaptation_time_s,
         mode=cfg.background.mode,
     )
+
+
+def _light_wrap_state_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Every input that gives a dynamic wrap sample different semantics."""
+
+    policy = cfg.compositing.light_wrap_stabilization
+    enabled = (
+        policy.mode == "temporal_bounded"
+        and cfg.compositing.light_wrap > 0.0
+        and cfg.background.mode in {"video", "camera"}
+    )
+    if not enabled:
+        return ("off",)
+    return (
+        policy.mode,
+        policy.time_constant_s,
+        cfg.compositing.light_wrap,
+        cfg.compositing.blend_space,
+        resolved_output_size(cfg),
+        _backdrop_visual_key(cfg),
+    )
+
+
+def _new_light_wrap_stabilizer(cfg: AppConfig) -> LightWrapStabilizer | None:
+    if _light_wrap_state_key(cfg) == ("off",):
+        return None
+    return LightWrapStabilizer(cfg.compositing.light_wrap_stabilization.time_constant_s)
 
 
 def _plan_stats(prefix: str, plan: Any) -> dict[str, object]:
@@ -641,6 +885,73 @@ def _safe_close(resource: Any, label: str) -> None:
         log.exception("cannot close %s", label)
 
 
+@dataclass(frozen=True)
+class _CaptureSequenceSnapshot:
+    """Content-free identity of unique captures accepted by the pipeline."""
+
+    last_sequence: int | None
+    gap_events: int
+    missing_inputs: int
+
+
+class _CaptureSequenceTimeline:
+    """Count source-sequence gaps independently of segmentation decisions."""
+
+    def __init__(self) -> None:
+        self._last_sequence: int | None = None
+        self._gap_events = 0
+        self._missing_inputs = 0
+
+    def observe(self, sequence: int) -> None:
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("capture sequence must be a non-negative integer")
+        previous = self._last_sequence
+        if previous is not None:
+            if sequence <= previous:
+                raise ValueError(
+                    "capture sequence must increase for every accepted input"
+                )
+            missing = sequence - previous - 1
+            if missing:
+                self._gap_events += 1
+                self._missing_inputs += missing
+        self._last_sequence = sequence
+
+    def snapshot(self) -> _CaptureSequenceSnapshot:
+        return _CaptureSequenceSnapshot(
+            last_sequence=self._last_sequence,
+            gap_events=self._gap_events,
+            missing_inputs=self._missing_inputs,
+        )
+
+
+@dataclass(frozen=True)
+class _TemporalStateOwner:
+    """One generation-owned segmenter/refiner pair and its exact policy."""
+
+    policy: tuple[object, ...]
+    generation: int | None
+    segmenter: Any = field(repr=False)
+    refiner: Any = field(repr=False)
+
+    def matches(
+        self,
+        *,
+        policy: tuple[object, ...],
+        generation: int | None,
+        segmenter: Any,
+        refiner: Any,
+    ) -> bool:
+        """Return whether policy, generation, and both stateful objects agree."""
+
+        return (
+            self.policy == policy
+            and self.generation == generation
+            and self.segmenter is segmenter
+            and self.refiner is refiner
+        )
+
+
 @dataclass
 class _Resources:
     cfg: AppConfig
@@ -651,7 +962,10 @@ class _Resources:
     backdrop: Any
     output: Any
     visual_generation: int = 0
+    segmentation_generation: int = 0
+    light_wrap_generation: int = 0
     harmonizer: ColorHarmonizer | None = None
+    light_wrap_stabilizer: LightWrapStabilizer | None = None
     color_reset_token: tuple[object, ...] | None = None
     background_geometry_token: tuple[object, ...] | None = None
     background_geometry_transitions: int = 0
@@ -660,6 +974,12 @@ class _Resources:
     color_correction_scene_cuts: int = 0
     color_correction_transitions: int = 0
     canvas_size: Size = field(init=False)
+    capture_sequence_timeline: _CaptureSequenceTimeline = field(
+        init=False,
+        repr=False,
+    )
+    segmentation_timeline: SegmentationTimeline = field(init=False, repr=False)
+    temporal_state_owner: _TemporalStateOwner = field(init=False, repr=False)
     color_analysis_executor: ThreadPoolExecutor = field(init=False, repr=False)
     color_backdrop_analysis_token: tuple[object, ...] | None = field(
         default=None,
@@ -674,6 +994,14 @@ class _Resources:
 
     def __post_init__(self) -> None:
         self.canvas_size = resolved_output_size(self.cfg)
+        self.capture_sequence_timeline = _CaptureSequenceTimeline()
+        self.segmentation_timeline = SegmentationTimeline()
+        self.temporal_state_owner = _TemporalStateOwner(
+            policy=_segmenter_key(self.cfg),
+            generation=self.segmentation_generation,
+            segmenter=self.segmenter,
+            refiner=self.refiner,
+        )
         # The three independent linear-light analysis resizes release the GIL.
         # A resource-owned pool runs them concurrently and is closed with the
         # pipeline generation, avoiding process-global worker lifetime.
@@ -683,6 +1011,8 @@ class _Resources:
         )
         if self.harmonizer is None:
             self.harmonizer = _new_color_harmonizer(self.cfg)
+        if self.light_wrap_stabilizer is None:
+            self.light_wrap_stabilizer = _new_light_wrap_stabilizer(self.cfg)
 
     @property
     def canvas_shape(self) -> tuple[int, int, int]:
@@ -732,6 +1062,8 @@ class _Resources:
             log.exception("cannot close color analysis workers")
         _safe_close(self.output, "video output")
         _safe_close(self.backdrop, "backdrop")
+        _safe_close(self.light_wrap_stabilizer, "light-wrap stabilizer")
+        _safe_close(self.refiner, "mask refiner")
         _safe_close(self.segmenter, "segmenter")
         _safe_close(self.capture, "capture")
 
@@ -742,17 +1074,77 @@ class _Activation:
     replace_segmenter: bool = False
     segmenter: Any = None
     refiner: Any = None
+    temporal_state_owner: _TemporalStateOwner | None = field(
+        default=None,
+        repr=False,
+    )
+    temporal_trial_context: SegmentationFrameContext | None = None
+    temporal_trial_dirty: bool = False
     replace_backdrop: bool = False
     backdrop: Any = None
     visual_state_changed: bool = False
     replace_harmonizer: bool = False
     harmonizer: ColorHarmonizer | None = None
+    replace_light_wrap_stabilizer: bool = False
+    light_wrap_stabilizer: LightWrapStabilizer | None = None
+    promoted: bool = False
+
+    def take_segmenter(self) -> Any:
+        """Detach and return a staged segmenter still owned by this activation."""
+
+        if self.promoted or not self.replace_segmenter:
+            return None
+        segmenter = self.segmenter
+        self.replace_segmenter = False
+        self.segmenter = None
+        self.refiner = None
+        self.temporal_state_owner = None
+        self.temporal_trial_context = None
+        self.temporal_trial_dirty = False
+        return segmenter
+
+    def take_backdrop(self) -> Any:
+        """Detach and return a staged backdrop still owned by this activation."""
+
+        if self.promoted or not self.replace_backdrop:
+            return None
+        backdrop = self.backdrop
+        self.replace_backdrop = False
+        self.backdrop = None
+        return backdrop
+
+    def mark_promoted(self) -> None:
+        """Transfer every staged object to live resources exactly once."""
+
+        if self.promoted:
+            return
+        self.promoted = True
+        self.replace_segmenter = False
+        self.segmenter = None
+        self.refiner = None
+        self.temporal_state_owner = None
+        self.temporal_trial_context = None
+        self.temporal_trial_dirty = False
+        self.replace_backdrop = False
+        self.backdrop = None
+        self.replace_harmonizer = False
+        self.harmonizer = None
+        self.replace_light_wrap_stabilizer = False
+        self.light_wrap_stabilizer = None
 
     def discard(self) -> None:
-        if self.replace_backdrop:
-            _safe_close(self.backdrop, "staged backdrop")
-        if self.replace_segmenter:
-            _safe_close(self.segmenter, "staged segmenter")
+        _safe_close(self.take_backdrop(), "staged backdrop")
+        if self.replace_light_wrap_stabilizer:
+            _safe_close(
+                self.light_wrap_stabilizer,
+                "staged light-wrap stabilizer",
+            )
+            self.replace_light_wrap_stabilizer = False
+            self.light_wrap_stabilizer = None
+        refiner = self.refiner
+        segmenter = self.take_segmenter()
+        _safe_close(refiner, "staged mask refiner")
+        _safe_close(segmenter, "staged segmenter")
 
 
 @dataclass(frozen=True)
@@ -764,6 +1156,14 @@ class _PreparedColorFrame:
     backdrop_linear_bgr: np.ndarray | None = None
     edge_foreground_linear_bgr: np.ndarray | None = None
     snapshot: HarmonizerSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class _PreflightResult:
+    """Already-sent startup output and the capture it consumed."""
+
+    output: np.ndarray
+    capture_sequence: int
 
 
 @dataclass
@@ -1087,6 +1487,7 @@ class Pipeline:
         ``staging_patch`` points constructors at a hidden candidate asset.
         The promotion callback runs only after construction and trial succeed,
         inside the same compare-and-swap activation that publishes config.
+        Its rollback pair must tolerate a partially completed promotion.
         """
         base = self.runtime.read()
         candidate = base.config.patched(patch)
@@ -1401,9 +1802,13 @@ class Pipeline:
             state = self.runtime.read()
             resources = self._open_resources(state)
             self._active_state = state
-            initial_output = self._preflight(resources)
+            preflight = self._preflight(resources)
             self._startup_done.set()
-            self._loop(resources, initial_output=initial_output)
+            self._loop(
+                resources,
+                initial_output=preflight.output,
+                initial_capture_sequence=preflight.capture_sequence,
+            )
         except BaseException as exc:
             log.exception("pipeline crashed")
             self._error = exc
@@ -1456,7 +1861,14 @@ class Pipeline:
                 )
                 activation.replace_segmenter = True
                 activation.refiner = refiner_for(
-                    candidate.segmentation, activation.segmenter
+                    candidate.segmentation,
+                    activation.segmenter,
+                )
+                activation.temporal_state_owner = _TemporalStateOwner(
+                    policy=_segmenter_key(candidate),
+                    generation=None,
+                    segmenter=activation.segmenter,
+                    refiner=activation.refiner,
                 )
             if _backdrop_provider_key(candidate) != _backdrop_provider_key(current):
                 activation.backdrop = _build_backdrop(candidate)
@@ -1469,6 +1881,11 @@ class Pipeline:
             ) != _color_state_key(current)
             if activation.replace_harmonizer:
                 activation.harmonizer = _new_color_harmonizer(candidate)
+            activation.replace_light_wrap_stabilizer = _light_wrap_state_key(
+                candidate
+            ) != _light_wrap_state_key(current)
+            if activation.replace_light_wrap_stabilizer:
+                activation.light_wrap_stabilizer = _new_light_wrap_stabilizer(candidate)
         except Exception as exc:
             activation.discard()
             raise ActivationError(str(exc)) from exc
@@ -1486,8 +1903,12 @@ class Pipeline:
         if prepared is None:
             raise ActivationError("candidate resources were not prepared off-lane")
         activation = prepared
+        if activation.promoted:
+            raise ActivationError("prepared activation was already promoted")
         activation.candidate = candidate
-        segmentation_changed = _segmenter_key(candidate) != _segmenter_key(old_cfg)
+        old_segmentation_policy = _segmenter_key(old_cfg)
+        candidate_segmentation_policy = _segmenter_key(candidate)
+        segmentation_changed = candidate_segmentation_policy != old_segmentation_policy
         background_changed = _backdrop_provider_key(
             candidate
         ) != _backdrop_provider_key(old_cfg)
@@ -1495,6 +1916,9 @@ class Pipeline:
             old_cfg
         )
         color_state_changed = _color_state_key(candidate) != _color_state_key(old_cfg)
+        light_wrap_state_changed = _light_wrap_state_key(
+            candidate
+        ) != _light_wrap_state_key(old_cfg)
         if segmentation_changed != activation.replace_segmenter:
             raise ActivationError("prepared segmentation candidate is stale")
         if background_changed != activation.replace_backdrop:
@@ -1503,21 +1927,57 @@ class Pipeline:
             raise ActivationError("prepared visual-state candidate is stale")
         if color_state_changed != activation.replace_harmonizer:
             raise ActivationError("prepared color-state candidate is stale")
-        if not segmentation_changed:
-            activation.refiner = resources.refiner
+        if light_wrap_state_changed != activation.replace_light_wrap_stabilizer:
+            raise ActivationError("prepared light-wrap-state candidate is stale")
+        live_owner = resources.temporal_state_owner
+        if not live_owner.matches(
+            policy=old_segmentation_policy,
+            generation=resources.segmentation_generation,
+            segmenter=resources.segmenter,
+            refiner=resources.refiner,
+        ):
+            raise ActivationError("live temporal-state ownership is inconsistent")
+        if segmentation_changed:
+            candidate_owner = activation.temporal_state_owner
+            if candidate_owner is None or not candidate_owner.matches(
+                policy=candidate_segmentation_policy,
+                generation=None,
+                segmenter=activation.segmenter,
+                refiner=activation.refiner,
+            ):
+                raise ActivationError(
+                    "prepared segmenter/refiner policy ownership is stale"
+                )
+            activation.temporal_state_owner = _TemporalStateOwner(
+                policy=candidate_owner.policy,
+                generation=resources.segmentation_generation + 1,
+                segmenter=candidate_owner.segmenter,
+                refiner=candidate_owner.refiner,
+            )
+        elif activation.temporal_state_owner is not None:
+            raise ActivationError(
+                "unchanged segmentation policy cannot own candidate temporal state"
+            )
         if not background_changed:
             activation.backdrop = resources.backdrop
         if not color_state_changed:
             activation.harmonizer = resources.harmonizer
         elif activation.harmonizer is None:
             raise ActivationError("prepared color harmonizer is missing")
+        if not light_wrap_state_changed:
+            activation.light_wrap_stabilizer = resources.light_wrap_stabilizer
+        elif (
+            _light_wrap_state_key(candidate) != ("off",)
+            and activation.light_wrap_stabilizer is None
+        ):
+            raise ActivationError("prepared light-wrap stabilizer is missing")
         return activation
 
     def _trial_activation(
         self,
         resources: _Resources,
         activation: _Activation,
-        frame: np.ndarray,
+        captured: CapturedFrame,
     ) -> None:
         """Exercise only staged/synthetic state before committing.
 
@@ -1525,8 +1985,17 @@ class Pipeline:
         called here, so a failed trial preserves recurrent state, temporal mask,
         video position, and blur caches exactly.
         """
+        # A trial backend is untrusted until it succeeds. Give it a detached
+        # raster so it cannot mutate or retain the authoritative capture slot.
+        frame = np.ascontiguousarray(captured.pixels).copy()
         old_cfg = resources.cfg
-        segmentation_changed = activation.candidate.segmentation != old_cfg.segmentation
+        # Resource ownership follows `_segmenter_key`, which includes both the
+        # segmentation policy and acceleration/provider policy. Trial that exact
+        # replacement set so an acceleration-only commit cannot install an
+        # unexercised backend.
+        segmentation_changed = _segmenter_key(activation.candidate) != _segmenter_key(
+            old_cfg
+        )
         background_changed = _backdrop_provider_key(
             activation.candidate
         ) != _backdrop_provider_key(old_cfg)
@@ -1573,11 +2042,31 @@ class Pipeline:
                     boundary="candidate backdrop geometry",
                 )
             if segmentation_changed:
+                context = self._segmentation_context(captured)
+                candidate_owner = activation.temporal_state_owner
+                if candidate_owner is None or not candidate_owner.matches(
+                    policy=_segmenter_key(activation.candidate),
+                    generation=resources.segmentation_generation + 1,
+                    segmenter=activation.segmenter,
+                    refiner=activation.refiner,
+                ):
+                    raise ActivationError(
+                        "candidate trial does not own its temporal state"
+                    )
+                activation.temporal_trial_context = context
+                activation.temporal_trial_dirty = True
+                self._reset_temporal_pair(
+                    activation.segmenter,
+                    activation.refiner,
+                    TemporalResetReason.SEGMENTATION_CONFIG,
+                    context.timestamp_ns,
+                )
                 mask = self._segment_and_refine_mask(
                     activation.segmenter,
                     activation.refiner,
                     frame,
                     privacy_safe=activation.candidate.background.mode == "remote",
+                    context=context,
                 )
             else:
                 # A deterministic synthetic edge exercises backdrop/compositor
@@ -1599,10 +2088,35 @@ class Pipeline:
             else:
                 bg = np.zeros_like(frame)
 
+            candidate_segmenter = (
+                activation.segmenter if segmentation_changed else resources.segmenter
+            )
+            candidate_ratio = getattr(
+                candidate_segmenter,
+                "last_downsample_ratio",
+                None,
+            )
+            candidate_policy = resolve_matte_policy(
+                activation.candidate.segmentation,
+                activation.candidate.compositing,
+                segmenter_matte_backend_kind(candidate_segmenter),
+                resolved_rvm_ratio=(
+                    float(candidate_ratio)
+                    if isinstance(candidate_ratio, (int, float))
+                    and not isinstance(candidate_ratio, bool)
+                    and math.isfinite(float(candidate_ratio))
+                    else None
+                ),
+                passthrough=(activation.candidate.background.mode == "passthrough"),
+                canvas_shape=(resources.canvas_size[1], resources.canvas_size[0]),
+                light_wrap_stabilization_eligible=(
+                    activation.candidate.background.mode in {"video", "camera"}
+                ),
+            )
             edge_fg = (
                 activation.segmenter.last_foreground
                 if segmentation_changed
-                and activation.candidate.compositing.use_model_foreground
+                and candidate_policy.effective.use_model_foreground
                 else None
             )
             if edge_fg is not None:
@@ -1615,21 +2129,43 @@ class Pipeline:
             if base_harmonizer is None:
                 raise ActivationError("candidate color harmonizer is missing")
             trial_harmonizer = base_harmonizer.clone()
-            trial_last_time = trial_harmonizer.snapshot().last_timestamp_s
-            trial_now = (
-                0.0 if trial_last_time is None else trial_last_time + (1.0 / 30.0)
-            )
             prepared_color = self._prepare_color_frame(
                 resources,
                 frame,
                 bg,
                 mask,
                 edge_fg,
-                now_s=trial_now,
+                now_s=captured.captured_at_ns / 1_000_000_000.0,
                 cfg=activation.candidate,
                 harmonizer=trial_harmonizer,
                 track_live_state=False,
             )
+            prepared_light_wrap: PreparedLightWrap | None = None
+            base_wrap_stabilizer = (
+                activation.light_wrap_stabilizer
+                if activation.replace_light_wrap_stabilizer
+                else resources.light_wrap_stabilizer
+            )
+            if (
+                candidate_policy.effective.light_wrap > 0.0
+                and base_wrap_stabilizer is not None
+            ):
+                trial_wrap_stabilizer = base_wrap_stabilizer.clone()
+                prepared_light_wrap = prepare_light_wrap(
+                    bg,
+                    blend_space=activation.candidate.compositing.blend_space,
+                    stabilizer=trial_wrap_stabilizer,
+                    context=LightWrapFrameContext(
+                        frame_id=0,
+                        timestamp_ns=captured.captured_at_ns,
+                        source_token=("activation-trial", id(activation)),
+                    ),
+                    backdrop_linear_bgr=(
+                        prepared_color.backdrop_linear_bgr
+                        if activation.candidate.compositing.blend_space == "linear_srgb"
+                        else None
+                    ),
+                )
             out = self._composite_prepared_color(
                 activation.candidate,
                 frame,
@@ -1637,8 +2173,23 @@ class Pipeline:
                 mask,
                 edge_fg,
                 prepared_color,
+                light_wrap=candidate_policy.effective.light_wrap,
+                prepared_light_wrap=prepared_light_wrap,
             )
             self._validate_output_frame(out, resources.canvas_size)
+            if segmentation_changed:
+                # Trials are validation-only. Never publish recurrence,
+                # foreground, refiner history, or input identity derived from
+                # an unsent trial. The normal timeline still records a config
+                # reset on the first authoritative input after commit.
+                assert activation.temporal_trial_context is not None
+                self._reset_temporal_pair(
+                    activation.segmenter,
+                    activation.refiner,
+                    TemporalResetReason.SEGMENTATION_CONFIG,
+                    activation.temporal_trial_context.timestamp_ns,
+                )
+                activation.temporal_trial_dirty = False
         except Exception as exc:
             raise ActivationError(str(exc)) from exc
 
@@ -1652,8 +2203,18 @@ class Pipeline:
         old_cfg = resources.cfg
         old_segmenter = resources.segmenter
         old_refiner = resources.refiner
+        old_temporal_state_owner = getattr(
+            resources,
+            "temporal_state_owner",
+            None,
+        )
         old_backdrop = resources.backdrop
         old_harmonizer = getattr(resources, "harmonizer", None)
+        old_light_wrap_stabilizer = getattr(
+            resources,
+            "light_wrap_stabilizer",
+            None,
+        )
         old_color_reset_token = getattr(resources, "color_reset_token", None)
         old_backdrop_analysis_token = getattr(
             resources,
@@ -1667,6 +2228,13 @@ class Pipeline:
         )
         old_version = resources.version
         old_visual_generation = resources.visual_generation
+        old_segmentation_generation = getattr(resources, "segmentation_generation", 0)
+        old_light_wrap_generation = getattr(resources, "light_wrap_generation", 0)
+        old_segmentation_timeline = (
+            resources.segmentation_timeline.checkpoint()
+            if activation.replace_segmenter
+            else None
+        )
         old_active_state = self._active_state
         old_backdrop_geometry = (
             resources.backdrop.geometry
@@ -1689,10 +2257,44 @@ class Pipeline:
         new_active_state = ConfigState(
             activation.candidate.model_copy(deep=True), version
         )
+        candidate_owner = activation.temporal_state_owner
+        if activation.replace_segmenter:
+            if (
+                activation.temporal_trial_context is None
+                or activation.temporal_trial_dirty
+                or candidate_owner is None
+                or not candidate_owner.matches(
+                    policy=_segmenter_key(activation.candidate),
+                    generation=old_segmentation_generation + 1,
+                    segmenter=activation.segmenter,
+                    refiner=activation.refiner,
+                )
+            ):
+                raise ActivationError(
+                    "candidate temporal state was not cleanly trialed"
+                )
+        elif (
+            old_temporal_state_owner is not None
+            and not old_temporal_state_owner.matches(
+                policy=_segmenter_key(activation.candidate),
+                generation=old_segmentation_generation,
+                segmenter=old_segmenter,
+                refiner=old_refiner,
+            )
+        ):
+            raise ActivationError(
+                "unchanged segmentation policy lost temporal-state ownership"
+            )
         try:
             if activation.replace_segmenter:
+                assert candidate_owner is not None
                 resources.segmenter = activation.segmenter
-            resources.refiner = activation.refiner
+                resources.refiner = activation.refiner
+                resources.segmentation_generation = old_segmentation_generation + 1
+                resources.temporal_state_owner = candidate_owner
+                resources.segmentation_timeline.request_reset(
+                    TemporalResetReason.SEGMENTATION_CONFIG
+                )
             if activation.replace_backdrop:
                 resources.backdrop = activation.backdrop
             if activation.replace_harmonizer:
@@ -1700,6 +2302,9 @@ class Pipeline:
                     raise ActivationError("staged color harmonizer is missing")
                 resources.harmonizer = activation.harmonizer
                 resources.color_reset_token = None
+            if activation.replace_light_wrap_stabilizer:
+                resources.light_wrap_stabilizer = activation.light_wrap_stabilizer
+                resources.light_wrap_generation = old_light_wrap_generation + 1
             if activation.visual_state_changed:
                 resources.visual_generation += 1
                 invalidate_analysis = getattr(
@@ -1726,8 +2331,11 @@ class Pipeline:
         except BaseException:
             resources.segmenter = old_segmenter
             resources.refiner = old_refiner
+            if old_temporal_state_owner is not None:
+                resources.temporal_state_owner = old_temporal_state_owner
             resources.backdrop = old_backdrop
             resources.harmonizer = old_harmonizer
+            resources.light_wrap_stabilizer = old_light_wrap_stabilizer
             resources.color_reset_token = old_color_reset_token
             if hasattr(resources, "color_backdrop_analysis_token"):
                 resources.color_backdrop_analysis_token = old_backdrop_analysis_token
@@ -1736,6 +2344,10 @@ class Pipeline:
             resources.cfg = old_cfg
             resources.version = old_version
             resources.visual_generation = old_visual_generation
+            resources.segmentation_generation = old_segmentation_generation
+            resources.light_wrap_generation = old_light_wrap_generation
+            if old_segmentation_timeline is not None:
+                resources.segmentation_timeline.restore(old_segmentation_timeline)
             self._active_state = old_active_state
             if (
                 old_backdrop_geometry is not None
@@ -1769,7 +2381,7 @@ class Pipeline:
         self,
         resources: _Resources,
         request: _PatchRequest,
-        trial_frame: np.ndarray,
+        trial_frame: CapturedFrame,
     ) -> None:
         with request.lock:
             if request.cancelled:
@@ -1820,7 +2432,7 @@ class Pipeline:
             request.fail(exc)
             return
 
-        old_backdrop = old_segmenter = None
+        old_backdrop = old_segmenter = old_light_wrap_stabilizer = None
         old_cfg: AppConfig | None = None
         with request.lock:
             if request.cancelled:
@@ -1830,17 +2442,31 @@ class Pipeline:
             try:
 
                 def activate(next_version: int) -> None:
-                    nonlocal old_backdrop, old_segmenter, old_cfg
-                    promoted = False
-                    if request.before_activate is not None:
-                        request.before_activate()
-                        promoted = True
+                    nonlocal old_backdrop
+                    nonlocal old_segmenter
+                    nonlocal old_light_wrap_stabilizer
+                    nonlocal old_cfg
+                    promotion_attempted = request.before_activate is not None
                     try:
+                        if request.before_activate is not None:
+                            request.before_activate()
+                        replaced_light_wrap_stabilizer = (
+                            resources.light_wrap_stabilizer
+                            if activation.replace_light_wrap_stabilizer
+                            else None
+                        )
                         old_backdrop, old_segmenter, old_cfg = self._install_activation(
                             resources, activation, next_version
                         )
+                        old_light_wrap_stabilizer = replaced_light_wrap_stabilizer
                     except BaseException:
-                        if promoted and request.rollback_activate is not None:
+                        if (
+                            promotion_attempted
+                            and request.rollback_activate is not None
+                        ):
+                            # If rollback itself fails, surface that cleanup
+                            # failure: the API must report that storage
+                            # ownership could not be restored.
                             request.rollback_activate()
                         raise
 
@@ -1856,35 +2482,61 @@ class Pipeline:
                 self._schedule_discard_activation(activation)
                 request.error = exc
             else:
-                if old_cfg is not None:
-                    self._post_install_activation(resources, old_cfg)
+                # From here onward the candidate belongs exclusively to live
+                # resources. Detach it before any best-effort side effect can
+                # fail and accidentally route it through candidate cleanup.
+                activation.mark_promoted()
                 request.result = committed
-                changed = _changed_paths(old_cfg or resources.cfg, request.candidate)
-                log.info(
-                    "config update accepted origin=%s version=%d fields=%s summary=%s",
-                    request.origin,
-                    committed.version,
-                    ",".join(changed) or "none",
-                    sanitized_config_summary(request.candidate, changed),
-                )
+                if old_cfg is not None:
+                    try:
+                        self._post_install_activation(resources, old_cfg)
+                    except Exception:
+                        log.exception("cannot apply committed config side effects")
+                try:
+                    changed = _changed_paths(
+                        old_cfg or resources.cfg,
+                        request.candidate,
+                    )
+                    log.info(
+                        "config update accepted origin=%s version=%d fields=%s "
+                        "summary=%s",
+                        request.origin,
+                        committed.version,
+                        ",".join(changed) or "none",
+                        sanitized_config_summary(request.candidate, changed),
+                    )
+                except Exception:
+                    log.exception("cannot audit committed config update")
             # Publish success/failure before teardown. A blocking or faulty
             # old backend must not delay or invalidate an already-committed ack.
             request.done.set()
         self._schedule_close(old_backdrop, "replaced backdrop")
         self._schedule_close(old_segmenter, "replaced segmenter")
+        self._schedule_close(
+            old_light_wrap_stabilizer,
+            "replaced light-wrap stabilizer",
+        )
 
     def _schedule_discard_activation(self, activation: _Activation | None) -> None:
         if activation is None:
             return
-        if activation.replace_backdrop:
-            backdrop = activation.backdrop
-            activation.backdrop = None
-            activation.replace_backdrop = False
+        backdrop = activation.take_backdrop()
+        if backdrop is not None:
             self._schedule_close(backdrop, "discarded staged backdrop")
-        if activation.replace_segmenter:
-            segmenter = activation.segmenter
-            activation.segmenter = None
-            activation.replace_segmenter = False
+        if activation.replace_light_wrap_stabilizer:
+            stabilizer = activation.light_wrap_stabilizer
+            activation.replace_light_wrap_stabilizer = False
+            activation.light_wrap_stabilizer = None
+            if stabilizer is not None:
+                self._schedule_close(
+                    stabilizer,
+                    "discarded staged light-wrap stabilizer",
+                )
+        refiner = activation.refiner if activation.replace_segmenter else None
+        segmenter = activation.take_segmenter()
+        if refiner is not None:
+            self._schedule_close(refiner, "discarded staged mask refiner")
+        if segmenter is not None:
             self._schedule_close(segmenter, "discarded staged segmenter")
 
     def _handle_mutation_request(
@@ -2001,10 +2653,76 @@ class Pipeline:
             segmentation_fallback,
             "ml-backend-unavailable" if segmentation_fallback else "",
         )
+        effective_controls = self._effective_matte_controls(resources)
+        effective_refiner = effective_controls["refiner"]
+        if not isinstance(effective_refiner, dict):
+            effective_refiner = {}
+        effective_boundary = effective_refiner.get("boundary_stabilization", {})
+        if not isinstance(effective_boundary, dict):
+            effective_boundary = {}
+        effective_edge_refine = bool(effective_refiner.get("edge_refine", False))
+        effective_edge_refinement_mode = str(
+            effective_controls.get("edge_refinement_mode", "off") or "off"
+        )
+        raw_edge_refinement_radius = effective_controls.get(
+            "edge_refinement_radius_px",
+            0,
+        )
+        effective_edge_refinement_radius_px = (
+            raw_edge_refinement_radius if type(raw_edge_refinement_radius) is int else 0
+        )
+        produces_matte = bool(effective_controls["produces_matte"])
+        effective_mask_shift = effective_controls["mask_shift"]
+        if type(effective_mask_shift) is not int:
+            effective_mask_shift = 0
+        effective_light_wrap = effective_controls["light_wrap"]
+        if not isinstance(effective_light_wrap, (int, float)) or isinstance(
+            effective_light_wrap, bool
+        ):
+            effective_light_wrap = 0.0
+        capture_sequence = resources.capture_sequence_timeline.snapshot()
+        temporal = resources.segmentation_timeline.snapshot()
         return {
             "mode": cfg.background.mode,
             "segmentation_backend": type(resources.segmenter).__name__,
             "segmentation_device": resources.segmenter.device,
+            "segmentation_generation": resources.segmentation_generation,
+            "capture_sequence": capture_sequence.last_sequence or 0,
+            "capture_sequence_gap_count": capture_sequence.gap_events,
+            "capture_missing_input_count": capture_sequence.missing_inputs,
+            "matte_reset_count": temporal.reset_count,
+            "matte_last_reset_reason": (
+                ""
+                if temporal.last_reset_reason is None
+                else temporal.last_reset_reason.value
+            ),
+            "segmentation_produces_matte": produces_matte,
+            "effective_rvm_downsample_ratio": effective_controls[
+                "rvm_downsample_ratio"
+            ],
+            "effective_mask_blur": int(effective_refiner.get("mask_blur", 0) or 0),
+            "effective_edge_refine": effective_edge_refine,
+            "effective_edge_refinement_mode": effective_edge_refinement_mode,
+            "effective_edge_refinement_radius_px": (
+                effective_edge_refinement_radius_px
+            ),
+            "effective_mask_shift": effective_mask_shift,
+            "effective_temporal_smoothing": float(
+                effective_refiner.get("temporal_smoothing", 0.0) or 0.0
+            ),
+            "effective_boundary_stabilization_mode": str(
+                effective_boundary.get("mode", "off") or "off"
+            ),
+            "effective_boundary_stabilization_time_constant_s": float(
+                effective_boundary.get("time_constant_s", 0.1) or 0.1
+            ),
+            "effective_boundary_stabilization_max_motion_px_per_s": float(
+                effective_boundary.get("max_motion_px_per_s", 720.0) or 720.0
+            ),
+            "effective_use_model_foreground": bool(
+                effective_controls["use_model_foreground"] and produces_matte
+            ),
+            "effective_light_wrap": float(effective_light_wrap),
             "output_backend": type(resources.output).__name__,
             "output_target_fps": cfg.output.fps,
             "output_width": getattr(
@@ -2362,22 +3080,47 @@ class Pipeline:
         frame: np.ndarray,
         *,
         privacy_safe: bool,
+        context: SegmentationFrameContext | None = None,
         stage_timings: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Validate and retain both backend and post-refiner alpha stages."""
 
         started = time.monotonic_ns() if stage_timings is not None else 0
+        reset_count_before = int(getattr(segmenter, "temporal_reset_count", 0) or 0)
+        raw_mask = (
+            segmenter.segment(frame, context=context)
+            if isinstance(segmenter, Segmenter)
+            else segmenter.segment(frame)
+        )
         raw = cls._validate_mask(
-            segmenter.segment(frame),
+            raw_mask,
             frame,
             privacy_safe=False,
         )
+        reset_count_after = int(getattr(segmenter, "temporal_reset_count", 0) or 0)
+        reset_reason = getattr(segmenter, "last_temporal_reset_reason", None)
+        if reset_count_after > reset_count_before and isinstance(
+            reset_reason, TemporalResetReason
+        ):
+            # Stateful backends can discover a discontinuity internally (RVM
+            # geometry and provider recovery). Pair the refiner only after a
+            # valid alpha exists, and before it sees this exact boundary frame.
+            reset_refiner = getattr(refiner, "reset_temporal_state", None)
+            if callable(reset_refiner):
+                reset_refiner(
+                    reset_reason,
+                    None if context is None else context.timestamp_ns,
+                )
         if stage_timings is not None:
             stage_timings["backend_inference_ms"] = (
                 time.monotonic_ns() - started
             ) / 1_000_000.0
         started = time.monotonic_ns() if stage_timings is not None else 0
-        refined = refiner.refine(raw, frame)
+        refined = (
+            refiner.refine(raw, frame, context=context)
+            if isinstance(refiner, MaskRefiner)
+            else refiner.refine(raw, frame)
+        )
         validated = cls._validate_mask(
             refined,
             frame,
@@ -2397,6 +3140,7 @@ class Pipeline:
         frame: np.ndarray,
         *,
         privacy_safe: bool,
+        context: SegmentationFrameContext | None = None,
     ) -> np.ndarray:
         """Compatibility wrapper for callers that need only final alpha."""
 
@@ -2405,54 +3149,123 @@ class Pipeline:
             refiner,
             frame,
             privacy_safe=privacy_safe,
+            context=context,
         )
         return refined
+
+    @staticmethod
+    def _segmentation_context(captured: CapturedFrame) -> SegmentationFrameContext:
+        return SegmentationFrameContext(
+            sequence=captured.sequence,
+            timestamp_ns=captured.captured_at_ns,
+            generation=captured.generation,
+            geometry_generation=captured.geometry_generation,
+            shape=captured.pixels.shape[:2],
+        )
+
+    @staticmethod
+    def _reset_temporal_pair(
+        segmenter: Any,
+        refiner: Any,
+        reason: TemporalResetReason,
+        timestamp_ns: int,
+    ) -> None:
+        """Reset both temporal owners before the discontinuity frame."""
+
+        reset_segmenter = getattr(segmenter, "reset_temporal_state", None)
+        if callable(reset_segmenter):
+            reset_segmenter(reason, timestamp_ns)
+        reset_refiner = getattr(refiner, "reset_temporal_state", None)
+        if callable(reset_refiner):
+            reset_refiner(reason, timestamp_ns)
+
+    def _segment_resource_masks(
+        self,
+        resources: _Resources,
+        captured: CapturedFrame,
+        *,
+        privacy_safe: bool,
+        stage_timings: dict[str, float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply one timeline decision, then process its exact boundary frame."""
+
+        context = self._segmentation_context(captured)
+        checkpoint = resources.segmentation_timeline.checkpoint()
+        boundary = resources.segmentation_timeline.observe(context)
+        reset_count_before: int | None = None
+        try:
+            if boundary.reset_reason is not None:
+                self._reset_temporal_pair(
+                    resources.segmenter,
+                    resources.refiner,
+                    boundary.reset_reason,
+                    context.timestamp_ns,
+                )
+            reset_count_before = int(
+                getattr(resources.segmenter, "temporal_reset_count", 0) or 0
+            )
+            result = self._segment_and_refine_masks(
+                resources.segmenter,
+                resources.refiner,
+                captured.pixels,
+                privacy_safe=privacy_safe,
+                context=context,
+                stage_timings=stage_timings,
+            )
+        except BaseException:
+            backend_recovered = (
+                reset_count_before is not None
+                and int(getattr(resources.segmenter, "temporal_reset_count", 0) or 0)
+                > reset_count_before
+                and getattr(resources.segmenter, "last_temporal_reset_reason", None)
+                is TemporalResetReason.BACKEND_RECOVERY
+            )
+            resources.segmentation_timeline.restore(checkpoint)
+            retry_reason = (
+                TemporalResetReason.BACKEND_RECOVERY
+                if backend_recovered
+                else boundary.reset_reason
+            )
+            if retry_reason is not None:
+                # The failed input is rolled back, so publish the reset only
+                # when it is paired with the next successfully accepted
+                # boundary frame rather than counting the failed attempt too.
+                resources.segmentation_timeline.request_reset(retry_reason)
+            raise
+        backend_recovered = (
+            reset_count_before is not None
+            and int(getattr(resources.segmenter, "temporal_reset_count", 0) or 0)
+            > reset_count_before
+            and getattr(resources.segmenter, "last_temporal_reset_reason", None)
+            is TemporalResetReason.BACKEND_RECOVERY
+        )
+        if backend_recovered:
+            resources.segmentation_timeline.record_reset(
+                TemporalResetReason.BACKEND_RECOVERY
+            )
+        return result
 
     def _new_matte_evidence(
         self,
         resources: _Resources,
-        frame: np.ndarray,
-        *,
-        dequeued_monotonic_ns: int,
+        captured: CapturedFrame,
     ) -> MatteFrameEvidence | None:
         recorder = self._matte_recorder
         if recorder is None or not recorder.accepting:
             return None
-        health = (
-            resources.capture.health_snapshot()
-            if hasattr(resources.capture, "health_snapshot")
-            else None
-        )
-        capture_timestamp = getattr(health, "captured_monotonic_ns", None)
-        if type(capture_timestamp) is int and capture_timestamp >= 0:
-            timestamp_ns = capture_timestamp
-            timestamp_source = "capture-completion"
-        else:
-            timestamp_ns = dequeued_monotonic_ns
-            timestamp_source = "unique-frame-dequeue"
-        capture_sequence = getattr(health, "sequence", None)
-        if type(capture_sequence) is not int or capture_sequence <= 0:
-            capture_sequence = self._matte_bundle_sequence
         metadata = MatteCaptureMetadata(
             bundle_sequence=self._matte_bundle_sequence,
-            capture_sequence=capture_sequence,
-            capture_monotonic_ns=timestamp_ns,
-            timestamp_source=timestamp_source,
-            capture_generation=int(getattr(health, "generation", 0) or 0),
-            geometry_generation=int(
-                getattr(
-                    health,
-                    "geometry_generation",
-                    getattr(health, "geometry_transitions", 0),
-                )
-                or 0
-            ),
+            capture_sequence=captured.sequence,
+            capture_monotonic_ns=captured.captured_at_ns,
+            timestamp_source="capture-completion",
+            capture_generation=captured.generation,
+            geometry_generation=captured.geometry_generation,
         )
         self._matte_bundle_sequence += 1
         cfg = resources.cfg
         return MatteFrameEvidence(
             metadata=metadata,
-            raw_frame=frame,
+            raw_frame=captured.pixels,
             configured_controls={
                 "segmentation": cfg.segmentation.model_dump(mode="json"),
                 "acceleration": cfg.acceleration.model_dump(mode="json"),
@@ -2469,43 +3282,147 @@ class Pipeline:
         )
 
     @staticmethod
-    def _effective_matte_controls(resources: _Resources) -> dict[str, object]:
+    def _matte_policy_snapshot(resources: _Resources) -> MattePolicySnapshot:
+        """Resolve the current policy from actual live backend/runtime facts."""
+
         segmenter = resources.segmenter
-        refiner_cfg = getattr(resources.refiner, "cfg", None)
         ratio = getattr(segmenter, "last_downsample_ratio", None)
+        return resolve_matte_policy(
+            resources.cfg.segmentation,
+            resources.cfg.compositing,
+            segmenter_matte_backend_kind(segmenter),
+            resolved_rvm_ratio=(
+                float(ratio)
+                if isinstance(ratio, (int, float))
+                and not isinstance(ratio, bool)
+                and math.isfinite(float(ratio))
+                else None
+            ),
+            passthrough=resources.cfg.background.mode == "passthrough",
+            canvas_shape=(resources.canvas_size[1], resources.canvas_size[0]),
+            light_wrap_stabilization_eligible=(
+                resources.cfg.background.mode in {"video", "camera"}
+            ),
+        )
+
+    @staticmethod
+    def _effective_matte_controls(
+        resources: _Resources,
+        *,
+        rvm_telemetry: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Project compatibility fields from the typed policy snapshot."""
+
+        segmenter = resources.segmenter
+        policy = Pipeline._matte_policy_snapshot(resources)
+        effective = policy.effective
+        refiner_cfg = policy.effective_refiner_config(resources.cfg.segmentation)
         return {
             "segmentation_backend": type(segmenter).__name__,
             "segmentation_device": str(getattr(segmenter, "device", "unknown")),
-            "produces_matte": bool(getattr(segmenter, "produces_matte", False)),
-            "rvm_downsample_ratio": (
-                float(ratio)
-                if isinstance(ratio, (int, float)) and math.isfinite(float(ratio))
-                else None
+            "acceleration": _acceleration_evidence(segmenter),
+            "rvm_telemetry": (
+                rvm_telemetry
+                if rvm_telemetry is not None
+                else _rvm_telemetry_evidence(segmenter)
             ),
-            "refiner": (
-                refiner_cfg.model_dump(mode="json")
-                if refiner_cfg is not None and hasattr(refiner_cfg, "model_dump")
-                else {}
+            "output_sink": _output_sink_evidence(
+                getattr(resources, "output", None),
             ),
-            "mask_shift": int(getattr(refiner_cfg, "mask_shift", 0) or 0),
-            "use_model_foreground": bool(
-                resources.cfg.compositing.use_model_foreground
+            "produces_matte": (
+                policy.selected_backend_kind.value == "true_alpha_recurrent"
+                and not policy.passthrough
             ),
-            "light_wrap": float(resources.cfg.compositing.light_wrap),
+            "rvm_downsample_ratio": effective.rvm_downsample_ratio,
+            "refiner": refiner_cfg.model_dump(mode="json"),
+            "edge_refinement_mode": effective.edge_refinement_mode,
+            "edge_refinement_radius_px": effective.edge_refinement_radius_px,
+            "mask_shift": effective.mask_shift,
+            "use_model_foreground": effective.use_model_foreground,
+            "light_wrap": effective.light_wrap,
+            "light_wrap_stabilization": Pipeline._light_wrap_evidence(resources),
             "blend_space": resources.cfg.compositing.blend_space,
+            "matte_policy": policy.to_dict(),
         }
 
     @staticmethod
     def _backdrop_diagnostic_identity(resources: _Resources) -> dict[str, object]:
         backdrop = resources.backdrop
         if backdrop is None:
-            return {"provider": "none"}
+            return {
+                "provider": "none",
+                "visual_generation": resources.visual_generation,
+            }
         identity = getattr(backdrop, "diagnostic_frame_identity", None)
         if callable(identity):
             value = identity()
             if isinstance(value, dict):
-                return value
-        return {"provider": type(backdrop).__name__}
+                return {
+                    **value,
+                    "visual_generation": resources.visual_generation,
+                }
+        return {
+            "provider": type(backdrop).__name__,
+            "visual_generation": resources.visual_generation,
+        }
+
+    @staticmethod
+    def _light_wrap_frame_context(
+        resources: _Resources,
+    ) -> LightWrapFrameContext | None:
+        """Resolve typed backdrop timing without consulting diagnostics/stats."""
+
+        backdrop = resources.backdrop
+        timing_method = getattr(backdrop, "temporal_frame_timing", None)
+        if not callable(timing_method):
+            return None
+        timing = timing_method()
+        if timing is None:
+            return None
+        if not isinstance(timing, BackdropFrameTiming):
+            raise ValueError("backdrop temporal timing contract is invalid")
+        return LightWrapFrameContext(
+            frame_id=timing.frame_id,
+            timestamp_ns=timing.timestamp_ns,
+            source_token=(
+                resources.light_wrap_generation,
+                id(backdrop),
+                resources.canvas_size,
+            ),
+            discontinuity_revision=timing.discontinuity_revision,
+        )
+
+    @staticmethod
+    def _light_wrap_evidence(
+        resources: _Resources,
+    ) -> dict[str, object]:
+        configured = resources.cfg.compositing.light_wrap_stabilization
+        stabilizer = getattr(resources, "light_wrap_stabilizer", None)
+        snapshot: LightWrapSnapshot | None = (
+            None if stabilizer is None else stabilizer.snapshot()
+        )
+        effective_mode = (
+            configured.mode
+            if stabilizer is not None and resources.cfg.compositing.light_wrap > 0.0
+            else "off"
+        )
+        return {
+            "configured_mode": configured.mode,
+            "effective_mode": effective_mode,
+            "time_constant_s": configured.time_constant_s,
+            "generation": getattr(resources, "light_wrap_generation", 0),
+            "updates": 0 if snapshot is None else snapshot.updates,
+            "repeated_frames": (0 if snapshot is None else snapshot.repeated_frames),
+            "reset_count": 0 if snapshot is None else snapshot.reset_count,
+            "scene_cut_count": (0 if snapshot is None else snapshot.scene_cut_count),
+            "last_reset_reason": (
+                ""
+                if snapshot is None or snapshot.last_reset_reason is None
+                else snapshot.last_reset_reason.value
+            ),
+            "last_dt_s": None if snapshot is None else snapshot.last_dt_s,
+            "retained_bytes": (0 if snapshot is None else snapshot.retained_bytes),
+        }
 
     def _submit_matte_evidence(
         self,
@@ -2668,12 +3585,13 @@ class Pipeline:
     def _render_local_mode(
         self,
         resources: _Resources,
-        frame: np.ndarray,
+        captured: CapturedFrame,
         *,
         color_outcome: dict[str, object] | None = None,
         matte_evidence: MatteFrameEvidence | None = None,
         timings: dict[str, float] | None = None,
     ) -> np.ndarray:
+        frame = captured.pixels
         mode = resources.cfg.background.mode
         if mode == "passthrough":
             return frame
@@ -2682,6 +3600,7 @@ class Pipeline:
         out, _ = self._local_composite(
             resources,
             frame,
+            captured=captured,
             privacy_safe=mode == "remote",
             color_outcome=color_outcome,
             matte_evidence=matte_evidence,
@@ -2697,6 +3616,9 @@ class Pipeline:
         mask: np.ndarray,
         edge_foreground: np.ndarray | None,
         prepared: _PreparedColorFrame,
+        *,
+        light_wrap: float,
+        prepared_light_wrap: PreparedLightWrap | None = None,
     ) -> np.ndarray:
         """Render with shared decoded inputs when correction prepared them."""
 
@@ -2718,10 +3640,11 @@ class Pipeline:
                 mask,
                 foreground_linear_bgr=foreground_linear,
                 backdrop_linear_bgr=backdrop_linear,
-                light_wrap=compositing.light_wrap,
+                light_wrap=light_wrap,
                 edge_foreground_bgr=edge_foreground,
                 edge_foreground_linear_bgr=edge_linear,
                 color_transform=prepared.transform,
+                prepared_light_wrap=prepared_light_wrap,
             )
         if (
             compositing.blend_space == "srgb_legacy"
@@ -2735,7 +3658,7 @@ class Pipeline:
                 foreground_linear_rgb=np.ascontiguousarray(
                     foreground_linear[..., ::-1]
                 ),
-                light_wrap=compositing.light_wrap,
+                light_wrap=light_wrap,
                 edge_foreground_bgr=edge_foreground,
                 edge_foreground_linear_rgb=(
                     None
@@ -2743,15 +3666,17 @@ class Pipeline:
                     else np.ascontiguousarray(edge_linear[..., ::-1])
                 ),
                 color_transform=prepared.transform,
+                prepared_light_wrap=prepared_light_wrap,
             )
         return composite(
             frame,
             backdrop_frame,
             mask,
-            light_wrap=compositing.light_wrap,
+            light_wrap=light_wrap,
             edge_foreground=edge_foreground,
             blend_space=compositing.blend_space,
             color_transform=prepared.transform,
+            prepared_light_wrap=prepared_light_wrap,
         )
 
     def _prepare_color_frame(
@@ -2763,6 +3688,7 @@ class Pipeline:
         edge_foreground: np.ndarray | None,
         *,
         now_s: float,
+        captured: CapturedFrame | None = None,
         cfg: AppConfig | None = None,
         harmonizer: ColorHarmonizer | None = None,
         track_live_state: bool = True,
@@ -2799,20 +3725,11 @@ class Pipeline:
             backdrop_content_rect: Any = None
             backdrop_geometry_token: object = None
             if track_live_state:
-                health = (
-                    resources.capture.health_snapshot()
-                    if hasattr(resources.capture, "health_snapshot")
-                    else None
-                )
-                generation_value = getattr(health, "generation", None)
-                if type(generation_value) is int and generation_value >= 0:
-                    source_generation = generation_value
-                foreground_content_rect = getattr(health, "content_rect", None)
-                geometry_generation = getattr(
-                    health,
-                    "geometry_generation",
-                    getattr(health, "geometry_transitions", 0),
-                )
+                geometry_generation = 0
+                if captured is not None:
+                    source_generation = captured.generation
+                    foreground_content_rect = captured.content_rect
+                    geometry_generation = captured.geometry_generation
                 provider = resources.backdrop
                 if provider is not None and hasattr(provider, "content_rect"):
                     backdrop_content_rect = provider.content_rect(
@@ -2909,7 +3826,7 @@ class Pipeline:
             snapshot=active_harmonizer.snapshot(),
         )
 
-    def _preflight(self, resources: _Resources) -> np.ndarray:
+    def _preflight(self, resources: _Resources) -> _PreflightResult:
         """Read and process a real frame before reporting startup readiness."""
         camera_wait = (
             2.0
@@ -2917,16 +3834,21 @@ class Pipeline:
             else resources.cfg.camera.recovery_timeout_s + 2.0
         )
         deadline = time.monotonic() + camera_wait
-        frame: np.ndarray | None = None
-        dequeued_monotonic_ns = 0
-        while frame is None and time.monotonic() < deadline and not self._stop.is_set():
-            frame = resources.capture.read()
-            if frame is not None:
-                dequeued_monotonic_ns = time.monotonic_ns()
-            if frame is None:
+        captured: CapturedFrame | None = None
+        while (
+            captured is None and time.monotonic() < deadline and not self._stop.is_set()
+        ):
+            captured = resources.capture.read()
+            if captured is None:
                 self._stop.wait(0.05)
-        if frame is None:
+        if captured is None:
             raise ActivationError("capture returned no frame during startup preflight")
+        diagnostic_frame_started_ns = (
+            time.monotonic_ns()
+            if self._matte_recorder is not None and self._matte_recorder.accepting
+            else None
+        )
+        frame = captured.pixels
         try:
             frame = self._validate_canvas_frame(
                 frame,
@@ -2935,11 +3857,11 @@ class Pipeline:
             )
         except ValueError as exc:
             raise ActivationError(str(exc)) from exc
+        resources.capture_sequence_timeline.observe(captured.sequence)
         remote_mode = resources.cfg.background.mode == "remote"
         matte_evidence = self._new_matte_evidence(
             resources,
-            frame,
-            dequeued_monotonic_ns=dequeued_monotonic_ns,
+            captured,
         )
         privacy_reason = ""
         color_outcome: dict[str, object] = {}
@@ -2952,10 +3874,9 @@ class Pipeline:
                 # is already part of the hot-swappable resource generation.
                 # Exercise it so a later background-only PATCH cannot reveal a
                 # backend failure for the first time.
-                self._segment_and_refine_mask(
-                    resources.segmenter,
-                    resources.refiner,
-                    frame,
+                self._segment_resource_masks(
+                    resources,
+                    captured,
                     privacy_safe=False,
                 )
             if remote_mode:
@@ -2966,6 +3887,7 @@ class Pipeline:
                 _candidate, privacy_reason = self._local_composite(
                     resources,
                     frame,
+                    captured=captured,
                     privacy_safe=True,
                     color_outcome=color_outcome,
                 )
@@ -2975,7 +3897,7 @@ class Pipeline:
                 self._latest_raw_frame = frame.copy()
                 out = self._render_local_mode(
                     resources,
-                    frame,
+                    captured,
                     color_outcome=color_outcome,
                     matte_evidence=matte_evidence,
                     timings=matte_timings,
@@ -2999,6 +3921,13 @@ class Pipeline:
             matte_evidence.timings_ms["output_send_ms"] = (
                 sent_monotonic_ns - send_started
             ) / 1_000_000.0
+            if diagnostic_frame_started_ns is not None:
+                matte_evidence.timings_ms["frame_total_ms"] = (
+                    sent_monotonic_ns - diagnostic_frame_started_ns
+                ) / 1_000_000.0
+            rss_bytes = process_rss_bytes()
+            if rss_bytes is not None:
+                matte_evidence.resource_samples["rss_bytes"] = rss_bytes
         if self._submit_matte_evidence(matte_evidence, out):
             assert matte_evidence is not None
             self._matte_last_source_sequence = matte_evidence.metadata.bundle_sequence
@@ -3020,13 +3949,14 @@ class Pipeline:
         self._record_color_output(resources, color_outcome, processed=True)
         if privacy_reason:
             log.warning("remote privacy fallback active reason=%s", privacy_reason)
-        return out
+        return _PreflightResult(out, captured.sequence)
 
     def _local_composite(
         self,
         resources: _Resources,
         frame: np.ndarray,
         *,
+        captured: CapturedFrame | None = None,
         privacy_safe: bool,
         timings: dict[str, float] | None = None,
         color_outcome: dict[str, object] | None = None,
@@ -3042,13 +3972,40 @@ class Pipeline:
             diagnostic_stage_timings: dict[str, float] | None = (
                 {} if matte_evidence is not None else None
             )
-            raw_mask, mask = self._segment_and_refine_masks(
-                resources.segmenter,
-                resources.refiner,
-                frame,
-                privacy_safe=privacy_safe,
-                stage_timings=diagnostic_stage_timings,
-            )
+            if captured is None:
+                raw_mask, mask = self._segment_and_refine_masks(
+                    resources.segmenter,
+                    resources.refiner,
+                    frame,
+                    privacy_safe=privacy_safe,
+                    stage_timings=diagnostic_stage_timings,
+                )
+            else:
+                raw_mask, mask = self._segment_resource_masks(
+                    resources,
+                    captured,
+                    privacy_safe=privacy_safe,
+                    stage_timings=diagnostic_stage_timings,
+                )
+            rvm_telemetry: dict[str, object] | None = None
+            if matte_evidence is not None:
+                # Capture one sanitized immutable snapshot for this exact
+                # successful segmentation. Reuse it for both timing and
+                # controls so later code cannot accidentally attribute a
+                # different inference to this frame.
+                rvm_telemetry = _rvm_telemetry_evidence(resources.segmenter)
+                if (
+                    diagnostic_stage_timings is not None
+                    and rvm_telemetry.get("applicable") is True
+                ):
+                    for evidence_key, timing_key in (
+                        ("preprocess_ms", "rvm_preprocess_ms"),
+                        ("session_run_ms", "rvm_session_run_ms"),
+                        ("postprocess_ms", "rvm_postprocess_ms"),
+                    ):
+                        value = rvm_telemetry.get(evidence_key)
+                        if isinstance(value, float):
+                            diagnostic_stage_timings[timing_key] = value
             if timings is not None:
                 timings["segmentation_ms"] = (
                     time.monotonic_ns() - started
@@ -3075,10 +4032,11 @@ class Pipeline:
             )
             if timings is not None:
                 timings["background_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
+            matte_policy = self._matte_policy_snapshot(resources)
             backend_clean_foreground = resources.segmenter.last_foreground
             edge_fg = (
                 backend_clean_foreground
-                if cfg.compositing.use_model_foreground
+                if matte_policy.effective.use_model_foreground
                 else None
             )
             if edge_fg is not None:
@@ -3101,7 +4059,12 @@ class Pipeline:
                     bg,
                     mask,
                     edge_fg,
-                    now_s=time.monotonic(),
+                    now_s=(
+                        captured.captured_at_ns / 1_000_000_000.0
+                        if captured is not None
+                        else time.monotonic()
+                    ),
+                    captured=captured,
                 )
                 if timings is not None:
                     timings["color_correction_ms"] = (
@@ -3112,7 +4075,52 @@ class Pipeline:
                 if timings is not None:
                     timings["color_correction_ms"] = 0.0
             started = time.monotonic_ns()
+            next_light_wrap_stabilizer: LightWrapStabilizer | None = None
             try:
+                prepared_light_wrap: PreparedLightWrap | None = None
+                active_light_wrap_stabilizer = getattr(
+                    resources,
+                    "light_wrap_stabilizer",
+                    None,
+                )
+                if (
+                    matte_policy.effective.light_wrap > 0.0
+                    and active_light_wrap_stabilizer is not None
+                ):
+                    wrap_context = self._light_wrap_frame_context(resources)
+                    if wrap_context is not None:
+                        candidate_light_wrap_stabilizer: LightWrapStabilizer = (
+                            active_light_wrap_stabilizer.clone()
+                        )
+                        next_light_wrap_stabilizer = candidate_light_wrap_stabilizer
+                        backdrop_linear = prepared_color.backdrop_linear_bgr
+                        if (
+                            cfg.compositing.blend_space == "linear_srgb"
+                            and backdrop_linear is None
+                        ):
+                            backdrop_linear = bgr_u8_to_linear_rgb(bg)
+                            prepared_color = _PreparedColorFrame(
+                                transform=prepared_color.transform,
+                                foreground_linear_bgr=(
+                                    prepared_color.foreground_linear_bgr
+                                ),
+                                backdrop_linear_bgr=backdrop_linear,
+                                edge_foreground_linear_bgr=(
+                                    prepared_color.edge_foreground_linear_bgr
+                                ),
+                                snapshot=prepared_color.snapshot,
+                            )
+                        prepared_light_wrap = prepare_light_wrap(
+                            bg,
+                            blend_space=cfg.compositing.blend_space,
+                            stabilizer=candidate_light_wrap_stabilizer,
+                            context=wrap_context,
+                            backdrop_linear_bgr=(
+                                backdrop_linear
+                                if cfg.compositing.blend_space == "linear_srgb"
+                                else None
+                            ),
+                        )
                 rendered = self._composite_prepared_color(
                     cfg,
                     frame,
@@ -3120,6 +4128,8 @@ class Pipeline:
                     mask,
                     edge_fg,
                     prepared_color,
+                    light_wrap=matte_policy.effective.light_wrap,
+                    prepared_light_wrap=prepared_light_wrap,
                 )
             except ColorError as exc:
                 # A photometric transform/conversion failure follows the same
@@ -3130,14 +4140,19 @@ class Pipeline:
                     True,
                     type(exc).__name__,
                 )
+                # Preparation is transactional with the render. A fallback
+                # that did not consume the prepared sample cannot publish its
+                # candidate temporal history.
+                next_light_wrap_stabilizer = None
                 rendered = composite(
                     frame,
                     bg,
                     mask,
-                    light_wrap=cfg.compositing.light_wrap,
+                    light_wrap=matte_policy.effective.light_wrap,
                     edge_foreground=edge_fg,
                     blend_space=cfg.compositing.blend_space,
                     color_transform=IDENTITY_TRANSFORM,
+                    prepared_light_wrap=None,
                 )
                 if color_outcome is not None:
                     color_outcome.update(
@@ -3158,6 +4173,8 @@ class Pipeline:
                         )
                     )
             self._validate_output_frame(rendered, resources.canvas_size)
+            if next_light_wrap_stabilizer is not None:
+                resources.light_wrap_stabilizer = next_light_wrap_stabilizer
             if timings is not None:
                 timings["composite_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
             if matte_evidence is not None and not privacy_safe:
@@ -3166,8 +4183,12 @@ class Pipeline:
                 matte_evidence.clean_foreground = backend_clean_foreground
                 matte_evidence.backdrop_frame = bg
                 matte_evidence.base_composite = rendered
+                matte_evidence.segmentation_diagnostics = (
+                    segmenter_diagnostics_snapshot(resources.segmenter)
+                )
                 matte_evidence.effective_controls = self._effective_matte_controls(
-                    resources
+                    resources,
+                    rvm_telemetry=rvm_telemetry,
                 )
                 if diagnostic_stage_timings is not None:
                     matte_evidence.timings_ms.update(diagnostic_stage_timings)
@@ -3207,7 +4228,11 @@ class Pipeline:
         return guarded
 
     def _loop(
-        self, resources: _Resources, *, initial_output: np.ndarray | None = None
+        self,
+        resources: _Resources,
+        *,
+        initial_output: np.ndarray | None = None,
+        initial_capture_sequence: int | None = None,
     ) -> None:
         frame_interval = 1.0 / resources.cfg.output.fps
         fps_window: deque[float] = deque()
@@ -3222,6 +4247,12 @@ class Pipeline:
         last_output = initial_output
         fallback_active = initial_remote_slate
         fallback_reason = "startup-slate" if initial_remote_slate else ""
+        last_capture_sequence = initial_capture_sequence
+        if (
+            initial_capture_sequence is not None
+            and resources.capture_sequence_timeline.snapshot().last_sequence is None
+        ):
+            resources.capture_sequence_timeline.observe(initial_capture_sequence)
         previous_remote_fallback: tuple[bool, str] = (False, "")
         last_color_status = _color_stats(
             resources.cfg,
@@ -3240,8 +4271,19 @@ class Pipeline:
 
         while not self._stop.is_set():
             loop_start = time.monotonic()
-            frame = resources.capture.read()
-            dequeued_monotonic_ns = time.monotonic_ns() if frame is not None else 0
+            captured = resources.capture.read()
+            if captured is not None and last_capture_sequence is not None:
+                if captured.sequence < last_capture_sequence:
+                    raise RuntimeError(
+                        "capture sequence reordered from "
+                        f"{last_capture_sequence} to {captured.sequence}"
+                    )
+                if captured.sequence == last_capture_sequence:
+                    # A source must not return the already-consumed preflight
+                    # slot as a new input. Ignore an accidental duplicate
+                    # without re-running any temporal consumer.
+                    captured = None
+            frame = captured.pixels if captured is not None else None
             matte_evidence: MatteFrameEvidence | None = None
             used_remote_candidate = False
             timings = {
@@ -3251,14 +4293,26 @@ class Pipeline:
                 "composite_ms": 0.0,
             }
             processed = frame is not None
+            diagnostic_frame_started_ns = (
+                time.monotonic_ns()
+                if (
+                    processed
+                    and self._matte_recorder is not None
+                    and self._matte_recorder.accepting
+                )
+                else None
+            )
             if processed:
                 assert frame is not None
+                assert captured is not None
                 frame = self._validate_canvas_frame(
                     frame,
                     resources.canvas_size,
                     boundary="capture",
                 )
+                resources.capture_sequence_timeline.observe(captured.sequence)
                 frames_in += 1
+                last_capture_sequence = captured.sequence
                 self.hub.publish_raw(frame)
 
                 # A real current frame is the activation trial input. No candidate
@@ -3269,14 +4323,13 @@ class Pipeline:
                     request = None
                 if request is not None:
                     if isinstance(request, _PatchRequest):
-                        self._handle_patch_request(resources, request, frame)
+                        self._handle_patch_request(resources, request, captured)
                     else:
                         self._handle_mutation_request(resources, request)
 
                 matte_evidence = self._new_matte_evidence(
                     resources,
-                    frame,
-                    dequeued_monotonic_ns=dequeued_monotonic_ns,
+                    captured,
                 )
                 process_started = time.monotonic_ns()
                 cfg = resources.cfg
@@ -3322,6 +4375,7 @@ class Pipeline:
                     out_frame, _ = self._local_composite(
                         resources,
                         frame,
+                        captured=captured,
                         privacy_safe=False,
                         timings=timings,
                         color_outcome=color_outcome,
@@ -3389,6 +4443,13 @@ class Pipeline:
             output_send_ms = (sent_monotonic_ns - send_started) / 1_000_000.0
             if matte_evidence is not None:
                 matte_evidence.timings_ms["output_send_ms"] = output_send_ms
+                if diagnostic_frame_started_ns is not None:
+                    matte_evidence.timings_ms["frame_total_ms"] = (
+                        sent_monotonic_ns - diagnostic_frame_started_ns
+                    ) / 1_000_000.0
+                rss_bytes = process_rss_bytes()
+                if rss_bytes is not None:
+                    matte_evidence.resource_samples["rss_bytes"] = rss_bytes
                 if self._submit_matte_evidence(matte_evidence, out_frame):
                     self._matte_last_source_sequence = (
                         matte_evidence.metadata.bundle_sequence

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
 
@@ -17,6 +18,7 @@ from .color import (
     bgr_u8_to_linear_rgb,
     linear_rgb_to_bgr_u8,
 )
+from .light_wrap import LightWrapFrameContext, LightWrapStabilizer
 
 try:
     import cv2 as _cv2
@@ -30,6 +32,31 @@ cv2: Any = _cv2
 BlendSpace = Literal["srgb_legacy", "linear_srgb"]
 
 
+@dataclass(frozen=True)
+class PreparedLightWrap:
+    """One full-canvas blurred wrap sample in the declared BGR working space."""
+
+    pixels_bgr: np.ndarray
+    blend_space: BlendSpace
+    stabilized: bool
+
+
+def _downscaled_blur_sample(
+    image: np.ndarray,
+    scale: int = 8,
+    kernel: int = 9,
+) -> np.ndarray:
+    """Return the bounded blurred raster retained by temporal wrap state."""
+
+    h, w = image.shape[:2]
+    sw, sh = max(4, w // scale), max(4, h // scale)
+    small = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(
+        cv2.GaussianBlur(small, (kernel, kernel), 0),
+        dtype=np.float32,
+    )
+
+
 def _downscaled_blur(image: np.ndarray, scale: int = 8, kernel: int = 9) -> np.ndarray:
     """Large soft blur on the cheap: blur at 1/scale resolution and upsample."""
     h, w = image.shape[:2]
@@ -37,6 +64,85 @@ def _downscaled_blur(image: np.ndarray, scale: int = 8, kernel: int = 9) -> np.n
     small = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA)
     small = cv2.GaussianBlur(small, (kernel, kernel), 0)
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+
+def prepare_light_wrap(
+    backdrop_bgr: np.ndarray,
+    *,
+    blend_space: BlendSpace,
+    stabilizer: LightWrapStabilizer,
+    context: LightWrapFrameContext,
+    backdrop_linear_bgr: np.ndarray | None = None,
+) -> PreparedLightWrap:
+    """Prepare and stabilize only the blurred backdrop wrap sample.
+
+    Callers must not invoke this function when the effective wrap strength is
+    zero.  That early bypass is what guarantees no blur work or temporal-state
+    advancement for ``light_wrap: 0``.
+    """
+
+    backdrop_bgr = _validate_frame(backdrop_bgr, name="backdrop_bgr")
+    if blend_space not in ("srgb_legacy", "linear_srgb"):
+        raise ValueError("blend_space must be 'srgb_legacy' or 'linear_srgb'")
+    if not isinstance(stabilizer, LightWrapStabilizer):
+        raise ValueError("stabilizer must be a LightWrapStabilizer")
+    if not isinstance(context, LightWrapFrameContext):
+        raise ValueError("context must be a LightWrapFrameContext")
+    if cv2 is None:
+        raise ColorError("opencv-python is required for stabilized light wrap")
+
+    if blend_space == "srgb_legacy":
+        if backdrop_linear_bgr is not None:
+            raise ValueError(
+                "backdrop_linear_bgr is only valid for linear_srgb light wrap"
+            )
+        working = backdrop_bgr
+        value_scale = 255.0
+    else:
+        working = (
+            _bgr_u8_to_linear_bgr_prevalidated(backdrop_bgr)
+            if backdrop_linear_bgr is None
+            else _validate_prevalidated_linear_bgr(
+                backdrop_linear_bgr,
+                name="backdrop_linear_bgr",
+                expected_shape=backdrop_bgr.shape,
+            )
+        )
+        value_scale = 1.0
+
+    try:
+        sample = _downscaled_blur_sample(working)
+    except cv2.error as exc:
+        raise ColorError("OpenCV light-wrap preparation failed") from exc
+    filtered = stabilizer.update(
+        sample,
+        context,
+        value_scale=value_scale,
+        channel_order="bgr",
+    )
+    height, width = backdrop_bgr.shape[:2]
+    try:
+        pixels = (
+            _downscaled_blur(working)
+            if np.array_equal(filtered, sample)
+            else np.ascontiguousarray(
+                cv2.resize(
+                    filtered,
+                    (width, height),
+                    interpolation=cv2.INTER_LINEAR,
+                ),
+                dtype=np.float32,
+            )
+        )
+    except cv2.error as exc:
+        raise ColorError("OpenCV light-wrap preparation failed") from exc
+    pixels = np.ascontiguousarray(pixels, dtype=np.float32)
+    pixels.setflags(write=False)
+    return PreparedLightWrap(
+        pixels_bgr=pixels,
+        blend_space=blend_space,
+        stabilized=True,
+    )
 
 
 def _validate_frame(
@@ -115,6 +221,39 @@ def _validate_linear_frame(
     return frame
 
 
+def _validate_prepared_light_wrap(
+    prepared: object,
+    *,
+    blend_space: BlendSpace,
+    expected_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """Validate a prepared BGR sample at the compositor trust boundary."""
+
+    if not isinstance(prepared, PreparedLightWrap):
+        raise ValueError("prepared_light_wrap must be a PreparedLightWrap")
+    if prepared.blend_space != blend_space:
+        raise ValueError("prepared light-wrap blend space does not match compositor")
+    if type(prepared.stabilized) is not bool:
+        raise ValueError("prepared light-wrap stabilized flag must be boolean")
+    pixels = prepared.pixels_bgr
+    if (
+        not isinstance(pixels, np.ndarray)
+        or pixels.dtype != np.float32
+        or pixels.ndim != 3
+        or pixels.shape != expected_shape
+        or pixels.size == 0
+        or not pixels.flags.c_contiguous
+        or not np.isfinite(pixels).all()
+    ):
+        raise ValueError(
+            "prepared light-wrap pixels must be finite contiguous float32 BGR"
+        )
+    maximum = 255.0 if blend_space == "srgb_legacy" else 1.0
+    if float(np.min(pixels)) < 0.0 or float(np.max(pixels)) > maximum:
+        raise ValueError("prepared light-wrap pixels lie outside the working space")
+    return pixels
+
+
 def _validated_light_wrap(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError("light_wrap must be a finite number in [0, 1]")
@@ -143,6 +282,7 @@ def _legacy_blend_encoded(
     *,
     light_wrap: float,
     edge_foreground: np.ndarray | None,
+    prepared_light_wrap: PreparedLightWrap | None,
 ) -> np.ndarray:
     """Run the frozen historical encoded-value arithmetic."""
     alpha = mask[..., None].astype(np.float32)
@@ -152,8 +292,16 @@ def _legacy_blend_encoded(
         band = 4.0 * alpha * (1.0 - alpha)
         if edge_foreground is not None:
             fg = fg * (1.0 - band) + edge_foreground.astype(np.float32) * band
-        if light_wrap > 0.0 and cv2 is not None:
-            wrap = _downscaled_blur(backdrop)
+        if light_wrap > 0.0 and (cv2 is not None or prepared_light_wrap is not None):
+            wrap = (
+                _downscaled_blur(backdrop)
+                if prepared_light_wrap is None
+                else _validate_prepared_light_wrap(
+                    prepared_light_wrap,
+                    blend_space="srgb_legacy",
+                    expected_shape=foreground.shape,
+                )
+            )
             k = light_wrap * band
             fg = fg * (1.0 - k) + wrap * k
 
@@ -169,6 +317,7 @@ def _legacy_composite(
     light_wrap: float,
     edge_foreground: np.ndarray | None,
     color_transform: ColorTransform | None,
+    prepared_light_wrap: PreparedLightWrap | None,
 ) -> np.ndarray:
     """Preserve the historical path, decoding only a requested transform."""
 
@@ -199,6 +348,7 @@ def _legacy_composite(
         mask,
         light_wrap=light_wrap,
         edge_foreground=transformed_edge,
+        prepared_light_wrap=prepared_light_wrap,
     )
 
 
@@ -212,6 +362,7 @@ def composite_legacy_predecoded(
     edge_foreground_bgr: np.ndarray | None = None,
     edge_foreground_linear_rgb: np.ndarray | None = None,
     color_transform: ColorTransform | None = None,
+    prepared_light_wrap: PreparedLightWrap | None = None,
 ) -> np.ndarray:
     """Apply a predecoded foreground transform, then legacy encoded blending."""
 
@@ -271,6 +422,7 @@ def composite_legacy_predecoded(
         mask,
         light_wrap=light_wrap,
         edge_foreground=transformed_edge,
+        prepared_light_wrap=prepared_light_wrap,
     )
 
 
@@ -285,6 +437,7 @@ def composite_linear_predecoded(
     edge_foreground_bgr: np.ndarray | None = None,
     edge_foreground_linear_rgb: np.ndarray | None = None,
     color_transform: ColorTransform | None = None,
+    prepared_light_wrap: PreparedLightWrap | None = None,
 ) -> np.ndarray:
     """Composite already-decoded inputs without another full-frame EOTF pass.
 
@@ -358,8 +511,18 @@ def composite_linear_predecoded(
             working_foreground = (
                 working_foreground * (1.0 - band) + transformed_edge * band
             )
-        if light_wrap > 0.0 and cv2 is not None:
-            wrap = _downscaled_blur(backdrop_linear_rgb)
+        if light_wrap > 0.0 and (cv2 is not None or prepared_light_wrap is not None):
+            wrap = (
+                _downscaled_blur(backdrop_linear_rgb)
+                if prepared_light_wrap is None
+                else np.ascontiguousarray(
+                    _validate_prepared_light_wrap(
+                        prepared_light_wrap,
+                        blend_space="linear_srgb",
+                        expected_shape=foreground_bgr.shape,
+                    )[..., ::-1]
+                )
+            )
             k = light_wrap * band
             working_foreground = working_foreground * (1.0 - k) + wrap * k
 
@@ -440,6 +603,7 @@ def _composite_linear_bgr_prevalidated(
     edge_foreground_bgr: np.ndarray | None = None,
     edge_foreground_linear_bgr: np.ndarray | None = None,
     color_transform: ColorTransform | None = None,
+    prepared_light_wrap: PreparedLightWrap | None = None,
 ) -> np.ndarray:
     """Accelerated production compositor over validated linear-BGR buffers.
 
@@ -511,6 +675,7 @@ def _composite_linear_bgr_prevalidated(
                 else np.ascontiguousarray(edge_foreground_linear_bgr[..., ::-1])
             ),
             color_transform=color_transform,
+            prepared_light_wrap=prepared_light_wrap,
         )
 
     identity_transform = _is_identity_transform(color_transform)
@@ -544,7 +709,15 @@ def _composite_linear_bgr_prevalidated(
                     band,
                 )
             if light_wrap > 0.0:
-                wrap = _downscaled_blur(backdrop_linear_bgr)
+                wrap = (
+                    _downscaled_blur(backdrop_linear_bgr)
+                    if prepared_light_wrap is None
+                    else _validate_prepared_light_wrap(
+                        prepared_light_wrap,
+                        blend_space="linear_srgb",
+                        expected_shape=foreground_bgr.shape,
+                    )
+                )
                 working_foreground = _interpolate_linear_bgr(
                     working_foreground,
                     wrap,
@@ -579,6 +752,7 @@ def _composite_linear_bgr(
     light_wrap: float = 0.0,
     edge_foreground_bgr: np.ndarray | None = None,
     color_transform: ColorTransform | None = None,
+    prepared_light_wrap: PreparedLightWrap | None = None,
 ) -> np.ndarray:
     """Decode validated external inputs once and use the accelerated BGR lane."""
 
@@ -599,6 +773,7 @@ def _composite_linear_bgr(
         edge_foreground_bgr=edge_foreground_bgr,
         edge_foreground_linear_bgr=edge_foreground_linear_bgr,
         color_transform=color_transform,
+        prepared_light_wrap=prepared_light_wrap,
     )
 
 
@@ -611,6 +786,7 @@ def composite(
     edge_foreground: np.ndarray | None = None,
     blend_space: BlendSpace = "srgb_legacy",
     color_transform: ColorTransform | None = None,
+    prepared_light_wrap: PreparedLightWrap | None = None,
 ) -> np.ndarray:
     """Blend a validated BGR foreground over a backdrop in an explicit space.
 
@@ -656,6 +832,7 @@ def composite(
             light_wrap=light_wrap,
             edge_foreground=edge_foreground,
             color_transform=color_transform,
+            prepared_light_wrap=prepared_light_wrap,
         )
     foreground_linear_rgb = bgr_u8_to_linear_rgb(foreground)
     backdrop_linear_rgb = bgr_u8_to_linear_rgb(backdrop)
@@ -672,4 +849,5 @@ def composite(
         edge_foreground_bgr=edge_foreground,
         edge_foreground_linear_rgb=edge_foreground_linear_rgb,
         color_transform=color_transform,
+        prepared_light_wrap=prepared_light_wrap,
     )

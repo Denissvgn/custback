@@ -1170,6 +1170,8 @@ def evaluate_bundle(
     timing_series: dict[str, list[float]] = {}
     allocation_series: list[float] = []
     memory_series: list[float] = []
+    rss_series: list[float] = []
+    vram_series: list[float] = []
     artifact_series: list[float] = []
     evaluator_array_series: list[float] = []
 
@@ -1356,12 +1358,18 @@ def evaluate_bundle(
         if isinstance(resources, dict):
             allocation = resources.get("allocation_bytes")
             memory = resources.get("memory_bytes")
+            rss = resources.get("rss_bytes")
+            vram = resources.get("vram_bytes")
             if isinstance(allocation, (int, float)) and not isinstance(
                 allocation, bool
             ):
                 allocation_series.append(float(allocation))
             if isinstance(memory, (int, float)) and not isinstance(memory, bool):
                 memory_series.append(float(memory))
+            if isinstance(rss, (int, float)) and not isinstance(rss, bool):
+                rss_series.append(float(rss))
+            if isinstance(vram, (int, float)) and not isinstance(vram, bool):
+                vram_series.append(float(vram))
         recorded_bytes = frame_metrics["recorded_artifact_bytes"]
         assert isinstance(recorded_bytes, int)
         artifact_series.append(float(recorded_bytes))
@@ -1441,6 +1449,14 @@ def evaluate_bundle(
             "runtime_memory_bytes": {
                 "available": bool(memory_series),
                 **_summary(memory_series),
+            },
+            "runtime_rss_bytes": {
+                "available": bool(rss_series),
+                **_summary(rss_series),
+            },
+            "runtime_vram_bytes": {
+                "available": bool(vram_series),
+                **_summary(vram_series),
             },
             "recorded_artifact_bytes": _summary(artifact_series),
             "evaluator_loaded_array_bytes": _summary(evaluator_array_series),

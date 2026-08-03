@@ -190,6 +190,34 @@ def test_output_timeline_reports_repeats_updates_send_fps_and_sequence_gaps(
     assert performance["timings_ms"]["backend_inference_ms"]["p95"] == 8.475
     assert performance["runtime_allocation_bytes"]["available"] is True
     assert performance["runtime_memory_bytes"]["p95"] == 64_019_456.0
+    assert performance["runtime_rss_bytes"]["available"] is False
+    assert performance["runtime_rss_bytes"]["p95"] is None
+    assert performance["runtime_vram_bytes"]["available"] is False
+    assert performance["runtime_vram_bytes"]["p95"] is None
+
+
+def test_quality_report_summarizes_optional_rss_and_vram_samples(tmp_path):
+    fixture = evidence.generate_fixture(
+        tmp_path,
+        "repeats_and_sequence_gaps",
+        gates=(),
+    )
+    manifest_path = fixture.bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for sequence, frame in enumerate(manifest["frames"]):
+        frame["resource_samples"]["rss_bytes"] = 70_000_000 + sequence * 1_000
+        frame["resource_samples"]["vram_bytes"] = 90_000_000 + sequence * 2_000
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    report = evaluate_bundle(fixture.bundle)
+    performance = report["aggregate"]["performance"]
+    assert performance["runtime_rss_bytes"]["available"] is True
+    assert performance["runtime_rss_bytes"]["p95"] == 70_004_750.0
+    assert performance["runtime_vram_bytes"]["available"] is True
+    assert performance["runtime_vram_bytes"]["p95"] == 90_009_500.0
 
 
 def test_post_base_extension_cannot_overwrite_base_metric_namespace(tmp_path):

@@ -22,6 +22,7 @@ from custback.matte_diagnostics import (
     ReplayOptions,
     replay_bundle,
 )
+from custback.segmentation import SegmentationFrameContext, TemporalResetReason
 
 
 def _mode(path: Path) -> int:
@@ -72,6 +73,25 @@ def _controls() -> dict[str, object]:
             "anchor_x": 0.5,
             "anchor_y": 0.5,
         },
+    }
+
+
+def _mediapipe_diagnostics(
+    *,
+    delta_ms: int | None = 33,
+    adjustment_count: int = 0,
+    adjustment_ms: int = 0,
+) -> dict[str, object]:
+    return {
+        "backend": "mediapipe",
+        "input_frame_shape": [12, 16],
+        "model_mask_shape": [6, 8],
+        "output_mask_shape": [12, 16],
+        "effective_timestamp_delta_ms": delta_ms,
+        "timestamp_adjustment_count": adjustment_count,
+        "timestamp_adjustment_ms": adjustment_ms,
+        "last_timestamp_adjusted": adjustment_ms > 0,
+        "resize_interpolation": "linear",
     }
 
 
@@ -130,6 +150,7 @@ def test_full_bundle_round_trip_and_frozen_replay_are_exact(tmp_path):
     recorder = MatteDiagnosticRecorder(bundle_dir, max_bytes=2_000_000)
     first, first_rendered = _evidence(0, 1_000_000_000)
     second, second_rendered = _evidence(1, 1_033_000_000)
+    first.segmentation_diagnostics = _mediapipe_diagnostics(delta_ms=None)
     assert recorder.submit(first, first_rendered)
     recorder._queue.join()
     assert recorder.submit(second, second_rendered)
@@ -142,6 +163,11 @@ def test_full_bundle_round_trip_and_frozen_replay_are_exact(tmp_path):
         1_000_000_000,
         1_033_000_000,
     ]
+    assert (
+        bundle.frames[0]["segmentation_diagnostics"] == first.segmentation_diagnostics
+    )
+    assert "effective_timestamp_ms" not in bundle.frames[0]["segmentation_diagnostics"]
+    assert "segmentation_diagnostics" not in bundle.frames[1]
     np.testing.assert_array_equal(
         bundle.load_array(bundle.frames[0], "raw_mask"),
         first.raw_mask,
@@ -158,6 +184,103 @@ def test_full_bundle_round_trip_and_frozen_replay_are_exact(tmp_path):
     report = replay_bundle(bundle_dir, tmp_path / "replay")
     assert [frame["reference_exact"] for frame in report["frames"]] == [True, True]
     assert report["frames"][0]["reference_max_channel_delta"] == 0
+    assert report["frames"][0]["segmentation_diagnostics"] == {
+        "recorded": first.segmentation_diagnostics,
+        "rerun": None,
+    }
+    assert "segmentation_diagnostics" not in report["frames"][1]
+
+
+def test_v1_resource_samples_accept_legacy_and_optional_rss_vram_fields(tmp_path):
+    bundle_dir = tmp_path / "bundle"
+    first, first_rendered = _evidence(0, 1_000_000_000)
+    second, second_rendered = _evidence(1, 1_033_000_000)
+    first.resource_samples = {
+        "allocation_bytes": 1_024,
+        "memory_bytes": 2_048,
+    }
+    second.resource_samples = {
+        "rss_bytes": 3_072,
+        "vram_bytes": 4_096,
+    }
+    with MatteDiagnosticRecorder(bundle_dir, max_bytes=2_000_000) as recorder:
+        assert recorder.submit(first, first_rendered)
+        recorder._queue.join()
+        assert recorder.submit(second, second_rendered)
+
+    bundle = MatteReplayBundle(bundle_dir)
+    assert bundle.manifest["version"] == 1
+    assert bundle.frames[0]["resource_samples"] == first.resource_samples
+    assert bundle.frames[1]["resource_samples"] == second.resource_samples
+
+
+@pytest.mark.parametrize(
+    "resources",
+    (
+        {"rss_bytes": True},
+        {"vram_bytes": -1},
+        {"private_gpu_path": 1},
+    ),
+)
+def test_bundle_rejects_invalid_extended_resource_samples(tmp_path, resources):
+    bundle_dir = tmp_path / "bundle"
+    evidence, rendered = _evidence(0, 1)
+    with MatteDiagnosticRecorder(bundle_dir, max_bytes=2_000_000) as recorder:
+        assert recorder.submit(evidence, rendered)
+    manifest_path = bundle_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["frames"][0]["resource_samples"] = resources
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(MatteDiagnosticsError, match="resource samples"):
+        MatteReplayBundle(bundle_dir)
+
+
+@pytest.mark.parametrize(
+    "invalid_diagnostics",
+    [
+        pytest.param(
+            {**_mediapipe_diagnostics(), "effective_timestamp_ms": 33},
+            id="absolute-timestamp-is-not-persisted",
+        ),
+        pytest.param(
+            {
+                **_mediapipe_diagnostics(),
+                "output_mask_shape": [6, 8],
+            },
+            id="output-shape-does-not-match-input",
+        ),
+        pytest.param(
+            {
+                **_mediapipe_diagnostics(),
+                "resize_interpolation": "area",
+            },
+            id="resize-policy-contradicts-shapes",
+        ),
+        pytest.param(
+            {
+                **_mediapipe_diagnostics(),
+                "timestamp_adjustment_ms": 1,
+            },
+            id="adjustment-flag-is-inconsistent",
+        ),
+    ],
+)
+def test_bundle_rejects_malformed_segmentation_diagnostics(
+    tmp_path,
+    invalid_diagnostics,
+):
+    bundle_dir = tmp_path / "bundle"
+    evidence, rendered = _evidence(0, 1)
+    with MatteDiagnosticRecorder(bundle_dir, max_bytes=2_000_000) as recorder:
+        assert recorder.submit(evidence, rendered)
+    manifest_path = bundle_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["frames"][0]["segmentation_diagnostics"] = invalid_diagnostics
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(MatteDiagnosticsError, match="segmentation diagnostic"):
+        MatteReplayBundle(bundle_dir)
 
 
 def test_scalar_output_timeline_keeps_repeats_out_of_unique_input_track(tmp_path):
@@ -228,6 +351,143 @@ def test_model_rerun_uses_recorded_selection_without_live_capture(tmp_path):
     assert report["mode"] == "rerun"
     assert len(report["frames"]) == 1
     assert (tmp_path / "rerun" / "frames" / "00000000" / "composite.npy").is_file()
+
+
+def test_model_rerun_preserves_recorded_timeline_and_config_resets(
+    tmp_path,
+    monkeypatch,
+):
+    events: list[tuple[object, ...]] = []
+    created = 0
+
+    class SpySegmenter:
+        last_foreground = None
+
+        def __init__(self, identifier: int):
+            self.identifier = identifier
+            self.temporal_reset_count = 0
+            self.last_temporal_reset_reason = None
+            self.last_shape = (12, 16)
+
+        def reset_temporal_state(self, reason, timestamp_ns):
+            self.temporal_reset_count += 1
+            self.last_temporal_reset_reason = reason
+            events.append(("segment-reset", self.identifier, reason, timestamp_ns))
+
+        def segment(self, frame, *, context=None):
+            events.append(("segment", self.identifier, context))
+            self.last_shape = frame.shape[:2]
+            return np.full(frame.shape[:2], 0.5, dtype=np.float32)
+
+        def telemetry_snapshot(self):
+            return {
+                **_mediapipe_diagnostics(delta_ms=None),
+                "input_frame_shape": self.last_shape,
+                "model_mask_shape": self.last_shape,
+                "output_mask_shape": self.last_shape,
+                "resize_interpolation": "none",
+                # Snapshot consumers must explicitly discard this private
+                # submitted-clock value from persisted evidence.
+                "effective_timestamp_ms": 123,
+            }
+
+        def close(self):
+            events.append(("close", self.identifier))
+
+    class SpyRefiner:
+        def __init__(self, identifier: int):
+            self.identifier = identifier
+
+        def reset_temporal_state(self, reason, timestamp_ns):
+            events.append(("refiner-reset", self.identifier, reason, timestamp_ns))
+
+        def refine(self, mask, _frame, *, context=None):
+            events.append(("refine", self.identifier, context))
+            return mask
+
+    def create_spy(*_args, **_kwargs):
+        nonlocal created
+        result = SpySegmenter(created)
+        created += 1
+        return result
+
+    def create_refiner(_cfg, segmenter):
+        return SpyRefiner(segmenter.identifier)
+
+    monkeypatch.setattr("custback.matte_diagnostics.create_segmenter", create_spy)
+    monkeypatch.setattr("custback.matte_diagnostics.refiner_for", create_refiner)
+
+    bundle_dir = tmp_path / "bundle"
+    first, first_rendered = _evidence(0, 1_000_000_000)
+    second, second_rendered = _evidence(1, 1_033_000_000)
+    second_segmentation = second.configured_controls["segmentation"]
+    assert isinstance(second_segmentation, dict)
+    second_segmentation["threshold"] = 0.6
+    recorder = MatteDiagnosticRecorder(bundle_dir, max_bytes=4_000_000)
+    assert recorder.submit(first, first_rendered)
+    recorder._queue.join()
+    assert recorder.submit(second, second_rendered)
+    recorder.close()
+
+    report = replay_bundle(
+        bundle_dir,
+        tmp_path / "rerun",
+        options=ReplayOptions(mode="rerun", model_foreground="off"),
+    )
+
+    resets = [event for event in events if str(event[0]).endswith("reset")]
+    assert resets == [
+        (
+            "segment-reset",
+            0,
+            TemporalResetReason.INITIAL,
+            1_000_000_000,
+        ),
+        (
+            "refiner-reset",
+            0,
+            TemporalResetReason.INITIAL,
+            1_000_000_000,
+        ),
+        (
+            "segment-reset",
+            1,
+            TemporalResetReason.SEGMENTATION_CONFIG,
+            1_033_000_000,
+        ),
+        (
+            "refiner-reset",
+            1,
+            TemporalResetReason.SEGMENTATION_CONFIG,
+            1_033_000_000,
+        ),
+    ]
+    segment_contexts = [event[2] for event in events if event[0] == "segment"]
+    refine_contexts = [event[2] for event in events if event[0] == "refine"]
+    expected = [
+        SegmentationFrameContext(10, 1_000_000_000, 2, 3, (12, 16)),
+        SegmentationFrameContext(11, 1_033_000_000, 2, 3, (12, 16)),
+    ]
+    assert segment_contexts == expected
+    assert refine_contexts == expected
+    assert [
+        frame["segmentation_diagnostics"]["rerun"] for frame in report["frames"]
+    ] == [
+        {
+            **_mediapipe_diagnostics(delta_ms=None),
+            "input_frame_shape": [12, 16],
+            "model_mask_shape": [12, 16],
+            "output_mask_shape": [12, 16],
+            "resize_interpolation": "none",
+        },
+        {
+            **_mediapipe_diagnostics(delta_ms=None),
+            "input_frame_shape": [12, 16],
+            "model_mask_shape": [12, 16],
+            "output_mask_shape": [12, 16],
+            "resize_interpolation": "none",
+        },
+    ]
 
 
 def test_composite_only_is_explicitly_insufficient_for_matte_metrics(tmp_path):
@@ -445,10 +705,25 @@ def test_pipeline_records_only_unique_full_composites_after_output_send(tmp_path
     assert [frame["sequence"] for frame in bundle.frames] == list(
         range(len(bundle.frames))
     )
-    assert all(int(frame["capture_monotonic_ns"]) > 0 for frame in bundle.frames)
+    capture_sequences = [int(frame["capture_sequence"]) for frame in bundle.frames]
+    capture_timestamps = [int(frame["capture_monotonic_ns"]) for frame in bundle.frames]
+    assert all(
+        current > previous
+        for previous, current in zip(capture_sequences, capture_sequences[1:])
+    )
+    assert all(timestamp > 0 for timestamp in capture_timestamps)
+    assert capture_timestamps == sorted(capture_timestamps)
+    assert all(
+        frame["timestamp_source"] == "capture-completion" for frame in bundle.frames
+    )
     assert all("output_send_ms" in frame["timings_ms"] for frame in bundle.frames)
     assert all(
         frame["effective_controls"]["segmentation_backend"] == "HeuristicSegmenter"
+        for frame in bundle.frames
+    )
+    assert all(
+        frame["effective_controls"]["edge_refinement_mode"] == "off"
+        and frame["effective_controls"]["edge_refinement_radius_px"] == 0
         for frame in bundle.frames
     )
     assert len(bundle.output_events) >= len(bundle.frames)

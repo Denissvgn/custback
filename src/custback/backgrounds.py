@@ -71,6 +71,15 @@ _IMAGE_FORMATS = {
 DEFAULT_BACKGROUNDS_DIR = Path.home() / ".local" / "share" / "custback" / "backgrounds"
 
 
+@dataclass(frozen=True)
+class BackdropFrameTiming:
+    """Path-free identity and actual presentation time for temporal consumers."""
+
+    frame_id: int
+    timestamp_ns: int
+    discontinuity_revision: int = 0
+
+
 def list_background_files(directory: Path) -> list[Path]:
     """Image and video files available for cycling, sorted by name."""
     if not directory.is_dir():
@@ -347,6 +356,11 @@ class BackdropProvider(ABC):
 
         return {"provider": type(self).__name__}
 
+    def temporal_frame_timing(self) -> BackdropFrameTiming | None:
+        """Return timing only for providers whose pixels can advance."""
+
+        return None
+
     def stats_dict(self) -> dict[str, object]:
         """Return current-provider playback telemetry.
 
@@ -601,6 +615,7 @@ class VideoBackdrop(BackdropProvider):
         self._frames_skipped = 0
         self._frames_reused = 0
         self._seek_count = 0
+        self._discontinuity_revision = 0
         self._decode_failures = 0
         self._last_returned_logical_index: int | None = None
         self._skip_warning_emitted = False
@@ -660,6 +675,20 @@ class VideoBackdrop(BackdropProvider):
         deadline_s: float,
         color_contract: ResolvedVideoColor | None,
     ) -> None:
+        crossed_known_loop = (
+            self._frame_count > 0
+            and self._logical_index >= 0
+            and logical_index // self._frame_count
+            > self._logical_index // self._frame_count
+        )
+        crossed_unknown_loop = (
+            not self._frame_count
+            and source_index == 0
+            and self._source_index > 0
+            and logical_index > self._logical_index
+        )
+        if crossed_known_loop or crossed_unknown_loop:
+            self._discontinuity_revision += 1
         self._last_raw = orient_frame(frame, self._orientation.rotation, False)
         self._source_index = source_index
         self._logical_index = logical_index
@@ -979,6 +1008,7 @@ class VideoBackdrop(BackdropProvider):
             self._last_reliable_source_index = source_index
         self._prefetch_next()
         self._seek_count += 1
+        self._discontinuity_revision += 1
         return True
 
     def _decode_first(self, now: float) -> None:
@@ -1183,8 +1213,20 @@ class VideoBackdrop(BackdropProvider):
             "source_index": self._source_index,
             "logical_index": self._logical_index,
             "pts_s": self._current_pts_s,
+            "timeline_s": self._current_deadline_s,
+            "seek_count": self._seek_count,
+            "discontinuity_revision": self._discontinuity_revision,
             "timing_mode": "container" if self._container_timing else "nominal",
         }
+
+    def temporal_frame_timing(self) -> BackdropFrameTiming | None:
+        if self._logical_index < 0:
+            return None
+        return BackdropFrameTiming(
+            frame_id=self._logical_index,
+            timestamp_ns=max(0, round(self._current_deadline_s * 1_000_000_000)),
+            discontinuity_revision=self._discontinuity_revision,
+        )
 
     def reset_stats(self) -> None:
         """Exclude activation trials from counters of the installed provider."""
@@ -1282,6 +1324,14 @@ class CameraBackdrop(BackdropProvider):
             "generation": self._raw_generation,
             "capture_monotonic_ns": self._last_capture_monotonic_ns,
         }
+
+    def temporal_frame_timing(self) -> BackdropFrameTiming | None:
+        if self._raw_generation <= 0 or self._last_capture_monotonic_ns is None:
+            return None
+        return BackdropFrameTiming(
+            frame_id=self._raw_generation,
+            timestamp_ns=self._last_capture_monotonic_ns,
+        )
 
     def _invalidate_geometry_cache(self) -> None:
         self._last_fit = None

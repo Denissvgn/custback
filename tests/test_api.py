@@ -339,7 +339,12 @@ def test_status_and_config_with_bearer(stack):
         "capture_fps",
         "capture_frames_read",
         "capture_dropped_frames",
+        "capture_sequence",
+        "capture_sequence_gap_count",
+        "capture_missing_input_count",
         "capture_frame_age_ms",
+        "matte_reset_count",
+        "matte_last_reset_reason",
         "output_target_fps",
         "output_repeated_frames",
         "processing_deadline_misses",
@@ -350,6 +355,11 @@ def test_status_and_config_with_bearer(stack):
         "background_video_frames_skipped",
     } <= body.keys()
     assert body["capture_backend"] == "synthetic"
+    assert body["capture_sequence"] >= 1
+    assert body["capture_sequence_gap_count"] == 0
+    assert body["capture_missing_input_count"] == 0
+    assert body["matte_reset_count"] >= 1
+    assert body["matte_last_reset_reason"] == "initial"
     assert body["output_fallback_active"] is False
     if sys.platform == "win32":
         assert body["native_ring"] in {"section absent", "section present"}
@@ -1337,6 +1347,34 @@ def test_openapi_documents_bodies_and_local_docs_have_no_cdn(stack):
     assert schema["paths"]["/status"]["get"]["responses"]["200"]["content"][
         "application/json"
     ]["schema"]["$ref"].endswith("/_StatusResponse")
+    temporal_status_fields = {
+        "capture_sequence",
+        "capture_sequence_gap_count",
+        "capture_missing_input_count",
+        "matte_reset_count",
+        "matte_last_reset_reason",
+    }
+    status_schema = schemas["_StatusResponse"]
+    assert temporal_status_fields <= set(status_schema["properties"])
+    assert temporal_status_fields <= set(status_schema["required"])
+    for field in temporal_status_fields - {"matte_last_reset_reason"}:
+        assert status_schema["properties"][field]["type"] == "integer"
+    assert status_schema["properties"]["matte_last_reset_reason"]["type"] == "string"
+    spatial_edge_status_fields = {
+        "effective_edge_refinement_mode",
+        "effective_edge_refinement_radius_px",
+    }
+    assert spatial_edge_status_fields <= set(status_schema["properties"])
+    assert spatial_edge_status_fields <= set(status_schema["required"])
+    assert status_schema["properties"]["effective_edge_refinement_mode"]["enum"] == [
+        "off",
+        "legacy_watershed",
+        "stable_guided",
+    ]
+    assert (
+        status_schema["properties"]["effective_edge_refinement_radius_px"]["type"]
+        == "integer"
+    )
     assert schema["paths"]["/backgrounds"]["get"]["responses"]["200"]["content"][
         "application/json"
     ]["schema"]["$ref"].endswith("/_BackgroundListResponse")

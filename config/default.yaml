@@ -67,11 +67,21 @@ segmentation:
   delegate: cpu        # cpu | gpu — mediapipe inference device; rvm picks
                        # CUDA automatically when onnxruntime-gpu is installed
   rvm_downsample: 0.0  # rvm internal resolution ratio, 0 = auto from frame size
-  threshold: 0.5
+  threshold: 0.5       # heuristic backend only; ignored by rvm/mediapipe
   mask_blur: 7         # edge feathering (odd kernel, 0 = off)
-  edge_refine: true    # bounded marker-watershed snap within an 8 px band
+  edge_refine: true    # compatibility/master switch for spatial edge refinement
+  spatial_edge_refinement:
+    mode: legacy_watershed  # legacy_watershed | stable_guided (opt-in)
+    reference_short_edge_px: 720
+    radius_at_reference_px: 8
+    min_radius_px: 2
+    max_radius_px: 12
   mask_shift: 0        # grow (>0) / shrink (<0) mask by N px; -1..-2 removes halos
-  temporal_smoothing: 0.35  # flicker damping; motion still tracks instantly
+  temporal_smoothing: 0.35  # compatibility EMA; unchanged when policy below is off
+  boundary_stabilization:
+    mode: "off"        # off | motion_aware (experimental; requires qualification)
+    time_constant_s: 0.1
+    max_motion_px_per_s: 720.0
 
 # RVM inference acceleration policy (onnxruntime execution provider).
 # Independent of segmentation.delegate above, which only selects MediaPipe's
@@ -91,6 +101,11 @@ compositing:
   # linear_srgb performs correction, clean-foreground replacement, light wrap,
   # and alpha blending in linear light. srgb_legacy retains encoded blending.
   blend_space: srgb_legacy    # srgb_legacy | linear_srgb; schema-1 compatibility
+  light_wrap_stabilization:
+    # Explicit qualification candidate for changing video/camera wrap samples.
+    # Off preserves the historical stateless light-wrap pixels.
+    mode: "off"               # off | temporal_bounded
+    time_constant_s: 0.12     # inert while mode is off
   color_correction:
     # auto is eligible only for image/video/camera backdrops. Passthrough,
     # blur, solid color, and remote output remain identity; low confidence is

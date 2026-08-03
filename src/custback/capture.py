@@ -1,9 +1,10 @@
 """Camera capture sources and bounded capture-worker health telemetry.
 
-All sources yield canonical-canvas, C-contiguous BGR uint8 frames. Device
-negotiation remains tied to the configured acquisition request. Real OpenCV
-capture runs in one dedicated reader because ``VideoCapture.read`` may block;
-the pipeline only ever consumes the newest completed normalized frame.
+All sources yield immutable envelopes around canonical-canvas, C-contiguous
+BGR uint8 frames. Device negotiation remains tied to the configured
+acquisition request. Real OpenCV capture runs in one dedicated reader because
+``VideoCapture.read`` may block; the pipeline only ever consumes the newest
+completed normalized frame.
 """
 
 from __future__ import annotations
@@ -61,6 +62,24 @@ class _CaptureNegotiationRetry(CaptureError):
 
 
 @dataclass(frozen=True)
+class CapturedFrame:
+    """One canonical pixel array and its atomic capture identity.
+
+    ``captured_at_ns`` uses this process's monotonic clock at successful source
+    read completion. The frozen envelope prevents consumers from accidentally
+    re-associating metadata with different pixels; consumers must continue to
+    treat the owned pixel array itself as read-only.
+    """
+
+    pixels: np.ndarray
+    sequence: int
+    captured_at_ns: int
+    generation: int
+    geometry_generation: int
+    content_rect: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
 class CameraControlObservation:
     """One side-effect-free OpenCV camera-property observation.
 
@@ -110,9 +129,9 @@ class CaptureHealth:
     # ``generation`` and ``geometry_generation`` describe the last frame
     # returned by ``read()``, not a newer frame waiting in the reader slot.
     # This lets downstream temporal state reset at the exact frame boundary.
-    # ``sequence`` and ``captured_monotonic_ns`` are the matching recorder-only
-    # identity.  They are intentionally absent from public status; MATTE-1.1
-    # will later carry typed timing through the processing contract itself.
+    # ``sequence`` and ``captured_monotonic_ns`` mirror the matching envelope
+    # for diagnostics. Temporal consumers use ``CapturedFrame`` directly so a
+    # separate health sample can never race the pixel array.
     sequence: int = 0
     captured_monotonic_ns: int | None = None
     generation: int = 0
@@ -146,8 +165,8 @@ class CaptureHealth:
 
 class CaptureSource(ABC):
     @abstractmethod
-    def read(self) -> np.ndarray | None:
-        """Return the newest unread BGR frame, or ``None`` if unavailable."""
+    def read(self) -> CapturedFrame | None:
+        """Return the newest unread captured frame, or ``None`` if unavailable."""
 
     def health_snapshot(self) -> CaptureHealth:
         """Return capture health without blocking or mutating the source."""
@@ -320,7 +339,7 @@ class OpenCVCapture(CaptureSource):
         self._generation_has_frame = False
         self._open_attempts = 0
 
-        self._slot: np.ndarray | None = None
+        self._slot: CapturedFrame | None = None
         self._slot_sequence = 0
         self._slot_generation = 0
         self._slot_geometry_generation = 0
@@ -752,7 +771,8 @@ class OpenCVCapture(CaptureSource):
                         type(exc).__name__,
                     )
                     return
-                finished = time.monotonic()
+                captured_at_ns = time.monotonic_ns()
+                finished = captured_at_ns / 1_000_000_000.0
                 if stop.is_set():
                     break
                 if not ok or frame is None:
@@ -797,12 +817,10 @@ class OpenCVCapture(CaptureSource):
                 with self._lock:
                     if generation != self._generation or self._closed:
                         return
-                    if (
-                        self._slot is not None
-                        and self._slot_sequence != self._delivered_sequence
+                    if self._slot is not None and (
+                        self._slot.sequence != self._delivered_sequence
                     ):
                         self._dropped_frames += 1
-                    self._slot = frame
                     self._slot_sequence += 1
                     self._slot_generation = generation
                     self._slot_geometry_generation = self._geometry_transitions
@@ -813,9 +831,17 @@ class OpenCVCapture(CaptureSource):
                         content.right,
                         content.bottom,
                     )
+                    self._slot = CapturedFrame(
+                        pixels=frame,
+                        sequence=self._slot_sequence,
+                        captured_at_ns=captured_at_ns,
+                        generation=generation,
+                        geometry_generation=self._geometry_transitions,
+                        content_rect=self._slot_content_rect,
+                    )
                     self._slot_identity = CaptureHealth(
                         sequence=self._slot_sequence,
-                        captured_monotonic_ns=int(round(finished * 1_000_000_000)),
+                        captured_monotonic_ns=captured_at_ns,
                         generation=generation,
                         geometry_generation=self._geometry_transitions,
                         content_rect=self._slot_content_rect,
@@ -1124,7 +1150,7 @@ class OpenCVCapture(CaptureSource):
             self._stop_current_worker()
 
     # -- public API ---------------------------------------------------
-    def read(self) -> np.ndarray | None:
+    def read(self) -> CapturedFrame | None:
         """Return the latest unread frame without blocking on camera control."""
 
         # A native open call may itself ignore backend timeouts.  Publishing
@@ -1138,14 +1164,15 @@ class OpenCVCapture(CaptureSource):
             fatal = self._fatal_error
             if fatal is not None:
                 raise fatal
-            if self._slot is None or self._slot_sequence == self._delivered_sequence:
+            if self._slot is None or self._slot.sequence == self._delivered_sequence:
                 return None
-            self._delivered_sequence = self._slot_sequence
-            self._delivered_generation = self._slot_generation
-            self._delivered_geometry_generation = self._slot_geometry_generation
-            self._delivered_content_rect = self._slot_content_rect
+            captured = self._slot
+            self._delivered_sequence = captured.sequence
+            self._delivered_generation = captured.generation
+            self._delivered_geometry_generation = captured.geometry_generation
+            self._delivered_content_rect = captured.content_rect
             self._delivered_identity = self._slot_identity
-            return self._slot
+            return captured
 
     def health_snapshot(self) -> CaptureHealth:
         now = time.monotonic()
@@ -1246,9 +1273,10 @@ class SyntheticCapture(CaptureSource):
         self._timestamps: deque[float] = deque(maxlen=1024)
         self._first_frame_at: float | None = None
         self._last_frame_at: float | None = None
+        self._last_captured_at_ns: int | None = None
         self._read_ms: float | None = None
 
-    def read(self) -> np.ndarray | None:
+    def read(self) -> CapturedFrame | None:
         started = time.monotonic()
         with self._lock:
             if self._closed:
@@ -1262,12 +1290,16 @@ class SyntheticCapture(CaptureSource):
         ellipse = ((xx - cx) / (w * 0.14)) ** 2 + ((yy - cy) / (h * 0.3)) ** 2 <= 1.0
         frame[ellipse] = (200, 190, 210)
         frame = apply_transform(frame, self._plan)
-        finished = time.monotonic()
         with self._lock:
+            # Sequence and timestamp are assigned at the same serialized
+            # boundary so concurrent synthetic readers cannot invert them.
+            captured_at_ns = time.monotonic_ns()
+            finished = captured_at_ns / 1_000_000_000.0
             self._frames_read += 1
             if self._first_frame_at is None:
                 self._first_frame_at = finished
             self._last_frame_at = finished
+            self._last_captured_at_ns = captured_at_ns
             self._timestamps.append(finished)
             while self._timestamps and finished - self._timestamps[0] > 2.0:
                 self._timestamps.popleft()
@@ -1277,7 +1309,21 @@ class SyntheticCapture(CaptureSource):
                 if self._read_ms is None
                 else 0.1 * read_ms + 0.9 * self._read_ms
             )
-        return frame
+            sequence = self._frames_read
+            content = self._plan.content_rect
+            return CapturedFrame(
+                pixels=frame,
+                sequence=sequence,
+                captured_at_ns=captured_at_ns,
+                generation=1,
+                geometry_generation=1,
+                content_rect=(
+                    content.left,
+                    content.top,
+                    content.right,
+                    content.bottom,
+                ),
+            )
 
     def health_snapshot(self) -> CaptureHealth:
         now = time.monotonic()
@@ -1294,11 +1340,7 @@ class SyntheticCapture(CaptureSource):
             )
             return CaptureHealth(
                 sequence=self._frames_read,
-                captured_monotonic_ns=(
-                    None
-                    if self._last_frame_at is None
-                    else int(round(self._last_frame_at * 1_000_000_000))
-                ),
+                captured_monotonic_ns=self._last_captured_at_ns,
                 generation=1 if self._frames_read else 0,
                 geometry_generation=1 if self._frames_read else 0,
                 content_rect=(

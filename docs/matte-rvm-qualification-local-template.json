@@ -1,0 +1,588 @@
+{
+  "schema": "custback.rvm-qualification-local-reference",
+  "version": 1,
+  "status": "template-only-not-qualification-evidence",
+  "usage": {
+    "warning": "Copy one object from templates into its own owner-only JSON file; this wrapper is not accepted by matte-rvm-qualify.",
+    "plan_json_pointer": "/templates/plan",
+    "cpu_run_json_pointer": "/templates/run_cpu_native_raw",
+    "accelerator_run_json_pointer": "/templates/run_cuda_native_raw",
+    "replacement_rule": "Replace every REPLACE_ value, every illustrative digest or sample, and expand cells to the complete Cartesian matrix before qualification.",
+    "sample_note": "The three-element run arrays demonstrate schema only; replace them with at least 30 warm-up plus 300 steady-state frame-aligned samples spanning at least 10 seconds.",
+    "hardware_digest_note": "After replacing inventory fields, compute identity_sha256 over canonical sorted compact ASCII JSON plus one final newline.",
+    "source_identity_note": "Replace the illustrative source digests with canonical pre-resize RGB8 clip/frame digests; every native run shares the exact source object and every decimated run uses the same clip digest with the exact every-other frame_sha256 projection.",
+    "policy_note": "quality_policy_id and the ratified quality/cadence/sample/queue limits are mandatory; local plans may strengthen but cannot weaken them."
+  },
+  "templates": {
+    "plan": {
+      "schema": "custback.rvm-qualification-plan",
+      "version": 1,
+      "ablation_report": "REPLACE_WITH_PRIVATE_MATTE_0_3_REPORT.json",
+      "provenance": {
+        "qualification_id": "local_rvm_qualification",
+        "kind": "consented-local",
+        "license_or_consent_reference": "REPLACE_WITH_CONSENT_RECORD_ID",
+        "contains_private_footage_in_repository": false
+      },
+      "candidates": [
+        {
+          "id": "shortlist_explicit",
+          "role": "shortlist",
+          "ablation_candidate_id": "replace_shortlist_id",
+          "model_id": "rvm_mobilenetv3_fp32.onnx",
+          "model_sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+          "model_bytes": 14975696,
+          "segmentation": {
+            "backend": "rvm",
+            "model_path": "",
+            "delegate": "cpu",
+            "rvm_downsample": 0.5,
+            "threshold": 0.5,
+            "mask_blur": 0,
+            "edge_refine": false,
+            "mask_shift": 0,
+            "temporal_smoothing": 0.0,
+            "boundary_stabilization": {
+              "mode": "off",
+              "time_constant_s": 0.1,
+              "max_motion_px_per_s": 720.0
+            },
+            "spatial_edge_refinement": {
+              "mode": "legacy_watershed",
+              "reference_short_edge_px": 720,
+              "radius_at_reference_px": 8,
+              "min_radius_px": 2,
+              "max_radius_px": 12
+            }
+          }
+        },
+        {
+          "id": "automatic_detail",
+          "role": "auto",
+          "ablation_candidate_id": "",
+          "model_id": "rvm_mobilenetv3_fp32.onnx",
+          "model_sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+          "model_bytes": 14975696,
+          "segmentation": {
+            "backend": "rvm",
+            "model_path": "",
+            "delegate": "cpu",
+            "rvm_downsample": 0.0,
+            "threshold": 0.5,
+            "mask_blur": 7,
+            "edge_refine": true,
+            "mask_shift": 0,
+            "temporal_smoothing": 0.35,
+            "boundary_stabilization": {
+              "mode": "off",
+              "time_constant_s": 0.1,
+              "max_motion_px_per_s": 720.0
+            },
+            "spatial_edge_refinement": {
+              "mode": "legacy_watershed",
+              "reference_short_edge_px": 720,
+              "radius_at_reference_px": 8,
+              "min_radius_px": 2,
+              "max_radius_px": 12
+            }
+          }
+        },
+        {
+          "id": "compatibility",
+          "role": "compatibility_baseline",
+          "ablation_candidate_id": "",
+          "model_id": "rvm_mobilenetv3_fp32.onnx",
+          "model_sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+          "model_bytes": 14975696,
+          "segmentation": {
+            "backend": "auto",
+            "model_path": "",
+            "delegate": "cpu",
+            "rvm_downsample": 0.0,
+            "threshold": 0.5,
+            "mask_blur": 7,
+            "edge_refine": true,
+            "mask_shift": 0,
+            "temporal_smoothing": 0.35,
+            "boundary_stabilization": {
+              "mode": "off",
+              "time_constant_s": 0.1,
+              "max_motion_px_per_s": 720.0
+            },
+            "spatial_edge_refinement": {
+              "mode": "legacy_watershed",
+              "reference_short_edge_px": 720,
+              "radius_at_reference_px": 8,
+              "min_radius_px": 2,
+              "max_radius_px": 12
+            }
+          }
+        }
+      ],
+      "hardware": [
+        {
+          "id": "host_linux",
+          "providers": [
+            "cpu",
+            "cuda"
+          ],
+          "canvas_ids": [
+            "hd"
+          ]
+        },
+        {
+          "id": "host_windows",
+          "providers": [
+            "cpu",
+            "directml"
+          ],
+          "canvas_ids": [
+            "hd"
+          ]
+        }
+      ],
+      "canvases": [
+        {
+          "id": "hd",
+          "width": 1280,
+          "height": 720
+        }
+      ],
+      "qualified_compositor": {
+        "light_wrap": 0.25,
+        "use_model_foreground": true,
+        "blend_space": "srgb_legacy",
+        "light_wrap_stabilization": {
+          "mode": "off",
+          "time_constant_s": 0.12
+        },
+        "color_correction": {
+          "mode": "off",
+          "strength": 0.5,
+          "exposure_limit_ev": 0.85,
+          "white_balance_strength": 0.5,
+          "adaptation_time_s": 0.8
+        }
+      },
+      "policy": {
+        "quality_policy_id": "matte-0.2-ratified-v1",
+        "quality_gates": [
+          {
+            "id": "opaque_p05",
+            "family": "opaque_core",
+            "metric": "aggregate.metrics.opaque_core_alpha_p05.p05",
+            "op": ">=",
+            "value": 0.95
+          },
+          {
+            "id": "opaque_below",
+            "family": "opaque_core",
+            "metric": "aggregate.metrics.opaque_core_fraction_below_0_95.p95",
+            "op": "<=",
+            "value": 0.05
+          },
+          {
+            "id": "foreground_holes",
+            "family": "opaque_core",
+            "metric": "aggregate.metrics.foreground_hole_components.max",
+            "op": "<=",
+            "value": 0
+          },
+          {
+            "id": "background_alpha",
+            "family": "background",
+            "metric": "aggregate.metrics.background_alpha_mean.p95",
+            "op": "<=",
+            "value": 0.01
+          },
+          {
+            "id": "halo_area",
+            "family": "halo",
+            "metric": "aggregate.metrics.exterior_halo_area_ratio.p95",
+            "op": "<=",
+            "value": 0.02
+          },
+          {
+            "id": "halo_width",
+            "family": "halo",
+            "metric": "aggregate.metrics.exterior_halo_width_p95_px.p95",
+            "op": "<=",
+            "value": 3.0
+          },
+          {
+            "id": "alpha_mse",
+            "family": "fine_detail",
+            "metric": "aggregate.metrics.ground_truth_alpha_mse.p95",
+            "op": "<=",
+            "value": 0.01
+          },
+          {
+            "id": "gradient_mae",
+            "family": "fine_detail",
+            "metric": "aggregate.metrics.ground_truth_gradient_mae.p95",
+            "op": "<=",
+            "value": 0.05
+          },
+          {
+            "id": "uncertain_coverage",
+            "family": "fine_detail",
+            "metric": "aggregate.metrics.uncertain_pixel_fraction.p50",
+            "op": ">=",
+            "value": 0.05
+          },
+          {
+            "id": "contour_motion",
+            "family": "temporal",
+            "metric": "aggregate.metrics.contour_displacement_p95_px.p95",
+            "op": "<=",
+            "value": 1.5
+          },
+          {
+            "id": "alpha_motion",
+            "family": "temporal",
+            "metric": "aggregate.metrics.compensated_alpha_temporal_abs_diff.p95",
+            "op": "<=",
+            "value": 0.05
+          },
+          {
+            "id": "motion_trail",
+            "family": "temporal",
+            "metric": "aggregate.metrics.motion_trail_area_ratio.p95",
+            "op": "<=",
+            "value": 0.02
+          }
+        ],
+        "native30_service_p95_ms": 33.333,
+        "native30_min_unique_fps": 29.0,
+        "decimated15_service_p95_ms": 66.667,
+        "decimated15_min_unique_fps": 14.5,
+        "min_warmup_frames": 30,
+        "min_steady_frames": 300,
+        "min_observation_s": 10.0,
+        "max_queue_age_ms": 33.333334,
+        "max_queue_age_growth_ms": 5.0,
+        "minimum_profile_hardware_count": 2
+      },
+      "profile_proposals": [],
+      "cells": [
+        {
+          "id": "shortlist_linux_cpu_hd_n_raw",
+          "candidate_id": "shortlist_explicit",
+          "hardware_id": "host_linux",
+          "provider": "cpu",
+          "canvas_id": "hd",
+          "cadence": "native30",
+          "render_mode": "raw_model",
+          "status": "recorded",
+          "bundle": "REPLACE_WITH_NATIVE_CPU_RAW_BUNDLE",
+          "annotations": "REPLACE_WITH_NATIVE_CPU_RAW_ANNOTATIONS",
+          "run": "REPLACE_WITH_NATIVE_CPU_RAW_RUN.json",
+          "availability_reason": "",
+          "native30_cell_id": "",
+          "paired_raw_cell_id": ""
+        },
+        {
+          "id": "shortlist_linux_cpu_hd_n_comp",
+          "candidate_id": "shortlist_explicit",
+          "hardware_id": "host_linux",
+          "provider": "cpu",
+          "canvas_id": "hd",
+          "cadence": "native30",
+          "render_mode": "qualified_compositor",
+          "status": "recorded",
+          "bundle": "REPLACE_WITH_NATIVE_CPU_COMPOSITOR_BUNDLE",
+          "annotations": "REPLACE_WITH_NATIVE_CPU_COMPOSITOR_ANNOTATIONS",
+          "run": "REPLACE_WITH_NATIVE_CPU_COMPOSITOR_RUN.json",
+          "availability_reason": "",
+          "native30_cell_id": "",
+          "paired_raw_cell_id": "shortlist_linux_cpu_hd_n_raw"
+        },
+        {
+          "id": "shortlist_linux_cpu_hd_d_raw",
+          "candidate_id": "shortlist_explicit",
+          "hardware_id": "host_linux",
+          "provider": "cpu",
+          "canvas_id": "hd",
+          "cadence": "decimated15",
+          "render_mode": "raw_model",
+          "status": "recorded",
+          "bundle": "REPLACE_WITH_DECIMATED_CPU_RAW_BUNDLE",
+          "annotations": "REPLACE_WITH_DECIMATED_CPU_RAW_ANNOTATIONS",
+          "run": "REPLACE_WITH_DECIMATED_CPU_RAW_RUN.json",
+          "availability_reason": "",
+          "native30_cell_id": "shortlist_linux_cpu_hd_n_raw",
+          "paired_raw_cell_id": ""
+        },
+        {
+          "id": "shortlist_linux_cpu_hd_d_comp",
+          "candidate_id": "shortlist_explicit",
+          "hardware_id": "host_linux",
+          "provider": "cpu",
+          "canvas_id": "hd",
+          "cadence": "decimated15",
+          "render_mode": "qualified_compositor",
+          "status": "recorded",
+          "bundle": "REPLACE_WITH_DECIMATED_CPU_COMPOSITOR_BUNDLE",
+          "annotations": "REPLACE_WITH_DECIMATED_CPU_COMPOSITOR_ANNOTATIONS",
+          "run": "REPLACE_WITH_DECIMATED_CPU_COMPOSITOR_RUN.json",
+          "availability_reason": "",
+          "native30_cell_id": "shortlist_linux_cpu_hd_n_comp",
+          "paired_raw_cell_id": "shortlist_linux_cpu_hd_d_raw"
+        },
+        {
+          "id": "shortlist_linux_cuda_hd_n_raw",
+          "candidate_id": "shortlist_explicit",
+          "hardware_id": "host_linux",
+          "provider": "cuda",
+          "canvas_id": "hd",
+          "cadence": "native30",
+          "render_mode": "raw_model",
+          "status": "recorded",
+          "bundle": "REPLACE_WITH_NATIVE_CUDA_RAW_BUNDLE",
+          "annotations": "REPLACE_WITH_NATIVE_CUDA_RAW_ANNOTATIONS",
+          "run": "REPLACE_WITH_NATIVE_CUDA_RAW_RUN.json",
+          "availability_reason": "",
+          "native30_cell_id": "",
+          "paired_raw_cell_id": ""
+        }
+      ]
+    },
+    "run_cpu_native_raw": {
+      "schema": "custback.rvm-qualification-run",
+      "version": 1,
+      "bundle_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "evidence_kind": "model-backed",
+      "provenance": {
+        "kind": "consented-local",
+        "reference": "REPLACE_WITH_CONSENT_RECORD_ID",
+        "contains_private_pixels": false
+      },
+      "source": {
+        "clip_sha256": "01f867c41ad43a5ef12f4a1d54ed79cfc001ce376fa8a10437f9b4eab3a9c775",
+        "frame_sha256": [
+          "09e53cac5acb9c492170905431a6f4ca0a08fbbf29c58abb5ed766283bbf6f70",
+          "c4439aa2a5f2d94a47ade6d3f89a30ff87238d32b58d1e357292b0441401eda5",
+          "6d95fc193f5936a8ed8e9c5b7444115cf858d5ebf49140fbe604de72d77e1ad4"
+        ],
+        "pixel_contract": "canonical-pre-resize-rgb8"
+      },
+      "hardware": {
+        "id": "host_linux",
+        "label": "REPLACE_WITH_CONTENT_FREE_HARDWARE_LABEL",
+        "platform": "linux-x86_64",
+        "identity_sha256": "34e26979fdda93f12a99a2822de46aee99063efb5d1d73d1439d92deb538a431",
+        "identity_source": "qualification-hardware-inventory-v1",
+        "inventory": {
+          "cpu_model": "REPLACE_CPU_MODEL",
+          "accelerators": [
+            "REPLACE_CUDA_ACCELERATOR"
+          ],
+          "memory_bytes": 17179869184,
+          "os_name": "Linux",
+          "os_version": "REPLACE_OS_VERSION",
+          "architecture": "x86_64"
+        }
+      },
+      "model": {
+        "id": "rvm_mobilenetv3_fp32.onnx",
+        "sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+        "bytes": 14975696,
+        "license": "GPL-3.0",
+        "license_reviewed": true,
+        "packaging_supported": true,
+        "download_integrity": true,
+        "startup_succeeded": true
+      },
+      "provider": {
+        "requested": "cpu",
+        "execution_proven": true,
+        "runtime": {
+          "onnxruntime_version": "REPLACE_ORT_VERSION",
+          "execution_provider": "CPUExecutionProvider",
+          "provider_runtime_version": "REPLACE_CPU_RUNTIME_VERSION",
+          "driver_version": "not-applicable"
+        }
+      },
+      "resource_evidence": {
+        "sample_alignment": "one-per-unique-frame",
+        "rss_source": "process-api",
+        "rss_semantics": "process-current-resident-bytes",
+        "sampling_point": "post-sink-submit",
+        "vram_applicable": false,
+        "vram_source": "not-applicable",
+        "vram_semantics": "not-applicable"
+      },
+      "recurrence": {
+        "input_selection": "native-all",
+        "model_invocation_count": 3,
+        "fresh_temporal_state": true,
+        "output_projection_used": false
+      },
+      "warmup_frame_count": 30,
+      "startup_ms": [
+        125.0
+      ],
+      "memory_bytes": [
+        100000000,
+        100100000,
+        100200000
+      ],
+      "vram_bytes": null,
+      "service": {
+        "new_frame_service_ms": [
+          10.0,
+          9.0,
+          8.0
+        ],
+        "queue_age_ms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "duration_s": 0.066666667,
+        "capture_fps": 30.0,
+        "unique_composite_fps": 30.0,
+        "output_fps": 30.0,
+        "output_repeat_count": 0,
+        "output_timeline_complete": true,
+        "boundary": "unique-dequeue-through-sink-submit-excluding-deliberate-pacing",
+        "bundle_frame_total_alignment": "exact-non-pacing-sink"
+      }
+    },
+    "run_cuda_native_raw": {
+      "schema": "custback.rvm-qualification-run",
+      "version": 1,
+      "bundle_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "evidence_kind": "model-backed",
+      "provenance": {
+        "kind": "consented-local",
+        "reference": "REPLACE_WITH_CONSENT_RECORD_ID",
+        "contains_private_pixels": false
+      },
+      "source": {
+        "clip_sha256": "01f867c41ad43a5ef12f4a1d54ed79cfc001ce376fa8a10437f9b4eab3a9c775",
+        "frame_sha256": [
+          "09e53cac5acb9c492170905431a6f4ca0a08fbbf29c58abb5ed766283bbf6f70",
+          "c4439aa2a5f2d94a47ade6d3f89a30ff87238d32b58d1e357292b0441401eda5",
+          "6d95fc193f5936a8ed8e9c5b7444115cf858d5ebf49140fbe604de72d77e1ad4"
+        ],
+        "pixel_contract": "canonical-pre-resize-rgb8"
+      },
+      "hardware": {
+        "id": "host_linux",
+        "label": "REPLACE_WITH_CONTENT_FREE_HARDWARE_LABEL",
+        "platform": "linux-x86_64",
+        "identity_sha256": "34e26979fdda93f12a99a2822de46aee99063efb5d1d73d1439d92deb538a431",
+        "identity_source": "qualification-hardware-inventory-v1",
+        "inventory": {
+          "cpu_model": "REPLACE_CPU_MODEL",
+          "accelerators": [
+            "REPLACE_CUDA_ACCELERATOR"
+          ],
+          "memory_bytes": 17179869184,
+          "os_name": "Linux",
+          "os_version": "REPLACE_OS_VERSION",
+          "architecture": "x86_64"
+        }
+      },
+      "model": {
+        "id": "rvm_mobilenetv3_fp32.onnx",
+        "sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+        "bytes": 14975696,
+        "license": "GPL-3.0",
+        "license_reviewed": true,
+        "packaging_supported": true,
+        "download_integrity": true,
+        "startup_succeeded": true
+      },
+      "provider": {
+        "requested": "cuda",
+        "execution_proven": true,
+        "runtime": {
+          "onnxruntime_version": "REPLACE_ORT_VERSION",
+          "execution_provider": "CUDAExecutionProvider",
+          "provider_runtime_version": "REPLACE_CUDA_RUNTIME_VERSION",
+          "driver_version": "REPLACE_CUDA_DRIVER_VERSION"
+        }
+      },
+      "resource_evidence": {
+        "sample_alignment": "one-per-unique-frame",
+        "rss_source": "process-api",
+        "rss_semantics": "process-current-resident-bytes",
+        "sampling_point": "post-sink-submit",
+        "vram_applicable": true,
+        "vram_source": "provider-api",
+        "vram_semantics": "process-current-allocated-bytes"
+      },
+      "recurrence": {
+        "input_selection": "native-all",
+        "model_invocation_count": 3,
+        "fresh_temporal_state": true,
+        "output_projection_used": false
+      },
+      "warmup_frame_count": 30,
+      "startup_ms": [
+        85.0
+      ],
+      "memory_bytes": [
+        110000000,
+        110100000,
+        110200000
+      ],
+      "vram_bytes": [
+        240000000,
+        240100000,
+        240200000
+      ],
+      "service": {
+        "new_frame_service_ms": [
+          6.0,
+          5.0,
+          5.0
+        ],
+        "queue_age_ms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "duration_s": 0.066666667,
+        "capture_fps": 30.0,
+        "unique_composite_fps": 30.0,
+        "output_fps": 30.0,
+        "output_repeat_count": 0,
+        "output_timeline_complete": true,
+        "boundary": "unique-dequeue-through-sink-submit-excluding-deliberate-pacing",
+        "bundle_frame_total_alignment": "exact-non-pacing-sink"
+      }
+    }
+  },
+  "local_review": {
+    "artifacts": {
+      "screening_report_sha256": "",
+      "qualification_plan_sha256": "",
+      "qualification_evidence_sha256": "",
+      "model_artifact_sha256": []
+    },
+    "coverage": {
+      "hardware_ids": [],
+      "providers": [],
+      "canvas_ids": [],
+      "candidate_ids": [],
+      "native_30_and_decimated_15_complete": false,
+      "raw_and_qualified_compositor_complete": false
+    },
+    "decisions": {
+      "candidate_status": {},
+      "recommended_profiles": {},
+      "production_profile_selected": false,
+      "global_default_changed": false,
+      "high_detail_global_default": false
+    },
+    "review": {
+      "reviewer": "",
+      "reviewed_at": "",
+      "status": "not-reviewed",
+      "notes": ""
+    }
+  }
+}

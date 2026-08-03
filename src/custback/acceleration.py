@@ -358,7 +358,7 @@ class ProofResult:
 
 def prove_rvm_provider(
     ort: Any,
-    model_path: str,
+    model_path: str | bytes,
     candidate: ProviderCandidate,
     *,
     height: int = 64,
@@ -388,7 +388,7 @@ def prove_rvm_provider(
         # guard against a registered CUDA/DirectML provider that executes no RVM
         # nodes.
         session = ort.InferenceSession(
-            str(model_path),
+            model_path,
             sess_options=options,
             providers=[candidate.as_ort_arg(), CPU_PROVIDER],
         )

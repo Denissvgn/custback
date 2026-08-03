@@ -66,9 +66,23 @@ either an absolute value or a baseline multiplier.
 | RVM foreground | RGB error | Mean absolute clean-foreground versus annotated foreground RGB error where ground-truth alpha is between `0.05` and `0.95`, normalized by 255. Null when either track is absent. |
 | Motion | trail area | Pixels belonging to the previous ground-truth contour but not the current contour that remain `alpha >= 0.5`, divided by current ground-truth foreground area. Consecutive intervals above `1%` form the dominance-run metric. |
 | Edge color | RGB variation | Mean normalized RGB change from registered previous final composite where current alpha is uncertain and differs from registered alpha by no more than `0.01`. |
+| Light-wrap attribution | `light_wrap_attributable_rgb_variation` | Mean temporal RGB change of the paired base-compositor contribution `W[t] = (C_wrap_on[t] - C_wrap_off[t]) / 255` in the held-alpha soft-edge band. Each same-frame pair differs only in light-wrap strength; configured stabilization is identical and the preceding contribution is registered by the annotation transform. |
 | Ground truth | SAD/MAE/MSE/gradient | Sum/mean absolute alpha error, mean squared alpha error, and mean magnitude of the Sobel-gradient error. |
-| Performance | timing p50/p95 | Every recorded segmentation, refinement, background, compositor, compositor-substage, send, and full-frame timing is summarized independently. |
-| Resources | allocation/memory | Instrumented `allocation_bytes` and `memory_bytes` samples are summarized when present. Null with `available=false` is mandatory when the recorder did not carry samples. Diagnostic artifact volume and evaluator loaded-array bytes are separate, always-available measurements and are not mislabeled as runtime allocation. |
+| Performance | timing p50/p95 | Every recorded segmentation, RVM preprocessing/session/postprocessing, refinement, background, compositor, compositor-substage, send, and full-frame timing is summarized independently. `frame_total_ms` ends after sink submission; the narrower compatibility `frame_processing_ms` remains separate. |
+| Resources | allocation/memory | Instrumented `allocation_bytes`, `memory_bytes`, process `rss_bytes`, and accelerator `vram_bytes` samples are summarized independently when present. Null with `available=false` is mandatory when the recorder did not carry a sample. Diagnostic artifact volume and evaluator loaded-array bytes are separate, always-available measurements and are not mislabeled as runtime allocation. |
+
+The paired light-wrap metric isolates temporal movement introduced by wrap
+from legitimate moving-backdrop color visible through fractional alpha. It is
+computed from per-frame base composites, not by subtracting two aggregate
+`edge_band_rgb_variation` values or using a post-base output. Wrap-on and
+wrap-off rows must have identical source/backdrop artifacts and timestamps,
+raw/refined alpha digests, configured stabilization, model-foreground
+selection, blend space, and color transform. The metric is null—and a
+light-wrap qualification decision fails closed—when a required pair or
+identity proof is absent or any required segment has no held-alpha interval.
+It supplements rather than replaces final edge variation, static-appearance
+comparison, scene-cut smear, and alpha invariance checks. See the
+[dynamic light-wrap qualification contract](matte-light-wrap.md).
 
 Per-frame metrics retain sequence, segment, registration method/matrix, and
 capture timestamp. Aggregate summaries include count, mean, p05, p50, p95,
@@ -104,6 +118,9 @@ The acceptance tests prove that frozen alpha fails motion lag despite zero
 uncompensated flicker, two-pixel jitter fails the stationary contour gate,
 dynamic backdrop changes the edge-color family while alpha metrics remain
 zero, and stable under-opacity fails the core gate while passing jitter gates.
+Generated paired wrap controls can validate
+`light_wrap_attributable_rgb_variation` arithmetic and fail-closed coverage,
+but they cannot ratify a production light-wrap policy or default.
 
 Reproduce:
 

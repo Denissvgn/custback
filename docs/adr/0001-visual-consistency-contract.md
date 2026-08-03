@@ -473,6 +473,17 @@ swaps config and temporal state at one frame boundary.
 
 The implementation makes this ownership explicit:
 
+- `_Resources` owns one segmenter/refiner pair together with its exact
+  segmentation/acceleration policy and generation;
+- a segmentation-policy `_Activation` owns a fresh pair, trials it against a
+  detached copy of the boundary capture, then resets the pair before commit;
+- trial masks and recurrence are never promoted. Commit installs only the
+  scrubbed pair and requests a configuration reset, after which the normal
+  frame lane processes that exact capture identity as the first authoritative
+  input. In passthrough/remote mode the installed pair remains clean with the
+  reset pending until matte processing next runs;
+- background-presentation-only changes retain the live pair, ownership object,
+  generation, and temporal history;
 - `_Resources` owns one harmonizer and one reset token;
 - `_Activation` constructs a fresh harmonizer whenever the correction policy,
   blend space, backdrop visual identity/geometry, camera/canvas geometry, or

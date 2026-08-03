@@ -68,9 +68,62 @@ timestamp, timestamp source, capture and geometry generations, configured and
 effective segmentation/compositor controls, effective color transform,
 backdrop frame identity/timestamp where available, and stage timings. Current
 camera capture can provide capture-completion time; injected/test sources that
-do not provide it are honestly labeled `unique-frame-dequeue`. A later typed
-segmenter timing contract may consume these timestamps directly; version 1
-replay already preserves them and can pace from their deltas.
+do not provide it are honestly labeled `unique-frame-dequeue`. MediaPipe frames
+may also contain strict, content-free `segmentation_diagnostics`: input/model/
+returned mask dimensions, resize method, effective timestamp delta, and
+same-millisecond quantization adjustment. The segmenter-local epoch and
+absolute effective model timestamp are deliberately omitted. Existing
+version-1 bundles without this optional object remain valid.
+
+Successful RVM frames additionally carry path-free
+`effective_controls.rvm_telemetry`: input/output shapes; configured
+auto-versus-explicit detail; the resolved ratio; separate preprocessing,
+ONNX-session, and output-validation timings; model identity, SHA-256, and byte
+count; and the provider/fallback snapshot associated with that result. The
+same stage costs are copied to `timings_ms` as `rvm_preprocess_ms`,
+`rvm_session_run_ms`, and `rvm_postprocess_ms` so they can be aggregated
+without interpreting controls. Frame-derived values remain null until an RVM
+result is fully validated, and a reset clears them. Non-RVM frames record the
+telemetry object as not applicable.
+
+Full recordings also store the typed backend-policy snapshot beneath
+`effective_controls.matte_policy`. It keeps the actual selected/effective
+backend kinds and, for each matte control, its configured value, effective
+value, `effective`/`bypassed`/`inapplicable` state, and content-free reason.
+The separate `configured_controls` object remains the persisted-intent
+authority. Older version-1 bundles without the additive snapshot remain valid;
+frozen replay never invents a policy snapshot that was not recorded. See
+[the backend-policy contract](matte-backend-policies.md).
+
+Spatial-refinement controls include the configured
+`spatial_edge_refinement` policy and, where refinement is effective, its
+resolved canonical-canvas radius. Schema-version-1 bundles recorded before
+that nested control existed resolve to `legacy_watershed`, preserving model
+rerun behavior. `stable_guided` remains an explicit qualification candidate;
+recording it does not make it a production preset. The policy/radius/timing
+scalars are safe manifest metadata, but denoised guides, covariance maps, and
+intermediate candidate alpha are not added as ordinary diagnostic tracks. See
+[the spatial-refinement contract](matte-spatial-refinement.md).
+
+Eligible dynamic-backdrop frames may also carry the additive
+`effective_controls.light_wrap_stabilization` snapshot: configured/effective
+mode, time constant, state generation, update/repeat/reset/scene-cut counts,
+last reset reason and elapsed `dt`, and retained-byte count. Video
+`backdrop_identity` includes the path-free presentation timeline,
+discontinuity revision, and visual generation needed to distinguish reuse,
+seek/loop, and provider replacement; camera identity uses its frame generation
+and capture-completion monotonic time. Older version-1 bundles without these
+optional fields remain valid, but they cannot exercise a stateful frozen
+light-wrap candidate without the generation proof. Intermediate filtered wrap
+rasters are not a normal artifact track; the exact backdrop and composites
+already make the opt-in bundle identifiable. See the
+[dynamic light-wrap contract](matte-light-wrap.md).
+
+When available, `resource_samples.rss_bytes` records process resident memory
+after the complete frame has passed sink submission. An optional
+`vram_bytes` sample uses the same additive version-1 extension. Missing
+resource instrumentation is preserved as unavailable by the evaluator; it is
+never converted to zero.
 
 ## Offline replay
 
@@ -104,6 +157,25 @@ and timestamp metadata and reports byte equality plus maximum per-channel
 difference against each recorded final composite. An unchanged frozen run also
 records `baseline_reproduction_passed` against the tolerance below before any
 attribution variant is considered.
+
+MATTE-2.4 qualification uses the recorded backdrop presentation timeline and
+discontinuity identity as algorithm inputs. `--realtime` may pace replay for
+observation, but wall-clock scheduling must not alter pixels or temporal state.
+The `--light-wrap 0` variant is the same-frame control for a recorded wrap-on
+composite; paired reports must prove that source/backdrop artifacts,
+timestamps, alpha digests, model-foreground selection, blend space, and color
+transform are otherwise identical.
+
+Model-rerun mode reconstructs the recorded spatial policy before intentional
+`mask_shift`, configured blur, and any optional motion-aware temporal
+stabilization. Frozen mode instead consumes the recorded post-refiner alpha;
+use the owner-only ablation workflow to compare legacy and stable-guided
+postprocess candidates over fixed raw alpha/source timestamps.
+
+When segmentation diagnostics are available, replay records the original
+snapshot and, for model-rerun mode, the freshly observed snapshot separately so
+timestamp and resampling behavior can be compared without exposing an absolute
+model clock.
 
 With color correction off, unchanged frozen replay is expected to be byte
 exact. When a recorded correction path used shared predecoded intermediates,

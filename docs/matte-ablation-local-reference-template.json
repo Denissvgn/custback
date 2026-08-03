@@ -28,6 +28,13 @@
   },
   "decisions": {
     "mediapipe_watershed": "not-decided",
+    "spatial_edge_refinement_mediapipe": "not-decided",
+    "dynamic_light_wrap": {
+      "status": "not-decided",
+      "paired_rows": [],
+      "computed_pair_count": 0,
+      "production_default_selected": false
+    },
     "alpha_motion_vs_edge_color_motion": {},
     "matte_2_5_rvm_candidates": [],
     "matte_3_4_cost_candidates": [],

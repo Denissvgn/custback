@@ -967,13 +967,18 @@ class TestBackdrops:
         bd = VideoBackdrop(str(path), clock=lambda: now[0])
         try:
             first = bd.frame(64, 48).copy()
+            first_timing = bd.temporal_frame_timing()
             assert np.array_equal(bd.frame(64, 48), first)  # same instant: hold
+            assert bd.temporal_frame_timing() == first_timing
             now[0] = 0.5
             second = bd.frame(64, 48).copy()
+            second_timing = bd.temporal_frame_timing()
             now[0] = 1.0
             third = bd.frame(64, 48).copy()
+            third_timing = bd.temporal_frame_timing()
             now[0] = 1.5
             looped = bd.frame(64, 48).copy()
+            looped_timing = bd.temporal_frame_timing()
             stats = bd.stats_dict()
         finally:
             bd.close()
@@ -983,6 +988,25 @@ class TestBackdrops:
         assert stats["background_video_frames_displayed"] == 4
         assert stats["background_video_frames_reused"] == 1
         assert stats["background_video_frames_skipped"] == 0
+        assert first_timing is not None
+        assert second_timing is not None
+        assert third_timing is not None
+        assert looped_timing is not None
+        assert [
+            first_timing.frame_id,
+            second_timing.frame_id,
+            third_timing.frame_id,
+            looped_timing.frame_id,
+        ] == [0, 1, 2, 3]
+        assert (
+            first_timing.timestamp_ns
+            < second_timing.timestamp_ns
+            < third_timing.timestamp_ns
+            < looped_timing.timestamp_ns
+        )
+        assert looped_timing.discontinuity_revision > (
+            third_timing.discontinuity_revision
+        )
 
     def test_video_backdrop_stats_can_reset_after_unsent_activation_trial(
         self, monkeypatch
@@ -1137,6 +1161,7 @@ class TestBackdrops:
             assert int(backdrop.frame(6, 4).mean()) == 0
             now[0] = 0.5
             assert int(backdrop.frame(6, 4).mean()) == 5
+            before_seek = backdrop.temporal_frame_timing()
             # Orientation-control probing is construction-only; playback still
             # needs no seek for this five-frame stale interval.
             assert not [
@@ -1147,14 +1172,52 @@ class TestBackdrops:
             assert capture.grab_calls == 4  # decode only the final skipped image
             now[0] = 1.5
             assert int(backdrop.frame(6, 4).mean()) == 15
+            after_seek = backdrop.temporal_frame_timing()
             assert (cv2.CAP_PROP_POS_FRAMES, 15) in capture.set_calls
             stats = backdrop.stats_dict()
             assert stats["background_video_frames_displayed"] == 3
             assert stats["background_video_frames_skipped"] == 13
             assert stats["background_video_seek_count"] == 1
             assert stats["background_video_skip_ratio"] == pytest.approx(13 / 16)
+            assert before_seek is not None and after_seek is not None
+            assert after_seek.timestamp_ns > before_seek.timestamp_ns
+            assert (
+                after_seek.discontinuity_revision > before_seek.discontinuity_revision
+            )
+            revision = after_seek.discontinuity_revision
+            backdrop.reset_stats()
+            timing_after_reset = backdrop.temporal_frame_timing()
+            assert timing_after_reset is not None
+            assert timing_after_reset.discontinuity_revision == revision
         finally:
             backdrop.close()
+
+    def test_video_skip_crossing_loop_resets_even_when_target_is_not_frame_zero(
+        self,
+        monkeypatch,
+    ):
+        pytest.importorskip("cv2")
+        capture = FakeVideoCapture(range(5), fps=10.0)
+        monkeypatch.setattr(
+            backgrounds_mod.cv2,
+            "VideoCapture",
+            lambda _path: capture,
+        )
+        now = [0.0]
+        backdrop = VideoBackdrop("skipped-loop.avi", clock=lambda: now[0])
+        try:
+            assert int(backdrop.frame(6, 4).mean()) == 0
+            before = backdrop.temporal_frame_timing()
+            now[0] = 0.6
+            assert int(backdrop.frame(6, 4).mean()) == 1
+            after = backdrop.temporal_frame_timing()
+        finally:
+            backdrop.close()
+
+        assert before is not None
+        assert after is not None
+        assert after.frame_id == 6
+        assert after.discontinuity_revision > before.discontinuity_revision
 
     def test_video_backdrop_uses_timestamp_seek_and_keeps_loop_phase(self, monkeypatch):
         cv2 = pytest.importorskip("cv2")

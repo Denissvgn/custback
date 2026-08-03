@@ -13,6 +13,7 @@ import pytest
 
 import custback.capture as capture_mod
 from custback.capture import (
+    CapturedFrame,
     CaptureError,
     CaptureModeError,
     OpenCVCapture,
@@ -155,9 +156,9 @@ class _FakeCV2:
 def _wait_for_frame(
     capture: OpenCVCapture,
     *,
-    predicate: Callable[[np.ndarray], bool] | None = None,
+    predicate: Callable[[CapturedFrame], bool] | None = None,
     timeout: float = 1.0,
-) -> np.ndarray:
+) -> CapturedFrame:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         frame = capture.read()
@@ -221,9 +222,9 @@ def test_acquisition_stays_640x480_while_cover_normalizes_circle_to_1280x720(
 
         frame = _wait_for_frame(capture)
 
-        assert frame.shape == (720, 1280, 3)
-        assert frame.dtype == np.uint8
-        assert frame.flags.c_contiguous
+        assert frame.pixels.shape == (720, 1280, 3)
+        assert frame.pixels.dtype == np.uint8
+        assert frame.pixels.flags.c_contiguous
         requested = {prop: value for prop, value in cap.set_calls}
         assert requested[_FakeCV2.CAP_PROP_FRAME_WIDTH] == 640.0
         assert requested[_FakeCV2.CAP_PROP_FRAME_HEIGHT] == 480.0
@@ -236,7 +237,7 @@ def test_acquisition_stays_640x480_while_cover_normalizes_circle_to_1280x720(
             840,
         )
 
-        foreground_y, foreground_x = np.where(frame[:, :, 0] >= 128)
+        foreground_y, foreground_x = np.where(frame.pixels[:, :, 0] >= 128)
         circle_width = int(foreground_x.max() - foreground_x.min() + 1)
         circle_height = int(foreground_y.max() - foreground_y.min() + 1)
         assert abs(circle_width - circle_height) <= 1
@@ -268,7 +269,12 @@ def test_health_separates_property_delivered_oriented_and_normalized_dimensions(
         frame = _wait_for_frame(capture)
         health = capture.health_snapshot()
 
-        assert frame.shape == (20, 40, 3)
+        assert frame.pixels.shape == (20, 40, 3)
+        assert frame.sequence == health.sequence == 1
+        assert frame.captured_at_ns == health.captured_monotonic_ns
+        assert frame.generation == health.generation == 1
+        assert frame.geometry_generation == health.geometry_generation == 1
+        assert frame.content_rect == health.content_rect == (7, 0, 33, 20)
         assert (health.width, health.height) == (64, 48)
         assert (health.delivered_width, health.delivered_height) == (32, 24)
         assert (health.oriented_width, health.oriented_height) == (32, 24)
@@ -385,9 +391,16 @@ def test_dynamic_delivered_size_warn_replans_and_keeps_canonical_slot(
         second = _wait_for_frame(capture)
         health = capture.health_snapshot()
 
-        assert first.shape == second.shape == (30, 40, 3)
-        assert int(first[0, 0, 0]) == 11
-        assert int(second[0, 0, 0]) == 99
+        assert first.pixels.shape == second.pixels.shape == (30, 40, 3)
+        assert int(first.pixels[0, 0, 0]) == 11
+        assert int(second.pixels[0, 0, 0]) == 99
+        assert (first.sequence, second.sequence) == (1, 2)
+        assert first.captured_at_ns <= second.captured_at_ns
+        assert first.generation == second.generation == 1
+        assert (first.geometry_generation, second.geometry_generation) == (1, 2)
+        assert first.content_rect == second.content_rect == (0, 0, 40, 30)
+        assert second.geometry_generation == health.geometry_generation
+        assert second.content_rect == health.content_rect
         assert (health.delivered_width, health.delivered_height) == (16, 32)
         assert (health.oriented_width, health.oriented_height) == (16, 32)
         assert (health.normalized_width, health.normalized_height) == (40, 30)
@@ -419,7 +432,7 @@ def test_legacy_stretch_aspect_upgrade_note_is_emitted_once_per_capture(
         cap.push(np.full((32, 16, 3), 99, dtype=np.uint8))
         _wait_for_frame(
             capture,
-            predicate=lambda frame: int(frame[0, 0, 0]) == 99,
+            predicate=lambda frame: int(frame.pixels[0, 0, 0]) == 99,
         )
 
         note = "visual-policy upgrade note"
@@ -474,7 +487,7 @@ def test_dynamic_delivered_size_is_fatal_in_error_mode(
     )
     try:
         cap.push(np.full((24, 32, 3), 11, dtype=np.uint8))
-        assert _wait_for_frame(capture).shape == (30, 40, 3)
+        assert _wait_for_frame(capture).pixels.shape == (30, 40, 3)
         cap.push(np.full((32, 16, 3), 99, dtype=np.uint8))
 
         error = _wait_for_error(capture, CaptureModeError)
@@ -510,7 +523,7 @@ def test_reconnect_replans_from_the_new_generation_delivered_size(
     try:
         first = _wait_for_frame(
             capture,
-            predicate=lambda frame: int(frame[0, 0, 0]) == 11,
+            predicate=lambda frame: int(frame.pixels[0, 0, 0]) == 11,
         )
         first_health = capture.health_snapshot()
         capture._stall_after_s = 0.03
@@ -519,12 +532,19 @@ def test_reconnect_replans_from_the_new_generation_delivered_size(
 
         second = _wait_for_frame(
             capture,
-            predicate=lambda frame: int(frame[0, 0, 0]) == 99,
+            predicate=lambda frame: int(frame.pixels[0, 0, 0]) == 99,
             timeout=0.8,
         )
         health = capture.health_snapshot()
 
-        assert first.shape == second.shape == (30, 40, 3)
+        assert first.pixels.shape == second.pixels.shape == (30, 40, 3)
+        assert first.sequence < second.sequence
+        assert first.captured_at_ns <= second.captured_at_ns
+        assert first.generation == 1
+        assert first.geometry_generation == 1
+        assert second.generation == 2
+        assert second.geometry_generation == 2
+        assert second.content_rect == health.content_rect
         assert first_health.generation == 1
         assert first_health.geometry_generation == 1
         assert health.generation == 2
@@ -564,7 +584,7 @@ def test_reconnect_identity_is_promoted_only_with_its_frame(
     try:
         _wait_for_frame(
             capture,
-            predicate=lambda frame: int(frame[0, 0, 0]) == 11,
+            predicate=lambda frame: int(frame.pixels[0, 0, 0]) == 11,
         )
         first_health = capture.health_snapshot()
         capture._stall_after_s = 0.03
@@ -595,8 +615,13 @@ def test_reconnect_identity_is_promoted_only_with_its_frame(
         assert before_promotion.geometry_transitions == 1
 
         promoted = capture.read()
-        assert promoted is not None and int(promoted[0, 0, 0]) == 99
+        assert promoted is not None and int(promoted.pixels[0, 0, 0]) == 99
         after_promotion = capture.health_snapshot()
+        assert promoted.sequence == after_promotion.sequence
+        assert promoted.captured_at_ns == after_promotion.captured_monotonic_ns
+        assert promoted.generation == after_promotion.generation == 2
+        assert promoted.geometry_generation == after_promotion.geometry_generation == 2
+        assert promoted.content_rect == after_promotion.content_rect
         assert after_promotion.generation == 2
         assert after_promotion.camera_controls.generation == 2
         assert (
@@ -633,7 +658,7 @@ def test_rotation_then_viewer_horizontal_mirror_occurs_before_slot_publish(
         frame = _wait_for_frame(capture)
         expected = np.ascontiguousarray(np.rot90(raw, -1)[:, ::-1])
 
-        np.testing.assert_array_equal(frame, expected)
+        np.testing.assert_array_equal(frame.pixels, expected)
         health = capture.health_snapshot()
         assert (health.delivered_width, health.delivered_height) == (16, 32)
         assert (health.oriented_width, health.oriented_height) == (32, 16)
@@ -700,9 +725,9 @@ def test_each_delivered_frame_is_transformed_exactly_once_before_the_slot(
     )
     try:
         cap.push(np.full((24, 32, 3), 1, dtype=np.uint8))
-        assert int(_wait_for_frame(capture)[0, 0, 0]) == 1
+        assert int(_wait_for_frame(capture).pixels[0, 0, 0]) == 1
         cap.push(np.full((24, 32, 3), 2, dtype=np.uint8))
-        assert int(_wait_for_frame(capture)[0, 0, 0]) == 2
+        assert int(_wait_for_frame(capture).pixels[0, 0, 0]) == 2
 
         assert calls == [(32, 24), (32, 24)]
         assert capture.health_snapshot().frames_read == 2
@@ -713,7 +738,10 @@ def test_each_delivered_frame_is_transformed_exactly_once_before_the_slot(
 def test_synthetic_capture_uses_the_same_rotation_mirror_and_canvas_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixed_time = SimpleNamespace(monotonic=lambda: 100.0)
+    fixed_time = SimpleNamespace(
+        monotonic=lambda: 100.0,
+        monotonic_ns=lambda: 100_000_000_000,
+    )
     monkeypatch.setattr(capture_mod, "time", fixed_time)
     real_apply = capture_mod.apply_transform
     calls = 0
@@ -748,7 +776,12 @@ def test_synthetic_capture_uses_the_same_rotation_mirror_and_canvas_path(
         frame = capture.read()
 
         assert frame is not None
-        np.testing.assert_array_equal(frame, expected)
+        np.testing.assert_array_equal(frame.pixels, expected)
+        assert frame.sequence == 1
+        assert frame.captured_at_ns == 100_000_000_000
+        assert frame.generation == 1
+        assert frame.geometry_generation == 1
+        assert frame.content_rect == (0, 0, 32, 16)
         assert calls == 1
         health = capture.health_snapshot()
         assert (health.width, health.height) == (16, 32)

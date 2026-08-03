@@ -208,9 +208,17 @@ raw/mask/backdrop/composite bundle; `--matte-diagnostics-mode composite-only`
 records downstream output without claiming matte authority. Replay and
 single-variant compositor attribution run offline with `custback matte-replay`;
 the four-boundary RVM diagnosis is `custback matte-diagnose`, and bounded
-same-source screening is `custback matte-ablate`. See
+same-source screening is `custback matte-ablate`. Cross-device RVM
+alpha/detail/performance qualification is the separate, fail-closed
+`custback matte-rvm-qualify` workflow; it does not create a runtime preset or
+change the automatic default. See
 [docs/matte-replay-bundle.md](docs/matte-replay-bundle.md) for the privacy,
-format, and command contract.
+format, and command contract, and
+[docs/matte-rvm-profiles.md](docs/matte-rvm-profiles.md) for the formal
+qualification matrix.
+For reversible, backend-aware troubleshooting while qualification is pending,
+use the
+[immediate matte operator guide](docs/matte-operator-mitigations.md).
 
 ## Rendering quality & GPU acceleration
 
@@ -225,21 +233,47 @@ listed below; do not assume every available quality policy is enabled:
   fallback. Built-in models live in `~/.cache/custback/models`; their pinned
   size and SHA-256 are verified on every use, and downloads are locked,
   bounded, and published atomically.
-* **Edge-aware refinement** (`segmentation.edge_refine`) — bounded marker
-  watershed may move the contour only inside an eight-pixel uncertainty band,
-  so it follows nearby hair and shoulder edges without disturbing the mask
-  elsewhere. RVM mattes skip this binary-mask operation.
+* **Edge-aware refinement** (`segmentation.edge_refine` and
+  `segmentation.spatial_edge_refinement`) — schema 1 retains the historical
+  bounded marker watershed. An opt-in `stable_guided` candidate uses a
+  resolution-scaled, contrast/confidence-gated guided-alpha path that preserves
+  soft values and falls back to the exact current matte when support is weak
+  or ambiguous. It is available for private replay qualification, not selected
+  as a production preset; see
+  [the spatial design and evidence boundary](docs/matte-spatial-refinement.md).
+  RVM mattes skip both generic spatial policies.
 * **Halo control** (`segmentation.mask_shift`) — grow/shrink the mask by N
   pixels; `-1`/`-2` removes leftover background fringes.
-* **Adaptive temporal smoothing** (`segmentation.temporal_smoothing`) —
-  static regions are damped against flicker while moving edges track
-  immediately (no ghost trails).
+* **Compatibility temporal smoothing** (`segmentation.temporal_smoothing`) —
+  the historical frame-count EMA remains unchanged for existing
+  configurations. It is locally change-gated, but it has no source-motion
+  correspondence and is not claimed to eliminate every trail.
+* **Motion-aware boundary stabilization**
+  (`segmentation.boundary_stabilization`) — an experimental, default-off
+  policy registers prior alpha with a bounded low-resolution source guide,
+  applies real capture `dt`, and blends only a confidence-approved contour
+  band. It is available for replay qualification, not selected as a production
+  preset; see [the design and evidence boundary](docs/matte-boundary-stabilization.md).
 * **Light wrap** (`compositing.light_wrap`) — backdrop light bleeds subtly
-  into the person's edge band, the classic compositing trick that makes the
-  subject sit *in* the scene rather than on top of it.
+  into the person's edge band. The optional
+  `compositing.light_wrap_stabilization` policy bounds changes from video or
+  camera backdrops using actual backdrop time; it is experimental and
+  default-off, while the historical stateless pixels remain the compatibility
+  path. See the
+  [light-wrap design and evidence boundary](docs/matte-light-wrap.md).
 * **Color-spill removal** (`compositing.use_model_foreground`, rvm only) —
   edge pixels contaminated by your real room's colors are replaced with the
   model's clean-foreground prediction.
+* **Backend-specific controls** — `segmentation.threshold` affects only the
+  heuristic backend, where its compatibility score cutoff is
+  `threshold × 0.8`. RVM preserves native soft alpha without threshold or
+  opaque-core calibration; it neutralizes generic blur, legacy/guided spatial
+  refinement, and the legacy temporal EMA while retaining `mask_shift`. An
+  explicitly selected motion-aware policy remains separate and active.
+  Controls are resolved as effective, bypassed, or inapplicable for the actual
+  selected backend. `GET /config` reports configured intent, while existing
+  `GET /status` fields report effective compatibility values; see the
+  [backend-policy contract](docs/matte-backend-policies.md).
 * **Person-free blur** — in blur mode the person is excluded from the
   background blur (normalized masked convolution), so they leave no smeared
   ghost around their own silhouette. The blur also runs at reduced
@@ -356,7 +390,7 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /status` | run ID; input/output FPS; capture/drop/repeat/skip counters; stage timings; active and fallback backends |
+| `GET /status` | run ID; input/output FPS; capture/drop/repeat/skip counters; stage timings; active backend/device and effective matte controls |
 | `GET /config` / `PATCH /config` | read / partially update config live |
 | `POST /background/image` | upload static backdrop and switch to it |
 | `POST /background/video` | upload live (video) backdrop and switch to it |
@@ -387,8 +421,9 @@ auth_header | curl --config - -X POST http://127.0.0.1:8710/background/video \
      -F file=@beach_loop.mp4
 ```
 
-`GET /config` always describes effective behavior and carries
-`X-Config-Version`. PATCHes are serialized and transactional. Background,
+`GET /config` describes configured intent and carries `X-Config-Version`;
+`GET /status` reports active backend/device and backend-resolved matte controls.
+PATCHes are serialized and transactional. Background,
 segmentation, compositing, remote timeout, and remote fallback fields can
 activate live; camera, output, API bind/security, and upload-limit changes
 return `409 restart_required`. Avatar proxy URL, token file, CA bundle, and
@@ -638,9 +673,11 @@ This release intentionally breaks the old unauthenticated control plane:
 | Module | Responsibility |
 | --- | --- |
 | `capture.py` | camera sources (OpenCV, synthetic test pattern) |
-| `segmentation.py` | person mask: RVM matting (CUDA/CPU) / MediaPipe / heuristic fallback; bounded marker-watershed refinement + adaptive temporal smoothing |
+| `segmentation.py` | person mask: RVM matting (CUDA/CPU) / MediaPipe / heuristic fallback; spatial refinement and timeline-owned temporal processing |
+| `matte_policy.py` | typed configured-versus-effective backend policy and applicability resolver |
 | `backgrounds.py` | backdrop providers: image, video loop, approved local camera target, person-free blur, color |
 | `compositor.py` | alpha blending of person over backdrop; light wrap + color-spill removal |
+| `light_wrap.py` | generation-owned elapsed-time stabilization for dynamic-backdrop wrap samples |
 | `diagnostics.py` | secure rotating logs, run correlation, and safe config audit records |
 | `matte_diagnostics.py` | opt-in private bounded matte recorder and offline frozen/model replay |
 | `matte_quality.py` / `matte_attribution.py` / `matte_ablation.py` | digest-bound metrics, four-boundary RVM attribution, and bounded same-source screening |

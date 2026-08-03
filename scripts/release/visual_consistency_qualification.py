@@ -47,7 +47,7 @@ if TYPE_CHECKING or not _LIGHTWEIGHT_CLI:
     import custback.geometry as geometry_mod
     import custback.pipeline as pipeline_mod
     from custback.backgrounds import BackdropProvider, CameraBackdrop, VideoBackdrop
-    from custback.capture import CaptureHealth
+    from custback.capture import CapturedFrame, CaptureHealth
     from custback.color import (
         ColorEstimate,
         ColorHarmonizer,
@@ -77,7 +77,9 @@ else:
         pass
 
     BackdropProvider = CameraBackdrop = VideoBackdrop = _RuntimePlaceholder
-    CaptureHealth = ColorEstimate = ColorHarmonizer = _RuntimePlaceholder
+    CapturedFrame = CaptureHealth = ColorEstimate = ColorHarmonizer = (
+        _RuntimePlaceholder
+    )
     AppConfig = RuntimeConfig = FrameHub = Pipeline = NullOutput = _RuntimePlaceholder
     apply_color_transform = estimate_color_transform_linear = None
     linear_rgb_to_bgr_u8 = composite = composite_linear_predecoded = None
@@ -730,17 +732,31 @@ class _SequenceCapture:
         self.fps = fps
         self.frames_read = 0
 
-    def read(self) -> np.ndarray | None:
+    def read(self) -> CapturedFrame | None:
         value = self.frames.pop(0) if self.frames else None
         if value is None:
             return None
         self.frames_read += 1
-        return value.copy()
+        return CapturedFrame(
+            pixels=value.copy(),
+            sequence=self.frames_read,
+            captured_at_ns=self.frames_read * 1_000_000_000 // self.fps,
+            generation=0,
+            geometry_generation=0,
+            content_rect=(0, 0, self.width, self.height),
+        )
 
     def health_snapshot(self) -> CaptureHealth:
         return CaptureHealth(
+            sequence=self.frames_read,
+            captured_monotonic_ns=(
+                None
+                if self.frames_read == 0
+                else self.frames_read * 1_000_000_000 // self.fps
+            ),
             generation=0,
             geometry_generation=0,
+            content_rect=(0, 0, self.width, self.height),
             backend="qualification",
             width=self.width,
             height=self.height,

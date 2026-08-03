@@ -1,12 +1,19 @@
 include config/default.yaml
 include docs/matte-ablation.md
 include docs/matte-ablation-local-reference-template.json
+include docs/matte-boundary-stabilization.md
+include docs/matte-backend-policies.md
+include docs/matte-light-wrap.md
+include docs/matte-operator-mitigations.md
 include docs/matte-alpha-attribution.md
 include docs/matte-alpha-attribution-local-template.json
 include docs/matte-quality-baseline.md
 include docs/matte-quality-local-qualification-template.json
 include docs/matte-quality-metrics.md
 include docs/matte-replay-bundle.md
+include docs/matte-rvm-profiles.md
+include docs/matte-rvm-qualification-local-template.json
+include docs/matte-spatial-refinement.md
 include docs/visual-consistency-phase4-qualification-runbook.md
 include docs/visual-consistency-phase4-qualification-template.json
 include docs/visual-consistency-rollout.md
@@ -15,7 +22,14 @@ include scripts/release/visual-policy-rollout.json
 include scripts/release/visual_consistency_qualification.py
 include tests/matte_quality_evidence.py
 include tests/matte_ablation_evidence.py
+include tests/matte_rvm_qualification_evidence.py
+include tests/test_light_wrap.py
 include tests/test_matte_attribution.py
 include tests/test_matte_ablation.py
+include tests/test_matte_policy.py
+include tests/test_matte_rvm_qualification.py
+include tests/test_matte_operator_mitigations.py
+include tests/test_matte_stabilizer.py
+include tests/test_spatial_edge_refinement.py
 include tests/visual_consistency_evidence.py
 recursive-include tests/fixtures/migration *.json *.yaml

@@ -12,7 +12,7 @@ cv2 = pytest.importorskip("cv2")
 
 import custback.compositor as compositor_mod
 import custback.pipeline as pipeline_mod
-from custback.capture import CaptureHealth
+from custback.capture import CapturedFrame, CaptureHealth
 from custback.color import (
     ANALYSIS_LONG_EDGE,
     ColorBehavior,
@@ -29,6 +29,14 @@ from custback.color import (
 )
 from custback.config import AppConfig, RuntimeConfig
 from custback.hub import FrameHub
+from custback.matte_diagnostics import (
+    MatteCaptureMetadata,
+    MatteDiagnosticRecorder,
+    MatteFrameEvidence,
+    MatteReplayBundle,
+)
+from custback.matte_policy import MatteBackendKind
+from custback.light_wrap import LightWrapFrameContext, LightWrapStabilizer
 from custback.pipeline import (
     ActivationError,
     Pipeline,
@@ -36,7 +44,30 @@ from custback.pipeline import (
     RestartRequiredError,
 )
 from custback.pipeline import ConfigConflictError, _restart_only_changes
+from custback.segmentation import RVMTelemetry
 from custback.vcam import NullOutput
+
+
+def _captured(
+    pixels: np.ndarray,
+    sequence: int = 1,
+    *,
+    captured_at_ns: int | None = None,
+    generation: int = 1,
+    geometry_generation: int = 1,
+    content_rect: tuple[int, int, int, int] | None = None,
+) -> CapturedFrame:
+    height, width = pixels.shape[:2]
+    return CapturedFrame(
+        pixels=pixels,
+        sequence=sequence,
+        captured_at_ns=(
+            1_000_000_000 + sequence if captured_at_ns is None else captured_at_ns
+        ),
+        generation=generation,
+        geometry_generation=geometry_generation,
+        content_rect=content_rect or (0, 0, width, height),
+    )
 
 
 def make_runtime(mode="color", **bg_overrides) -> RuntimeConfig:
@@ -59,6 +90,16 @@ def wait_for_frame(hub: FrameHub, seq=-1, timeout=5.0):
         if frame is not None:
             return frame, new_seq
     raise AssertionError("no frame produced in time")
+
+
+def wait_for_stats(hub: FrameHub, predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        stats = hub.stats_dict()
+        if predicate(stats):
+            return stats
+        time.sleep(0.01)
+    raise AssertionError("status did not reach the expected state")
 
 
 def run_pipeline(runtime):
@@ -200,6 +241,255 @@ def test_hot_mode_switch():
         else:
             raise AssertionError("mode switch did not take effect")
         assert hub.stats_dict()["mode"] == "color"
+    finally:
+        pipeline.stop()
+
+
+def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
+    baseline = (
+        make_runtime(mode="color")
+        .snapshot()
+        .patched({"segmentation": {"backend": "rvm"}})
+    )
+    runtime = RuntimeConfig(baseline)
+
+    class FakeRvm:
+        produces_matte = True
+        device = "cuda"
+        last_foreground = None
+
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.last_downsample_ratio = None
+
+        def segment(self, frame):
+            self.last_downsample_ratio = self.cfg.rvm_downsample or 0.4
+            self.last_foreground = frame.copy()
+            return np.full(frame.shape[:2], 0.5, np.float32)
+
+        def close(self):
+            pass
+
+    class FakeMediaPipe:
+        produces_matte = False
+        last_foreground = None
+
+        def __init__(self, cfg):
+            self.device = "gpu" if cfg.delegate == "gpu" else "cpu"
+
+        def segment(self, frame):
+            return np.full(frame.shape[:2], 0.5, np.float32)
+
+        def close(self):
+            pass
+
+    def create(cfg, **_kwargs):
+        return FakeMediaPipe(cfg) if cfg.backend == "mediapipe" else FakeRvm(cfg)
+
+    monkeypatch.setattr(pipeline_mod, "create_segmenter", create)
+    pipeline, hub = run_pipeline(runtime)
+
+    def patch(value):
+        state = pipeline.apply_config_patch(value)
+        return wait_for_stats(
+            hub,
+            lambda stats: stats["config_version"] == state.version,
+        )
+
+    try:
+        stats = wait_for_stats(
+            hub,
+            lambda value: value["effective_rvm_downsample_ratio"] == 0.4,
+        )
+        assert stats["segmentation_backend"] == "FakeRvm"
+        assert stats["segmentation_device"] == "cuda"
+        assert stats["segmentation_generation"] == 0
+        assert stats["segmentation_produces_matte"] is True
+        assert stats["effective_mask_blur"] == 0
+        assert stats["effective_edge_refine"] is False
+        assert stats["effective_edge_refinement_mode"] == "off"
+        assert stats["effective_edge_refinement_radius_px"] == 0
+        assert stats["effective_mask_shift"] == 0
+        assert stats["effective_temporal_smoothing"] == 0.0
+        assert stats["effective_boundary_stabilization_mode"] == "off"
+        assert stats["effective_boundary_stabilization_time_constant_s"] == 0.1
+        assert stats["effective_boundary_stabilization_max_motion_px_per_s"] == 720.0
+        assert stats["effective_use_model_foreground"] is True
+        assert stats["effective_light_wrap"] == 0.25
+
+        stats = patch({"compositing": {"light_wrap": 0.0}})
+        assert stats["effective_light_wrap"] == 0.0
+        assert stats["effective_use_model_foreground"] is True
+        assert stats["segmentation_generation"] == 0
+        stats = patch(
+            {
+                "compositing": {
+                    "light_wrap": baseline.compositing.light_wrap,
+                }
+            }
+        )
+        assert stats["effective_light_wrap"] == baseline.compositing.light_wrap
+        assert stats["segmentation_generation"] == 0
+
+        stats = patch({"compositing": {"use_model_foreground": False}})
+        assert stats["effective_use_model_foreground"] is False
+        assert stats["effective_light_wrap"] == baseline.compositing.light_wrap
+        assert stats["segmentation_generation"] == 0
+        stats = patch(
+            {
+                "compositing": {
+                    "use_model_foreground": (baseline.compositing.use_model_foreground),
+                }
+            }
+        )
+        assert stats["effective_use_model_foreground"] is True
+        assert stats["segmentation_generation"] == 0
+
+        stats = patch({"segmentation": {"rvm_downsample": 0.5}})
+        assert stats["effective_rvm_downsample_ratio"] == 0.5
+        assert stats["segmentation_generation"] == 1
+        stats = patch(
+            {
+                "segmentation": {
+                    "rvm_downsample": baseline.segmentation.rvm_downsample,
+                }
+            }
+        )
+        assert stats["effective_rvm_downsample_ratio"] == 0.4
+        assert stats["segmentation_generation"] == 2
+
+        stats = patch({"segmentation": {"mask_shift": -1}})
+        assert stats["effective_mask_shift"] == -1
+        assert stats["segmentation_generation"] == 3
+        stats = patch(
+            {"segmentation": {"mask_shift": baseline.segmentation.mask_shift}}
+        )
+        assert stats["effective_mask_shift"] == 0
+        assert stats["segmentation_generation"] == 4
+
+        stats = patch(
+            {
+                "segmentation": {
+                    "backend": "mediapipe",
+                    "delegate": "cpu",
+                }
+            }
+        )
+        assert stats["segmentation_backend"] == "FakeMediaPipe"
+        assert stats["segmentation_produces_matte"] is False
+        assert stats["effective_rvm_downsample_ratio"] is None
+        assert stats["effective_edge_refine"] is True
+        assert stats["effective_edge_refinement_mode"] == "legacy_watershed"
+        assert stats["effective_edge_refinement_radius_px"] == 8
+        assert stats["effective_mask_blur"] == baseline.segmentation.mask_blur
+        assert stats["effective_boundary_stabilization_mode"] == "off"
+        assert stats["effective_use_model_foreground"] is False
+        assert stats["segmentation_generation"] == 5
+
+        stats = patch({"segmentation": {"edge_refine": False}})
+        assert stats["effective_edge_refine"] is False
+        assert stats["effective_edge_refinement_mode"] == "off"
+        assert stats["effective_edge_refinement_radius_px"] == 0
+        assert stats["segmentation_generation"] == 6
+        stats = patch(
+            {"segmentation": {"edge_refine": baseline.segmentation.edge_refine}}
+        )
+        assert stats["effective_edge_refine"] is True
+        assert stats["effective_edge_refinement_mode"] == "legacy_watershed"
+        assert stats["effective_edge_refinement_radius_px"] == 8
+        assert stats["segmentation_generation"] == 7
+
+        stats = patch(
+            {"segmentation": {"spatial_edge_refinement": {"mode": "stable_guided"}}}
+        )
+        assert stats["effective_edge_refine"] is True
+        assert stats["effective_edge_refinement_mode"] == "stable_guided"
+        assert stats["effective_edge_refinement_radius_px"] == 2
+        assert stats["segmentation_generation"] == 8
+    finally:
+        pipeline.stop()
+
+
+def test_motion_boundary_policy_is_reported_separately_from_legacy_ema(
+    monkeypatch,
+):
+    configured = (
+        make_runtime(mode="color")
+        .snapshot()
+        .patched(
+            {
+                "segmentation": {
+                    "backend": "mediapipe",
+                    "temporal_smoothing": 0.8,
+                    "boundary_stabilization": {
+                        "mode": "motion_aware",
+                        "time_constant_s": 0.06,
+                        "max_motion_px_per_s": 420.0,
+                    },
+                }
+            }
+        )
+    )
+
+    class FakeMediaPipe:
+        produces_matte = False
+        device = "cpu"
+        last_foreground = None
+
+        def segment(self, frame):
+            return np.full(frame.shape[:2], 0.5, np.float32)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_segmenter",
+        lambda _cfg, **_kwargs: FakeMediaPipe(),
+    )
+    pipeline, hub = run_pipeline(RuntimeConfig(configured))
+    try:
+        stats = wait_for_stats(
+            hub,
+            lambda value: (
+                value["effective_boundary_stabilization_mode"] == "motion_aware"
+            ),
+        )
+        assert stats["effective_temporal_smoothing"] == 0.0
+        assert stats["effective_boundary_stabilization_time_constant_s"] == 0.06
+        assert stats["effective_boundary_stabilization_max_motion_px_per_s"] == 420.0
+    finally:
+        pipeline.stop()
+
+
+def test_remote_privacy_slate_survives_matte_mitigation_apply_and_rollback():
+    runtime = make_runtime(mode="remote", remote_fallback_mode="blur")
+    baseline = runtime.snapshot()
+    pipeline, hub = run_pipeline(runtime)
+    try:
+        frame, sequence = wait_for_frame(hub)
+        assert np.array_equal(frame, Pipeline._privacy_slate(frame.shape))
+        assert hub.stats_dict()["remote_fallback_mode"] == "privacy-slate"
+
+        for patch in (
+            {"compositing": {"light_wrap": 0.0}},
+            {"compositing": {"light_wrap": baseline.compositing.light_wrap}},
+            {"segmentation": {"mask_shift": -1}},
+            {"segmentation": {"mask_shift": baseline.segmentation.mask_shift}},
+            {"segmentation": {"spatial_edge_refinement": {"mode": "stable_guided"}}},
+            {
+                "segmentation": {
+                    "spatial_edge_refinement": {
+                        "mode": (baseline.segmentation.spatial_edge_refinement.mode)
+                    }
+                }
+            },
+        ):
+            pipeline.apply_config_patch(patch)
+            frame, sequence = wait_for_frame(hub, sequence)
+            assert np.array_equal(frame, Pipeline._privacy_slate(frame.shape))
+            assert runtime.snapshot().background.mode == "remote"
+            assert hub.stats_dict()["remote_fallback_mode"] == "privacy-slate"
     finally:
         pipeline.stop()
 
@@ -655,6 +945,31 @@ def test_config_change_audit_has_origin_version_fields_and_safe_summary(caplog):
         pipeline.stop()
 
 
+def test_committed_patch_ack_survives_post_commit_side_effect_failure(monkeypatch):
+    runtime = make_runtime(mode="color", color=[255, 0, 0])
+    pipeline, hub = run_pipeline(runtime)
+    try:
+        wait_for_frame(hub)
+        monkeypatch.setattr(
+            pipeline,
+            "_post_install_activation",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected post-commit failure")
+            ),
+        )
+
+        state = pipeline.apply_config_patch(
+            {"background": {"color": [0, 0, 255]}},
+        )
+
+        assert state.version == 1
+        assert state.config.background.color == (0, 0, 255)
+        assert runtime.read() == state
+        assert pipeline.running
+    finally:
+        pipeline.stop()
+
+
 def test_bad_backdrop_update_keeps_running():
     runtime = make_runtime(mode="color", color=[255, 0, 0])
     pipeline, hub = run_pipeline(runtime)
@@ -704,6 +1019,41 @@ def test_staged_asset_promotion_commits_atomically_and_rolls_back_install_failur
         assert state.config.background.image_path == str(final)
         assert final.is_file() and not hidden.exists()
         assert promotions == ["promote"]
+
+        # If promotion mutates storage and then reports a failure, the paired
+        # rollback is still armed. No candidate pointer or config generation
+        # becomes live.
+        partial_hidden = tmp_path / (".upload-" + ("c" * 32) + ".png")
+        partial_final = tmp_path / (("c" * 32) + ".png")
+        assert cv2.imwrite(str(partial_hidden), image)
+        partial_events = []
+
+        def partial_promote():
+            partial_events.append("promote")
+            partial_hidden.replace(partial_final)
+            raise RuntimeError("promotion failed after rename")
+
+        def partial_rollback():
+            partial_events.append("rollback")
+            partial_final.replace(partial_hidden)
+
+        with pytest.raises(RuntimeError, match="promotion failed after rename"):
+            pipeline.apply_staged_config_patch(
+                {"background": {"mode": "image", "image_path": str(partial_final)}},
+                {
+                    "background": {
+                        "mode": "image",
+                        "image_path": str(partial_hidden),
+                    }
+                },
+                partial_promote,
+                partial_rollback,
+            )
+        current = runtime.read()
+        assert current.version == 1
+        assert current.config.background.image_path == str(final)
+        assert partial_hidden.is_file() and not partial_final.exists()
+        assert partial_events == ["promote", "rollback"]
 
         # A second candidate is promoted only inside the CAS activation. If
         # pointer installation fails, the path and effective config both roll
@@ -947,8 +1297,11 @@ def test_runtime_privacy_gate_protects_vcam_and_preview(monkeypatch):
     raw = (raw % 251).astype(np.uint8)
 
     class FixedCapture:
+        sequence = 0
+
         def read(self):
-            return raw.copy()
+            self.sequence += 1
+            return _captured(raw.copy(), self.sequence)
 
         def close(self):
             pass
@@ -1014,8 +1367,11 @@ def test_privacy_capacity_exhaustion_revokes_renderer_and_slates_all_sinks(
     raw = (raw % 251).astype(np.uint8)
 
     class FixedCapture:
+        sequence = 0
+
         def read(self):
-            return raw.copy()
+            self.sequence += 1
+            return _captured(raw.copy(), self.sequence)
 
         def close(self):
             pass
@@ -1468,7 +1824,7 @@ def test_hot_geometry_commit_refits_reused_provider_and_failed_trial_is_inert(
         backdrop,
         NullOutput(64, 32, 30),
     )
-    trial_frame = np.zeros((32, 64, 3), np.uint8)
+    trial_frame = _captured(np.zeros((32, 64, 3), np.uint8))
     top_anchored = backdrop.frame(64, 32).copy()
 
     committed_cfg = cfg.patched({"background": {"anchor_y": 1.0}})
@@ -1565,6 +1921,268 @@ def test_visual_generation_changes_without_replacing_reused_backdrop():
     assert resources.cfg.compositing.color_correction.mode == "auto"
 
 
+def test_light_wrap_policy_hot_activation_installs_fresh_generation() -> None:
+    current = AppConfig.from_dict(
+        {
+            "camera": {"width": 32, "height": 24},
+            "background": {
+                "mode": "video",
+                "video_path": "/operator/background.mp4",
+            },
+            "segmentation": {"backend": "heuristic"},
+            "compositing": {
+                "light_wrap": 0.8,
+                "light_wrap_stabilization": {
+                    "mode": "temporal_bounded",
+                    "time_constant_s": 0.12,
+                },
+            },
+            "output": {"backend": "null"},
+        }
+    )
+    candidate = current.patched(
+        {"compositing": {"light_wrap_stabilization": {"time_constant_s": 0.2}}}
+    )
+
+    class Segmenter:
+        device = "cpu"
+        matte_backend_kind = MatteBackendKind.BINARY_COARSE
+        last_foreground = None
+        last_downsample_ratio = None
+
+        def close(self) -> None:
+            pass
+
+    class Refiner:
+        def close(self) -> None:
+            pass
+
+    class Backdrop:
+        def close(self) -> None:
+            pass
+
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        Segmenter(),
+        Refiner(),
+        Backdrop(),
+        NullOutput(32, 24, 30),
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    pipeline._active_state = pipeline_mod.ConfigState(current, 0)
+    original = resources.light_wrap_stabilizer
+    assert original is not None
+    original.update(
+        np.full((4, 4, 3), 64.0, np.float32),
+        LightWrapFrameContext(0, 0, ("installed-video",)),
+        value_scale=255.0,
+        channel_order="bgr",
+    )
+    original_snapshot = original.snapshot()
+
+    prepared = Pipeline._prepare_activation_off_lane(current, candidate)
+    assert prepared.replace_light_wrap_stabilizer is True
+    assert prepared.light_wrap_stabilizer is not None
+    assert prepared.light_wrap_stabilizer.snapshot().updates == 0
+    staged = pipeline._stage_activation(resources, candidate, prepared)
+    pipeline._trial_activation(
+        resources,
+        staged,
+        _captured(np.full((24, 32, 3), 90, np.uint8)),
+    )
+
+    assert original.snapshot() == original_snapshot
+    assert staged.light_wrap_stabilizer is not None
+    assert staged.light_wrap_stabilizer.snapshot().updates == 0
+    pipeline._install_activation(resources, staged, 1)
+
+    assert resources.light_wrap_stabilizer is staged.light_wrap_stabilizer
+    assert resources.light_wrap_stabilizer is not original
+    installed_stabilizer = resources.light_wrap_stabilizer
+    assert installed_stabilizer is not None
+    assert installed_stabilizer.snapshot().updates == 0
+    assert resources.light_wrap_generation == 1
+    assert resources.segmentation_generation == 0
+    assert resources.cfg.compositing.light_wrap_stabilization.time_constant_s == 0.2
+    resources.close()
+
+
+def test_light_wrap_state_key_tracks_only_dynamic_wrap_semantics() -> None:
+    active = AppConfig.from_dict(
+        {
+            "background": {
+                "mode": "video",
+                "video_path": "/operator/background.mp4",
+            },
+            "compositing": {
+                "light_wrap": 0.8,
+                "light_wrap_stabilization": {
+                    "mode": "temporal_bounded",
+                    "time_constant_s": 0.12,
+                },
+            },
+        }
+    )
+    key = pipeline_mod._light_wrap_state_key(active)
+
+    assert key != ("off",)
+    assert (
+        pipeline_mod._light_wrap_state_key(
+            active.patched({"segmentation": {"threshold": 0.73}})
+        )
+        == key
+    )
+    assert (
+        pipeline_mod._light_wrap_state_key(
+            active.patched({"compositing": {"color_correction": {"strength": 0.75}}})
+        )
+        == key
+    )
+    for patch in (
+        {"background": {"anchor_x": 0.25}},
+        {"background": {"video_path": "/operator/replacement.mp4"}},
+        {"compositing": {"blend_space": "linear_srgb"}},
+        {"compositing": {"light_wrap_stabilization": {"time_constant_s": 0.2}}},
+    ):
+        assert pipeline_mod._light_wrap_state_key(active.patched(patch)) != key
+    assert pipeline_mod._light_wrap_state_key(
+        active.patched({"compositing": {"light_wrap": 0.0}})
+    ) == ("off",)
+    assert pipeline_mod._light_wrap_state_key(
+        active.patched({"compositing": {"light_wrap_stabilization": {"mode": "off"}}})
+    ) == ("off",)
+    assert pipeline_mod._light_wrap_state_key(
+        active.patched(
+            {
+                "background": {
+                    "mode": "image",
+                    "image_path": "/operator/background.png",
+                }
+            }
+        )
+    ) == ("off",)
+
+    class Backdrop:
+        @staticmethod
+        def temporal_frame_timing():
+            return pipeline_mod.BackdropFrameTiming(3, 100_000_000)
+
+    class Resources:
+        backdrop = Backdrop()
+        canvas_size = (1280, 720)
+        light_wrap_generation = 4
+        visual_generation = 1
+
+    resources = Resources()
+    first_context = Pipeline._light_wrap_frame_context(
+        cast(pipeline_mod._Resources, resources)
+    )
+    resources.visual_generation += 1
+    second_context = Pipeline._light_wrap_frame_context(
+        cast(pipeline_mod._Resources, resources)
+    )
+    assert first_context is not None
+    assert second_context is not None
+    assert first_context.source_token == second_context.source_token
+    assert Pipeline._backdrop_diagnostic_identity(
+        cast(pipeline_mod._Resources, resources)
+    ) == {
+        "provider": "Backdrop",
+        "visual_generation": 2,
+    }
+
+
+def test_failed_light_wrap_trial_preserves_live_state_and_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = AppConfig.from_dict(
+        {
+            "camera": {"width": 32, "height": 24},
+            "background": {
+                "mode": "video",
+                "video_path": "/operator/background.mp4",
+            },
+            "segmentation": {"backend": "heuristic"},
+            "compositing": {
+                "light_wrap": 0.8,
+                "light_wrap_stabilization": {
+                    "mode": "temporal_bounded",
+                    "time_constant_s": 0.12,
+                },
+            },
+            "output": {"backend": "null"},
+        }
+    )
+    candidate = current.patched(
+        {"compositing": {"light_wrap_stabilization": {"time_constant_s": 0.2}}}
+    )
+
+    class Segmenter:
+        device = "cpu"
+        matte_backend_kind = MatteBackendKind.BINARY_COARSE
+        last_foreground = None
+        last_downsample_ratio = None
+
+        def close(self) -> None:
+            pass
+
+    class Closable:
+        def close(self) -> None:
+            pass
+
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        Segmenter(),
+        Closable(),
+        Closable(),
+        NullOutput(32, 24, 30),
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    live = resources.light_wrap_stabilizer
+    assert live is not None
+    live.update(
+        np.full((4, 4, 3), 64.0, np.float32),
+        LightWrapFrameContext(0, 0, ("installed-video",)),
+        value_scale=255.0,
+        channel_order="bgr",
+    )
+    before = live.snapshot()
+    prepared = Pipeline._prepare_activation_off_lane(current, candidate)
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        0,
+        prepared_activation=prepared,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "prepare_light_wrap",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("candidate wrap trial failed")
+        ),
+    )
+
+    pipeline._handle_patch_request(
+        resources,
+        request,
+        _captured(np.full((24, 32, 3), 90, np.uint8)),
+    )
+
+    assert isinstance(request.error, ActivationError)
+    assert request.result is None
+    assert resources.light_wrap_stabilizer is live
+    assert live.snapshot() == before
+    assert resources.light_wrap_generation == 0
+    assert resources.segmentation_generation == 0
+    assert resources.version == 0
+    assert resources.cfg == current
+    assert pipeline.runtime.read().config == current
+    resources.close()
+
+
 def test_failed_visual_install_rolls_back_generation_and_reused_resources():
     current = AppConfig()
     candidate = current.patched(
@@ -1580,6 +2198,15 @@ def test_failed_visual_install_rolls_back_generation_and_reused_resources():
     old_harmonizer.reset(5.0, reason=ColorReason.INVALID)
     old_harmonizer_snapshot = old_harmonizer.snapshot()
     replacement_harmonizer = ColorHarmonizer(0.8, mode=candidate.background.mode)
+    old_light_wrap = LightWrapStabilizer(0.12)
+    old_light_wrap.update(
+        np.full((4, 4, 3), 32.0, np.float32),
+        LightWrapFrameContext(0, 0, ("old-wrap",)),
+        value_scale=255.0,
+        channel_order="bgr",
+    )
+    old_light_wrap_snapshot = old_light_wrap.snapshot()
+    replacement_light_wrap = LightWrapStabilizer(0.2)
 
     class FailingResources:
         version = 7
@@ -1590,6 +2217,8 @@ def test_failed_visual_install_rolls_back_generation_and_reused_resources():
         output = None
         visual_generation = 3
         harmonizer = old_harmonizer
+        light_wrap_stabilizer = old_light_wrap
+        light_wrap_generation = 4
         color_reset_token = ("stable",)
 
         def __init__(self):
@@ -1616,6 +2245,8 @@ def test_failed_visual_install_rolls_back_generation_and_reused_resources():
         visual_state_changed=True,
         replace_harmonizer=True,
         harmonizer=replacement_harmonizer,
+        replace_light_wrap_stabilizer=True,
+        light_wrap_stabilizer=replacement_light_wrap,
     )
 
     with pytest.raises(RuntimeError, match="injected install failure"):
@@ -1630,6 +2261,9 @@ def test_failed_visual_install_rolls_back_generation_and_reused_resources():
     assert resources.backdrop is old_backdrop
     assert resources.harmonizer is old_harmonizer
     assert resources.harmonizer.snapshot() == old_harmonizer_snapshot
+    assert resources.light_wrap_stabilizer is old_light_wrap
+    assert resources.light_wrap_stabilizer.snapshot() == old_light_wrap_snapshot
+    assert resources.light_wrap_generation == 4
     assert resources.color_reset_token == ("stable",)
     assert resources.visual_generation == 3
     assert pipeline._active_state is old_state
@@ -1914,7 +2548,11 @@ def test_success_ack_precedes_exactly_once_old_resource_close(monkeypatch):
     )
     handler = threading.Thread(
         target=pipeline._handle_patch_request,
-        args=(resources, request, np.zeros((72, 128, 3), np.uint8)),
+        args=(
+            resources,
+            request,
+            _captured(np.zeros((72, 128, 3), np.uint8)),
+        ),
     )
     handler.start()
     assert request.done.wait(1.0)
@@ -1987,7 +2625,9 @@ def test_failed_background_trial_preserves_working_processing_state(monkeypatch)
     activation = pipeline._stage_activation(resources, candidate, prepared)
     with pytest.raises(ActivationError):
         pipeline._trial_activation(
-            resources, activation, np.zeros((72, 128, 3), np.uint8)
+            resources,
+            activation,
+            _captured(np.zeros((72, 128, 3), np.uint8)),
         )
     activation.discard()
     assert segmenter.calls == 0
@@ -2068,7 +2708,7 @@ def test_slow_capture_repeats_last_safe_output_without_backlog(monkeypatch):
             self.calls += 1
             if self.calls == 1 or self.calls % 3 == 1:
                 self.frames_read += 1
-                return frame.copy()
+                return _captured(frame.copy(), self.frames_read)
             return None
 
         def health_snapshot(self):
@@ -2103,6 +2743,57 @@ def test_slow_capture_repeats_last_safe_output_without_backlog(monkeypatch):
         )
         assert stats["capture_frames_read"] == stats["frames_in"]
         assert stats["fps_attainment_pct"] is not None
+    finally:
+        pipeline.stop()
+
+
+def test_preflight_handoff_ignores_an_already_consumed_capture_sequence(
+    monkeypatch,
+):
+    startup_pixels = np.full((72, 128, 3), 40, np.uint8)
+    live_pixels = np.full((72, 128, 3), 90, np.uint8)
+    startup = _captured(startup_pixels, 7, captured_at_ns=7_000_000_000)
+    live = _captured(live_pixels, 8, captured_at_ns=8_000_000_000)
+
+    class DuplicateStartupCapture:
+        def __init__(self):
+            # Model a faulty handoff that exposes the already-sent startup
+            # capture once more before the first genuinely new input.
+            self.frames = [startup, startup, live]
+
+        def read(self):
+            return self.frames.pop(0) if self.frames else None
+
+        def health_snapshot(self):
+            return CaptureHealth(
+                sequence=8,
+                captured_monotonic_ns=8_000_000_000,
+                generation=1,
+                geometry_generation=1,
+                content_rect=(0, 0, 128, 72),
+                backend="duplicate-startup-fake",
+                normalized_width=128,
+                normalized_height=72,
+                frames_read=2,
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_capture",
+        lambda _cfg, _canvas: DuplicateStartupCapture(),
+    )
+    pipeline, hub = run_pipeline(make_runtime(mode="color"))
+    try:
+        stats = wait_for_stats(hub, lambda value: value["frames_in"] >= 2)
+        # Preflight is input one and sequence 8 is input two. The duplicate
+        # sequence 7 becomes only an output repeat and never a temporal input.
+        assert stats["frames_in"] == 2
+        raw, _sequence = hub.raw.latest()
+        assert raw is not None
+        np.testing.assert_array_equal(raw, live_pixels)
     finally:
         pipeline.stop()
 
@@ -2274,6 +2965,12 @@ class _FixedMaskSegmenter:
     ):
         self.mask = mask
         self.last_foreground = edge_foreground
+        self.matte_backend_kind = (
+            MatteBackendKind.TRUE_ALPHA_RECURRENT
+            if edge_foreground is not None
+            else MatteBackendKind.BINARY_COARSE
+        )
+        self.produces_matte = edge_foreground is not None
         self.closed = False
 
     def segment(self, _frame):
@@ -2281,6 +2978,21 @@ class _FixedMaskSegmenter:
 
     def close(self):
         self.closed = True
+
+
+class _TelemetryMaskSegmenter(_FixedMaskSegmenter):
+    def telemetry_snapshot(self):
+        return {
+            "input_frame_shape": (24, 32),
+            "model_mask_shape": (12, 16),
+            "output_mask_shape": (24, 32),
+            "effective_timestamp_ms": 127,
+            "effective_timestamp_delta_ms": 34,
+            "timestamp_adjustment_count": 1,
+            "timestamp_adjustment_ms": 0,
+            "last_timestamp_adjusted": False,
+            "resize_interpolation": "linear",
+        }
 
 
 class _IdentityRefiner:
@@ -2354,7 +3066,7 @@ class _SequenceCapture:
         value = self.frames.pop(0) if self.frames else None
         if value is not None:
             self.frames_read += 1
-            return value.copy()
+            return _captured(value.copy(), self.frames_read)
         return None
 
     def health_snapshot(self):
@@ -2443,6 +3155,10 @@ def test_color_correction_eligibility_is_explicit_and_bypasses_to_identity(
         np.full((24, 32), 0.5, np.float32),
         None,
         now_s=10.0,
+        captured=_captured(
+            np.full((24, 32, 3), 80, np.uint8),
+            captured_at_ns=10_000_000_000,
+        ),
     )
 
     if eligible:
@@ -2544,6 +3260,11 @@ def test_image_backdrop_analysis_cache_is_bounded_and_generation_scoped(
                 mask,
                 None,
                 now_s=timestamp,
+                captured=_captured(
+                    foreground,
+                    int(timestamp),
+                    captured_at_ns=int(timestamp * 1_000_000_000),
+                ),
             )
         assert len(analysis_builds) == 1
         assert estimator_analyses[0] is estimator_analyses[1]
@@ -2572,6 +3293,11 @@ def test_image_backdrop_analysis_cache_is_bounded_and_generation_scoped(
             mask,
             None,
             now_s=3.0,
+            captured=_captured(
+                foreground,
+                3,
+                captured_at_ns=3_000_000_000,
+            ),
         )
         assert len(analysis_builds) == 2
         assert estimator_analyses[2] is not estimator_analyses[1]
@@ -2607,6 +3333,11 @@ def test_image_backdrop_analysis_cache_is_bounded_and_generation_scoped(
             mask,
             None,
             now_s=4.0,
+            captured=_captured(
+                foreground,
+                4,
+                captured_at_ns=4_000_000_000,
+            ),
         )
         assert len(analysis_builds) == 3
         assert estimator_analyses[3] is not estimator_analyses[2]
@@ -2671,6 +3402,10 @@ def test_live_reset_consumes_first_reliable_estimate_with_production_harmonizer(
         mask,
         None,
         now_s=10.0,
+        captured=_captured(
+            foreground,
+            captured_at_ns=10_000_000_000,
+        ),
     )
     snapshot = harmonizer.snapshot()
     assert first.transform.is_identity
@@ -2687,6 +3422,11 @@ def test_live_reset_consumes_first_reliable_estimate_with_production_harmonizer(
         mask,
         None,
         now_s=10.0 + 1.0 / 30.0,
+        captured=_captured(
+            foreground,
+            2,
+            captured_at_ns=10_000_000_000 + 1_000_000_000 // 30,
+        ),
     )
     assert second.transform.exposure_ev > 0.0
 
@@ -2746,6 +3486,10 @@ def test_live_backdrop_geometry_token_change_hard_resets_harmonizer(monkeypatch)
         mask,
         None,
         now_s=10.0,
+        captured=_captured(
+            foreground,
+            captured_at_ns=10_000_000_000,
+        ),
     )
     active = pipeline._prepare_color_frame(
         resources,
@@ -2754,6 +3498,11 @@ def test_live_backdrop_geometry_token_change_hard_resets_harmonizer(monkeypatch)
         mask,
         None,
         now_s=10.0 + 1.0 / 30.0,
+        captured=_captured(
+            foreground,
+            2,
+            captured_at_ns=10_000_000_000 + 1_000_000_000 // 30,
+        ),
     )
     assert active.transform.exposure_ev > 0.0
 
@@ -2765,6 +3514,11 @@ def test_live_backdrop_geometry_token_change_hard_resets_harmonizer(monkeypatch)
         mask,
         None,
         now_s=10.0 + 2.0 / 30.0,
+        captured=_captured(
+            foreground,
+            3,
+            captured_at_ns=10_000_000_000 + 2_000_000_000 // 30,
+        ),
     )
     snapshot = harmonizer.snapshot()
     assert reset.transform.is_identity
@@ -2959,6 +3713,73 @@ def test_estimator_exception_is_fail_soft_with_identity_render(monkeypatch):
     assert len(harmonizer.error_calls) == 1
 
 
+def test_live_light_wrap_preparation_error_falls_back_without_advancing_state(
+    monkeypatch,
+):
+    cfg = _color_integration_config(
+        "video",
+        correction_mode="off",
+        blend_space="linear_srgb",
+    ).patched(
+        {
+            "compositing": {
+                "light_wrap": 0.8,
+                "light_wrap_stabilization": {
+                    "mode": "temporal_bounded",
+                    "time_constant_s": 0.2,
+                },
+            }
+        }
+    )
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    background = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+
+    class TimedBackdrop(_FixedBackdrop):
+        @staticmethod
+        def temporal_frame_timing():
+            return pipeline_mod.BackdropFrameTiming(1, 1_000_000_000)
+
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        TimedBackdrop(background),
+        None,
+    )
+    stabilizer = resources.light_wrap_stabilizer
+    assert stabilizer is not None
+    before = stabilizer.snapshot()
+    monkeypatch.setattr(
+        pipeline_mod,
+        "prepare_light_wrap",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            compositor_mod.ColorError("forced wrap preparation failure")
+        ),
+    )
+
+    rendered, reason = Pipeline(RuntimeConfig(cfg), FrameHub())._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+    )
+    expected = pipeline_mod.composite(
+        frame,
+        background,
+        mask,
+        light_wrap=0.8,
+        blend_space="linear_srgb",
+        color_transform=IDENTITY_TRANSFORM,
+    )
+
+    assert reason == ""
+    np.testing.assert_array_equal(rendered, expected)
+    assert resources.light_wrap_stabilizer is stabilizer
+    assert stabilizer.snapshot() == before
+
+
 @pytest.mark.parametrize("operation", ["transform", "encode"])
 def test_opencv_photometric_error_retries_identity_exactly_once(
     monkeypatch,
@@ -3127,6 +3948,136 @@ def test_repeat_output_does_not_advance_harmonizer(
     assert stats["output_repeated_frames"] == repeated_frames
 
 
+def test_temporal_timeline_status_counts_gaps_and_boundary_resets():
+    cfg = _color_integration_config(
+        "image",
+        correction_mode="off",
+        blend_space="srgb_legacy",
+    )
+    raw = np.full((24, 32, 3), 64, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    captures = [
+        _captured(raw.copy(), 1, captured_at_ns=1_000_000_000),
+        _captured(raw.copy(), 3, captured_at_ns=1_100_000_000),
+        None,
+        _captured(raw.copy(), 6, captured_at_ns=2_300_000_000),
+    ]
+
+    class TimelineCapture:
+        def __init__(self):
+            self.frames = list(captures)
+            self.frames_read = 0
+
+        def read(self):
+            captured = self.frames.pop(0) if self.frames else None
+            if captured is not None:
+                self.frames_read += 1
+            return captured
+
+        def health_snapshot(self):
+            return CaptureHealth(
+                sequence=6,
+                captured_monotonic_ns=2_300_000_000,
+                generation=1,
+                geometry_generation=1,
+                backend="timeline-fake",
+                width=32,
+                height=24,
+                normalized_width=32,
+                normalized_height=24,
+                frames_read=self.frames_read,
+                dropped_frames=3,
+            )
+
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    output = _StopAfterOutput(pipeline, 4)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        TimelineCapture(),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        output,
+    )
+
+    pipeline._loop(resources)
+
+    stats = hub.stats_dict()
+    assert stats["capture_sequence"] == 6
+    assert stats["capture_sequence_gap_count"] == 2
+    assert stats["capture_missing_input_count"] == 3
+    assert stats["capture_dropped_frames"] == 3
+    assert stats["matte_reset_count"] == 2
+    assert stats["matte_last_reset_reason"] == "timestamp-gap"
+    assert stats["output_repeated_frames"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "segmentation_backend", "background_overrides"),
+    [
+        pytest.param("passthrough", "heuristic", {}, id="passthrough"),
+        pytest.param(
+            "remote",
+            "none",
+            {"remote_fallback_mode": "color"},
+            id="remote-no-segmenter",
+        ),
+    ],
+)
+def test_capture_status_advances_when_output_mode_bypasses_segmentation(
+    mode,
+    segmentation_backend,
+    background_overrides,
+):
+    cfg = (
+        make_runtime(mode=mode, **background_overrides)
+        .snapshot()
+        .patched({"segmentation": {"backend": segmentation_backend}})
+    )
+    pipeline, hub = run_pipeline(RuntimeConfig(cfg))
+    try:
+        stats = wait_for_stats(hub, lambda value: value["frames_in"] >= 5)
+        assert stats["capture_sequence"] == stats["frames_in"]
+        assert stats["capture_frames_read"] == stats["frames_in"]
+        assert stats["capture_sequence_gap_count"] == 0
+        assert stats["capture_missing_input_count"] == 0
+    finally:
+        pipeline.stop()
+
+
+def test_remote_to_local_transition_does_not_invent_capture_gaps():
+    cfg = (
+        make_runtime(mode="remote", remote_fallback_mode="color")
+        .snapshot()
+        .patched({"segmentation": {"backend": "none"}})
+    )
+    pipeline, hub = run_pipeline(RuntimeConfig(cfg))
+    try:
+        before = wait_for_stats(hub, lambda value: value["frames_in"] >= 5)
+        assert before["capture_sequence"] == before["frames_in"]
+        assert before["capture_sequence_gap_count"] == 0
+        assert before["capture_missing_input_count"] == 0
+
+        committed = pipeline.apply_config_patch(
+            {"background": {"mode": "color"}},
+            origin="test",
+        )
+        after = wait_for_stats(
+            hub,
+            lambda value: (
+                value["config_version"] == committed.version
+                and value["capture_sequence"] > before["capture_sequence"]
+            ),
+        )
+        assert after["capture_sequence"] == after["frames_in"]
+        assert after["capture_sequence_gap_count"] == 0
+        assert after["capture_missing_input_count"] == 0
+    finally:
+        pipeline.stop()
+
+
 @pytest.mark.parametrize("remote_candidate", [False, True])
 def test_auto_correction_leaves_remote_candidate_or_privacy_slate_untouched(
     monkeypatch,
@@ -3225,6 +4176,343 @@ def test_color_correction_has_a_separate_deterministic_timing_bucket(monkeypatch
     }
 
 
+def test_private_matte_frame_total_includes_sink_send_and_samples_rss(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _color_integration_config("image")
+    raw = np.full((24, 32, 3), 80, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    bundle_root = tmp_path / "bundle"
+    recorder = MatteDiagnosticRecorder(bundle_root, max_bytes=4_000_000)
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub, matte_recorder=recorder)
+
+    class SlowOutput(_StopAfterOutput):
+        def send(self, frame):
+            time.sleep(0.01)
+            super().send(frame)
+
+    output = SlowOutput(pipeline, 1)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([raw]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        output,
+    )
+    monkeypatch.setattr(pipeline_mod, "process_rss_bytes", lambda: 123_456_789)
+
+    try:
+        pipeline._loop(resources)
+    finally:
+        recorder.close()
+
+    bundle = MatteReplayBundle(bundle_root)
+    assert len(bundle.frames) == 1
+    frame = bundle.frames[0]
+    timings = frame["timings_ms"]
+    assert timings["output_send_ms"] >= 8.0
+    assert timings["frame_total_ms"] >= timings["output_send_ms"]
+    assert timings["frame_total_ms"] >= timings["frame_processing_ms"]
+    assert frame["resource_samples"]["rss_bytes"] == 123_456_789
+
+
+def test_private_matte_evidence_records_late_provider_fallback_without_reason_path():
+    cfg = _color_integration_config("image")
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+
+    class FallbackStatus:
+        def __init__(self, fallback):
+            self.requested_mode = "auto"
+            self.requested_provider = "cuda"
+            self.device_id = 2
+            self.state = "cpu_fallback" if fallback else "gpu_active"
+            self.active_provider = "cpu" if fallback else "cuda"
+            self.fallback_active = fallback
+            self.fallback_reason = "/private/models/rvm.onnx failed" if fallback else ""
+            self.fallback_count = int(fallback)
+            self.last_transition_ms = 0.1
+
+    class LateFallbackAcceleration:
+        def __init__(self):
+            self.fallback = False
+
+        def status(self):
+            return FallbackStatus(self.fallback)
+
+    class LateFallbackSegmenter(_FixedMaskSegmenter):
+        def __init__(self):
+            super().__init__(mask, np.full_like(frame, 90))
+            self.device = "cuda"
+            self.accel = LateFallbackAcceleration()
+
+        def segment(self, _frame):
+            self.device = "cpu"
+            self.accel.fallback = True
+            return super().segment(_frame)
+
+    segmenter = LateFallbackSegmenter()
+    assert segmenter.accel.status().active_provider == "cuda"
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        segmenter,
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+    )
+    evidence = MatteFrameEvidence(
+        metadata=MatteCaptureMetadata(
+            bundle_sequence=0,
+            capture_sequence=1,
+            capture_monotonic_ns=1_000_000_000,
+            timestamp_source="capture-completion",
+            capture_generation=0,
+            geometry_generation=0,
+        ),
+        raw_frame=frame,
+    )
+
+    rendered, reason = Pipeline(RuntimeConfig(cfg), FrameHub())._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+        matte_evidence=evidence,
+    )
+
+    assert reason == ""
+    assert rendered.shape == frame.shape
+    assert evidence.matte_authoritative is True
+    assert evidence.effective_controls["segmentation_device"] == "cpu"
+    assert evidence.effective_controls["acceleration"] == {
+        "applicable": True,
+        "requested_mode": "auto",
+        "requested_provider": "cuda",
+        "device_id": 2,
+        "state": "cpu_fallback",
+        "active_provider": "cpu",
+        "fallback_active": True,
+        "fallback_count": 1,
+        "fallback_reason_code": "provider-fallback",
+    }
+    assert "/private" not in repr(evidence.effective_controls)
+
+
+def test_private_matte_evidence_records_rvm_identity_ratio_and_stage_timings():
+    cfg = _color_integration_config("image")
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+
+    class TelemetrySegmenter(_FixedMaskSegmenter):
+        def __init__(self):
+            super().__init__(mask, np.full_like(frame, 90))
+            self.last_downsample_ratio = 1.0
+            self.snapshot_count = 0
+
+        def rvm_telemetry_snapshot(self):
+            self.snapshot_count += 1
+            return RVMTelemetry(
+                input_frame_shape=(24, 32),
+                output_alpha_shape=(24, 32),
+                output_foreground_shape=(24, 32, 3),
+                configured_downsample_mode="auto",
+                configured_downsample_ratio=0.0,
+                resolved_downsample_ratio=1.0,
+                preprocess_ms=1.25,
+                session_run_ms=2.5,
+                postprocess_ms=0.75,
+                model_builtin=True,
+                model_identity="rvm_mobilenetv3_fp32.onnx",
+                model_sha256="a" * 64,
+                model_bytes=1_234,
+                acceleration_state="cpu_fallback",
+                acceleration_active_provider="cpu",
+                acceleration_fallback_active=False,
+                acceleration_fallback_count=0,
+            )
+
+    segmenter = TelemetrySegmenter()
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        segmenter,
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+    )
+    evidence = MatteFrameEvidence(
+        metadata=MatteCaptureMetadata(
+            bundle_sequence=0,
+            capture_sequence=1,
+            capture_monotonic_ns=1_000_000_000,
+            timestamp_source="capture-completion",
+            capture_generation=0,
+            geometry_generation=0,
+        ),
+        raw_frame=frame,
+    )
+
+    rendered, reason = Pipeline(RuntimeConfig(cfg), FrameHub())._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+        matte_evidence=evidence,
+    )
+
+    assert reason == ""
+    assert rendered.shape == frame.shape
+    assert segmenter.snapshot_count == 1
+    assert evidence.effective_controls["rvm_telemetry"] == {
+        "applicable": True,
+        "input_frame_shape": [24, 32],
+        "output_alpha_shape": [24, 32],
+        "output_foreground_shape": [24, 32, 3],
+        "configured_downsample_mode": "auto",
+        "configured_downsample_ratio": 0.0,
+        "resolved_downsample_ratio": 1.0,
+        "preprocess_ms": 1.25,
+        "session_run_ms": 2.5,
+        "postprocess_ms": 0.75,
+        "model_builtin": True,
+        "model_identity": "rvm_mobilenetv3_fp32.onnx",
+        "model_sha256": "a" * 64,
+        "model_bytes": 1_234,
+        "acceleration_state": "cpu_fallback",
+        "acceleration_active_provider": "cpu",
+        "acceleration_fallback_active": False,
+        "acceleration_fallback_count": 0,
+    }
+    assert evidence.timings_ms["rvm_preprocess_ms"] == 1.25
+    assert evidence.timings_ms["rvm_session_run_ms"] == 2.5
+    assert evidence.timings_ms["rvm_postprocess_ms"] == 0.75
+    assert "/private" not in repr(evidence.effective_controls)
+
+
+def test_rvm_evidence_rejects_untyped_hostile_or_failing_snapshots():
+    class UntypedSnapshot:
+        @staticmethod
+        def rvm_telemetry_snapshot():
+            return {"model_identity": "/private/models/rvm.onnx"}
+
+    class FailingSnapshot:
+        @staticmethod
+        def rvm_telemetry_snapshot():
+            raise RuntimeError("/private/models/rvm.onnx")
+
+    class HostileTypedSnapshot:
+        @staticmethod
+        def rvm_telemetry_snapshot():
+            return RVMTelemetry(
+                input_frame_shape=(24, 32),
+                output_alpha_shape=(24, 32),
+                output_foreground_shape=(24, 32, 3),
+                configured_downsample_mode="auto",
+                configured_downsample_ratio=0.0,
+                resolved_downsample_ratio=1.0,
+                preprocess_ms=float("nan"),
+                session_run_ms=2.5,
+                postprocess_ms=0.75,
+                model_builtin=False,
+                model_identity="/private/models/rvm.onnx",
+                model_sha256="a" * 64,
+                model_bytes=1_234,
+                acceleration_state="cpu_fallback",
+                acceleration_active_provider="cpu",
+                acceleration_fallback_active=False,
+                acceleration_fallback_count=0,
+            )
+
+    assert pipeline_mod._rvm_telemetry_evidence(UntypedSnapshot()) == {
+        "applicable": False
+    }
+    assert pipeline_mod._rvm_telemetry_evidence(FailingSnapshot()) == {
+        "applicable": False
+    }
+    assert pipeline_mod._rvm_telemetry_evidence(HostileTypedSnapshot()) == {
+        "applicable": False
+    }
+
+
+def test_output_sink_evidence_uses_actual_bounded_pacing_contract():
+    assert pipeline_mod._output_sink_evidence(NullOutput(32, 24, 30)) == {
+        "applicable": True,
+        "backend": "null",
+        "paces": False,
+    }
+
+    class UnknownPacingSink:
+        paces = True
+
+    assert pipeline_mod._output_sink_evidence(UnknownPacingSink()) == {
+        "applicable": True,
+        "backend": "unknown",
+        "paces": True,
+    }
+    assert pipeline_mod._output_sink_evidence(None) == {
+        "applicable": False,
+        "backend": "unknown",
+        "paces": None,
+    }
+
+
+def test_mediapipe_telemetry_is_attached_only_to_private_matte_evidence():
+    cfg = _color_integration_config("color")
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _TelemetryMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+    )
+    evidence = MatteFrameEvidence(
+        metadata=MatteCaptureMetadata(
+            bundle_sequence=0,
+            capture_sequence=1,
+            capture_monotonic_ns=1_000_000_000,
+            timestamp_source="capture-completion",
+            capture_generation=0,
+            geometry_generation=0,
+        ),
+        raw_frame=frame,
+    )
+
+    rendered, reason = Pipeline(RuntimeConfig(cfg), FrameHub())._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+        matte_evidence=evidence,
+    )
+
+    assert reason == ""
+    assert rendered.shape == frame.shape
+    assert evidence.segmentation_diagnostics == {
+        "backend": "mediapipe",
+        "input_frame_shape": [24, 32],
+        "model_mask_shape": [12, 16],
+        "output_mask_shape": [24, 32],
+        "effective_timestamp_delta_ms": 34,
+        "timestamp_adjustment_count": 1,
+        "timestamp_adjustment_ms": 0,
+        "last_timestamp_adjusted": False,
+        "resize_interpolation": "linear",
+    }
+    assert "effective_timestamp_ms" not in evidence.segmentation_diagnostics
+    assert not (
+        set(evidence.segmentation_diagnostics)
+        & (set(evidence.effective_controls) | set(evidence.timings_ms))
+    )
+
+
 @pytest.mark.parametrize("change", ["visual", "segmentation"])
 def test_successful_color_state_commit_installs_pristine_harmonizer(
     monkeypatch,
@@ -3276,7 +4564,7 @@ def test_successful_color_state_commit_installs_pristine_harmonizer(
     pipeline._handle_patch_request(
         resources,
         request,
-        np.zeros((24, 32, 3), np.uint8),
+        _captured(np.zeros((24, 32, 3), np.uint8)),
     )
 
     assert request.error is None
@@ -3316,7 +4604,7 @@ def test_unrelated_hot_commit_preserves_harmonizer_object_and_snapshot():
     pipeline._handle_patch_request(
         resources,
         request,
-        np.zeros((24, 32, 3), np.uint8),
+        _captured(np.zeros((24, 32, 3), np.uint8)),
     )
 
     assert request.error is None
@@ -3369,7 +4657,7 @@ def test_rejected_activation_paths_do_not_mutate_live_harmonizer(
     pipeline._handle_patch_request(
         resources,
         request,
-        np.zeros((24, 32, 3), np.uint8),
+        _captured(np.zeros((24, 32, 3), np.uint8)),
     )
 
     assert resources.harmonizer is live
@@ -3498,7 +4786,7 @@ def test_queued_ack_timeout_and_late_cancel_ack_preserve_live_harmonizer(
     pipeline._handle_patch_request(
         resources,
         request,
-        np.zeros((24, 32, 3), np.uint8),
+        _captured(np.zeros((24, 32, 3), np.uint8)),
     )
 
     assert resources.harmonizer is live

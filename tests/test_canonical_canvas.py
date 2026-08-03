@@ -29,7 +29,7 @@ else:  # Starlette < 1 uses the original httpx client contract.
 import custback.pipeline as pipeline_mod
 from custback.api.security import SecurityPolicy
 from custback.api.server import create_app
-from custback.capture import CaptureHealth
+from custback.capture import CapturedFrame, CaptureHealth
 from custback.config import AppConfig, ConfigState, RuntimeConfig
 from custback.hub import FrameHub
 from custback.pipeline import ActivationError, Pipeline, _Resources
@@ -139,7 +139,7 @@ class _ScriptedCapture:
         self.frames_read = 0
         self.closed = False
 
-    def read(self) -> np.ndarray | None:
+    def read(self) -> CapturedFrame | None:
         if self.closed:
             return None
         if self._frames:
@@ -149,10 +149,30 @@ class _ScriptedCapture:
         else:
             return None
         self.frames_read += 1
-        return frame
+        assert frame is not None
+        height, width = frame.shape[:2]
+        return CapturedFrame(
+            pixels=frame,
+            sequence=self.frames_read,
+            captured_at_ns=self.frames_read * 1_000_000,
+            generation=1,
+            geometry_generation=1,
+            content_rect=(0, 0, width, height),
+        )
 
     def health_snapshot(self) -> CaptureHealth:
         return CaptureHealth(
+            sequence=self.frames_read,
+            captured_monotonic_ns=(
+                self.frames_read * 1_000_000 if self.frames_read else None
+            ),
+            generation=1 if self.frames_read else 0,
+            geometry_generation=1 if self.frames_read else 0,
+            content_rect=(
+                (0, 0, self._normalized_size[0], self._normalized_size[1])
+                if self.frames_read
+                else None
+            ),
             backend="scripted",
             width=ACQUISITION_SIZE[0],
             height=ACQUISITION_SIZE[1],

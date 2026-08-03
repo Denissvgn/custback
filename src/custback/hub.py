@@ -31,6 +31,25 @@ class Stats:
     mode: str = ""
     segmentation_backend: str = ""
     segmentation_device: str = ""
+    segmentation_generation: int = 0
+    capture_sequence: int = 0
+    capture_sequence_gap_count: int = 0
+    capture_missing_input_count: int = 0
+    matte_reset_count: int = 0
+    matte_last_reset_reason: str = ""
+    segmentation_produces_matte: bool = False
+    effective_rvm_downsample_ratio: float | None = None
+    effective_mask_blur: int = 0
+    effective_edge_refine: bool = False
+    effective_edge_refinement_mode: str = "off"
+    effective_edge_refinement_radius_px: int = 0
+    effective_mask_shift: int = 0
+    effective_temporal_smoothing: float = 0.0
+    effective_boundary_stabilization_mode: str = "off"
+    effective_boundary_stabilization_time_constant_s: float = 0.1
+    effective_boundary_stabilization_max_motion_px_per_s: float = 720.0
+    effective_use_model_foreground: bool = False
+    effective_light_wrap: float = 0.0
     output_backend: str = ""
     remote_connected: bool = False
     remote_frames_used: int = 0
@@ -465,6 +484,43 @@ class FrameHub:
                 "mode": self.stats.mode,
                 "segmentation_backend": self.stats.segmentation_backend,
                 "segmentation_device": self.stats.segmentation_device,
+                "segmentation_generation": self.stats.segmentation_generation,
+                "capture_sequence": self.stats.capture_sequence,
+                "capture_sequence_gap_count": self.stats.capture_sequence_gap_count,
+                "capture_missing_input_count": self.stats.capture_missing_input_count,
+                "matte_reset_count": self.stats.matte_reset_count,
+                "matte_last_reset_reason": self.stats.matte_last_reset_reason,
+                "segmentation_produces_matte": self.stats.segmentation_produces_matte,
+                "effective_rvm_downsample_ratio": self._rounded_optional(
+                    self.stats.effective_rvm_downsample_ratio, 6
+                ),
+                "effective_mask_blur": self.stats.effective_mask_blur,
+                "effective_edge_refine": self.stats.effective_edge_refine,
+                "effective_edge_refinement_mode": (
+                    self.stats.effective_edge_refinement_mode
+                ),
+                "effective_edge_refinement_radius_px": (
+                    self.stats.effective_edge_refinement_radius_px
+                ),
+                "effective_mask_shift": self.stats.effective_mask_shift,
+                "effective_temporal_smoothing": round(
+                    self.stats.effective_temporal_smoothing, 4
+                ),
+                "effective_boundary_stabilization_mode": (
+                    self.stats.effective_boundary_stabilization_mode
+                ),
+                "effective_boundary_stabilization_time_constant_s": round(
+                    self.stats.effective_boundary_stabilization_time_constant_s,
+                    4,
+                ),
+                "effective_boundary_stabilization_max_motion_px_per_s": round(
+                    self.stats.effective_boundary_stabilization_max_motion_px_per_s,
+                    4,
+                ),
+                "effective_use_model_foreground": (
+                    self.stats.effective_use_model_foreground
+                ),
+                "effective_light_wrap": round(self.stats.effective_light_wrap, 4),
                 "output_backend": self.stats.output_backend,
                 "remote_connected": self.stats.remote_connected,
                 "remote_frames_used": self.stats.remote_frames_used,

@@ -14,8 +14,10 @@ from custback.config import (
     AppConfig,
     ConfigVersionConflictError,
     RuntimeConfig,
+    SpatialEdgeRefinementConfig,
     materialize_config_schema_defaults,
     resolved_output_size,
+    spatial_edge_refinement_radius,
 )
 
 
@@ -54,6 +56,16 @@ def test_defaults_valid():
     assert correction.exposure_limit_ev == 0.85
     assert correction.white_balance_strength == 0.5
     assert correction.adaptation_time_s == 0.8
+    assert cfg.segmentation.boundary_stabilization.mode == "off"
+    assert cfg.segmentation.boundary_stabilization.time_constant_s == 0.1
+    assert cfg.segmentation.boundary_stabilization.max_motion_px_per_s == 720.0
+    assert cfg.segmentation.spatial_edge_refinement == SpatialEdgeRefinementConfig(
+        mode="legacy_watershed",
+        reference_short_edge_px=720,
+        radius_at_reference_px=8,
+        min_radius_px=2,
+        max_radius_px=12,
+    )
     assert cfg.api.renderer_token_file == "~/.config/custback/renderer-token"
 
 
@@ -67,6 +79,11 @@ def test_packaged_default_yaml_pins_compatibility_visual_policy():
     assert cfg.background.fit_mode == "cover"
     assert cfg.compositing.blend_space == "srgb_legacy"
     assert cfg.compositing.color_correction == AppConfig().compositing.color_correction
+    assert cfg.segmentation.boundary_stabilization.mode == "off"
+    assert (
+        cfg.segmentation.spatial_edge_refinement
+        == AppConfig().segmentation.spatial_edge_refinement
+    )
     assert resolved_output_size(cfg) == (cfg.camera.width, cfg.camera.height)
 
 
@@ -142,14 +159,52 @@ def test_schema_v1_absent_fields_are_bound_before_model_defaults():
             "adaptation_time_s": 0.8,
         },
         "blend_space": "srgb_legacy",
+        "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12,
+        },
     }
     assert materialized["background"]["fit_mode"] == "cover"
     assert materialized["output"] == {"width": None, "height": None}
+    assert materialized["segmentation"] == {
+        "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0,
+        },
+        "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12,
+        },
+    }
     assert raw == {
         "schema_version": 1,
         "camera": {"width": 640, "height": 480},
         "compositing": {"color_correction": {"strength": 0.7}},
     }
+
+
+def test_schema_v1_partial_spatial_edge_policy_binds_all_legacy_parameters():
+    raw = {
+        "schema_version": 1,
+        "segmentation": {
+            "spatial_edge_refinement": {"mode": "stable_guided"},
+        },
+    }
+
+    materialized = materialize_config_schema_defaults(raw)
+
+    assert materialized["segmentation"]["spatial_edge_refinement"] == {
+        "mode": "stable_guided",
+        "reference_short_edge_px": 720,
+        "radius_at_reference_px": 8,
+        "min_radius_px": 2,
+        "max_radius_px": 12,
+    }
+    assert raw["segmentation"]["spatial_edge_refinement"] == {"mode": "stable_guided"}
 
 
 def test_avatar_proxy_cli_overrides_map_atomically_into_runtime(tmp_path):
@@ -468,9 +523,48 @@ def test_runtime_public_mutations_are_disabled_before_they_can_split_resources()
 def test_new_quality_fields_defaults():
     cfg = AppConfig()
     assert cfg.segmentation.edge_refine is True
+    assert cfg.segmentation.spatial_edge_refinement.mode == "legacy_watershed"
     assert cfg.segmentation.mask_shift == 0
     assert cfg.compositing.light_wrap == 0.25
     assert cfg.compositing.use_model_foreground is True
+    assert cfg.compositing.light_wrap_stabilization.mode == "off"
+    assert cfg.compositing.light_wrap_stabilization.time_constant_s == 0.12
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((90, 160), 2),
+        ((360, 640), 4),
+        ((720, 1280), 8),
+        ((1080, 1920), 12),
+        ((2160, 3840), 12),
+    ],
+)
+def test_stable_spatial_edge_refinement_radius_scales_and_clamps(shape, expected):
+    policy = SpatialEdgeRefinementConfig(mode="stable_guided")
+
+    assert spatial_edge_refinement_radius(policy, shape) == expected
+
+
+@pytest.mark.parametrize("shape", [(90, 160), (720, 1280), (2160, 3840)])
+def test_legacy_spatial_edge_refinement_radius_remains_fixed(shape):
+    policy = SpatialEdgeRefinementConfig(mode="legacy_watershed")
+
+    assert spatial_edge_refinement_radius(policy, shape) == 8
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"min_radius_px": 9},
+        {"max_radius_px": 7},
+        {"radius_at_reference_px": 1, "min_radius_px": 2},
+    ],
+)
+def test_spatial_edge_refinement_reference_radius_must_be_inside_bounds(values):
+    with pytest.raises(ValueError, match="min_radius_px"):
+        SpatialEdgeRefinementConfig(**values)
 
 
 def test_invalid_delegate_rejected():
@@ -546,7 +640,19 @@ def test_falsey_non_mapping_config_roots_are_rejected(tmp_path):
     [
         {"segmentation": {"rvm_downsample": 0.01}},
         {"segmentation": {"mask_shift": 100}},
+        {"segmentation": {"boundary_stabilization": {"mode": "legacy"}}},
+        {"segmentation": {"boundary_stabilization": {"time_constant_s": float("nan")}}},
+        {"segmentation": {"boundary_stabilization": {"max_motion_px_per_s": 0.0}}},
+        {"segmentation": {"spatial_edge_refinement": {"mode": "unstable"}}},
+        {"segmentation": {"spatial_edge_refinement": {"reference_short_edge_px": 0}}},
+        {"segmentation": {"spatial_edge_refinement": {"max_radius_px": 33}}},
         {"compositing": {"light_wrap": 5.0}},
+        {"compositing": {"light_wrap_stabilization": {"mode": "unbounded"}}},
+        {
+            "compositing": {
+                "light_wrap_stabilization": {"time_constant_s": float("nan")}
+            }
+        },
         {"camera": {"width": "1280"}},  # strict: no string coercion
         {"segmentation": {"backend": "medipipe"}},
         {"unknown": {}},
@@ -612,3 +718,29 @@ def test_commit_with_activation_hides_candidate_until_resource_swap():
     assert effective["mode"] == "color"
     assert observed[0].config.background.mode == "color"
     assert observed[0].version == 1
+
+
+def test_commit_builds_return_snapshot_before_resource_activation(monkeypatch):
+    runtime = RuntimeConfig(AppConfig())
+    writer = runtime._coordinator_writer()
+    base = runtime.read()
+    candidate = base.config.patched({"background": {"mode": "color"}})
+    activated = []
+
+    monkeypatch.setattr(
+        AppConfig,
+        "model_copy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("snapshot allocation failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot allocation failed"):
+        writer.commit_with_activation(
+            candidate,
+            base.version,
+            lambda _version: activated.append(True),
+        )
+
+    assert activated == []
+    assert runtime.version == 0
