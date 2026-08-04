@@ -556,6 +556,8 @@ const result = {
   assumed: formatDiagnostic("background_video_color_assumed_fields",
     ["matrix", "range"]),
   noOverrides: formatDiagnostic("background_video_color_overridden_fields", []),
+  reuseRatio: formatDiagnostic("base_composite_reuse_ratio", 564 / 1105),
+  timing: formatDiagnostic("timing_ms", {"output.submission": 2.9}),
   controls,
   tagged: videoColorSummary({
     background_video_decoder_backend: "PYAV_FFMPEG",
@@ -583,6 +585,8 @@ process.stdout.write(JSON.stringify(result));
     values = json.loads(result.stdout)
     assert values["assumed"] == "Matrix, Range"
     assert values["noOverrides"] == "None"
+    assert values["reuseRatio"] == "51.0%"
+    assert values["timing"] == '{"output.submission":2.9}'
     assert (
         "Preserve · V4l2 · Read Only Qualified · no writes · generation 3"
         in values["controls"]
@@ -594,6 +598,205 @@ process.stdout.write(JSON.stringify(result));
         "good",
     ]
     assert values["legacy"][1] == "warn"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_system_diagnostics_report_backend_selection_and_effective_policy():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    for key in (
+        "segmentation_selection",
+        "requested_backend",
+        "selected_backend",
+        "quality_tier",
+        "selection_mode",
+        "fallback_category",
+        "fallback_reason",
+        "guidance",
+        "active_device",
+        "active_provider",
+        "matte_policy",
+        "rvm_downsample_ratio",
+        "raw_alpha_mode",
+    ):
+        assert key in script
+    assert '["Subject detection", ...segmentationSummary(status)]' in script
+    assert "coreRows.push(...segmentationFallbackRows(status))" in script
+    assert "if (mattePolicy) coreRows.push(mattePolicy)" in script
+
+    title_case = (
+        "function titleCase"
+        + script.split("function titleCase", 1)[1].split("function setView", 1)[0]
+    )
+    helpers = (
+        "function boundedStatusText"
+        + script.split("function boundedStatusText", 1)[1].split(
+            "function formatDiagnostic", 1
+        )[0]
+    )
+    harness = r"""
+const downgraded = {
+  segmentation_backend: "MediaPipeSegmenter",
+  segmentation_device: "cpu",
+  segmentation_selection: {
+    requested_backend: "auto",
+    selected_backend: "mediapipe",
+    quality_tier: "segmentation",
+    selection_mode: "automatic",
+    fallback_active: true,
+    fallback_category: "runtime-not-installed",
+    fallback_reason: "RVM unavailable: runtime not installed",
+    guidance: "Install the RVM runtime profile and restart.",
+    active_device: "cpu",
+    active_provider: "cpu",
+    attempts: [],
+  },
+  matte_policy: {
+    effective: {
+      raw_alpha_mode: "native_soft_alpha",
+      rvm_downsample_ratio: 0.25,
+      edge_refine: false,
+      residual_temporal_mode: "model_only",
+      light_wrap: 0.1,
+    },
+  },
+};
+const explicit = {
+  segmentation_fallback_active: true,
+  segmentation_fallback_reason: "legacy-misclassification",
+  segmentation_selection: {
+    requested_backend: "mediapipe",
+    selected_backend: "mediapipe",
+    quality_tier: "segmentation",
+    selection_mode: "explicit",
+    fallback_active: false,
+    fallback_category: "none",
+    fallback_reason: "",
+    guidance: "",
+    active_device: "cpu",
+    active_provider: "cpu",
+    attempts: [],
+  },
+};
+const legacy = {
+  segmentation_backend: "RVMSegmenter",
+  segmentation_device: "cpu",
+  segmentation_fallback_active: true,
+  segmentation_fallback_reason: "ml-backend-unavailable",
+};
+process.stdout.write(JSON.stringify({
+  downgradedSummary: segmentationSummary(downgraded),
+  downgradedRows: segmentationFallbackRows(downgraded),
+  policy: mattePolicySummary(downgraded),
+  explicitSummary: segmentationSummary(explicit),
+  explicitRows: segmentationFallbackRows(explicit),
+  legacySummary: segmentationSummary(legacy),
+  legacyRows: segmentationFallbackRows(legacy),
+}));
+"""
+    result = subprocess.run(
+        ["node"],
+        input=title_case + helpers + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    assert values["downgradedSummary"] == [
+        "MediaPipe · Segmentation tier · device CPU · "
+        "provider CPU · Automatic selection",
+        "warn",
+    ]
+    assert values["downgradedRows"] == [
+        [
+            "Backend downgrade",
+            "Auto → MediaPipe · Runtime Not Installed · "
+            "RVM unavailable: runtime not installed · "
+            "Install the RVM runtime profile and restart.",
+            "warn",
+        ]
+    ]
+    assert values["policy"] == [
+        "Effective matte policy",
+        "Native Soft Alpha · RVM ratio 0.25 · edge refine off · "
+        "temporal Model Only · light wrap 0.1",
+        "",
+    ]
+    assert values["explicitSummary"] == [
+        "MediaPipe · Segmentation tier · device CPU · "
+        "provider CPU · Explicit selection",
+        "",
+    ]
+    assert values["explicitRows"] == []
+    assert values["legacySummary"] == ["RVMSegmenter · Cpu", "warn"]
+    assert values["legacyRows"] == [
+        [
+            "Backend downgrade",
+            "Preferred backend unavailable · ml-backend-unavailable",
+            "warn",
+        ]
+    ]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_system_diagnostics_distinguish_visual_cadence_and_exact_repeat_equality():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    for key in (
+        "segmentation_update_fps",
+        "base_composite_update_fps",
+        "base_composite_reuse_ratio",
+        "exact_final_output_repeat_ratio",
+        "output_send_fps",
+        "last_unique_frame_age_ms",
+        "serialized_new_frame_deadline_misses",
+        "output_sink_pacing_events",
+        "output_sink_recovery_events",
+        "application_pacing_events",
+        "output_schedule_late_events",
+        "cadence_mismatch_active",
+        "timing_schema_version",
+        "timing_ms",
+        "extensions",
+    ):
+        assert key in script
+
+    cadence_rows = (
+        "function visualCadenceRows"
+        + script.split("function visualCadenceRows", 1)[1].split(
+            "function geometrySummary", 1
+        )[0]
+    )
+    harness = r"""
+const rows = visualCadenceRows({
+  segmentation_update_count: 541,
+  segmentation_update_fps: 14.9,
+  base_composite_update_count: 541,
+  base_composite_update_fps: 15.0,
+  base_composite_reuse_count: 564,
+  base_composite_reuse_fps: 14.7,
+  base_composite_reuse_ratio: 564 / 1105,
+  exact_final_output_repeat_count: 564,
+  exact_final_output_repeat_fps: 14.7,
+  exact_final_output_repeat_ratio: 564 / 1104,
+  cadence_mismatch_active: true,
+});
+process.stdout.write(JSON.stringify(rows));
+"""
+    result = subprocess.run(
+        ["node"],
+        input=cadence_rows + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    rows = json.loads(result.stdout)
+    assert rows == [
+        ["Visual updates", "15.0 fps · 541 total", "warn"],
+        ["Segmentation updates", "14.9 fps · 541 total", "warn"],
+        ["Safe-base reuse", "14.7 fps · 564 total · 51.0%", "warn"],
+        ["Exact final-output repeats", "14.7 fps · 564 total · 51.1%", "warn"],
+    ]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")

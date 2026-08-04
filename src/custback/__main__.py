@@ -476,19 +476,46 @@ def _classify_service_failure(
 
 def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
     stats = hub.stats_dict()
+    selection = stats["segmentation_selection"]
+    matte_policy = stats["matte_policy"]
+    effective_policy = matte_policy["effective"]
     log.info(
         "shutdown reason=%s exit=%d uptime=%.1fs frames_in=%d frames_out=%d "
+        "backend=%s->%s tier=%s device=%s provider=%s backend_fallback=%s "
+        "backend_fallback_category=%s backend_fallback_reason=%s "
+        "rvm_ratio=%s alpha_policy=%s edge_policy=%s temporal_policy=%s "
+        "light_wrap=%s blend_space=%s "
         "capture_fps=%.1f output_fps=%.1f read_failures=%d restarts=%d "
         "repeats=%d video_skips=%d capture_read_ms=%s segmentation_ms=%s "
         "background_ms=%s color_correction_ms=%s composite_ms=%s output_send_ms=%s "
         "frame_processing_ms=%s capture_generation=%d camera_geometry=%d "
         "background_geometry=%d corrections_applied=%d corrections_bypassed=%d "
-        "color_scene_cuts=%d color_transitions=%d",
+        "color_scene_cuts=%d color_transitions=%d unique_updates=%d "
+        "segmentation_updates=%d output_sends=%d safe_base_reuses=%d "
+        "safe_base_reuse_pct=%.1f exact_final_repeats=%d capture_gaps=%d "
+        "capture_missing=%d capture_slot_overwrites=%d processing_deadline_misses=%d "
+        "serialized_deadline_misses=%d sink_pacing_events=%d "
+        "sink_recovery_events=%d application_pacing_events=%d "
+        "schedule_late_events=%d matte_resets=%d matte_last_reset=%s",
         reason,
         exit_code,
         stats["uptime_s"],
         stats["frames_in"],
         stats["frames_out"],
+        selection["requested_backend"],
+        selection["selected_backend"],
+        selection["quality_tier"],
+        selection["active_device"],
+        selection["active_provider"],
+        selection["fallback_active"],
+        selection["fallback_category"],
+        selection["fallback_reason"] or "none",
+        effective_policy["rvm_downsample_ratio"],
+        effective_policy["raw_alpha_mode"],
+        effective_policy["edge_refinement_mode"],
+        effective_policy["residual_temporal_mode"],
+        effective_policy["light_wrap"],
+        matte_policy["blend_space"],
         stats["capture_fps"],
         stats["fps"],
         stats["capture_read_failures"],
@@ -509,6 +536,23 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         stats["color_correction_bypassed_frames"],
         stats["color_correction_scene_cuts"],
         stats["color_correction_transitions"],
+        stats["base_composite_update_count"],
+        stats["segmentation_update_count"],
+        stats["output_send_count"],
+        stats["base_composite_reuse_count"],
+        stats["base_composite_reuse_ratio"] * 100.0,
+        stats["exact_final_output_repeat_count"],
+        stats["capture_sequence_gap_count"],
+        stats["capture_missing_input_count"],
+        stats["capture_dropped_frames"],
+        stats["processing_deadline_misses"],
+        stats["serialized_new_frame_deadline_misses"],
+        stats["output_sink_pacing_events"],
+        stats["output_sink_recovery_events"],
+        stats["application_pacing_events"],
+        stats["output_schedule_late_events"],
+        stats["matte_reset_count"],
+        stats["matte_last_reset_reason"] or "none",
     )
 
 
@@ -661,10 +705,23 @@ def run(
 
         if exit_code == 0 and not stop.is_set() and pipeline is not None:
             ready = hub.stats_dict()
+            selection = ready["segmentation_selection"]
+            matte_policy = ready["matte_policy"]
+            effective_policy = matte_policy["effective"]
             log.info(
                 "ready api=%s camera_requested=%s/%sx%s@%s "
                 "camera_negotiated=%s/%s %sx%s@%s segmenter=%s/%s output=%s "
-                "%sx%s@%s preview=%s visual_policy=%s",
+                "backend=%s->%s tier=%s selection_mode=%s provider=%s "
+                "backend_fallback=%s backend_fallback_category=%s "
+                "backend_fallback_reason=%s rvm_ratio=%s alpha_policy=%s "
+                "edge_policy=%s temporal_policy=%s light_wrap=%s blend_space=%s "
+                "%sx%s@%s preview=%s unique_updates=%d segmentation_updates=%d "
+                "output_sends=%d safe_base_reuses=%d exact_final_repeats=%d "
+                "capture_gaps=%d capture_missing=%d capture_slot_overwrites=%d "
+                "processing_deadline_misses=%d serialized_deadline_misses=%d "
+                "sink_pacing_events=%d sink_recovery_events=%d "
+                "application_pacing_events=%d schedule_late_events=%d "
+                "matte_resets=%d matte_last_reset=%s visual_policy=%s",
                 api_address,
                 cfg.camera.pixel_format,
                 cfg.camera.width,
@@ -678,10 +735,40 @@ def run(
                 ready["segmentation_backend"],
                 ready["segmentation_device"],
                 ready["output_backend"],
+                selection["requested_backend"],
+                selection["selected_backend"],
+                selection["quality_tier"],
+                selection["selection_mode"],
+                selection["active_provider"],
+                selection["fallback_active"],
+                selection["fallback_category"],
+                selection["fallback_reason"] or "none",
+                effective_policy["rvm_downsample_ratio"],
+                effective_policy["raw_alpha_mode"],
+                effective_policy["edge_refinement_mode"],
+                effective_policy["residual_temporal_mode"],
+                effective_policy["light_wrap"],
+                matte_policy["blend_space"],
                 ready["output_width"],
                 ready["output_height"],
                 ready["output_fps"],
                 "native" if cfg.output.preview else "disabled",
+                ready["base_composite_update_count"],
+                ready["segmentation_update_count"],
+                ready["output_send_count"],
+                ready["base_composite_reuse_count"],
+                ready["exact_final_output_repeat_count"],
+                ready["capture_sequence_gap_count"],
+                ready["capture_missing_input_count"],
+                ready["capture_dropped_frames"],
+                ready["processing_deadline_misses"],
+                ready["serialized_new_frame_deadline_misses"],
+                ready["output_sink_pacing_events"],
+                ready["output_sink_recovery_events"],
+                ready["application_pacing_events"],
+                ready["output_schedule_late_events"],
+                ready["matte_reset_count"],
+                ready["matte_last_reset_reason"] or "none",
                 sanitized_config_summary(cfg, list(_VISUAL_POLICY_DIAGNOSTIC_FIELDS)),
             )
 
@@ -776,6 +863,17 @@ def main(argv: list[str] | None = None) -> int:
         from .avatar.__main__ import main as avatar_main
 
         return avatar_main(effective_argv[1:], prog="custback avatar")
+    if effective_argv[:1] == ["capture-diagnose"]:
+        # Capture diagnosis opens only the production camera reader and
+        # canonical normalization path. It deliberately bypasses normal
+        # logging/config activation so no model, API, preview, or sink can
+        # contaminate the capture-only cadence measurement.
+        from .capture_diagnostics import main as capture_diagnostics_main
+
+        return capture_diagnostics_main(
+            effective_argv[1:],
+            prog="custback capture-diagnose",
+        )
     if effective_argv[:1] == ["matte-replay"]:
         # Replay is intentionally independent of normal config, camera, API,
         # virtual output, and durable runtime logs.
@@ -818,6 +916,16 @@ def main(argv: list[str] | None = None) -> int:
         return matte_rvm_qualification_main(
             effective_argv[1:],
             prog="custback matte-rvm-qualify",
+        )
+    if effective_argv[:1] == ["matte-performance"]:
+        # Matrix-only profiling is offline. Explicit --collect-full-path also
+        # opens the built-in model and requested local sink, but never live
+        # capture, preview, API, or network resources.
+        from .matte_performance import main as matte_performance_main
+
+        return matte_performance_main(
+            effective_argv[1:],
+            prog="custback matte-performance",
         )
 
     args = build_parser().parse_args(effective_argv)

@@ -86,6 +86,215 @@ class SegmenterPreparation:
     """ML backends whose dependencies and model bytes passed startup checks."""
 
     ready_backends: frozenset[str] = frozenset()
+    attempts: tuple[SegmenterSelectionAttempt, ...] = ()
+
+
+SegmenterBackendName = Literal["rvm", "mediapipe", "heuristic", "none"]
+SelectionMode = Literal["automatic", "explicit", "model-format"]
+PreparationResult = Literal["ready", "unavailable", "not-run", "not-applicable"]
+ActivationResult = Literal["selected", "failed", "not-attempted"]
+SelectionFailurePhase = Literal["runtime", "model", "activation"]
+SelectionReasonCategory = Literal[
+    "none",
+    "runtime-not-installed",
+    "runtime-unavailable",
+    "model-unavailable",
+    "permission-denied",
+    "preparation-unavailable",
+    "activation-failed",
+    "all-ml-backends-unavailable",
+]
+
+
+class SegmentationQualityTier(str, Enum):
+    """Operator-facing visual capability of the selected backend."""
+
+    MATTING = "matting"
+    SEGMENTATION = "segmentation"
+    HEURISTIC = "heuristic"
+    NONE = "none"
+
+
+_BACKEND_QUALITY_TIERS: dict[SegmenterBackendName, SegmentationQualityTier] = {
+    "rvm": SegmentationQualityTier.MATTING,
+    "mediapipe": SegmentationQualityTier.SEGMENTATION,
+    "heuristic": SegmentationQualityTier.HEURISTIC,
+    "none": SegmentationQualityTier.NONE,
+}
+
+
+@dataclass(frozen=True)
+class SegmenterSelectionAttempt:
+    """One bounded, path-free backend preparation/activation outcome."""
+
+    backend: SegmenterBackendName
+    quality_tier: SegmentationQualityTier
+    preparation_result: PreparationResult
+    activation_result: ActivationResult
+    reason_category: SelectionReasonCategory = "none"
+    reason: str = ""
+    guidance: str = ""
+
+    def __post_init__(self) -> None:
+        expected = _BACKEND_QUALITY_TIERS[self.backend]
+        if self.quality_tier is not expected:
+            raise ValueError("selection attempt quality tier does not match backend")
+        for name in ("reason", "guidance"):
+            value = getattr(self, name)
+            if "\n" in value or "\r" in value or len(value) > 240:
+                raise ValueError(
+                    f"selection attempt {name} must be bounded one-line text"
+                )
+        if (self.reason_category == "none") != (not self.reason and not self.guidance):
+            raise ValueError(
+                "selection attempt reason fields/category are inconsistent"
+            )
+        if self.activation_result == "selected" and (
+            self.reason_category != "none" or self.preparation_result == "unavailable"
+        ):
+            raise ValueError("selected attempt cannot be unavailable or failed")
+        if self.activation_result == "failed" and self.reason_category == "none":
+            raise ValueError("failed selection attempt requires a reason")
+        if self.preparation_result == "unavailable" and (
+            self.activation_result != "not-attempted" or self.reason_category == "none"
+        ):
+            raise ValueError(
+                "unavailable preparation must retain a reason without activation"
+            )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "backend": self.backend,
+            "quality_tier": self.quality_tier.value,
+            "preparation_result": self.preparation_result,
+            "activation_result": self.activation_result,
+            "reason_category": self.reason_category,
+            "reason": self.reason,
+            "guidance": self.guidance,
+        }
+
+
+@dataclass(frozen=True)
+class SegmenterSelectionReport:
+    """Immutable backend decision retained with the selected segmenter."""
+
+    requested_backend: str
+    selected_backend: SegmenterBackendName
+    quality_tier: SegmentationQualityTier
+    selection_mode: SelectionMode
+    fallback_active: bool
+    fallback_category: SelectionReasonCategory
+    fallback_reason: str
+    guidance: str
+    active_device: str
+    active_provider: str
+    attempts: tuple[SegmenterSelectionAttempt, ...]
+
+    def __post_init__(self) -> None:
+        if self.requested_backend not in {
+            "auto",
+            "rvm",
+            "mediapipe",
+            "heuristic",
+            "none",
+        }:
+            raise ValueError("selection requested backend is invalid")
+        if self.quality_tier is not _BACKEND_QUALITY_TIERS[self.selected_backend]:
+            raise ValueError("selection quality tier does not match selected backend")
+        if self.fallback_active != (self.fallback_category != "none"):
+            raise ValueError("selection fallback flag/category are inconsistent")
+        if self.fallback_active and (not self.fallback_reason or not self.guidance):
+            raise ValueError("active fallback requires a reason and guidance")
+        if not self.fallback_active and (self.fallback_reason or self.guidance):
+            raise ValueError("non-fallback selections cannot carry fallback guidance")
+        for name in (
+            "requested_backend",
+            "fallback_reason",
+            "guidance",
+            "active_device",
+            "active_provider",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or "\n" in value or "\r" in value:
+                raise ValueError(f"selection {name} must be one-line text")
+            if len(value) > 240:
+                raise ValueError(f"selection {name} is too long")
+        if not self.attempts or len(self.attempts) > 4:
+            raise ValueError("selection report must contain one to four attempts")
+        if self.selection_mode == "explicit":
+            if self.requested_backend == "auto":
+                raise ValueError("automatic request cannot use explicit selection mode")
+            if self.selected_backend != self.requested_backend:
+                raise ValueError("explicit selection must select the requested backend")
+            expected_fallback = False
+        elif self.selection_mode == "automatic":
+            if self.requested_backend != "auto" or self.selected_backend == "none":
+                raise ValueError("automatic selection requires an auto backend request")
+            expected_fallback = self.selected_backend != "rvm"
+        else:
+            if self.requested_backend != "auto" or self.selected_backend == "none":
+                raise ValueError(
+                    "model-format selection requires an auto backend request"
+                )
+            expected_fallback = self.selected_backend == "heuristic"
+        if self.fallback_active != expected_fallback:
+            raise ValueError(
+                "selection mode/backend fallback semantics are inconsistent"
+            )
+        attempted_backends = [attempt.backend for attempt in self.attempts]
+        if len(set(attempted_backends)) != len(attempted_backends):
+            raise ValueError("selection report backend attempts must be unique")
+        selected_attempts = [
+            attempt
+            for attempt in self.attempts
+            if attempt.activation_result == "selected"
+        ]
+        if (
+            len(selected_attempts) != 1
+            or selected_attempts[0].backend != self.selected_backend
+        ):
+            raise ValueError("selection report must identify its selected backend")
+        if self.selection_mode == "explicit":
+            expected_attempts = [self.selected_backend]
+        elif self.selection_mode == "automatic":
+            expected_attempts = {
+                "rvm": ["rvm", "mediapipe"],
+                "mediapipe": ["rvm", "mediapipe"],
+                "heuristic": ["rvm", "mediapipe", "heuristic"],
+            }[self.selected_backend]
+        elif self.selected_backend == "heuristic":
+            if attempted_backends[0] not in {"rvm", "mediapipe"}:
+                raise ValueError("model-format fallback must retain its ML candidate")
+            expected_attempts = [attempted_backends[0], "heuristic"]
+        else:
+            expected_attempts = [self.selected_backend]
+        if attempted_backends != expected_attempts:
+            raise ValueError("selection attempts do not match the selection mode")
+        selected_index = attempted_backends.index(self.selected_backend)
+        if any(
+            attempt.reason_category == "none"
+            for attempt in self.attempts[:selected_index]
+        ):
+            raise ValueError(
+                "preferred candidates before a fallback require diagnostics"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": "custback.backend-selection",
+            "version": 1,
+            "requested_backend": self.requested_backend,
+            "selected_backend": self.selected_backend,
+            "quality_tier": self.quality_tier.value,
+            "selection_mode": self.selection_mode,
+            "fallback_active": self.fallback_active,
+            "fallback_category": self.fallback_category,
+            "fallback_reason": self.fallback_reason,
+            "guidance": self.guidance,
+            "active_device": self.active_device,
+            "active_provider": self.active_provider,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
+        }
 
 
 SEGMENTATION_TIMESTAMP_GAP_RESET_NS = 1_000_000_000
@@ -382,6 +591,86 @@ class ModelAcquisitionError(RuntimeError):
     """A managed model could not be acquired and integrity-checked."""
 
 
+def _selection_failure(
+    backend: SegmenterBackendName,
+    exc: BaseException,
+    phase: SelectionFailurePhase,
+) -> tuple[SelectionReasonCategory, str, str]:
+    """Map a private exception onto bounded operator-facing diagnostics."""
+
+    label = "RVM" if backend == "rvm" else "MediaPipe"
+    if isinstance(exc, ModuleNotFoundError):
+        return (
+            "runtime-not-installed",
+            f"{label} unavailable: runtime not installed",
+            (
+                "Install the RVM runtime profile and restart."
+                if backend == "rvm"
+                else "Install the MediaPipe runtime profile and restart."
+            ),
+        )
+    if phase == "runtime" or isinstance(exc, ImportError):
+        return (
+            "runtime-unavailable",
+            f"{label} unavailable: runtime failed to load",
+            "Run custback doctor and repair the reported runtime profile.",
+        )
+    if isinstance(exc, PermissionError):
+        return (
+            "permission-denied",
+            f"{label} unavailable: model is not readable",
+            "Repair the managed model cache or select a readable custom model.",
+        )
+    if phase == "model" or isinstance(
+        exc,
+        (ModelAcquisitionError, FileNotFoundError),
+    ):
+        return (
+            "model-unavailable",
+            f"{label} unavailable: model is not ready",
+            "Run the installer or rebuild command to repair managed model assets.",
+        )
+    return (
+        "activation-failed",
+        f"{label} unavailable: backend activation failed",
+        "Run custback doctor and repair the reported runtime profile.",
+    )
+
+
+def _selection_attempt(
+    backend: SegmenterBackendName,
+    *,
+    preparation_result: PreparationResult,
+    activation_result: ActivationResult,
+    failure: BaseException | None = None,
+    failure_phase: SelectionFailurePhase = "activation",
+    unavailable_without_detail: bool = False,
+) -> SegmenterSelectionAttempt:
+    category: SelectionReasonCategory = "none"
+    reason = ""
+    guidance = ""
+    if failure is not None:
+        category, reason, guidance = _selection_failure(
+            backend,
+            failure,
+            failure_phase,
+        )
+    elif unavailable_without_detail:
+        category = "preparation-unavailable"
+        label = "RVM" if backend == "rvm" else "MediaPipe"
+        reason = f"{label} unavailable: startup preparation did not succeed"
+        guidance = "Run custback doctor and repair the reported runtime profile."
+    return SegmenterSelectionAttempt(
+        backend=backend,
+        quality_tier=_BACKEND_QUALITY_TIERS[backend],
+        preparation_result=preparation_result,
+        activation_result=activation_result,
+        reason_category=category,
+        reason=reason,
+        guidance=guidance,
+    )
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -664,12 +953,28 @@ def preacquire_segmenter_model(cfg: SegmentationConfig) -> SegmenterPreparation:
     else:
         candidates = ((cfg.backend, module_names.get(cfg.backend, cfg.backend)),)
     ready: set[str] = set()
+    attempts: list[SegmenterSelectionAttempt] = []
     custom_path = Path(cfg.model_path) if cfg.model_path else None
     for backend, module in candidates:
         if backend not in BUILTIN_MODELS:
             continue
+        selected_backend = cast(SegmenterBackendName, backend)
         try:
             importlib.import_module(module)
+        except Exception as exc:
+            if cfg.backend != "auto":
+                raise
+            attempt = _selection_attempt(
+                selected_backend,
+                preparation_result="unavailable",
+                activation_result="not-attempted",
+                failure=exc,
+                failure_phase="runtime",
+            )
+            attempts.append(attempt)
+            log.info("%s", attempt.reason)
+            continue
+        try:
             if backend == custom_backend:
                 assert custom_path is not None
                 if not custom_path.is_file():
@@ -681,11 +986,26 @@ def preacquire_segmenter_model(cfg: SegmentationConfig) -> SegmenterPreparation:
             else:
                 acquire_builtin_model(backend)
             ready.add(backend)
+            attempts.append(
+                _selection_attempt(
+                    selected_backend,
+                    preparation_result="ready",
+                    activation_result="not-attempted",
+                )
+            )
         except Exception as exc:
             if cfg.backend != "auto":
                 raise
-            log.info("%s model pre-acquisition unavailable (%s)", backend, exc)
-    return SegmenterPreparation(frozenset(ready))
+            attempt = _selection_attempt(
+                selected_backend,
+                preparation_result="unavailable",
+                activation_result="not-attempted",
+                failure=exc,
+                failure_phase="model",
+            )
+            attempts.append(attempt)
+            log.info("%s", attempt.reason)
+    return SegmenterPreparation(frozenset(ready), tuple(attempts))
 
 
 class Segmenter(ABC):
@@ -704,6 +1024,7 @@ class Segmenter(ABC):
     matte_backend_kind = MatteBackendKind.BINARY_COARSE
 
     def __init__(self) -> None:
+        self.selection_report: SegmenterSelectionReport | None = None
         self.temporal_reset_count = 0
         self.last_temporal_reset_reason: TemporalResetReason | None = None
         self.last_temporal_reset_timestamp_ns: int | None = None
@@ -872,8 +1193,8 @@ class MediaPipeSegmenter(Segmenter):
                 self._active_delegate = mp_python.BaseOptions.Delegate.GPU
                 self._segmenter = make(self._active_delegate)
                 self.device = "gpu"
-            except Exception as exc:
-                log.warning("mediapipe GPU delegate unavailable (%s); using CPU", exc)
+            except Exception:
+                log.warning("MediaPipe GPU delegate unavailable; using CPU")
                 self._active_delegate = None
         if self._segmenter is None:
             self._segmenter = make(None)
@@ -1338,11 +1659,18 @@ class RVMSegmenter(Segmenter):
 
     def _feeds(self, frame_bgr: np.ndarray, ratio: float) -> dict[str, np.ndarray]:
         assert self._rec is not None
-        if cv2 is not None:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        else:  # pragma: no cover
-            rgb = frame_bgr[..., ::-1]
-        src = rgb.astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+        height, width = frame_bgr.shape[:2]
+        # Fill the ONNX-native contiguous NCHW buffer directly.  The historical
+        # route allocated an RGB uint8 frame, a float32 HWC frame, and then the
+        # divided NCHW result.  A fresh result per inference deliberately
+        # preserves feed ownership for synchronous session implementations and
+        # test/evidence sessions that retain earlier feed dictionaries.
+        src = np.empty((1, 3, height, width), dtype=np.float32)
+        np.divide(
+            frame_bgr[..., ::-1].transpose(2, 0, 1),
+            np.float32(255.0),
+            out=src[0],
+        )
         return {
             "src": src,
             "r1i": self._rec[0],
@@ -1390,6 +1718,10 @@ class RVMSegmenter(Segmenter):
             # and stay on CPU. A CPU-side failure is not retried (it would loop).
             if not self.accel.on_gpu:
                 raise
+            if self._accel_cfg.mode == "gpu_required":
+                raise GpuRequiredError(
+                    "gpu_required RVM inference failed on the active accelerator"
+                ) from None
             self._recover_to_cpu(exc)
             self.reset_temporal_state(
                 TemporalResetReason.BACKEND_RECOVERY,
@@ -1422,7 +1754,16 @@ class RVMSegmenter(Segmenter):
             or not np.issubdtype(pha.dtype, np.floating)
         ):
             raise ValueError("RVM returned an invalid alpha")
-        alpha = np.ascontiguousarray(pha[0, 0].astype(np.float32))
+        # Detach the published alpha from runtime-owned outputs.  A valid
+        # session may alias graph outputs to an input or another output; the
+        # caller must not be able to mutate retained feeds or recurrent state
+        # through the returned mask.
+        alpha = np.array(
+            pha[0, 0],
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
         if (
             not bool(np.isfinite(alpha).all())
             or float(alpha.min(initial=0.0)) < 0.0
@@ -1439,8 +1780,18 @@ class RVMSegmenter(Segmenter):
             for state in next_recurrent
         ):
             raise ValueError("RVM returned invalid recurrent state")
-        fgr_rgb = np.clip(fgr[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
-        foreground = np.ascontiguousarray(fgr_rgb[..., ::-1])
+        # Keep the runtime-owned foreground output immutable: the fake session
+        # and a valid ONNX implementation may alias it to ``src``.  Clip the
+        # one historical multiplication result in place, then cast/channel-swap
+        # directly into the independently owned published BGR frame.
+        scaled_foreground = fgr[0].transpose(1, 2, 0) * 255.0
+        np.clip(scaled_foreground, 0, 255, out=scaled_foreground)
+        foreground = np.empty((h, w, 3), dtype=np.uint8)
+        np.copyto(
+            foreground,
+            scaled_foreground[..., ::-1],
+            casting="unsafe",
+        )
         postprocess_ns = time.monotonic_ns() - started
         acceleration = self.accel.status()
 
@@ -2671,6 +3022,13 @@ def segmenter_matte_backend_kind(segmenter: object) -> MatteBackendKind:
     kind = getattr(segmenter, "matte_backend_kind", None)
     if isinstance(kind, MatteBackendKind):
         return kind
+    class_name = type(segmenter).__name__.lower()
+    if "rvm" in class_name:
+        return MatteBackendKind.TRUE_ALPHA_RECURRENT
+    if "mediapipe" in class_name:
+        return MatteBackendKind.CONFIDENCE_MASK_VIDEO
+    if "null" in class_name:
+        return MatteBackendKind.NULL_PASSTHROUGH
     # Older extensions and narrow test doubles predate the explicit
     # capability. Preserve the one historical distinction they could express.
     if bool(getattr(segmenter, "produces_matte", False)):
@@ -2699,6 +3057,193 @@ def refiner_for(
     return MaskRefiner(policy.effective_refiner_config(cfg))
 
 
+def _segmenter_provider(
+    segmenter: object,
+    selected_backend: SegmenterBackendName,
+) -> str:
+    if selected_backend == "none":
+        return "none"
+    accel = getattr(segmenter, "accel", None)
+    if accel is not None:
+        try:
+            provider = accel.status().active_provider
+        except Exception:
+            provider = ""
+        if isinstance(provider, str) and provider:
+            return provider
+    device = str(getattr(segmenter, "device", "cpu") or "cpu").lower()
+    return device if device in {"cpu", "cuda", "directml", "coreml", "gpu"} else "cpu"
+
+
+def _selected_backend_name(segmenter: object) -> SegmenterBackendName:
+    report = getattr(segmenter, "selection_report", None)
+    if isinstance(report, SegmenterSelectionReport):
+        return report.selected_backend
+    class_name = type(segmenter).__name__.lower()
+    if "rvm" in class_name:
+        return "rvm"
+    if "mediapipe" in class_name:
+        return "mediapipe"
+    if "null" in class_name:
+        return "none"
+    kind = segmenter_matte_backend_kind(segmenter)
+    if kind is MatteBackendKind.TRUE_ALPHA_RECURRENT:
+        return "rvm"
+    if kind is MatteBackendKind.CONFIDENCE_MASK_VIDEO:
+        return "mediapipe"
+    if kind is MatteBackendKind.NULL_PASSTHROUGH:
+        return "none"
+    return "heuristic"
+
+
+def segmenter_selection_status(
+    segmenter: object,
+    requested_backend: str,
+) -> dict[str, object]:
+    """Return the versioned selection report with live device/provider state."""
+
+    report = getattr(segmenter, "selection_report", None)
+    if not isinstance(report, SegmenterSelectionReport):
+        selected = _selected_backend_name(segmenter)
+        device = (
+            "none"
+            if selected == "none"
+            else str(getattr(segmenter, "device", "cpu") or "cpu").lower()
+        )
+        attempts: list[SegmenterSelectionAttempt] = []
+        fallback_active = requested_backend == "auto" and selected != "rvm"
+        fallback_category: SelectionReasonCategory = "none"
+        fallback_reason = ""
+        guidance = ""
+        if fallback_active and selected in {"mediapipe", "heuristic"}:
+            attempts.append(
+                _selection_attempt(
+                    "rvm",
+                    preparation_result="unavailable",
+                    activation_result="not-attempted",
+                    unavailable_without_detail=True,
+                )
+            )
+        if fallback_active and selected == "heuristic":
+            attempts.append(
+                _selection_attempt(
+                    "mediapipe",
+                    preparation_result="unavailable",
+                    activation_result="not-attempted",
+                    unavailable_without_detail=True,
+                )
+            )
+            fallback_category = "all-ml-backends-unavailable"
+            fallback_reason = "RVM and MediaPipe unavailable: using heuristic detection"
+            guidance = (
+                "Install the RVM runtime profile for matting or the MediaPipe "
+                "profile for segmentation."
+            )
+        elif fallback_active:
+            fallback_category = "preparation-unavailable"
+            fallback_reason = "Preferred segmentation backend unavailable"
+            guidance = "Run custback doctor and repair the reported runtime profile."
+        attempts.append(
+            _selection_attempt(
+                selected,
+                preparation_result=(
+                    "not-applicable" if selected in {"heuristic", "none"} else "not-run"
+                ),
+                activation_result="selected",
+            )
+        )
+        if requested_backend == "auto" and selected == "rvm":
+            attempts.append(
+                _selection_attempt(
+                    "mediapipe",
+                    preparation_result="not-run",
+                    activation_result="not-attempted",
+                )
+            )
+        report = SegmenterSelectionReport(
+            requested_backend=requested_backend,
+            selected_backend=selected,
+            quality_tier=_BACKEND_QUALITY_TIERS[selected],
+            selection_mode="automatic" if requested_backend == "auto" else "explicit",
+            fallback_active=fallback_active,
+            fallback_category=fallback_category,
+            fallback_reason=fallback_reason,
+            guidance=guidance,
+            active_device=device,
+            active_provider=_segmenter_provider(segmenter, selected),
+            attempts=tuple(attempts),
+        )
+    value = report.to_dict()
+    selected_backend = report.selected_backend
+    value["active_device"] = (
+        "none"
+        if selected_backend == "none"
+        else str(getattr(segmenter, "device", report.active_device) or "cpu").lower()
+    )
+    value["active_provider"] = _segmenter_provider(segmenter, selected_backend)
+    return value
+
+
+def _attach_selection_report(
+    segmenter: Segmenter,
+    *,
+    cfg: SegmentationConfig,
+    selected_backend: SegmenterBackendName,
+    primary_backend: SegmenterBackendName,
+    selection_mode: SelectionMode,
+    attempts: list[SegmenterSelectionAttempt],
+) -> Segmenter:
+    fallback_active = cfg.backend == "auto" and selected_backend != primary_backend
+    fallback_category: SelectionReasonCategory = "none"
+    fallback_reason = ""
+    guidance = ""
+    if fallback_active:
+        failed = [
+            attempt
+            for attempt in attempts
+            if attempt.backend != selected_backend and attempt.reason_category != "none"
+        ]
+        if (
+            selection_mode == "automatic"
+            and selected_backend == "heuristic"
+            and {attempt.backend for attempt in failed} >= {"rvm", "mediapipe"}
+        ):
+            fallback_category = "all-ml-backends-unavailable"
+            fallback_reason = "RVM and MediaPipe unavailable: using heuristic detection"
+            guidance = (
+                "Install the RVM runtime profile for matting or the MediaPipe "
+                "profile for segmentation."
+            )
+        elif failed:
+            fallback_category = failed[0].reason_category
+            fallback_reason = failed[0].reason
+            guidance = failed[0].guidance
+        else:
+            fallback_category = "preparation-unavailable"
+            fallback_reason = "Preferred segmentation backend unavailable"
+            guidance = "Run custback doctor and repair the reported runtime profile."
+    device = (
+        "none"
+        if selected_backend == "none"
+        else str(getattr(segmenter, "device", "cpu") or "cpu").lower()
+    )
+    report = SegmenterSelectionReport(
+        requested_backend=cfg.backend,
+        selected_backend=selected_backend,
+        quality_tier=_BACKEND_QUALITY_TIERS[selected_backend],
+        selection_mode=selection_mode,
+        fallback_active=fallback_active,
+        fallback_category=fallback_category,
+        fallback_reason=fallback_reason,
+        guidance=guidance,
+        active_device=device,
+        active_provider=_segmenter_provider(segmenter, selected_backend),
+        attempts=tuple(attempts),
+    )
+    setattr(segmenter, "selection_report", report)
+    return segmenter
+
+
 def create_segmenter(
     cfg: SegmentationConfig,
     *,
@@ -2717,12 +3262,79 @@ def create_segmenter(
     if backend is None:
         backend = requested_backend
     prepared = preparation.ready_backends if preparation is not None else None
+    selection_mode: SelectionMode = (
+        "model-format"
+        if requested_backend == "auto" and _custom_model_backend(cfg) is not None
+        else ("automatic" if requested_backend == "auto" else "explicit")
+    )
+    primary_backend = cast(
+        SegmenterBackendName,
+        (
+            _custom_model_backend(cfg)
+            if selection_mode == "model-format"
+            else ("rvm" if requested_backend == "auto" else backend)
+        ),
+    )
+    prepared_attempts = (
+        {attempt.backend: attempt for attempt in preparation.attempts}
+        if preparation is not None
+        else {}
+    )
+    attempts: list[SegmenterSelectionAttempt] = []
+
+    def preparation_result(
+        candidate: SegmenterBackendName,
+    ) -> PreparationResult:
+        attempt = prepared_attempts.get(candidate)
+        if attempt is not None:
+            return attempt.preparation_result
+        if preparation is None:
+            return "not-run"
+        return "ready" if candidate in preparation.ready_backends else "unavailable"
+
+    def unavailable_attempt(candidate: SegmenterBackendName) -> None:
+        existing = prepared_attempts.get(candidate)
+        if existing is not None:
+            attempts.append(existing)
+        else:
+            attempts.append(
+                _selection_attempt(
+                    candidate,
+                    preparation_result="unavailable",
+                    activation_result="not-attempted",
+                    unavailable_without_detail=True,
+                )
+            )
+
+    if acceleration is not None and acceleration.mode == "gpu_required":
+        if backend not in {"auto", "rvm"}:
+            raise GpuRequiredError("gpu_required requires an RVM-eligible backend")
+        if prepared is not None and "rvm" not in prepared:
+            raise GpuRequiredError(
+                "gpu_required RVM startup preparation did not succeed"
+            )
     if backend == "none":
-        return NullSegmenter()
+        seg = NullSegmenter()
+        attempts.append(
+            _selection_attempt(
+                "none",
+                preparation_result="not-applicable",
+                activation_result="selected",
+            )
+        )
+        return _attach_selection_report(
+            seg,
+            cfg=cfg,
+            selected_backend="none",
+            primary_backend="none",
+            selection_mode=selection_mode,
+            attempts=attempts,
+        )
     if (
         prepared is not None
         and backend in {"rvm", "mediapipe"}
         and backend not in prepared
+        and requested_backend != "auto"
     ):
         raise ModelAcquisitionError(
             f"selected {backend} backend did not pass model pre-acquisition"
@@ -2735,26 +3347,105 @@ def create_segmenter(
                 allow_model_download=preparation is None,
             )
             log.info("using rvm matting backend on %s", seg.device)
-            return seg
+            attempts.append(
+                _selection_attempt(
+                    "rvm",
+                    preparation_result=preparation_result("rvm"),
+                    activation_result="selected",
+                )
+            )
+            if selection_mode == "automatic":
+                attempts.append(
+                    prepared_attempts.get("mediapipe")
+                    or _selection_attempt(
+                        "mediapipe",
+                        preparation_result=preparation_result("mediapipe"),
+                        activation_result="not-attempted",
+                        unavailable_without_detail=(
+                            preparation is not None
+                            and "mediapipe" not in preparation.ready_backends
+                            and "mediapipe" not in prepared_attempts
+                        ),
+                    )
+                )
+            return _attach_selection_report(
+                seg,
+                cfg=cfg,
+                selected_backend="rvm",
+                primary_backend=primary_backend,
+                selection_mode=selection_mode,
+                attempts=attempts,
+            )
         except GpuRequiredError:
             # gpu_required is an explicit operator demand for proven GPU
             # execution; never satisfy it by silently degrading to another
             # backend, regardless of backend=auto fallback.
             raise
         except Exception as exc:
+            if acceleration is not None and acceleration.mode == "gpu_required":
+                raise GpuRequiredError(
+                    "gpu_required RVM backend activation failed"
+                ) from None
             if requested_backend == "rvm":
                 raise
-            log.info("rvm backend unavailable (%s)", exc)
+            attempt = _selection_attempt(
+                "rvm",
+                preparation_result=preparation_result("rvm"),
+                activation_result="failed",
+                failure=exc,
+            )
+            attempts.append(attempt)
+            log.info("%s", attempt.reason)
+    elif backend in ("auto", "rvm"):
+        unavailable_attempt("rvm")
     if backend in ("auto", "mediapipe") and (
         prepared is None or "mediapipe" in prepared
     ):
         try:
             seg = MediaPipeSegmenter(cfg, allow_model_download=preparation is None)
             log.info("using mediapipe segmentation backend on %s", seg.device)
-            return seg
+            attempts.append(
+                _selection_attempt(
+                    "mediapipe",
+                    preparation_result=preparation_result("mediapipe"),
+                    activation_result="selected",
+                )
+            )
+            return _attach_selection_report(
+                seg,
+                cfg=cfg,
+                selected_backend="mediapipe",
+                primary_backend=primary_backend,
+                selection_mode=selection_mode,
+                attempts=attempts,
+            )
         except Exception as exc:
             if requested_backend == "mediapipe":
                 raise
-            log.info("mediapipe unavailable (%s); falling back to heuristic", exc)
+            attempt = _selection_attempt(
+                "mediapipe",
+                preparation_result=preparation_result("mediapipe"),
+                activation_result="failed",
+                failure=exc,
+            )
+            attempts.append(attempt)
+            log.info("%s; using heuristic detection", attempt.reason)
+    elif backend in ("auto", "mediapipe"):
+        unavailable_attempt("mediapipe")
     log.info("using heuristic segmentation backend")
-    return HeuristicSegmenter(cfg)
+    seg = HeuristicSegmenter(cfg)
+    attempts.append(
+        _selection_attempt(
+            "heuristic",
+            preparation_result="not-applicable",
+            activation_result="selected",
+        )
+    )
+    return _attach_selection_report(
+        seg,
+        cfg=cfg,
+        selected_backend="heuristic",
+        primary_backend=primary_backend,
+        selection_mode=selection_mode,
+        attempts=attempts,
+    )

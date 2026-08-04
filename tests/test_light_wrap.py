@@ -180,7 +180,7 @@ def test_opencv_preparation_failure_is_bounded_and_does_not_advance_state(
     before = stabilizer.snapshot()
     monkeypatch.setattr(
         compositor_mod,
-        "_downscaled_blur_sample",
+        "_downscaled_blur_with_sample",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             compositor_mod.cv2.error("forced light-wrap resize failure")
         ),

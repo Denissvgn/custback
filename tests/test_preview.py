@@ -413,11 +413,154 @@ def test_status_overlay_shows_actual_backends_cpu_and_fallbacks():
     assert "REMOTE FALLBACK" in warning_text
 
 
+def test_status_overlay_shows_structured_backend_downgrade_and_policy():
+    status, warnings = preview_mod._status_overlay_lines(
+        {
+            "segmentation_backend": "MediaPipeSegmenter",
+            "segmentation_device": "cpu",
+            "output_backend": "NullOutput",
+            "segmentation_selection": {
+                "requested_backend": "auto",
+                "selected_backend": "mediapipe",
+                "quality_tier": "segmentation",
+                "selection_mode": "automatic",
+                "fallback_active": True,
+                "fallback_category": "runtime-not-installed",
+                "fallback_reason": "RVM unavailable: runtime not installed",
+                "guidance": "Install the RVM runtime profile and restart.",
+                "active_device": "cpu",
+                "active_provider": "cpu",
+                "attempts": [],
+            },
+            "matte_policy": {
+                "effective": {
+                    "raw_alpha_mode": "confidence_soft_mask",
+                    "rvm_downsample_ratio": None,
+                    "edge_refine": True,
+                    "residual_temporal_mode": "explicit_motion_aware",
+                    "light_wrap": 0.15,
+                }
+            },
+        }
+    )
+
+    rendered = "\n".join(status)
+    assert (
+        "SEG mediapipe/cpu  TIER segmentation  PROVIDER cpu  SELECT automatic"
+    ) in rendered
+    assert (
+        "MATTE ALPHA confidence_soft_mask  EDGE on  "
+        "TEMPORAL explicit_motion_aware  LIGHT WRAP 0.15"
+    ) in rendered
+    assert warnings == [
+        "SEGMENTATION FALLBACK [runtime-not-installed]: "
+        "RVM unavailable: runtime not installed",
+        "SEGMENTATION ACTION: Install the RVM runtime profile and restart.",
+    ]
+
+
+def test_status_overlay_does_not_warn_for_explicit_mediapipe():
+    _status, warnings = preview_mod._status_overlay_lines(
+        {
+            # Structured selection is authoritative over the legacy flag.
+            "segmentation_fallback_active": True,
+            "segmentation_fallback_reason": "legacy-misclassification",
+            "segmentation_selection": {
+                "requested_backend": "mediapipe",
+                "selected_backend": "mediapipe",
+                "quality_tier": "segmentation",
+                "selection_mode": "explicit",
+                "fallback_active": False,
+                "fallback_category": "none",
+                "fallback_reason": "",
+                "guidance": "",
+                "active_device": "cpu",
+                "active_provider": "cpu",
+                "attempts": [],
+            },
+        }
+    )
+
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    ("backend", "tier", "device", "provider"),
+    [
+        ("rvm", "matting", "cuda", "cuda"),
+        ("mediapipe", "segmentation", "cpu", "cpu"),
+        ("heuristic", "heuristic", "cpu", "cpu"),
+        ("none", "none", "none", "none"),
+    ],
+)
+def test_status_overlay_covers_every_backend_quality_tier(
+    backend,
+    tier,
+    device,
+    provider,
+):
+    status, warnings = preview_mod._status_overlay_lines(
+        {
+            "segmentation_selection": {
+                "requested_backend": backend,
+                "selected_backend": backend,
+                "quality_tier": tier,
+                "selection_mode": "explicit",
+                "fallback_active": False,
+                "fallback_category": "none",
+                "fallback_reason": "",
+                "guidance": "",
+                "active_device": device,
+                "active_provider": provider,
+                "attempts": [],
+            }
+        }
+    )
+
+    assert (
+        f"SEG {backend}/{device}  TIER {tier}  PROVIDER {provider}  SELECT explicit"
+    ) in status[1]
+    assert warnings == []
+
+
 def test_status_overlay_marks_stalled_capture_age():
     _status, warnings = preview_mod._status_overlay_lines(
         {"capture_stalled": True, "capture_frame_age_ms": 2450.0}
     )
     assert warnings == ["CAPTURE STALLED (2450 ms since last frame)"]
+
+
+def test_status_overlay_distinguishes_visual_updates_from_output_sends():
+    status, warnings = preview_mod._status_overlay_lines(
+        {
+            "base_composite_update_fps": 15.0,
+            "segmentation_update_fps": 14.9,
+            "output_send_fps": 29.7,
+            "base_composite_reuse_ratio": 564 / 1105,
+            "exact_final_output_repeat_ratio": 564 / 1104,
+            "cadence_mismatch_active": True,
+        }
+    )
+
+    assert status == [
+        "starting  IN -- fps  OUT -- fps",
+        "SEG unknown/unknown  OUTPUT unknown  CONFIG v0",
+        "CADENCE VIS 15.0  SEG 14.9  SEND 29.7  BASE REUSE 51%  EXACT FINAL REPEAT 51%",
+    ]
+    assert warnings == ["VISUAL UPDATES 15 FPS; OUTPUT REPEATS TO 30 FPS"]
+
+
+def test_status_overlay_does_not_infer_mismatch_from_partial_cadence():
+    status, warnings = preview_mod._status_overlay_lines(
+        {
+            "base_composite_update_fps": 15.0,
+            "output_send_fps": 29.7,
+            "cadence_mismatch_active": False,
+        }
+    )
+
+    assert status[-1] == "CADENCE VIS 15.0  SEND 29.7"
+    assert warnings == []
 
 
 class TestPreviewController:

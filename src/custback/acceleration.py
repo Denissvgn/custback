@@ -19,12 +19,15 @@ this module proves the *actual* RVM graph, which is the product evidence.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
+import uuid as uuidlib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -77,6 +80,428 @@ class AccelState(str, Enum):
 
 class GpuRequiredError(RuntimeError):
     """``mode: gpu_required`` could not prove accelerator execution."""
+
+
+_CUDA_IDENTITY_SOURCE = "custback-cuda-driver-runtime-nvml-v1"
+_CUDA_IDENTITY_ERROR = "CUDA device identity is unavailable"
+_PCI_BUS_ID = re.compile(
+    r"(?P<domain>[0-9a-fA-F]{4}|[0-9a-fA-F]{8}):"
+    r"(?P<bus>[0-9a-fA-F]{2}):"
+    r"(?P<device>[0-9a-fA-F]{2})\."
+    r"(?P<function>[0-7])\Z"
+)
+_VERSION_TEXT = re.compile(r"[0-9]+(?:\.[0-9]+){1,7}\Z")
+_CUDA_COMPUTE_CAPABILITY_MAJOR = 75
+_CUDA_COMPUTE_CAPABILITY_MINOR = 76
+_NVML_ERROR_NOT_FOUND = 6
+_MAX_CUDA_DEVICE_COUNT = 1024
+_MAX_DEVICE_MEMORY_BYTES = 1 << 60
+_MAX_CUDA_VERSION = 1_000_000
+
+
+class _CudaUuid(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+
+class _NvmlMemory(ctypes.Structure):
+    _fields_ = [
+        ("total", ctypes.c_ulonglong),
+        ("free", ctypes.c_ulonglong),
+        ("used", ctypes.c_ulonglong),
+    ]
+
+
+def _load_cuda_identity_libraries() -> tuple[Any, Any, Any]:
+    """Load platform CUDA/NVML ABIs without invoking external commands."""
+
+    if sys.platform == "win32":
+        cuda_loader = getattr(ctypes, "WinDLL", ctypes.CDLL)
+        return (
+            cuda_loader("nvcuda.dll"),
+            cuda_loader("cudart64_12.dll"),
+            ctypes.CDLL("nvml.dll"),
+        )
+    elif sys.platform.startswith("linux"):
+        return (
+            ctypes.CDLL("libcuda.so.1"),
+            ctypes.CDLL("libcudart.so.12"),
+            ctypes.CDLL("libnvidia-ml.so.1"),
+        )
+    raise RuntimeError(_CUDA_IDENTITY_ERROR)
+
+
+def _configure_cuda_identity_apis(driver: Any, runtime: Any, nvml: Any) -> None:
+    """Declare only the stable C ABI surface consumed by the identity probe."""
+
+    driver.cuInit.argtypes = [ctypes.c_uint]
+    driver.cuInit.restype = ctypes.c_int
+    driver.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    driver.cuDeviceGetCount.restype = ctypes.c_int
+    driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    driver.cuDeviceGet.restype = ctypes.c_int
+    driver.cuDeviceGetName.argtypes = [
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    driver.cuDeviceGetName.restype = ctypes.c_int
+    uuid_getter = getattr(driver, "cuDeviceGetUuid_v2", None)
+    if uuid_getter is None:
+        uuid_getter = driver.cuDeviceGetUuid
+    uuid_getter.argtypes = [ctypes.POINTER(_CudaUuid), ctypes.c_int]
+    uuid_getter.restype = ctypes.c_int
+    memory_getter = getattr(driver, "cuDeviceTotalMem_v2", None)
+    if memory_getter is None:
+        memory_getter = driver.cuDeviceTotalMem
+    memory_getter.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.c_int]
+    memory_getter.restype = ctypes.c_int
+    driver.cuDeviceGetAttribute.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    driver.cuDeviceGetAttribute.restype = ctypes.c_int
+    driver.cuDeviceGetPCIBusId.argtypes = [
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    driver.cuDeviceGetPCIBusId.restype = ctypes.c_int
+    driver.cuDriverGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    driver.cuDriverGetVersion.restype = ctypes.c_int
+
+    runtime.cudaDeviceGetPCIBusId.argtypes = [
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    runtime.cudaDeviceGetPCIBusId.restype = ctypes.c_int
+    runtime.cudaDriverGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    runtime.cudaDriverGetVersion.restype = ctypes.c_int
+    runtime.cudaRuntimeGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    runtime.cudaRuntimeGetVersion.restype = ctypes.c_int
+
+    init = getattr(nvml, "nvmlInit_v2", None)
+    if init is None:
+        init = nvml.nvmlInit
+    init.argtypes = []
+    init.restype = ctypes.c_int
+    nvml.nvmlShutdown.argtypes = []
+    nvml.nvmlShutdown.restype = ctypes.c_int
+    nvml.nvmlSystemGetDriverVersion.argtypes = [
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_uint,
+    ]
+    nvml.nvmlSystemGetDriverVersion.restype = ctypes.c_int
+    nvml.nvmlSystemGetNVMLVersion.argtypes = [
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_uint,
+    ]
+    nvml.nvmlSystemGetNVMLVersion.restype = ctypes.c_int
+    nvml.nvmlDeviceGetHandleByUUID.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    nvml.nvmlDeviceGetHandleByUUID.restype = ctypes.c_int
+    nvml.nvmlDeviceGetUUID.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_uint,
+    ]
+    nvml.nvmlDeviceGetUUID.restype = ctypes.c_int
+    nvml.nvmlDeviceGetName.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_uint,
+    ]
+    nvml.nvmlDeviceGetName.restype = ctypes.c_int
+    nvml.nvmlDeviceGetMemoryInfo.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_NvmlMemory),
+    ]
+    nvml.nvmlDeviceGetMemoryInfo.restype = ctypes.c_int
+
+
+def _require_identity_success(result: object) -> None:
+    if type(result) is not int or result != 0:
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+
+
+def _identity_text(buffer: Any, *, maximum: int) -> str:
+    try:
+        value = bytes(buffer.value).decode("ascii")
+    except (AttributeError, UnicodeError):
+        raise RuntimeError(_CUDA_IDENTITY_ERROR) from None
+    if (
+        not value
+        or len(value) > maximum
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    return value
+
+
+def _identity_version_text(buffer: Any, *, maximum: int) -> str:
+    value = _identity_text(buffer, maximum=maximum)
+    if _VERSION_TEXT.fullmatch(value) is None or not any(
+        int(part) > 0 for part in value.split(".")
+    ):
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    return value
+
+
+def _positive_identity_int(value: int, *, maximum: int) -> int:
+    if type(value) is not int or not 0 < value <= maximum:
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    return value
+
+
+def _canonical_pci_bus_id(value: str) -> str:
+    matched = _PCI_BUS_ID.fullmatch(value)
+    if matched is None:
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    return (
+        f"{int(matched['domain'], 16):08x}:"
+        f"{int(matched['bus'], 16):02x}:"
+        f"{int(matched['device'], 16):02x}."
+        f"{int(matched['function'])}"
+    )
+
+
+def _nvml_identity(
+    nvml: Any,
+    *,
+    raw_uuid: bytes,
+) -> tuple[str, str, ctypes.c_void_p]:
+    canonical = str(uuidlib.UUID(bytes=raw_uuid))
+    matches: list[tuple[str, str, ctypes.c_void_p]] = []
+    for kind, prefix in (("gpu", "GPU-"), ("mig", "MIG-")):
+        candidate = f"{prefix}{canonical}"
+        handle = ctypes.c_void_p()
+        result = nvml.nvmlDeviceGetHandleByUUID(
+            candidate.encode("ascii"),
+            ctypes.byref(handle),
+        )
+        if type(result) is not int:
+            raise RuntimeError(_CUDA_IDENTITY_ERROR)
+        if result == _NVML_ERROR_NOT_FOUND:
+            continue
+        if result != 0 or handle.value is None:
+            raise RuntimeError(_CUDA_IDENTITY_ERROR)
+        matches.append((candidate, kind, handle))
+    if len(matches) != 1:
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    return matches[0]
+
+
+def _collect_cuda_device_identity(device_id: int) -> dict[str, object]:
+    driver, runtime, nvml = _load_cuda_identity_libraries()
+    _configure_cuda_identity_apis(driver, runtime, nvml)
+
+    _require_identity_success(driver.cuInit(0))
+    device_count = ctypes.c_int()
+    _require_identity_success(driver.cuDeviceGetCount(ctypes.byref(device_count)))
+    if (
+        not 0 < device_count.value <= _MAX_CUDA_DEVICE_COUNT
+        or device_id >= device_count.value
+    ):
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    device = ctypes.c_int()
+    _require_identity_success(driver.cuDeviceGet(ctypes.byref(device), device_id))
+
+    cuda_name_buffer = ctypes.create_string_buffer(256)
+    _require_identity_success(
+        driver.cuDeviceGetName(cuda_name_buffer, len(cuda_name_buffer), device.value)
+    )
+    cuda_name = _identity_text(cuda_name_buffer, maximum=255)
+
+    raw_uuid = _CudaUuid()
+    uuid_getter = getattr(driver, "cuDeviceGetUuid_v2", None)
+    if uuid_getter is None:
+        uuid_getter = driver.cuDeviceGetUuid
+    _require_identity_success(uuid_getter(ctypes.byref(raw_uuid), device.value))
+    uuid_bytes = bytes(raw_uuid.bytes)
+    if len(uuid_bytes) != 16 or not any(uuid_bytes):
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+
+    cuda_memory = ctypes.c_size_t()
+    memory_getter = getattr(driver, "cuDeviceTotalMem_v2", None)
+    if memory_getter is None:
+        memory_getter = driver.cuDeviceTotalMem
+    _require_identity_success(memory_getter(ctypes.byref(cuda_memory), device.value))
+    cuda_memory_bytes = _positive_identity_int(
+        int(cuda_memory.value),
+        maximum=_MAX_DEVICE_MEMORY_BYTES,
+    )
+
+    compute_major = ctypes.c_int()
+    compute_minor = ctypes.c_int()
+    _require_identity_success(
+        driver.cuDeviceGetAttribute(
+            ctypes.byref(compute_major),
+            _CUDA_COMPUTE_CAPABILITY_MAJOR,
+            device.value,
+        )
+    )
+    _require_identity_success(
+        driver.cuDeviceGetAttribute(
+            ctypes.byref(compute_minor),
+            _CUDA_COMPUTE_CAPABILITY_MINOR,
+            device.value,
+        )
+    )
+    major = _positive_identity_int(compute_major.value, maximum=99)
+    if not 0 <= compute_minor.value <= 99:
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    minor = int(compute_minor.value)
+
+    driver_version = ctypes.c_int()
+    runtime_driver_version = ctypes.c_int()
+    runtime_version = ctypes.c_int()
+    _require_identity_success(driver.cuDriverGetVersion(ctypes.byref(driver_version)))
+    _require_identity_success(
+        runtime.cudaDriverGetVersion(ctypes.byref(runtime_driver_version))
+    )
+    _require_identity_success(
+        runtime.cudaRuntimeGetVersion(ctypes.byref(runtime_version))
+    )
+    cuda_driver_version = _positive_identity_int(
+        driver_version.value,
+        maximum=_MAX_CUDA_VERSION,
+    )
+    if runtime_driver_version.value != cuda_driver_version:
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+    cuda_runtime_version = _positive_identity_int(
+        runtime_version.value,
+        maximum=_MAX_CUDA_VERSION,
+    )
+
+    driver_pci_buffer = ctypes.create_string_buffer(32)
+    _require_identity_success(
+        driver.cuDeviceGetPCIBusId(
+            driver_pci_buffer,
+            len(driver_pci_buffer),
+            device.value,
+        )
+    )
+    driver_pci_bus_id = _canonical_pci_bus_id(
+        _identity_text(driver_pci_buffer, maximum=31)
+    )
+
+    runtime_pci_buffer = ctypes.create_string_buffer(32)
+    _require_identity_success(
+        runtime.cudaDeviceGetPCIBusId(
+            runtime_pci_buffer,
+            len(runtime_pci_buffer),
+            device_id,
+        )
+    )
+    pci_bus_id = _canonical_pci_bus_id(_identity_text(runtime_pci_buffer, maximum=31))
+    if driver_pci_bus_id != pci_bus_id:
+        raise RuntimeError(_CUDA_IDENTITY_ERROR)
+
+    nvml_initialized = False
+    try:
+        init = getattr(nvml, "nvmlInit_v2", None)
+        if init is None:
+            init = nvml.nvmlInit
+        _require_identity_success(init())
+        nvml_initialized = True
+
+        uuid_value, uuid_kind, nvml_handle = _nvml_identity(
+            nvml,
+            raw_uuid=uuid_bytes,
+        )
+        nvml_uuid_buffer = ctypes.create_string_buffer(96)
+        _require_identity_success(
+            nvml.nvmlDeviceGetUUID(
+                nvml_handle,
+                nvml_uuid_buffer,
+                len(nvml_uuid_buffer),
+            )
+        )
+        if _identity_text(nvml_uuid_buffer, maximum=95) != uuid_value:
+            raise RuntimeError(_CUDA_IDENTITY_ERROR)
+
+        nvml_name_buffer = ctypes.create_string_buffer(256)
+        _require_identity_success(
+            nvml.nvmlDeviceGetName(
+                nvml_handle,
+                nvml_name_buffer,
+                len(nvml_name_buffer),
+            )
+        )
+        nvml_name = _identity_text(nvml_name_buffer, maximum=255)
+
+        nvml_memory = _NvmlMemory()
+        _require_identity_success(
+            nvml.nvmlDeviceGetMemoryInfo(
+                nvml_handle,
+                ctypes.byref(nvml_memory),
+            )
+        )
+        nvml_memory_bytes = _positive_identity_int(
+            int(nvml_memory.total),
+            maximum=_MAX_DEVICE_MEMORY_BYTES,
+        )
+
+        nvidia_driver_buffer = ctypes.create_string_buffer(128)
+        _require_identity_success(
+            nvml.nvmlSystemGetDriverVersion(
+                nvidia_driver_buffer,
+                len(nvidia_driver_buffer),
+            )
+        )
+        nvidia_driver_version = _identity_version_text(
+            nvidia_driver_buffer,
+            maximum=127,
+        )
+
+        nvml_version_buffer = ctypes.create_string_buffer(128)
+        _require_identity_success(
+            nvml.nvmlSystemGetNVMLVersion(
+                nvml_version_buffer,
+                len(nvml_version_buffer),
+            )
+        )
+        nvml_version = _identity_version_text(nvml_version_buffer, maximum=127)
+    finally:
+        if nvml_initialized:
+            _require_identity_success(nvml.nvmlShutdown())
+
+    return {
+        "identity_source": _CUDA_IDENTITY_SOURCE,
+        "ordinal": device_id,
+        "uuid": uuid_value,
+        "uuid_kind": uuid_kind,
+        "pci_bus_id": pci_bus_id,
+        "cuda_name": cuda_name,
+        "nvml_name": nvml_name,
+        "cuda_total_memory_bytes": cuda_memory_bytes,
+        "nvml_total_memory_bytes": nvml_memory_bytes,
+        "compute_capability_major": major,
+        "compute_capability_minor": minor,
+        "cuda_driver_version": cuda_driver_version,
+        "cuda_runtime_version": cuda_runtime_version,
+        "nvidia_driver_version": nvidia_driver_version,
+        "nvml_version": nvml_version,
+    }
+
+
+def collect_cuda_device_identity(device_id: int) -> dict[str, object]:
+    """Return exact, content-free-bindable identity for one visible CUDA device.
+
+    The returned values contain no paths, hostnames, pixels, or mutable
+    utilization state. Callers should retain only a digest of this object when
+    publishing content-free evidence.
+    """
+
+    if type(device_id) is not int or not 0 <= device_id <= 64:
+        raise ValueError("CUDA device id must be an integer in [0, 64]")
+    try:
+        return _collect_cuda_device_identity(device_id)
+    except Exception:
+        raise GpuRequiredError(_CUDA_IDENTITY_ERROR) from None
 
 
 @dataclass(frozen=True)

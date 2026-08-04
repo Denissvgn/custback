@@ -80,6 +80,33 @@ class CapturedFrame:
 
 
 @dataclass(frozen=True)
+class CaptureTimingSample:
+    """Pixel-free timing for one successfully published camera read.
+
+    The sample is retained only in a bounded in-memory ring for the standalone
+    capture diagnostic. ``captured_at_ns`` is monotonic process time rather
+    than wall time. The diagnostic serializes only offsets/deltas, never this
+    raw value or any frame-derived data.
+
+    OpenCV's ``read`` boundary includes device pacing, transfer, and backend
+    decode. It cannot, by itself, prove which of those components is causal.
+    ``normalization_ms`` begins after first-frame mode/control observation and
+    covers the canonical geometry conversion used by the production reader.
+    """
+
+    sequence: int
+    generation: int
+    geometry_generation: int
+    captured_at_ns: int
+    read_ms: float
+    negotiation_ms: float
+    normalization_ms: float
+    publish_ms: float
+    total_ms: float
+    reader_cpu_ms: float | None
+
+
+@dataclass(frozen=True)
 class CameraControlObservation:
     """One side-effect-free OpenCV camera-property observation.
 
@@ -172,6 +199,15 @@ class CaptureSource(ABC):
         """Return capture health without blocking or mutating the source."""
         return CaptureHealth()
 
+    def timing_samples(
+        self,
+        *,
+        after_sequence: int = 0,
+    ) -> tuple[CaptureTimingSample, ...]:
+        """Return bounded pixel-free samples newer than ``after_sequence``."""
+
+        return ()
+
     def close(self) -> None:
         pass
 
@@ -190,6 +226,22 @@ def _safe_get(cap: Any, prop: int | None) -> float | None:
     except Exception:
         return None
     return value if math.isfinite(value) else None
+
+
+def _thread_time_ns() -> int | None:
+    """Read current-thread CPU time when the runtime provides it."""
+
+    clock = getattr(time, "thread_time_ns", None)
+    if not callable(clock):
+        return None
+    try:
+        raw_value = clock()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    if type(raw_value) is not int:
+        return None
+    value = raw_value
+    return value if value >= 0 else None
 
 
 def _fourcc_value(code: str) -> int:
@@ -312,11 +364,22 @@ class OpenCVCapture(CaptureSource):
     _RATE_WINDOW_S = 2.0
     _RATE_WARNING_AFTER_S = 5.0
     _EWMA_ALPHA = 0.1
+    # The diagnostic permits 15 s of warm-up plus a 60 s measurement at the
+    # configured 240 FPS ceiling. Keep both phases until the measurement-bound
+    # filter runs, with bounded headroom for backend cadence variance.
+    _TIMING_SAMPLE_CAPACITY = 32_768
 
-    def __init__(self, cfg: CameraConfig, canvas_size: Size | None = None):
+    def __init__(
+        self,
+        cfg: CameraConfig,
+        canvas_size: Size | None = None,
+        *,
+        collect_timing: bool = False,
+    ):
         if cv2 is None:
             raise RuntimeError("opencv-python is required for camera capture")
         self.cfg = cfg
+        self._collect_timing = bool(collect_timing)
         self.canvas_size = canvas_size or (cfg.width, cfg.height)
         if (
             not isinstance(self.canvas_size, tuple)
@@ -353,6 +416,9 @@ class OpenCVCapture(CaptureSource):
         self._last_frame_at: float | None = None
         self._first_frame_at: float | None = None
         self._capture_timestamps: deque[float] = deque(maxlen=1024)
+        self._timing_samples: deque[CaptureTimingSample] = deque(
+            maxlen=self._TIMING_SAMPLE_CAPACITY if self._collect_timing else 0
+        )
 
         self._backend = "unknown"
         self._fourcc: str | None = None
@@ -757,6 +823,10 @@ class OpenCVCapture(CaptureSource):
         try:
             while not stop.is_set():
                 started = time.monotonic()
+                started_ns = time.monotonic_ns() if self._collect_timing else None
+                reader_cpu_started_ns = (
+                    _thread_time_ns() if self._collect_timing else None
+                )
                 try:
                     ok, frame = cap.read()
                 except BaseException as exc:
@@ -800,6 +870,9 @@ class OpenCVCapture(CaptureSource):
                         self._set_fatal(mode_error)
                         return
 
+                normalization_started_ns = (
+                    time.monotonic_ns() if self._collect_timing else None
+                )
                 try:
                     frame, plan = self._normalize_delivered_frame(frame, generation)
                 except CaptureModeError as exc:
@@ -810,6 +883,9 @@ class OpenCVCapture(CaptureSource):
                         CaptureError(f"camera frame conversion failed: {exc}")
                     )
                     return
+                normalization_finished_ns = (
+                    time.monotonic_ns() if self._collect_timing else None
+                )
 
                 recovered = False
                 announce_recovery = False
@@ -878,6 +954,52 @@ class OpenCVCapture(CaptureSource):
                         else self._EWMA_ALPHA * read_ms
                         + (1.0 - self._EWMA_ALPHA) * self._read_ms
                     )
+                    if self._collect_timing:
+                        assert started_ns is not None
+                        assert normalization_started_ns is not None
+                        assert normalization_finished_ns is not None
+                        published_at_ns = time.monotonic_ns()
+                        reader_cpu_finished_ns = _thread_time_ns()
+                        reader_cpu_ms = (
+                            None
+                            if reader_cpu_started_ns is None
+                            or reader_cpu_finished_ns is None
+                            or reader_cpu_finished_ns < reader_cpu_started_ns
+                            else (reader_cpu_finished_ns - reader_cpu_started_ns)
+                            / 1_000_000.0
+                        )
+                        self._timing_samples.append(
+                            CaptureTimingSample(
+                                sequence=self._slot_sequence,
+                                generation=generation,
+                                geometry_generation=self._geometry_transitions,
+                                captured_at_ns=captured_at_ns,
+                                read_ms=read_ms,
+                                negotiation_ms=max(
+                                    0.0,
+                                    (normalization_started_ns - captured_at_ns)
+                                    / 1_000_000.0,
+                                ),
+                                normalization_ms=max(
+                                    0.0,
+                                    (
+                                        normalization_finished_ns
+                                        - normalization_started_ns
+                                    )
+                                    / 1_000_000.0,
+                                ),
+                                publish_ms=max(
+                                    0.0,
+                                    (published_at_ns - normalization_finished_ns)
+                                    / 1_000_000.0,
+                                ),
+                                total_ms=max(
+                                    0.0,
+                                    (published_at_ns - started_ns) / 1_000_000.0,
+                                ),
+                                reader_cpu_ms=reader_cpu_ms,
+                            )
+                        )
                     recovered = self._recovering
                     # The initial asynchronous acquisition uses the same
                     # internal state as recovery.  It is not a recovery unless
@@ -1229,6 +1351,20 @@ class OpenCVCapture(CaptureSource):
                 camera_controls=identity.camera_controls,
             )
 
+    def timing_samples(
+        self,
+        *,
+        after_sequence: int = 0,
+    ) -> tuple[CaptureTimingSample, ...]:
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a non-negative integer")
+        with self._lock:
+            return tuple(
+                sample
+                for sample in self._timing_samples
+                if sample.sequence > after_sequence
+            )
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
@@ -1381,7 +1517,12 @@ class SyntheticCapture(CaptureSource):
             self._closed = True
 
 
-def open_capture(cfg: CameraConfig, canvas_size: Size | None = None) -> CaptureSource:
+def open_capture(
+    cfg: CameraConfig,
+    canvas_size: Size | None = None,
+    *,
+    collect_timing: bool = False,
+) -> CaptureSource:
     if cfg.synthetic:
         return SyntheticCapture(cfg, canvas_size)
-    return OpenCVCapture(cfg, canvas_size)
+    return OpenCVCapture(cfg, canvas_size, collect_timing=collect_timing)

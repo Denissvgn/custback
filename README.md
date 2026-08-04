@@ -80,6 +80,22 @@ Each installer subprocess is bounded to 15 minutes by default
 (`CUSTBACK_INSTALL_TIMEOUT_MS` accepts a positive millisecond override); doctor
 probes use a 60-second bound (`CUSTBACK_DOCTOR_TIMEOUT_MS`).
 
+The default npm profile is the **segmentation** quality tier: it attempts to
+install MediaPipe confidence-mask segmentation, but it does not install the
+RVM/ONNX Runtime **matting** tier. `segmentation.backend: auto` can only prefer
+RVM when that optional runtime is present. Choose one RVM profile explicitly
+for true-alpha edges:
+
+```bash
+custback rebuild --extras rvm  # CPU RVM
+custback rebuild --extras gpu  # NVIDIA/CUDA RVM
+custback doctor
+```
+
+The two RVM profiles are alternatives, not a combined extras list. An explicit
+`--extras` list replaces the stored intent; use `custback extras --json` first
+and retain any other compatible extras the installation still needs.
+
 An ordinary npm replacement removes the package-local venv used by custback
 0.3 before the new package's lifecycle script can inspect it. Run the candidate
 package's bridge **before** that first upgrade; it validates the old ownership
@@ -126,8 +142,9 @@ The device appears as **OBS Virtual Camera** in meeting apps.
 
 > MediaPipe wheels lag new Python releases; if `pip install -e '.[mediapipe,dev]'`
 > fails to resolve mediapipe, install without the extra (`pip install -e '.[dev]'`)
-> — custback then uses a low-quality fallback segmenter and logs a warning.
-> Use a Python version with mediapipe wheels (3.11/3.12) for production quality.
+> — custback then uses the heuristic quality tier and logs a warning.
+> Use a Python version with MediaPipe wheels (3.11/3.12) for the confidence-mask
+> segmentation tier, or install `rvm`/`gpu` for the true-alpha matting tier.
 
 ## Run
 
@@ -202,6 +219,30 @@ fallback transitions, capture recovery, readiness, and the shutdown summary
 are recorded with credential-free summaries and without paths, URLs, or API
 tokens.
 
+To separate camera acquisition from model, compositor, API, preview, and sink
+load, stop the normal process and run
+`custback capture-diagnose --output NEW_DIR`. It exercises only the production
+camera reader and canonical
+normalization path, writes no pixels, and reports capture pacing separately
+from optional matched full-runtime pacing. A full-runtime comparison uses a
+strict owner-only two-snapshot sidecar passed through `--runtime-evidence`;
+capture, processing, and output rates are computed from counter deltas over
+that bounded window, never from lifetime counters divided by total uptime.
+Exact hardware acceptance additionally requires both opaque identity digests,
+an explicit hardware attestation, and a numeric or recognized local
+camera-device source. File and URL streams are rejected. Deterministic tests
+do not qualify physical hardware; without reviewed local evidence the report
+remains `hardware-evidence-required`. See the
+[capture cadence diagnostic contract](docs/capture-cadence-diagnostics.md).
+
+During a normal run, capture, segmentation, safe-base updates, base reuse,
+exact final-output repeats, and output sends are separate status clocks.
+The preview and control dashboard warn when near-target output is being made
+from slower visual updates. Counts, rolling rates, timestamp/send jitter
+summaries, deadline and pacing event classes, timing boundaries, and the typed
+post-base extension are defined by the
+[visual cadence observability contract](docs/cadence-observability.md).
+
 Identifiable matte evidence is separate and off by default. An explicit
 `--matte-diagnostics-dir NEW_DIR` records a duration/size-bounded private
 raw/mask/backdrop/composite bundle; `--matte-diagnostics-mode composite-only`
@@ -216,9 +257,28 @@ change the automatic default. See
 format, and command contract, and
 [docs/matte-rvm-profiles.md](docs/matte-rvm-profiles.md) for the formal
 qualification matrix.
+The 720p compositor/service budget is measured separately with
+`custback matte-performance PRIVATE_BUNDLE --output NEW_DIR`. It runs the
+eight-cell compositor matrix without capture or output pacing and remains
+`not_decidable` until a source-matched, model-backed RVM/CUDA full-service
+sidecar is supplied. On qualified local hardware,
+`--collect-full-path --hardware-id TIER --sink-backend pyvirtualcam` produces
+and joins that evidence through the real unpaced sink-submission seam; it
+requires 330 distinct replay frames at default settings and never credits
+repeats. Its fixed-replay background profile measures a resident recorded-frame
+copy, and the cadence sweep includes the synchronous status/publication tail
+after submission. The ratified 22 ms compositor sub-budget is enforced again
+on the full hardware path; signed service headroom, the explicit
+30/27/24/20/15 FPS arrival sweep, and lower-rate classification rules are in
+[docs/matte-performance.md](docs/matte-performance.md) and
+[ADR 0003](docs/adr/0003-720p-compositor-budget.md).
 For reversible, backend-aware troubleshooting while qualification is pending,
 use the
 [immediate matte operator guide](docs/matte-operator-mitigations.md).
+Output-rate matte interpolation remains rejected and exact repeat remains the
+automatic cadence policy; the evidence limits, four-strategy comparison,
+privacy audit, and reconsideration gates are recorded in
+[ADR 0002](docs/adr/0002-output-rate-matte-interpolation.md).
 
 ## Rendering quality & GPU acceleration
 
@@ -232,7 +292,11 @@ listed below; do not assume every available quality policy is enabled:
   foreground prediction) → **mediapipe** (selfie segmentation) → heuristic
   fallback. Built-in models live in `~/.cache/custback/models`; their pinned
   size and SHA-256 are verified on every use, and downloads are locked,
-  bounded, and published atomically.
+  bounded, and published atomically. These are the **matting**,
+  **segmentation**, and **heuristic** quality tiers respectively. The default
+  npm profile attempts MediaPipe; RVM is optional and requires
+  `custback rebuild --extras rvm` (CPU) or
+  `custback rebuild --extras gpu` (NVIDIA/CUDA).
 * **Edge-aware refinement** (`segmentation.edge_refine` and
   `segmentation.spatial_edge_refinement`) — schema 1 retains the historical
   bounded marker watershed. An opt-in `stable_guided` candidate uses a
@@ -390,7 +454,7 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /status` | run ID; input/output FPS; capture/drop/repeat/skip counters; stage timings; active backend/device and effective matte controls |
+| `GET /status` | run ID; capture/segmentation/base/reuse/exact-final-repeat/send cadence; gaps, deadlines, pacing and jitter; stage timings; versioned backend quality/selection attempts and configured/effective matte policy |
 | `GET /config` / `PATCH /config` | read / partially update config live |
 | `POST /background/image` | upload static backdrop and switch to it |
 | `POST /background/video` | upload live (video) backdrop and switch to it |
@@ -679,6 +743,8 @@ This release intentionally breaks the old unauthenticated control plane:
 | `compositor.py` | alpha blending of person over backdrop; light wrap + color-spill removal |
 | `light_wrap.py` | generation-owned elapsed-time stabilization for dynamic-backdrop wrap samples |
 | `diagnostics.py` | secure rotating logs, run correlation, and safe config audit records |
+| `cadence.py` | bounded unique-base/reuse/exact-repeat/send cadence and interval health |
+| `capture_diagnostics.py` | bounded, pixel-free capture-only cadence measurement and native/runtime evidence comparison |
 | `matte_diagnostics.py` | opt-in private bounded matte recorder and offline frozen/model replay |
 | `matte_quality.py` / `matte_attribution.py` / `matte_ablation.py` | digest-bound metrics, four-boundary RVM attribution, and bounded same-source screening |
 | `gpu_probe.py` | real CUDA inference/profile capability probe for installer and doctor |

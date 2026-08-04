@@ -2032,12 +2032,137 @@ function cameraControlsSummary(value) {
   return parts.join(" · ");
 }
 
+function boundedStatusText(value, fallback = "") {
+  const text = String(value || fallback).replace(/\s+/g, " ").trim();
+  return text.slice(0, 200);
+}
+
+function backendDisplayName(value) {
+  const text = boundedStatusText(value, "unknown");
+  const names = {
+    rvm: "RVM",
+    mediapipe: "MediaPipe",
+    heuristic: "Heuristic",
+    none: "None",
+    auto: "Auto",
+  };
+  return names[text.toLowerCase()] || titleCase(text);
+}
+
+function deviceDisplayName(value) {
+  const text = boundedStatusText(value, "unknown");
+  if (/^(cpu|gpu|cuda|cuda:\d+)$/i.test(text)) return text.toUpperCase();
+  return titleCase(text);
+}
+
+function segmentationSelection(status) {
+  const candidate = status && status.segmentation_selection;
+  const structured = Boolean(
+    candidate && typeof candidate === "object" && !Array.isArray(candidate)
+  );
+  const selection = structured ? candidate : {};
+  return {
+    structured,
+    requestedBackend: boundedStatusText(
+      selection.requested_backend,
+      status && status.segmentation_backend
+    ),
+    selectedBackend: boundedStatusText(
+      selection.selected_backend,
+      status && status.segmentation_backend
+    ),
+    qualityTier: boundedStatusText(selection.quality_tier),
+    selectionMode: boundedStatusText(selection.selection_mode),
+    fallbackActive: structured
+      ? selection.fallback_active === true
+      : Boolean(status && status.segmentation_fallback_active),
+    fallbackCategory: boundedStatusText(selection.fallback_category),
+    fallbackReason: boundedStatusText(
+      selection.fallback_reason,
+      status && status.segmentation_fallback_reason
+    ),
+    guidance: boundedStatusText(selection.guidance),
+    activeDevice: boundedStatusText(
+      selection.active_device,
+      status && status.segmentation_device
+    ),
+    activeProvider: boundedStatusText(
+      selection.active_provider,
+      status && status.acceleration_active_provider
+    ),
+  };
+}
+
+function segmentationSummary(status) {
+  const selection = segmentationSelection(status);
+  if (!selection.structured) {
+    return [
+      titleCase(selection.selectedBackend) + " · "
+        + titleCase(selection.activeDevice),
+      selection.fallbackActive ? "warn" : "",
+    ];
+  }
+  const parts = [
+    backendDisplayName(selection.selectedBackend),
+    titleCase(selection.qualityTier || "unknown") + " tier",
+    "device " + deviceDisplayName(selection.activeDevice),
+    "provider " + deviceDisplayName(selection.activeProvider || "unknown"),
+  ];
+  if (selection.selectionMode) {
+    parts.push(titleCase(selection.selectionMode) + " selection");
+  }
+  return [parts.join(" · "), selection.fallbackActive ? "warn" : ""];
+}
+
+function segmentationFallbackRows(status) {
+  const selection = segmentationSelection(status);
+  if (!selection.fallbackActive) return [];
+  const route = selection.structured
+      && selection.requestedBackend && selection.selectedBackend
+    ? backendDisplayName(selection.requestedBackend) + " → "
+      + backendDisplayName(selection.selectedBackend)
+    : "Preferred backend unavailable";
+  const details = [route];
+  if (selection.fallbackCategory) {
+    details.push(titleCase(selection.fallbackCategory));
+  }
+  details.push(selection.fallbackReason || "Fallback reason unavailable");
+  if (selection.guidance) details.push(selection.guidance);
+  return [["Backend downgrade", details.join(" · "), "warn"]];
+}
+
+function mattePolicySummary(status) {
+  const policy = status && status.matte_policy;
+  const effective = policy && typeof policy === "object"
+    && !Array.isArray(policy) && policy.effective;
+  if (!effective || typeof effective !== "object" || Array.isArray(effective)) {
+    return null;
+  }
+  const parts = [titleCase(effective.raw_alpha_mode || "unknown alpha")];
+  const ratio = Number(effective.rvm_downsample_ratio);
+  if (effective.rvm_downsample_ratio !== null
+      && effective.rvm_downsample_ratio !== undefined
+      && Number.isFinite(ratio)) {
+    parts.push("RVM ratio " + ratio.toFixed(3).replace(/0+$/, "").replace(/\.$/, ""));
+  }
+  parts.push("edge refine " + (effective.edge_refine ? "on" : "off"));
+  if (effective.residual_temporal_mode) {
+    parts.push("temporal " + titleCase(effective.residual_temporal_mode));
+  }
+  const lightWrap = Number(effective.light_wrap);
+  if (Number.isFinite(lightWrap)) {
+    parts.push("light wrap " + lightWrap.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""));
+  }
+  return ["Effective matte policy", parts.join(" · "), ""];
+}
+
 function formatDiagnostic(key, value) {
   if (value === null || value === undefined || value === "") return "—";
   if (key === "camera_controls") return cameraControlsSummary(value);
   if (Array.isArray(value)) {
     return value.length ? value.map((item) => titleCase(item)).join(", ") : "None";
   }
+  if (typeof value === "object") return JSON.stringify(value);
   if (typeof value === "boolean") return value ? "Yes" : "No";
   if (typeof value === "number") {
     if (key.endsWith("_ms")) return value.toFixed(1) + " ms";
@@ -2048,7 +2173,8 @@ function formatDiagnostic(key, value) {
     }
     if (key.endsWith("_confidence")) return value.toFixed(2);
     if (key.endsWith("_rotation")) return value + "°";
-    if (key.includes("fps") || key.endsWith("_pct") || key.endsWith("_ratio")) {
+    if (key.endsWith("_ratio")) return (value * 100).toFixed(1) + "%";
+    if (key.includes("fps") || key.endsWith("_pct")) {
       return value.toFixed(1);
     }
     return new Intl.NumberFormat().format(value);
@@ -2068,6 +2194,7 @@ function formatDiagnostic(key, value) {
 }
 
 function diagnosticTone(key, value) {
+  if (key === "cadence_mismatch_active" && value === true) return "warn";
   if (key === "color_correction_state") {
     if (value === "active") return "good";
     if (["warming", "low-confidence", "stale-decay", "scene-cut"].includes(value)) {
@@ -2077,6 +2204,9 @@ function diagnosticTone(key, value) {
   }
   if ((key.includes("failure") || key.includes("miss") || key.includes("dropped")
       || key.includes("restart")) && Number(value) > 0) return "bad";
+  if ((key.includes("recovery") || key.includes("late")) && Number(value) > 0) {
+    return "warn";
+  }
   if ((key.includes("fallback") || key.includes("stalled")) && value === true) return "warn";
   if ((key === "connected" || key === "remote_connected") && value === true) return "good";
   if ((key === "connected" || key === "remote_connected") && value === false) return "bad";
@@ -2087,7 +2217,38 @@ function diagnosticLabel(key) {
   const labels = {
     fps: "Output frame rate", mode: "Output mode", capture_fps: "Capture frame rate",
     capture_frame_age_ms: "Latest frame age", frame_processing_ms: "Frame processing",
+    segmentation_update_count: "Segmentation updates",
+    segmentation_update_fps: "Segmentation update rate",
+    base_composite_update_count: "Base visual updates",
+    base_composite_update_fps: "Base visual-update rate",
+    base_composite_reuse_count: "Safe-base reuses",
+    base_composite_reuse_fps: "Safe-base reuse rate",
+    base_composite_reuse_ratio: "Safe-base reuse ratio",
+    exact_final_output_repeat_count: "Exact final-output repeats",
+    exact_final_output_repeat_fps: "Exact final-output repeat rate",
+    exact_final_output_repeat_ratio: "Exact final-output repeat ratio",
+    output_send_count: "Output sends",
+    output_send_fps: "Output send rate",
+    last_unique_frame_age_ms: "Last unique-frame age",
+    capture_timestamp_delta_p50_ms: "Capture timestamp delta p50",
+    capture_timestamp_delta_p95_ms: "Capture timestamp delta p95",
+    output_send_delta_p50_ms: "Output send delta p50",
+    output_send_delta_p95_ms: "Output send delta p95",
+    output_send_jitter_p50_ms: "Output send jitter p50",
+    output_send_jitter_p95_ms: "Output send jitter p95",
+    base_composite_delta_p50_ms: "Base visual-update delta p50",
+    base_composite_delta_p95_ms: "Base visual-update delta p95",
+    serialized_new_frame_deadline_misses: "Serialized new-frame deadline misses",
+    output_sink_pacing_events: "Output-sink pacing events",
+    output_sink_recovery_events: "Output-sink recovery events",
+    application_pacing_events: "Application pacing events",
+    output_schedule_late_events: "Late output schedules",
+    cadence_mismatch_active: "Visual cadence mismatch",
+    timing_schema_version: "Timing schema version",
+    timing_ms: "Pipeline timing boundaries",
+    extensions: "Status extensions",
     segmentation_backend: "Segmentation backend", segmentation_device: "Segmentation device",
+    segmentation_selection: "Backend selection", matte_policy: "Matte policy",
     acceleration_mode: "Acceleration policy", acceleration_requested_provider: "Requested provider",
     acceleration_active_provider: "Active provider", acceleration_state: "Acceleration state",
     acceleration_fallback_active: "GPU fallback active", acceleration_fallback_reason: "GPU fallback reason",
@@ -2147,6 +2308,40 @@ function allDiagnosticRows(object) {
   ]);
 }
 
+function visualCadenceRows(status) {
+  const count = (value) => new Intl.NumberFormat().format(Number(value) || 0);
+  const rate = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number.toFixed(1) : "—";
+  };
+  const ratio = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0
+      ? (number * 100).toFixed(1) + "%" : "—";
+  };
+  const tone = status.cadence_mismatch_active ? "warn" : "";
+  return [
+    ["Visual updates",
+      rate(status.base_composite_update_fps) + " fps · "
+        + count(status.base_composite_update_count) + " total",
+      tone],
+    ["Segmentation updates",
+      rate(status.segmentation_update_fps) + " fps · "
+        + count(status.segmentation_update_count) + " total",
+      tone],
+    ["Safe-base reuse",
+      rate(status.base_composite_reuse_fps) + " fps · "
+        + count(status.base_composite_reuse_count) + " total · "
+        + ratio(status.base_composite_reuse_ratio),
+      tone],
+    ["Exact final-output repeats",
+      rate(status.exact_final_output_repeat_fps) + " fps · "
+        + count(status.exact_final_output_repeat_count) + " total · "
+        + ratio(status.exact_final_output_repeat_ratio),
+      tone],
+  ];
+}
+
 function geometrySummary(status) {
   if (!status || !status.camera_fit) return "Waiting for geometry status";
   const sourceWidth = status.capture_delivered_width;
@@ -2198,11 +2393,17 @@ function renderDiagnostics() {
   if (status) {
     const dimensions = status.capture_width && status.capture_height
       ? status.capture_width + " × " + status.capture_height : "Negotiating";
+    const outputSendFps = Number.isFinite(Number(status.output_send_fps))
+      ? Number(status.output_send_fps) : Number(status.fps);
     const coreRows = [
       ["Camera", dimensions + " · " + status.capture_fps.toFixed(1) + " fps", status.capture_stalled ? "bad" : "good"],
-      ["Output", status.fps.toFixed(1) + " / " + status.output_target_fps + " fps", status.output_fallback_active ? "warn" : ""],
-      ["Subject detection", titleCase(status.segmentation_backend) + " · " + titleCase(status.segmentation_device), status.segmentation_fallback_active ? "warn" : ""],
+      ["Output", outputSendFps.toFixed(1) + " / " + status.output_target_fps + " fps", status.output_fallback_active ? "warn" : ""],
+      ["Subject detection", ...segmentationSummary(status)],
     ];
+    coreRows.push(...segmentationFallbackRows(status));
+    const mattePolicy = mattePolicySummary(status);
+    if (mattePolicy) coreRows.push(mattePolicy);
+    coreRows.push(...visualCadenceRows(status));
     // Acceleration is only meaningful for the RVM/ONNX Runtime backend; other
     // segmenters report an empty active provider. Show the truthful post-
     // fallback provider, not the requested one.
@@ -2219,6 +2420,8 @@ function renderDiagnostics() {
       ["Geometry", geometrySummary(status), ""],
       ["Colour correction", ...colorCorrectionSummary(status)],
       ["Frame processing", formatDiagnostic("frame_processing_ms", status.frame_processing_ms), ""],
+      ["Last unique frame", formatDiagnostic("last_unique_frame_age_ms", status.last_unique_frame_age_ms), status.cadence_mismatch_active ? "warn" : ""],
+      ["Serialized deadline misses", new Intl.NumberFormat().format(status.serialized_new_frame_deadline_misses), status.serialized_new_frame_deadline_misses ? "bad" : ""],
       ["Dropped camera frames", new Intl.NumberFormat().format(status.capture_dropped_frames), status.capture_dropped_frames ? "bad" : ""],
       ["Uptime", formatDuration(status.uptime_s), ""],
     );

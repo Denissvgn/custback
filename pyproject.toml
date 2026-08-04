@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# MediaPipe provides the production-quality person segmenter.
-# Without it, custback falls back to a simple heuristic segmenter.
+# MediaPipe provides the confidence-mask segmentation quality tier.
+# Without it or RVM, custback falls back to the heuristic quality tier.
 mediapipe = ["mediapipe>=0.10.14,<0.11"]
 # Robust Video Matting backend: best edge quality (true alpha matting),
 # CPU inference via onnxruntime.

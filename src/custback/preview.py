@@ -544,6 +544,13 @@ def _fps_text(actual: object, target: object) -> str:
     return f"{shown_actual}/{target_fps:.0f}"
 
 
+def _compact_status_text(value: object, default: str = "") -> str:
+    """Return a single-line, bounded status value suitable for the overlay."""
+
+    text = " ".join(str(value or default).split())
+    return text[:160]
+
+
 def _status_overlay_lines(
     stats: Mapping[str, object],
 ) -> tuple[list[str], list[str]]:
@@ -557,12 +564,61 @@ def _status_overlay_lines(
         f"OUT {_fps_text(stats.get('fps'), output_target)} fps"
     ]
 
-    backend = str(stats.get("segmentation_backend") or "unknown")
-    backend = backend.removesuffix("Segmenter").lower()
-    device = str(stats.get("segmentation_device") or "unknown").lower()
+    raw_selection = stats.get("segmentation_selection")
+    selection = raw_selection if isinstance(raw_selection, Mapping) else None
+    if selection is not None:
+        backend = _compact_status_text(
+            selection.get("selected_backend"), "unknown"
+        ).lower()
+        device = _compact_status_text(
+            selection.get("active_device"),
+            str(stats.get("segmentation_device") or "unknown"),
+        ).lower()
+        quality_tier = _compact_status_text(
+            selection.get("quality_tier"), "unknown"
+        ).lower()
+        provider = _compact_status_text(selection.get("active_provider"), "unknown")
+        selection_mode = _compact_status_text(
+            selection.get("selection_mode"), "unknown"
+        ).lower()
+    else:
+        backend = str(stats.get("segmentation_backend") or "unknown")
+        backend = backend.removesuffix("Segmenter").lower()
+        device = str(stats.get("segmentation_device") or "unknown").lower()
+        quality_tier = ""
+        provider = ""
+        selection_mode = ""
     output_backend = str(stats.get("output_backend") or "unknown")
     version = stats.get("config_version", 0)
-    status.append(f"SEG {backend}/{device}  OUTPUT {output_backend}  CONFIG v{version}")
+    segmenter_status = f"SEG {backend}/{device}"
+    if selection is not None:
+        segmenter_status += (
+            f"  TIER {quality_tier}  PROVIDER {provider}  SELECT {selection_mode}"
+        )
+    status.append(f"{segmenter_status}  OUTPUT {output_backend}  CONFIG v{version}")
+
+    raw_policy = stats.get("matte_policy")
+    policy = raw_policy if isinstance(raw_policy, Mapping) else None
+    raw_effective = policy.get("effective") if policy is not None else None
+    effective = raw_effective if isinstance(raw_effective, Mapping) else None
+    if effective is not None:
+        alpha_mode = _compact_status_text(
+            effective.get("raw_alpha_mode"), "unknown"
+        ).lower()
+        matte_parts = [f"ALPHA {alpha_mode}"]
+        rvm_ratio = _as_float(effective.get("rvm_downsample_ratio"))
+        if rvm_ratio is not None:
+            matte_parts.append(f"RVM RATIO {rvm_ratio:.3f}".rstrip("0").rstrip("."))
+        matte_parts.append(
+            "EDGE " + ("on" if effective.get("edge_refine") is True else "off")
+        )
+        temporal = _compact_status_text(effective.get("residual_temporal_mode"))
+        if temporal:
+            matte_parts.append(f"TEMPORAL {temporal.lower()}")
+        light_wrap = _as_float(effective.get("light_wrap"))
+        if light_wrap is not None:
+            matte_parts.append(f"LIGHT WRAP {light_wrap:.2f}".rstrip("0").rstrip("."))
+        status.append("MATTE " + "  ".join(matte_parts))
 
     capture_parts: list[str] = []
     width, height = stats.get("capture_width"), stats.get("capture_height")
@@ -618,6 +674,25 @@ def _status_overlay_lines(
             + f"skip {skip_ratio * 100:.0f}%"
         )
 
+    base_update_fps = _as_float(stats.get("base_composite_update_fps"))
+    segmentation_update_fps = _as_float(stats.get("segmentation_update_fps"))
+    output_send_fps = _as_float(stats.get("output_send_fps"))
+    base_reuse_ratio = _as_float(stats.get("base_composite_reuse_ratio"))
+    exact_repeat_ratio = _as_float(stats.get("exact_final_output_repeat_ratio"))
+    cadence_parts: list[str] = []
+    if base_update_fps is not None:
+        cadence_parts.append(f"VIS {base_update_fps:.1f}")
+    if segmentation_update_fps is not None:
+        cadence_parts.append(f"SEG {segmentation_update_fps:.1f}")
+    if output_send_fps is not None:
+        cadence_parts.append(f"SEND {output_send_fps:.1f}")
+    if base_reuse_ratio is not None:
+        cadence_parts.append(f"BASE REUSE {base_reuse_ratio * 100:.0f}%")
+    if exact_repeat_ratio is not None:
+        cadence_parts.append(f"EXACT FINAL REPEAT {exact_repeat_ratio * 100:.0f}%")
+    if cadence_parts:
+        status.append("CADENCE " + "  ".join(cadence_parts))
+
     warnings: list[str] = []
     if stats.get("capture_stalled"):
         age = _as_float(stats.get("capture_frame_age_ms"))
@@ -627,25 +702,50 @@ def _status_overlay_lines(
     elif stats.get("capture_target_met") is False:
         warnings.append("CAPTURE BELOW TARGET")
 
+    if stats.get("cadence_mismatch_active"):
+        if base_update_fps is not None and output_send_fps is not None:
+            warnings.append(
+                f"VISUAL UPDATES {base_update_fps:.0f} FPS; "
+                f"OUTPUT REPEATS TO {output_send_fps:.0f} FPS"
+            )
+        else:
+            warnings.append("VISUAL UPDATE CADENCE MISMATCH")
+
     if correction_state == "low-confidence":
         reason = str(stats.get("color_correction_reason") or "unspecified")
         warnings.append(f"COLOR LOW CONFIDENCE: {reason[:120]}")
     elif correction_state == "stale-decay":
         warnings.append("COLOR CORRECTION STALE: decaying to identity")
 
-    fallback_fields = (
+    fallback_fields = [
         ("output_fallback_active", "output_fallback_reason", "OUTPUT FALLBACK"),
-        (
-            "segmentation_fallback_active",
-            "segmentation_fallback_reason",
-            "SEGMENTATION FALLBACK",
-        ),
         ("remote_fallback_active", "remote_fallback_reason", "REMOTE FALLBACK"),
-    )
+    ]
+    if selection is None:
+        fallback_fields.insert(
+            1,
+            (
+                "segmentation_fallback_active",
+                "segmentation_fallback_reason",
+                "SEGMENTATION FALLBACK",
+            ),
+        )
     for active_key, reason_key, label in fallback_fields:
         if stats.get(active_key):
             reason = str(stats.get(reason_key) or "unspecified")
             warnings.append(f"{label}: {reason[:120]}")
+
+    if selection is not None and selection.get("fallback_active") is True:
+        category = _compact_status_text(
+            selection.get("fallback_category"), "unavailable"
+        )
+        reason = _compact_status_text(
+            selection.get("fallback_reason"), "preferred backend unavailable"
+        )
+        warnings.append(f"SEGMENTATION FALLBACK [{category[:64]}]: {reason[:120]}")
+        guidance = _compact_status_text(selection.get("guidance"))
+        if guidance:
+            warnings.append(f"SEGMENTATION ACTION: {guidance[:140]}")
     return status, warnings
 
 

@@ -26,7 +26,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 try:  # python-multipart >= 0.0.12 canonical namespace
     from python_multipart.exceptions import FormParserError, MultipartParseError
@@ -403,7 +403,290 @@ class _UploadResponse(BaseModel):
     config_version: int
 
 
+class _TimingFieldsResponse(BaseModel):
+    """Version-1 fixed duration registry; JSON keys are stable dotted paths."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    capture_read: float | None = Field(alias="capture.read")
+    segmentation_total: float | None = Field(alias="segmentation.total")
+    segmentation_preprocess: float | None = Field(alias="segmentation.preprocess")
+    segmentation_inference: float | None = Field(alias="segmentation.inference")
+    segmentation_postprocess: float | None = Field(alias="segmentation.postprocess")
+    background_total: float | None = Field(alias="background.total")
+    color_correction_total: float | None = Field(alias="color_correction.total")
+    compositor_total: float | None = Field(alias="compositor.total")
+    compositor_prepare: float | None = Field(alias="compositor.prepare")
+    compositor_blend: float | None = Field(alias="compositor.blend")
+    output_send_total: float | None = Field(alias="output.send_total")
+    output_submission: float | None = Field(alias="output.submission")
+    output_sink_pacing_wait: float | None = Field(alias="output.sink_pacing_wait")
+    output_application_pacing_wait: float | None = Field(
+        alias="output.application_pacing_wait"
+    )
+    output_schedule_lateness: float | None = Field(alias="output.schedule_lateness")
+    pipeline_processing_only: float | None = Field(alias="pipeline.processing_only")
+    pipeline_new_frame_service: float | None = Field(alias="pipeline.new_frame_service")
+    pipeline_new_frame_serialized_loop: float | None = Field(
+        alias="pipeline.new_frame_serialized_loop"
+    )
+
+
+class _PostBaseStageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    namespace: str = Field(pattern=r"^[a-z][a-z0-9-]{0,31}$")
+    update_count: int = Field(ge=0)
+    update_fps: float = Field(ge=0.0)
+    base_reuse_update_count: int = Field(ge=0)
+    base_reuse_update_fps: float = Field(ge=0.0)
+
+
+class _PostBaseResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_: Literal["custback.post-base-cadence"] = Field(alias="schema")
+    version: Literal[1]
+    stages: list[_PostBaseStageResponse] = Field(max_length=8)
+
+
+class _StatusExtensionsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    post_base: _PostBaseResponse
+
+
+_BackendName = Literal["rvm", "mediapipe", "heuristic", "none"]
+_QualityTier = Literal["matting", "segmentation", "heuristic", "none"]
+_SelectionReasonCategory = Literal[
+    "none",
+    "runtime-not-installed",
+    "runtime-unavailable",
+    "model-unavailable",
+    "permission-denied",
+    "preparation-unavailable",
+    "activation-failed",
+    "all-ml-backends-unavailable",
+]
+_PolicyText = Literal[
+    "off",
+    "motion_aware",
+    "legacy_watershed",
+    "stable_guided",
+    "temporal_bounded",
+    "native_soft_alpha",
+    "confidence_soft_mask",
+    "thresholded_binary_mask",
+    "opaque_passthrough",
+    "model_alpha_no_calibration",
+    "confidence_mask_no_calibration",
+    "heuristic_threshold",
+    "none",
+    "mask_shift_only",
+    "generic_postprocess",
+    "model_only",
+    "explicit_motion_aware",
+    "generic_temporal_policy",
+    "model-alpha-no-calibration;generic-postprocess",
+    "model-alpha-no-calibration;mask-shift-only",
+    "confidence_mask_no_calibration;generic-postprocess",
+    "heuristic_threshold;generic-postprocess",
+]
+_PolicyValue = _PolicyText | bool | int | float | None
+_PolicyReason = Literal[
+    "awaiting-first-rvm-inference",
+    "backdrop-has-no-dynamic-timeline",
+    "configured-active",
+    "configured-off",
+    "configured-ratio-resolved",
+    "generic-mask-policy",
+    "heuristic-score-cutoff",
+    "heuristic-threshold-produces-binary-mask",
+    "light-wrap-strength-is-zero",
+    "mediapipe-confidence-mask-does-not-use-threshold",
+    "null-or-passthrough-has-no-mask-threshold",
+    "null-or-passthrough-has-no-matte",
+    "null-or-passthrough-has-no-matte-refiner",
+    "null-or-passthrough-has-no-model-foreground",
+    "null-or-passthrough-has-no-rvm-inference",
+    "null-or-passthrough-has-no-soft-edge-composite",
+    "null-or-passthrough-has-no-temporal-matte",
+    "opaque-core-calibration-requires-separate-evidence",
+    "preserve-mediapipe-confidence-mask",
+    "preserve-rvm-pha-without-threshold",
+    "replaced-by-motion-aware",
+    "runtime-auto-ratio",
+    "rvm-native-alpha-bypasses-generic-blur",
+    "rvm-native-alpha-bypasses-generic-edge-refinement",
+    "rvm-native-alpha-is-never-hard-thresholded",
+    "rvm-recurrence-bypasses-generic-ema",
+    "selected-backend-does-not-produce-clean-foreground",
+    "selected-backend-does-not-use-rvm-ratio",
+]
+
+
+class _SegmentationSelectionAttemptResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    backend: _BackendName
+    quality_tier: _QualityTier
+    preparation_result: Literal[
+        "ready",
+        "unavailable",
+        "not-run",
+        "not-applicable",
+    ]
+    activation_result: Literal["selected", "failed", "not-attempted"]
+    reason_category: _SelectionReasonCategory
+    reason: str = Field(max_length=240)
+    guidance: str = Field(max_length=240)
+
+
+class _SegmentationSelectionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_: Literal["custback.backend-selection"] = Field(alias="schema")
+    version: Literal[1]
+    requested_backend: Literal["auto", "rvm", "mediapipe", "heuristic", "none"]
+    selected_backend: _BackendName
+    quality_tier: _QualityTier
+    selection_mode: Literal["automatic", "explicit", "model-format"]
+    fallback_active: bool
+    fallback_category: _SelectionReasonCategory
+    fallback_reason: str = Field(max_length=240)
+    guidance: str = Field(max_length=240)
+    active_device: str = Field(
+        min_length=1,
+        max_length=32,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
+    active_provider: str = Field(
+        min_length=1,
+        max_length=32,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
+    attempts: list[_SegmentationSelectionAttemptResponse] = Field(
+        min_length=1,
+        max_length=4,
+    )
+
+
+class _MattePolicyConfiguredResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rvm_downsample_ratio: float
+    threshold: float
+    mask_blur: int
+    edge_refine: bool
+    edge_refinement_mode: Literal["off", "legacy_watershed", "stable_guided"]
+    edge_refinement_reference_short_edge_px: int
+    edge_refinement_radius_at_reference_px: int
+    edge_refinement_min_radius_px: int
+    edge_refinement_max_radius_px: int
+    mask_shift: int
+    temporal_smoothing: float
+    boundary_stabilization_mode: BoundaryStabilizationMode
+    boundary_stabilization_time_constant_s: float
+    boundary_stabilization_max_motion_px_per_s: float
+    use_model_foreground: bool
+    light_wrap: float
+    light_wrap_stabilization_mode: Literal["off", "temporal_bounded"]
+    light_wrap_stabilization_time_constant_s: float
+
+
+class _MattePolicyEffectiveResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    raw_alpha_mode: Literal[
+        "native_soft_alpha",
+        "confidence_soft_mask",
+        "thresholded_binary_mask",
+        "opaque_passthrough",
+    ]
+    opaque_core_mode: Literal[
+        "model_alpha_no_calibration",
+        "confidence_mask_no_calibration",
+        "heuristic_threshold",
+        "none",
+    ]
+    halo_mode: Literal["mask_shift_only", "generic_postprocess", "none"]
+    residual_temporal_mode: Literal[
+        "model_only",
+        "explicit_motion_aware",
+        "generic_temporal_policy",
+        "none",
+    ]
+    rvm_downsample_ratio: float | None
+    threshold: float | None
+    mask_blur: int
+    edge_refine: bool
+    edge_refinement_mode: Literal["off", "legacy_watershed", "stable_guided"]
+    edge_refinement_radius_px: int
+    mask_shift: int
+    temporal_smoothing: float
+    boundary_stabilization_mode: BoundaryStabilizationMode
+    boundary_stabilization_time_constant_s: float
+    boundary_stabilization_max_motion_px_per_s: float
+    use_model_foreground: bool
+    light_wrap: float
+    light_wrap_stabilization_mode: Literal["off", "temporal_bounded"]
+    light_wrap_stabilization_time_constant_s: float
+
+
+class _MattePolicyControlResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    configured: _PolicyValue
+    effective: _PolicyValue
+    state: Literal["effective", "bypassed", "inapplicable"]
+    reason: _PolicyReason
+
+
+class _MattePolicyControlsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rvm_downsample_ratio: _MattePolicyControlResponse
+    raw_alpha: _MattePolicyControlResponse
+    threshold: _MattePolicyControlResponse
+    mask_blur: _MattePolicyControlResponse
+    edge_refine: _MattePolicyControlResponse
+    mask_shift: _MattePolicyControlResponse
+    temporal_smoothing: _MattePolicyControlResponse
+    boundary_stabilization: _MattePolicyControlResponse
+    use_model_foreground: _MattePolicyControlResponse
+    light_wrap: _MattePolicyControlResponse
+    light_wrap_stabilization: _MattePolicyControlResponse
+    opaque_core_halo: _MattePolicyControlResponse
+
+
+class _MattePolicyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_: Literal["custback.matte-policy"] = Field(alias="schema")
+    version: Literal[1]
+    blend_space: Literal["srgb_legacy", "linear_srgb"]
+    selected_backend_kind: Literal[
+        "true_alpha_recurrent",
+        "confidence_mask_video",
+        "binary_coarse",
+        "null_passthrough",
+    ]
+    backend_kind: Literal[
+        "true_alpha_recurrent",
+        "confidence_mask_video",
+        "binary_coarse",
+        "null_passthrough",
+    ]
+    passthrough: bool
+    experimental_rvm_generic: bool
+    configured: _MattePolicyConfiguredResponse
+    effective: _MattePolicyEffectiveResponse
+    controls: _MattePolicyControlsResponse
+
+
 class _StatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     run_id: str
     frames_in: int
     frames_out: int
@@ -411,6 +694,8 @@ class _StatusResponse(BaseModel):
     mode: str
     segmentation_backend: str
     segmentation_device: str
+    segmentation_selection: _SegmentationSelectionResponse
+    matte_policy: _MattePolicyResponse
     segmentation_generation: int
     capture_sequence: int
     capture_sequence_gap_count: int
@@ -486,7 +771,34 @@ class _StatusResponse(BaseModel):
     output_effective_fps: float
     fps_attainment_pct: float | None
     output_repeated_frames: int
+    segmentation_update_count: int
+    segmentation_update_fps: float
+    base_composite_update_count: int
+    base_composite_update_fps: float
+    base_composite_reuse_count: int
+    base_composite_reuse_fps: float
+    base_composite_reuse_ratio: float
+    exact_final_output_repeat_count: int
+    exact_final_output_repeat_fps: float
+    exact_final_output_repeat_ratio: float
+    output_send_count: int
+    output_send_fps: float
+    last_unique_frame_age_ms: float | None
+    capture_timestamp_delta_p50_ms: float | None
+    capture_timestamp_delta_p95_ms: float | None
+    output_send_delta_p50_ms: float | None
+    output_send_delta_p95_ms: float | None
+    output_send_jitter_p50_ms: float | None
+    output_send_jitter_p95_ms: float | None
+    base_composite_delta_p50_ms: float | None
+    base_composite_delta_p95_ms: float | None
+    cadence_mismatch_active: bool
     processing_deadline_misses: int
+    serialized_new_frame_deadline_misses: int
+    output_sink_pacing_events: int
+    output_sink_recovery_events: int
+    application_pacing_events: int
+    output_schedule_late_events: int
     capture_read_ms: float | None
     segmentation_ms: float | None
     background_ms: float | None
@@ -525,7 +837,15 @@ class _StatusResponse(BaseModel):
     color_input_assumption: str
     composite_ms: float | None
     output_send_ms: float | None
+    output_submission_ms: float | None
+    output_sink_pacing_wait_ms: float | None
+    application_pacing_wait_ms: float | None
+    output_schedule_lateness_ms: float | None
     frame_processing_ms: float | None
+    new_frame_service_ms: float | None
+    new_frame_serialized_loop_ms: float | None
+    timing_schema_version: Literal[1]
+    timing_ms: _TimingFieldsResponse
     output_fallback_active: bool
     output_fallback_reason: str
     segmentation_fallback_active: bool
@@ -556,7 +876,28 @@ class _StatusResponse(BaseModel):
     background_video_output_color: str | None
     background_video_color_assumed_fields: list[str]
     background_video_color_overridden_fields: list[str]
+    extensions: _StatusExtensionsResponse
     uptime_s: float
+
+    @model_validator(mode="after")
+    def _selection_matches_matte_policy(self) -> "_StatusResponse":
+        expected_kind = {
+            "rvm": "true_alpha_recurrent",
+            "mediapipe": "confidence_mask_video",
+            "heuristic": "binary_coarse",
+            "none": "null_passthrough",
+        }[self.segmentation_selection.selected_backend]
+        policy = self.matte_policy
+        if policy.selected_backend_kind != expected_kind:
+            raise ValueError("selected backend and matte policy kind do not match")
+        effective_kind = "null_passthrough" if policy.passthrough else expected_kind
+        if policy.backend_kind != effective_kind:
+            raise ValueError("matte policy passthrough/effective kind is inconsistent")
+        if policy.experimental_rvm_generic and (
+            expected_kind != "true_alpha_recurrent" or policy.passthrough
+        ):
+            raise ValueError("experimental RVM policy requires active RVM matting")
+        return self
 
 
 class _BackgroundListResponse(BaseModel):
@@ -603,7 +944,11 @@ def _map_apply_error(exc: BaseException) -> HTTPException:
     if name in ("ConfigConflictError", "ConfigVersionConflictError"):
         return _error(409, "config_conflict", str(exc))
     if name in ("ActivationError", "ConfigApplyError"):
-        return _error(422, "activation_failed", str(exc))
+        return _error(
+            422,
+            "activation_failed",
+            "candidate configuration could not be activated",
+        )
     if name == "ReconfigurationUnavailable" or isinstance(exc, TimeoutError):
         return _error(503, "reconfiguration_unavailable", str(exc))
     if isinstance(exc, OSError):
@@ -1953,8 +2298,28 @@ def create_app(
 
         body = hub.stats_dict()
         body["native_ring"] = native_ring_status()
+        try:
+            public = _StatusResponse.model_validate(body).model_dump(
+                mode="json",
+                by_alias=True,
+            )
+        except ValidationError:
+            log.error("public status failed schema validation")
+            return JSONResponse(
+                {
+                    "detail": {
+                        "code": "internal_error",
+                        "message": "internal API error",
+                    }
+                },
+                status_code=500,
+                headers={
+                    "X-Config-Version": str(body.get("config_version", "unknown"))
+                },
+            )
         return JSONResponse(
-            body, headers={"X-Config-Version": str(body["config_version"])}
+            public,
+            headers={"X-Config-Version": str(public["config_version"])},
         )
 
     @app.get("/config", response_model=PublicAppConfig)

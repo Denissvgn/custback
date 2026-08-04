@@ -1445,3 +1445,256 @@ class TestSegmentation:
             )
         ).refine(mask)
         assert shrunk.sum() < mask.sum() < grown.sum()
+
+
+@pytest.mark.parametrize(
+    ("use_model_foreground", "light_wrap"),
+    [
+        pytest.param(False, 0.0, id="plain"),
+        pytest.param(True, 0.0, id="model-foreground"),
+        pytest.param(False, 0.25, id="light-wrap"),
+        pytest.param(True, 0.25, id="model-foreground-and-light-wrap"),
+    ],
+)
+def test_legacy_workspace_is_byte_exact_and_preserves_frame_contracts(
+    use_model_foreground,
+    light_wrap,
+):
+    pytest.importorskip("cv2")
+    rng = np.random.default_rng(0x4D41545445)
+    shape = (32, 48, 3)
+    foreground = rng.integers(0, 256, shape, dtype=np.uint8)
+    backdrop = rng.integers(0, 256, shape, dtype=np.uint8)
+    clean_foreground = rng.integers(0, 256, shape, dtype=np.uint8)
+    mask = rng.random(shape[:2], dtype=np.float32)
+    mask[0] = 0.0
+    mask[-1] = 1.0
+    inputs_before = tuple(
+        value.copy() for value in (foreground, backdrop, clean_foreground, mask)
+    )
+    edge = clean_foreground if use_model_foreground else None
+    reference = composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=light_wrap,
+        edge_foreground=edge,
+        blend_space="srgb_legacy",
+    )
+    assert np.array_equal(
+        reference,
+        legacy_composite_reference(
+            foreground,
+            backdrop,
+            mask,
+            light_wrap=light_wrap,
+            edge_foreground=edge,
+        ),
+    )
+    workspace = compositor_mod.LegacyCompositorWorkspace(shape)
+    diagnostics = {}
+
+    optimized = composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=light_wrap,
+        edge_foreground=edge,
+        blend_space="srgb_legacy",
+        workspace=workspace,
+        diagnostics=diagnostics,
+    )
+
+    assert np.array_equal(optimized, reference)
+    assert optimized.dtype == np.uint8
+    assert optimized.shape == shape
+    assert optimized.flags.c_contiguous
+    assert int(optimized.min()) >= 0
+    assert int(optimized.max()) <= 255
+    assert np.array_equal(optimized[0], backdrop[0])
+    assert np.array_equal(optimized[-1], foreground[-1])
+    for value, before in zip(
+        (foreground, backdrop, clean_foreground, mask),
+        inputs_before,
+        strict=True,
+    ):
+        assert np.array_equal(value, before)
+    assert set(diagnostics) == set(compositor_mod.COMPOSITOR_SUBSTAGE_NAMES)
+    assert all(
+        isinstance(value, float) and np.isfinite(value) and value >= 0.0
+        for value in diagnostics.values()
+    )
+    if not use_model_foreground:
+        assert diagnostics["model_foreground_replacement"] == 0.0
+    if light_wrap == 0.0:
+        assert diagnostics["backdrop_blur_resize"] == 0.0
+        assert diagnostics["light_wrap_interpolation"] == 0.0
+
+
+def test_legacy_workspace_outputs_are_deterministic_and_independently_owned():
+    pytest.importorskip("cv2")
+    rng = np.random.default_rng(0x0BADC0DE)
+    shape = (24, 40, 3)
+    foreground = rng.integers(0, 256, shape, dtype=np.uint8)
+    backdrop = rng.integers(0, 256, shape, dtype=np.uint8)
+    clean_foreground = rng.integers(0, 256, shape, dtype=np.uint8)
+    mask = rng.random(shape[:2], dtype=np.float32)
+    workspace = compositor_mod.LegacyCompositorWorkspace(shape)
+
+    first = composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=0.25,
+        edge_foreground=clean_foreground,
+        workspace=workspace,
+    )
+    retained_first = first.copy()
+    second = composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=0.25,
+        edge_foreground=clean_foreground,
+        workspace=workspace,
+    )
+
+    assert first is not second
+    assert not np.shares_memory(first, second)
+    assert np.array_equal(first, retained_first)
+    assert np.array_equal(second, retained_first)
+    second.fill(0)
+    assert np.array_equal(first, retained_first)
+    assert workspace.snapshot().calls == 2
+
+
+def test_legacy_workspace_opencv_failure_uses_exact_reference_and_recovers(
+    monkeypatch,
+):
+    pytest.importorskip("cv2")
+    rng = np.random.default_rng(0xFA11BAC)
+    shape = (24, 40, 3)
+    foreground = rng.integers(0, 256, shape, dtype=np.uint8)
+    backdrop = rng.integers(0, 256, shape, dtype=np.uint8)
+    clean_foreground = rng.integers(0, 256, shape, dtype=np.uint8)
+    mask = rng.random(shape[:2], dtype=np.float32)
+    expected = composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=0.25,
+        edge_foreground=clean_foreground,
+    )
+    workspace = compositor_mod.LegacyCompositorWorkspace(shape)
+    real_add = compositor_mod.cv2.add
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise compositor_mod.cv2.error("forced compiled legacy failure")
+        return real_add(*args, **kwargs)
+
+    monkeypatch.setattr(compositor_mod.cv2, "add", fail_once)
+    recovered = composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=0.25,
+        edge_foreground=clean_foreground,
+        workspace=workspace,
+    )
+
+    assert calls == 1
+    assert workspace.snapshot().calls == 0
+    np.testing.assert_array_equal(recovered, expected)
+
+    subsequent = composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=0.25,
+        edge_foreground=clean_foreground,
+        workspace=workspace,
+    )
+    np.testing.assert_array_equal(subsequent, expected)
+    assert workspace.snapshot().calls == 1
+
+
+def test_legacy_workspace_does_not_swallow_structural_failure(monkeypatch):
+    shape = (8, 12, 3)
+    workspace = compositor_mod.LegacyCompositorWorkspace(shape)
+
+    def fail_contract(*_args, **_kwargs):
+        raise ValueError("forced strict workspace contract")
+
+    monkeypatch.setattr(workspace, "blend", fail_contract)
+    with pytest.raises(ValueError, match="strict workspace contract"):
+        composite(
+            frame(h=shape[0], w=shape[1], value=200),
+            frame(h=shape[0], w=shape[1], value=10),
+            np.full(shape[:2], 0.5, np.float32),
+            workspace=workspace,
+        )
+
+
+def test_legacy_workspace_reports_bounded_retained_and_transient_bytes():
+    shape = (24, 40, 3)
+    height, width, _channels = shape
+    workspace = compositor_mod.LegacyCompositorWorkspace(shape)
+    initial = workspace.snapshot()
+    expected_retained = (
+        2 * height * width * np.dtype(np.float32).itemsize
+        + 2 * height * width * 3 * np.dtype(np.float32).itemsize
+        + max(4, height // 8) * max(4, width // 8) * 3
+    )
+
+    assert initial.retained_bytes == expected_retained
+    assert initial.last_known_allocation_bytes == 0
+    assert initial.calls == 0
+    assert initial.closed is False
+
+    output = composite(
+        frame(h=height, w=width, value=200),
+        frame(h=height, w=width, value=10),
+        np.full((height, width), 0.5, np.float32),
+        workspace=workspace,
+    )
+    used = workspace.snapshot()
+
+    assert used.retained_bytes == expected_retained
+    assert used.last_known_allocation_bytes == output.nbytes
+    assert used.calls == 1
+    assert used.closed is False
+
+
+def test_legacy_workspace_rejects_shape_mismatch_and_use_after_close():
+    pytest.importorskip("cv2")
+    workspace = compositor_mod.LegacyCompositorWorkspace((24, 40, 3))
+    other_foreground = frame(h=20, w=40, value=200)
+    other_backdrop = frame(h=20, w=40, value=10)
+    other_mask = np.full((20, 40), 0.5, np.float32)
+
+    with pytest.raises(ValueError, match="workspace shape mismatch"):
+        composite(
+            other_foreground,
+            other_backdrop,
+            other_mask,
+            workspace=workspace,
+        )
+
+    workspace.close()
+    workspace.close()
+    closed = workspace.snapshot()
+    assert closed.closed is True
+    assert closed.retained_bytes == 0
+    assert closed.last_known_allocation_bytes == 0
+
+    with pytest.raises(RuntimeError, match="workspace is closed"):
+        composite(
+            frame(h=24, w=40, value=200),
+            frame(h=24, w=40, value=10),
+            np.full((24, 40), 0.5, np.float32),
+            workspace=workspace,
+        )

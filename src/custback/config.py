@@ -926,6 +926,23 @@ class AppConfig(_StrictModel):
             raise ValueError(f"unknown camera backdrop target ID: {selected!r}")
         return self
 
+    @model_validator(mode="after")
+    def _gpu_required_requires_rvm_eligibility(self) -> "AppConfig":
+        if self.acceleration.mode != "gpu_required":
+            return self
+        backend = self.segmentation.backend
+        format_constrained_mediapipe = (
+            backend == "auto"
+            and bool(self.segmentation.model_path)
+            and Path(self.segmentation.model_path).suffix.lower() == ".tflite"
+        )
+        if backend not in {"auto", "rvm"} or format_constrained_mediapipe:
+            raise ValueError(
+                "acceleration.mode=gpu_required requires an RVM-eligible "
+                "segmentation backend"
+            )
+        return self
+
     def resolved_backdrop_target(self) -> ResolvedBackdropTarget | None:
         """Return a detached, validated snapshot of the selected source."""
 

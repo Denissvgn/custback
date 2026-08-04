@@ -1,0 +1,116 @@
+{
+  "schema": "custback.matte-full-path-performance-evidence",
+  "version": 1,
+  "evidence_kind": "generated-proxy",
+  "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "hardware_id": "replace_cuda_host",
+  "hardware_identity_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "provider_environment_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "measurement_run_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+  "rvm_model_sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+  "bundle_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "measured_frame_lineage_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "matrix_row_id": "srgb_legacy_both",
+  "effective_policy": {
+    "resolved_rvm_downsample_ratio": 0.4,
+    "raw_alpha_mode": "native_soft_alpha",
+    "halo_mode": "mask_shift_only",
+    "mask_shift_px": 0,
+    "boundary_stabilization_mode": "off",
+    "use_model_foreground": true,
+    "light_wrap": 0.25,
+    "light_wrap_stabilization_mode": "off",
+    "blend_space": "srgb_legacy",
+    "color_correction_mode": "off"
+  },
+  "background_provider_scope": "resident-recorded-frame-copy",
+  "sink_id": "pyvirtualcam",
+  "sink_identity_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "sink_submission_copy_in_service_boundary": true,
+  "canvas": {
+    "width": 1280,
+    "height": 720,
+    "nominal_fps": 30
+  },
+  "backend": "rvm",
+  "provider": "cuda",
+  "fallback_count": 0,
+  "boundary": "unique-dequeue-through-sink-submit-excluding-deliberate-pacing",
+  "warmup_frame_count": 1,
+  "service_samples_ms": [
+    30.0,
+    30.0,
+    30.0
+  ],
+  "non_pacing_cycle_samples_ms": [
+    31.0,
+    31.0,
+    31.0
+  ],
+  "frame_processing_samples_ms": [
+    20.0,
+    20.0,
+    20.0
+  ],
+  "serialized_new_frame_samples_ms": [
+    37.0,
+    37.0,
+    37.0
+  ],
+  "rvm_preprocess_samples_ms": [
+    2.0,
+    2.0,
+    2.0
+  ],
+  "rvm_inference_samples_ms": [
+    5.0,
+    5.0,
+    5.0
+  ],
+  "rvm_postprocess_samples_ms": [
+    2.0,
+    2.0,
+    2.0
+  ],
+  "background_selection_samples_ms": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "compositor_samples_ms": [
+    10.0,
+    10.0,
+    10.0
+  ],
+  "post_composite_validation_samples_ms": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "sink_submission_samples_ms": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "pacing_wait_samples_ms": [
+    7.0,
+    7.0,
+    7.0
+  ],
+  "schedule_lateness_samples_ms": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "unique_composite_count": 3,
+  "model_invocation_count": 3,
+  "output_send_count": 3,
+  "output_repeat_count": 0,
+  "no_unread_repeat_count": 0,
+  "capture_slot_overwrite_count": 0,
+  "capture_sequence_gap_count": 0,
+  "capture_missing_input_count": 0,
+  "processing_deadline_miss_count": 0,
+  "serialized_new_frame_deadline_miss_count": 3,
+  "sink_recovery_count": 0
+}

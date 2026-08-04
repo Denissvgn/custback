@@ -349,11 +349,37 @@ test('launcher rebuild delegates to installer and never recursively deletes VENV
   assert.doesNotMatch(source, /rmSync\s*\(\s*targetPath/);
 });
 
+test('doctor explains installed backend quality tiers with actionable rebuild commands', () => {
+  assert.deepEqual(launcher.backendQualityProfile({ mediapipe: true, rvm: true }), {
+    level: 'note',
+    label: 'backend quality tier: matting',
+    hint: 'RVM true-alpha matting is installed; confirm the active provider in runtime status',
+  });
+
+  const defaultProfile = launcher.backendQualityProfile({ mediapipe: true, rvm: false });
+  assert.equal(defaultProfile.level, 'note');
+  assert.equal(defaultProfile.label, 'backend quality tier: segmentation');
+  assert.match(defaultProfile.hint, /MediaPipe confidence-mask segmentation is installed/);
+  assert.match(defaultProfile.hint, /custback rebuild --extras rvm \(CPU\)/);
+  assert.match(defaultProfile.hint, /custback rebuild --extras gpu \(NVIDIA\/CUDA\)/);
+
+  const coreProfile = launcher.backendQualityProfile({ mediapipe: false, rvm: false });
+  assert.equal(coreProfile.level, 'warn');
+  assert.equal(coreProfile.label, 'backend quality tier: heuristic');
+  assert.match(coreProfile.hint, /custback rebuild --extras mediapipe/);
+  assert.match(coreProfile.hint, /custback rebuild --extras rvm \(CPU\)/);
+  assert.match(coreProfile.hint, /custback rebuild --extras gpu \(NVIDIA\/CUDA\)/);
+});
+
 test('doctor keeps optional capabilities and machine setup non-fatal', () => {
   const source = fs.readFileSync(path.resolve(__dirname, '..', 'custback.js'), 'utf8');
-  assert.match(source, /note\('MediaPipe segmentation not installed'/);
+  assert.match(source, /note\('MediaPipe confidence-mask segmentation tier not installed'/);
+  assert.match(source, /note\('RVM true-alpha matting tier not installed'/);
   assert.match(source, /warn\('custback virtual camera device not found'/);
-  assert.doesNotMatch(source, /report\('MediaPipe segmentation not installed'/);
+  assert.doesNotMatch(
+    source,
+    /report\('MediaPipe confidence-mask segmentation tier not installed'/,
+  );
   assert.match(source, /requested\.includes\('mediapipe'\)/);
   assert.match(source, /requested\.includes\('gpu'\)/);
   assert.match(source, /installer\.cudaProbe\(python\)/);

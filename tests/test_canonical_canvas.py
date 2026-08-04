@@ -32,6 +32,7 @@ from custback.api.server import create_app
 from custback.capture import CapturedFrame, CaptureHealth
 from custback.config import AppConfig, ConfigState, RuntimeConfig
 from custback.hub import FrameHub
+from custback.matte_policy import MatteBackendKind
 from custback.pipeline import ActivationError, Pipeline, _Resources
 
 
@@ -224,6 +225,7 @@ class _RecordingOutput:
 class _TrackingSegmenter:
     device = "cpu"
     last_foreground = None
+    matte_backend_kind = MatteBackendKind.NULL_PASSTHROUGH
 
     def __init__(self, mask_value: float = 0.0) -> None:
         self.mask_value = mask_value

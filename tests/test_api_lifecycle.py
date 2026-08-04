@@ -201,6 +201,12 @@ def test_ready_and_shutdown_records_are_ordered_and_complete(monkeypatch, caplog
     assert "background.fit_mode=cover" in caplog.text
     assert "compositing.blend_space=srgb_legacy" in caplog.text
     assert "compositing.color_correction.mode=off" in caplog.text
+    assert caplog.text.count("backend=none->none tier=none") == 2
+    assert caplog.text.count("provider=none") == 2
+    assert caplog.text.count("backend_fallback=False") == 2
+    assert caplog.text.count("backend_fallback_category=none") == 2
+    assert caplog.text.count("alpha_policy=opaque_passthrough") == 2
+    assert caplog.text.count("blend_space=srgb_legacy") >= 2
     for field in (
         "capture_read_ms=",
         "segmentation_ms=",
@@ -211,6 +217,25 @@ def test_ready_and_shutdown_records_are_ordered_and_complete(monkeypatch, caplog
         "frame_processing_ms=",
     ):
         assert field in caplog.text
+    for field in (
+        "unique_updates=",
+        "segmentation_updates=",
+        "output_sends=",
+        "safe_base_reuses=",
+        "exact_final_repeats=",
+        "capture_gaps=",
+        "capture_missing=",
+        "capture_slot_overwrites=",
+        "processing_deadline_misses=",
+        "serialized_deadline_misses=",
+        "sink_pacing_events=",
+        "sink_recovery_events=",
+        "application_pacing_events=",
+        "schedule_late_events=",
+        "matte_resets=",
+        "matte_last_reset=",
+    ):
+        assert caplog.text.count(field) >= 2
     assert "model_preparation" in FakePipeline.instances[0].options
 
 

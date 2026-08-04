@@ -44,8 +44,12 @@ from custback.pipeline import (
     RestartRequiredError,
 )
 from custback.pipeline import ConfigConflictError, _restart_only_changes
-from custback.segmentation import RVMTelemetry
-from custback.vcam import NullOutput
+from custback.segmentation import (
+    HeuristicSegmenter,
+    RVMTelemetry,
+    segmenter_selection_status,
+)
+from custback.vcam import NullOutput, OutputSendTiming
 
 
 def _captured(
@@ -272,6 +276,7 @@ def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
 
     class FakeMediaPipe:
         produces_matte = False
+        matte_backend_kind = MatteBackendKind.CONFIDENCE_MASK_VIDEO
         last_foreground = None
 
         def __init__(self, cfg):
@@ -316,6 +321,44 @@ def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
         assert stats["effective_boundary_stabilization_max_motion_px_per_s"] == 720.0
         assert stats["effective_use_model_foreground"] is True
         assert stats["effective_light_wrap"] == 0.25
+        assert stats["segmentation_selection"] == {
+            "schema": "custback.backend-selection",
+            "version": 1,
+            "requested_backend": "rvm",
+            "selected_backend": "rvm",
+            "quality_tier": "matting",
+            "selection_mode": "explicit",
+            "fallback_active": False,
+            "fallback_category": "none",
+            "fallback_reason": "",
+            "guidance": "",
+            "active_device": "cuda",
+            "active_provider": "cuda",
+            "attempts": [
+                {
+                    "backend": "rvm",
+                    "quality_tier": "matting",
+                    "preparation_result": "not-run",
+                    "activation_result": "selected",
+                    "reason_category": "none",
+                    "reason": "",
+                    "guidance": "",
+                }
+            ],
+        }
+        assert stats["matte_policy"]["schema"] == "custback.matte-policy"
+        assert stats["matte_policy"]["version"] == 1
+        assert stats["matte_policy"]["blend_space"] == (
+            baseline.compositing.blend_space
+        )
+        assert stats["matte_policy"]["selected_backend_kind"] == (
+            MatteBackendKind.TRUE_ALPHA_RECURRENT
+        )
+        assert stats["matte_policy"]["effective"]["rvm_downsample_ratio"] == 0.4
+        assert stats["matte_policy"]["effective"]["raw_alpha_mode"] == (
+            "native_soft_alpha"
+        )
+        assert stats["matte_policy"]["controls"]["mask_blur"]["state"] == "bypassed"
 
         stats = patch({"compositing": {"light_wrap": 0.0}})
         assert stats["effective_light_wrap"] == 0.0
@@ -385,6 +428,17 @@ def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
         assert stats["effective_boundary_stabilization_mode"] == "off"
         assert stats["effective_use_model_foreground"] is False
         assert stats["segmentation_generation"] == 5
+        assert stats["segmentation_selection"]["requested_backend"] == "mediapipe"
+        assert stats["segmentation_selection"]["selected_backend"] == "mediapipe"
+        assert stats["segmentation_selection"]["quality_tier"] == "segmentation"
+        assert stats["segmentation_selection"]["fallback_active"] is False
+        assert stats["matte_policy"]["selected_backend_kind"] == (
+            MatteBackendKind.CONFIDENCE_MASK_VIDEO
+        )
+        assert stats["matte_policy"]["effective"]["rvm_downsample_ratio"] is None
+        assert stats["matte_policy"]["effective"]["raw_alpha_mode"] == (
+            "confidence_soft_mask"
+        )
 
         stats = patch({"segmentation": {"edge_refine": False}})
         assert stats["effective_edge_refine"] is False
@@ -2689,12 +2743,98 @@ def test_stats_populated():
     try:
         wait_for_frame(hub)
         stats = hub.stats_dict()
-        assert stats["frames_out"] >= 1
+        assert stats["output_send_count"] >= 2
+        assert stats["frames_out"] == stats["output_send_count"]
+        assert stats["frames_in"] == stats["base_composite_update_count"]
+        assert (
+            stats["segmentation_update_count"] == stats["base_composite_update_count"]
+        )
+        assert (
+            stats["base_composite_update_count"] + stats["base_composite_reuse_count"]
+            == stats["output_send_count"]
+        )
+        assert stats["output_repeated_frames"] == stats["base_composite_reuse_count"]
+        assert stats["last_unique_frame_age_ms"] is not None
+        assert stats["timing_schema_version"] == 1
+        assert set(stats["timing_ms"]) == set(pipeline_mod.TIMING_FIELD_NAMES)
         assert stats["mode"] == "color"
         assert stats["segmentation_backend"] == "HeuristicSegmenter"
         assert stats["output_backend"] == "NullOutput"
     finally:
         pipeline.stop()
+
+
+def test_terminal_capture_health_is_sampled_after_capture_stops(monkeypatch):
+    cfg = _color_integration_config("color")
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    events: list[str] = []
+
+    class FinalHealthCapture:
+        closed = False
+        close_calls = 0
+
+        def health_snapshot(self):
+            events.append("health-closed" if self.closed else "health-open")
+            return CaptureHealth(
+                backend="terminal-fake",
+                frames_read=1,
+                dropped_frames=7 if self.closed else 3,
+            )
+
+        def close(self):
+            self.close_calls += 1
+            self.closed = True
+            events.append("capture-close")
+
+    capture = FinalHealthCapture()
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        capture,
+        _FixedMaskSegmenter(np.ones((24, 32), np.float32)),
+        _IdentityRefiner(),
+        None,
+        NullOutput(32, 24, cfg.output.fps),
+    )
+    now_ns = time.monotonic_ns()
+    captured = _captured(
+        np.full((24, 32, 3), 60, np.uint8),
+        captured_at_ns=now_ns - 3_000_000,
+    )
+    preflight = pipeline_mod._PreflightResult(
+        output=captured.pixels.copy(),
+        captured=captured,
+        send_timing=OutputSendTiming(
+            submitted_at_ns=now_ns - 1_000_000,
+            completed_at_ns=now_ns,
+            submission_ms=1.0,
+            pacing_wait_ms=1.0,
+        ),
+        base_ready_at_ns=now_ns - 2_000_000,
+        segmentation_updated=False,
+        frame_processing_ms=1.0,
+        new_frame_service_ms=2.0,
+        new_frame_serialized_loop_ms=3.0,
+        timings={
+            "segmentation_ms": 0.0,
+            "background_ms": 0.0,
+            "color_correction_ms": 0.0,
+            "composite_ms": 0.0,
+        },
+        color_status={},
+        remote_fallback_active=False,
+        remote_fallback_reason="",
+    )
+    monkeypatch.setattr(pipeline, "_open_resources", lambda _state: resources)
+    monkeypatch.setattr(pipeline, "_preflight", lambda _resources: preflight)
+    monkeypatch.setattr(pipeline, "_loop", lambda *_args, **_kwargs: None)
+
+    pipeline._run()
+
+    assert capture.close_calls == 1
+    assert events[-2:] == ["capture-close", "health-closed"]
+    assert hub.stats_dict()["capture_dropped_frames"] == 7
 
 
 def test_slow_capture_repeats_last_safe_output_without_backlog(monkeypatch):
@@ -2741,10 +2881,272 @@ def test_slow_capture_repeats_last_safe_output_without_backlog(monkeypatch):
         assert stats["frames_out"] == (
             stats["frames_in"] + stats["output_repeated_frames"]
         )
+        assert stats["output_send_count"] == stats["frames_out"]
+        assert stats["base_composite_update_count"] == stats["frames_in"]
+        assert stats["base_composite_reuse_count"] == stats["output_repeated_frames"]
+        assert stats["base_composite_reuse_ratio"] == pytest.approx(
+            stats["base_composite_reuse_count"] / stats["output_send_count"],
+            abs=1e-4,
+        )
+        assert stats["cadence_mismatch_active"] is True
         assert stats["capture_frames_read"] == stats["frames_in"]
         assert stats["fps_attainment_pct"] is not None
     finally:
         pipeline.stop()
+
+
+def test_nonpacing_output_samples_capture_after_application_wait():
+    cfg = _color_integration_config("color")
+    raw_first = np.full((24, 32, 3), 40, np.uint8)
+    raw_second = np.full((24, 32, 3), 90, np.uint8)
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+
+    class BoundaryCapture:
+        def __init__(self):
+            self.first_sent = False
+            self.second_sent = False
+            self.second_ready_at = 0.0
+
+        def read(self):
+            if not self.first_sent:
+                self.first_sent = True
+                self.second_ready_at = time.monotonic() + 0.005
+                return _captured(raw_first.copy(), 1)
+            if not self.second_sent and time.monotonic() >= self.second_ready_at:
+                self.second_sent = True
+                return _captured(raw_second.copy(), 2)
+            return None
+
+        def health_snapshot(self):
+            return CaptureHealth(
+                backend="boundary-fake",
+                frames_read=int(self.first_sent) + int(self.second_sent),
+            )
+
+        def close(self):
+            pass
+
+    class NonPacingStopAfterOutput(_StopAfterOutput):
+        paces = False
+
+    output = NonPacingStopAfterOutput(pipeline, 2)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        BoundaryCapture(),
+        _FixedMaskSegmenter(np.ones((24, 32), np.float32)),
+        _IdentityRefiner(),
+        None,
+        output,
+    )
+    try:
+        pipeline._loop(resources)
+        stats = hub.stats_dict()
+        assert len(output.frames) == 2
+        assert stats["base_composite_update_count"] == 2
+        assert stats["base_composite_reuse_count"] == 0
+        assert stats["application_pacing_events"] == 1
+        assert np.array_equal(output.frames[1], raw_second)
+    finally:
+        resources.close()
+
+
+def test_nonpacing_preflight_waits_one_slot_before_first_steady_capture(
+    monkeypatch,
+):
+    cfg = _color_integration_config("color")
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    clock_ns = [0]
+    waits: list[float] = []
+    interval_ns = round(1_000_000_000 / cfg.output.fps)
+
+    class VirtualStop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            clock_ns[0] += round(timeout * 1_000_000_000)
+            return self.stopped
+
+    class NextCapture:
+        def read(self):
+            assert clock_ns[0] >= interval_ns
+            return _captured(
+                np.full((24, 32, 3), 90, np.uint8),
+                2,
+                captured_at_ns=clock_ns[0],
+            )
+
+        def health_snapshot(self):
+            return CaptureHealth(backend="startup-slot-fake", frames_read=2)
+
+        def close(self):
+            pass
+
+    class OneShotOutput:
+        paces = False
+        fallback_active = False
+        fallback_reason = ""
+
+        def send(self, _frame):
+            pipeline._stop.set()
+
+        def close(self):
+            pass
+
+    virtual_stop = VirtualStop()
+    pipeline._stop = cast(Any, virtual_stop)
+    monkeypatch.setattr(pipeline_mod.time, "monotonic_ns", lambda: clock_ns[0])
+    first = _captured(np.full((24, 32, 3), 40, np.uint8), 1, captured_at_ns=0)
+    preflight = pipeline_mod._PreflightResult(
+        output=first.pixels.copy(),
+        captured=first,
+        send_timing=OutputSendTiming(
+            submitted_at_ns=0,
+            completed_at_ns=0,
+            submission_ms=0.0,
+            pacing_wait_ms=0.0,
+        ),
+        base_ready_at_ns=0,
+        segmentation_updated=False,
+        frame_processing_ms=0.0,
+        new_frame_service_ms=0.0,
+        new_frame_serialized_loop_ms=0.0,
+        timings={
+            "segmentation_ms": 0.0,
+            "background_ms": 0.0,
+            "color_correction_ms": 0.0,
+            "composite_ms": 0.0,
+        },
+        color_status={},
+        remote_fallback_active=False,
+        remote_fallback_reason="",
+    )
+    tracker = pipeline_mod.CadenceTracker(cfg.output.fps)
+    tracker.record_send(
+        sent_at_ns=0,
+        capture_sequence=1,
+        captured_at_ns=0,
+        base_ready_at_ns=0,
+        base_updated=True,
+        segmentation_updated=False,
+        exact_final_repeat=False,
+    )
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        NextCapture(),
+        _FixedMaskSegmenter(np.ones((24, 32), np.float32)),
+        _IdentityRefiner(),
+        None,
+        OneShotOutput(),
+    )
+    try:
+        pipeline._loop(
+            resources,
+            preflight=preflight,
+            cadence_tracker=tracker,
+        )
+        assert waits == [pytest.approx(interval_ns / 1_000_000_000.0)]
+        stats = hub.stats_dict()
+        assert stats["output_send_count"] == 2
+        assert stats["base_composite_update_count"] == 2
+        assert stats["base_composite_reuse_count"] == 0
+        assert stats["application_pacing_events"] == 1
+        assert stats["output_send_delta_p50_ms"] == pytest.approx(
+            interval_ns / 1_000_000.0,
+            abs=0.001,
+        )
+    finally:
+        resources.close()
+
+
+def test_nonpacing_output_does_not_add_wait_after_over_budget_cycle(monkeypatch):
+    cfg = _color_integration_config("color")
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    clock_ns = [0]
+    waits: list[float] = []
+
+    class VirtualStop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            clock_ns[0] += round(timeout * 1_000_000_000)
+            return self.stopped
+
+    class SlowCapture:
+        sequence = 0
+
+        def read(self):
+            self.sequence += 1
+            clock_ns[0] += 40_000_000
+            return _captured(
+                np.full((24, 32, 3), self.sequence, np.uint8),
+                self.sequence,
+                captured_at_ns=clock_ns[0] - 1_000_000,
+            )
+
+        def health_snapshot(self):
+            return CaptureHealth(
+                backend="slow-service-fake",
+                frames_read=self.sequence,
+            )
+
+        def close(self):
+            pass
+
+    class NonPacingOutput:
+        paces = False
+        fallback_active = False
+        fallback_reason = ""
+
+        def __init__(self):
+            self.frames = 0
+
+        def send(self, _frame):
+            self.frames += 1
+            if self.frames == 3:
+                pipeline._stop.set()
+
+        def close(self):
+            pass
+
+    virtual_stop = VirtualStop()
+    pipeline._stop = cast(Any, virtual_stop)
+    monkeypatch.setattr(pipeline_mod.time, "monotonic_ns", lambda: clock_ns[0])
+    output = NonPacingOutput()
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        SlowCapture(),
+        _FixedMaskSegmenter(np.ones((24, 32), np.float32)),
+        _IdentityRefiner(),
+        None,
+        output,
+    )
+    try:
+        pipeline._loop(resources)
+        assert output.frames == 3
+        assert waits == []
+        assert hub.stats_dict()["application_pacing_events"] == 0
+    finally:
+        resources.close()
 
 
 def test_preflight_handoff_ignores_an_already_consumed_capture_sequence(
@@ -2896,7 +3298,7 @@ def test_fallback_logs_only_transitions_and_recovery(monkeypatch, caplog):
     monkeypatch.setattr(
         pipeline_mod,
         "create_segmenter",
-        lambda cfg, **_kwargs: pipeline_mod.HeuristicSegmenter(cfg),
+        lambda cfg, **_kwargs: HeuristicSegmenter(cfg),
     )
     with caplog.at_level("INFO", logger="custback.pipeline"):
         pipeline, hub = run_pipeline(runtime)
@@ -3946,6 +4348,12 @@ def test_repeat_output_does_not_advance_harmonizer(
     assert stats["frames_in"] == processed_frames
     assert stats["capture_frames_read"] == processed_frames
     assert stats["output_repeated_frames"] == repeated_frames
+    assert stats["base_composite_update_count"] == processed_frames
+    assert stats["segmentation_update_count"] == processed_frames
+    assert stats["base_composite_reuse_count"] == repeated_frames
+    assert stats["output_send_count"] == 2
+    assert stats["exact_final_output_repeat_count"] == 1
+    assert stats["exact_final_output_repeat_ratio"] == 1.0
 
 
 def test_temporal_timeline_status_counts_gaps_and_boundary_resets():
@@ -4154,6 +4562,9 @@ def test_color_correction_has_a_separate_deterministic_timing_bucket(monkeypatch
             5_000_000,
             12_000_000,
             13_000_000,
+            14_000_000,
+            14_000_000,
+            16_000_000,
             16_000_000,
         ]
     )
@@ -4172,6 +4583,8 @@ def test_color_correction_has_a_separate_deterministic_timing_bucket(monkeypatch
         "segmentation_ms": 1.0,
         "background_ms": 2.0,
         "color_correction_ms": 7.0,
+        "composite_prepare_ms": 1.0,
+        "composite_blend_ms": 2.0,
         "composite_ms": 3.0,
     }
 
@@ -4217,6 +4630,27 @@ def test_private_matte_frame_total_includes_sink_send_and_samples_rss(
     assert timings["output_send_ms"] >= 8.0
     assert timings["frame_total_ms"] >= timings["output_send_ms"]
     assert timings["frame_total_ms"] >= timings["frame_processing_ms"]
+    assert set(frame["compositor_substages_ms"]) == set(
+        compositor_mod.COMPOSITOR_SUBSTAGE_NAMES
+    )
+    assert all(
+        isinstance(value, float) and np.isfinite(value) and value >= 0.0
+        for value in frame["compositor_substages_ms"].values()
+    )
+    for name in (
+        "post_composite_validation_ms",
+        "guard_output_validation_ms",
+        "output_submission_ms",
+        "output_sink_pacing_wait_ms",
+        "application_pacing_wait_ms",
+        "output_schedule_lateness_ms",
+        "new_frame_service_ms",
+        "new_frame_serialized_loop_ms",
+    ):
+        assert isinstance(timings[name], float)
+        assert np.isfinite(timings[name])
+        assert timings[name] >= 0.0
+    assert timings["output_send_ms"] >= timings["output_submission_ms"]
     assert frame["resource_samples"]["rss_bytes"] == 123_456_789
 
 
@@ -4300,6 +4734,12 @@ def test_private_matte_evidence_records_late_provider_fallback_without_reason_pa
         "fallback_count": 1,
         "fallback_reason_code": "provider-fallback",
     }
+    selection = segmenter_selection_status(segmenter, "auto")
+    assert selection["selected_backend"] == "rvm"
+    assert selection["quality_tier"] == "matting"
+    assert selection["fallback_active"] is False
+    assert selection["active_device"] == "cpu"
+    assert selection["active_provider"] == "cpu"
     assert "/private" not in repr(evidence.effective_controls)
 
 
@@ -4794,3 +5234,104 @@ def test_queued_ack_timeout_and_late_cancel_ack_preserve_live_harmonizer(
     assert resources.color_reset_token == ("stable",)
     assert resources.cfg is current
     assert resources.version == 0
+
+
+def test_legacy_compositor_workspace_is_lazy_reused_and_generation_owned():
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    cfg = _color_integration_config(
+        "image",
+        correction_mode="off",
+        blend_space="srgb_legacy",
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+    )
+    assert resources._legacy_compositor_workspace is None
+
+    try:
+        first, first_reason = pipeline._local_composite(
+            resources,
+            frame,
+            privacy_safe=False,
+        )
+        workspace = resources._legacy_compositor_workspace
+        assert workspace is not None
+        first_snapshot = workspace.snapshot()
+
+        second, second_reason = pipeline._local_composite(
+            resources,
+            frame,
+            privacy_safe=False,
+        )
+
+        assert first_reason == second_reason == ""
+        assert np.array_equal(first, second)
+        assert resources._legacy_compositor_workspace is workspace
+        assert first_snapshot.calls == 1
+        assert workspace.snapshot().calls == 2
+    finally:
+        workspace = resources._legacy_compositor_workspace
+        resources.close()
+
+    assert workspace is not None
+    assert workspace.snapshot().closed is True
+    assert workspace.snapshot().retained_bytes == 0
+    assert resources._legacy_compositor_workspace is None
+    resources.close()
+
+
+def test_linear_compositor_does_not_allocate_legacy_workspace():
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    cfg = _color_integration_config(
+        "image",
+        correction_mode="off",
+        blend_space="linear_srgb",
+    )
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+    )
+
+    try:
+        rendered, reason = Pipeline(RuntimeConfig(cfg), FrameHub())._local_composite(
+            resources,
+            frame,
+            privacy_safe=False,
+        )
+        assert reason == ""
+        assert rendered.shape == frame.shape
+        assert resources._legacy_compositor_workspace is None
+    finally:
+        resources.close()
+
+
+def test_timing_projection_populates_reserved_compositor_buckets():
+    stage_ewma = {
+        "composite_ms": 4.0,
+        "composite_prepare_ms": 1.25,
+        "composite_blend_ms": 2.75,
+    }
+
+    projected = pipeline_mod._timing_fields(
+        stage_ewma,
+        capture_health=CaptureHealth(),
+        segmenter=object(),
+    )
+
+    assert projected["compositor.total"] == 4.0
+    assert projected["compositor.prepare"] == 1.25
+    assert projected["compositor.blend"] == 2.75

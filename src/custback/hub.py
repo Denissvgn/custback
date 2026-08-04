@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -20,6 +22,393 @@ from typing import Callable, Mapping
 import numpy as np
 
 from .geometry import Size, validate_bgr_frame
+
+
+TIMING_SCHEMA_VERSION = 1
+TIMING_FIELD_NAMES = (
+    "capture.read",
+    "segmentation.total",
+    "segmentation.preprocess",
+    "segmentation.inference",
+    "segmentation.postprocess",
+    "background.total",
+    "color_correction.total",
+    "compositor.total",
+    "compositor.prepare",
+    "compositor.blend",
+    "output.send_total",
+    "output.submission",
+    "output.sink_pacing_wait",
+    "output.application_pacing_wait",
+    "output.schedule_lateness",
+    "pipeline.processing_only",
+    "pipeline.new_frame_service",
+    "pipeline.new_frame_serialized_loop",
+)
+_TIMING_FIELD_SET = frozenset(TIMING_FIELD_NAMES)
+_MAX_PUBLIC_DURATION_MS = 3_600_000.0
+_POST_BASE_NAMESPACE_RE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
+_MAX_POST_BASE_STAGES = 8
+_SELECTION_KEYS = frozenset(
+    {
+        "schema",
+        "version",
+        "requested_backend",
+        "selected_backend",
+        "quality_tier",
+        "selection_mode",
+        "fallback_active",
+        "fallback_category",
+        "fallback_reason",
+        "guidance",
+        "active_device",
+        "active_provider",
+        "attempts",
+    }
+)
+_SELECTION_ATTEMPT_KEYS = frozenset(
+    {
+        "backend",
+        "quality_tier",
+        "preparation_result",
+        "activation_result",
+        "reason_category",
+        "reason",
+        "guidance",
+    }
+)
+_QUALITY_BY_BACKEND = {
+    "rvm": "matting",
+    "mediapipe": "segmentation",
+    "heuristic": "heuristic",
+    "none": "none",
+}
+_BACKEND_KIND_BY_SELECTED = {
+    "rvm": "true_alpha_recurrent",
+    "mediapipe": "confidence_mask_video",
+    "heuristic": "binary_coarse",
+    "none": "null_passthrough",
+}
+_SELECTION_REASON_CATEGORIES = frozenset(
+    {
+        "none",
+        "runtime-not-installed",
+        "runtime-unavailable",
+        "model-unavailable",
+        "permission-denied",
+        "preparation-unavailable",
+        "activation-failed",
+        "all-ml-backends-unavailable",
+    }
+)
+_SELECTION_PUBLIC_DIAGNOSTICS: dict[
+    str,
+    frozenset[tuple[str, str]],
+] = {
+    "none": frozenset({("", "")}),
+    "runtime-not-installed": frozenset(
+        {
+            (
+                "RVM unavailable: runtime not installed",
+                "Install the RVM runtime profile and restart.",
+            ),
+            (
+                "MediaPipe unavailable: runtime not installed",
+                "Install the MediaPipe runtime profile and restart.",
+            ),
+        }
+    ),
+    "runtime-unavailable": frozenset(
+        {
+            (
+                "RVM unavailable: runtime failed to load",
+                "Run custback doctor and repair the reported runtime profile.",
+            ),
+            (
+                "MediaPipe unavailable: runtime failed to load",
+                "Run custback doctor and repair the reported runtime profile.",
+            ),
+        }
+    ),
+    "model-unavailable": frozenset(
+        {
+            (
+                "RVM unavailable: model is not ready",
+                "Run the installer or rebuild command to repair managed model assets.",
+            ),
+            (
+                "MediaPipe unavailable: model is not ready",
+                "Run the installer or rebuild command to repair managed model assets.",
+            ),
+        }
+    ),
+    "permission-denied": frozenset(
+        {
+            (
+                "RVM unavailable: model is not readable",
+                "Repair the managed model cache or select a readable custom model.",
+            ),
+            (
+                "MediaPipe unavailable: model is not readable",
+                "Repair the managed model cache or select a readable custom model.",
+            ),
+        }
+    ),
+    "preparation-unavailable": frozenset(
+        {
+            (
+                "RVM unavailable: startup preparation did not succeed",
+                "Run custback doctor and repair the reported runtime profile.",
+            ),
+            (
+                "MediaPipe unavailable: startup preparation did not succeed",
+                "Run custback doctor and repair the reported runtime profile.",
+            ),
+            (
+                "Preferred segmentation backend unavailable",
+                "Run custback doctor and repair the reported runtime profile.",
+            ),
+        }
+    ),
+    "activation-failed": frozenset(
+        {
+            (
+                "RVM unavailable: backend activation failed",
+                "Run custback doctor and repair the reported runtime profile.",
+            ),
+            (
+                "MediaPipe unavailable: backend activation failed",
+                "Run custback doctor and repair the reported runtime profile.",
+            ),
+        }
+    ),
+    "all-ml-backends-unavailable": frozenset(
+        {
+            (
+                "RVM and MediaPipe unavailable: using heuristic detection",
+                "Install the RVM runtime profile for matting or the MediaPipe "
+                "profile for segmentation.",
+            )
+        }
+    ),
+}
+_MATTE_POLICY_KEYS = frozenset(
+    {
+        "schema",
+        "version",
+        "blend_space",
+        "selected_backend_kind",
+        "backend_kind",
+        "passthrough",
+        "experimental_rvm_generic",
+        "configured",
+        "effective",
+        "controls",
+    }
+)
+_MATTE_CONFIGURED_KEYS = frozenset(
+    {
+        "rvm_downsample_ratio",
+        "threshold",
+        "mask_blur",
+        "edge_refine",
+        "edge_refinement_mode",
+        "edge_refinement_reference_short_edge_px",
+        "edge_refinement_radius_at_reference_px",
+        "edge_refinement_min_radius_px",
+        "edge_refinement_max_radius_px",
+        "mask_shift",
+        "temporal_smoothing",
+        "boundary_stabilization_mode",
+        "boundary_stabilization_time_constant_s",
+        "boundary_stabilization_max_motion_px_per_s",
+        "use_model_foreground",
+        "light_wrap",
+        "light_wrap_stabilization_mode",
+        "light_wrap_stabilization_time_constant_s",
+    }
+)
+_MATTE_EFFECTIVE_KEYS = frozenset(
+    {
+        "raw_alpha_mode",
+        "opaque_core_mode",
+        "halo_mode",
+        "residual_temporal_mode",
+        "rvm_downsample_ratio",
+        "threshold",
+        "mask_blur",
+        "edge_refine",
+        "edge_refinement_mode",
+        "edge_refinement_radius_px",
+        "mask_shift",
+        "temporal_smoothing",
+        "boundary_stabilization_mode",
+        "boundary_stabilization_time_constant_s",
+        "boundary_stabilization_max_motion_px_per_s",
+        "use_model_foreground",
+        "light_wrap",
+        "light_wrap_stabilization_mode",
+        "light_wrap_stabilization_time_constant_s",
+    }
+)
+_MATTE_CONTROL_KEYS = frozenset(
+    {
+        "rvm_downsample_ratio",
+        "raw_alpha",
+        "threshold",
+        "mask_blur",
+        "edge_refine",
+        "mask_shift",
+        "temporal_smoothing",
+        "boundary_stabilization",
+        "use_model_foreground",
+        "light_wrap",
+        "light_wrap_stabilization",
+        "opaque_core_halo",
+    }
+)
+_MATTE_CONTROL_VALUE_KEYS = frozenset({"configured", "effective", "state", "reason"})
+_MATTE_POLICY_TEXT_VALUES = frozenset(
+    {
+        "off",
+        "motion_aware",
+        "legacy_watershed",
+        "stable_guided",
+        "temporal_bounded",
+        "native_soft_alpha",
+        "confidence_soft_mask",
+        "thresholded_binary_mask",
+        "opaque_passthrough",
+        "model_alpha_no_calibration",
+        "confidence_mask_no_calibration",
+        "heuristic_threshold",
+        "none",
+        "mask_shift_only",
+        "generic_postprocess",
+        "model_only",
+        "explicit_motion_aware",
+        "generic_temporal_policy",
+        "model-alpha-no-calibration;generic-postprocess",
+        "model-alpha-no-calibration;mask-shift-only",
+        "confidence_mask_no_calibration;generic-postprocess",
+        "heuristic_threshold;generic-postprocess",
+    }
+)
+_MATTE_CONTROL_REASONS = frozenset(
+    {
+        "awaiting-first-rvm-inference",
+        "backdrop-has-no-dynamic-timeline",
+        "configured-active",
+        "configured-off",
+        "configured-ratio-resolved",
+        "generic-mask-policy",
+        "heuristic-score-cutoff",
+        "heuristic-threshold-produces-binary-mask",
+        "light-wrap-strength-is-zero",
+        "mediapipe-confidence-mask-does-not-use-threshold",
+        "null-or-passthrough-has-no-mask-threshold",
+        "null-or-passthrough-has-no-matte",
+        "null-or-passthrough-has-no-matte-refiner",
+        "null-or-passthrough-has-no-model-foreground",
+        "null-or-passthrough-has-no-rvm-inference",
+        "null-or-passthrough-has-no-soft-edge-composite",
+        "null-or-passthrough-has-no-temporal-matte",
+        "opaque-core-calibration-requires-separate-evidence",
+        "preserve-mediapipe-confidence-mask",
+        "preserve-rvm-pha-without-threshold",
+        "replaced-by-motion-aware",
+        "runtime-auto-ratio",
+        "rvm-native-alpha-bypasses-generic-blur",
+        "rvm-native-alpha-bypasses-generic-edge-refinement",
+        "rvm-native-alpha-is-never-hard-thresholded",
+        "rvm-recurrence-bypasses-generic-ema",
+        "selected-backend-does-not-produce-clean-foreground",
+        "selected-backend-does-not-use-rvm-ratio",
+    }
+)
+
+
+def _empty_segmentation_selection() -> dict[str, object]:
+    return {
+        "schema": "custback.backend-selection",
+        "version": 1,
+        "requested_backend": "none",
+        "selected_backend": "none",
+        "quality_tier": "none",
+        "selection_mode": "explicit",
+        "fallback_active": False,
+        "fallback_category": "none",
+        "fallback_reason": "",
+        "guidance": "",
+        "active_device": "none",
+        "active_provider": "none",
+        "attempts": [
+            {
+                "backend": "none",
+                "quality_tier": "none",
+                "preparation_result": "not-applicable",
+                "activation_result": "selected",
+                "reason_category": "none",
+                "reason": "",
+                "guidance": "",
+            }
+        ],
+    }
+
+
+def _empty_matte_policy() -> dict[str, object]:
+    # Keep the hub's pre-start status valid against the same typed resolver
+    # used by the live pipeline instead of maintaining a second policy table.
+    from .config import CompositingConfig, SegmentationConfig
+    from .matte_policy import MatteBackendKind, resolve_matte_policy
+
+    compositing = CompositingConfig()
+    return {
+        "schema": "custback.matte-policy",
+        "version": 1,
+        "blend_space": compositing.blend_space,
+        **resolve_matte_policy(
+            SegmentationConfig(backend="none"),
+            compositing,
+            MatteBackendKind.NULL_PASSTHROUGH,
+        ).to_dict(),
+    }
+
+
+def _empty_timing_fields() -> dict[str, float | None]:
+    return dict.fromkeys(TIMING_FIELD_NAMES)
+
+
+@dataclass(frozen=True)
+class PostBaseProvenance:
+    """Typed cadence owned by one optional post-base output stage.
+
+    The stage can report its own output changes, including changes made while
+    the safe base was reused. It cannot publish or relabel capture,
+    segmentation, base-composite, reuse, or output-send truth.
+    """
+
+    update_count: int = 0
+    update_fps: float = 0.0
+    base_reuse_update_count: int = 0
+    base_reuse_update_fps: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("update_count", "base_reuse_update_count"):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise ValueError(f"post-base {name} must be a bounded nonnegative int")
+        for name in ("update_fps", "base_reuse_update_fps"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 10_000.0
+            ):
+                raise ValueError(
+                    f"post-base {name} must be a bounded nonnegative finite number"
+                )
 
 
 @dataclass
@@ -31,6 +420,10 @@ class Stats:
     mode: str = ""
     segmentation_backend: str = ""
     segmentation_device: str = ""
+    segmentation_selection: dict[str, object] = field(
+        default_factory=_empty_segmentation_selection
+    )
+    matte_policy: dict[str, object] = field(default_factory=_empty_matte_policy)
     segmentation_generation: int = 0
     capture_sequence: int = 0
     capture_sequence_gap_count: int = 0
@@ -101,7 +494,34 @@ class Stats:
     output_effective_fps: float = 0.0
     fps_attainment_pct: float | None = None
     output_repeated_frames: int = 0
+    segmentation_update_count: int = 0
+    segmentation_update_fps: float = 0.0
+    base_composite_update_count: int = 0
+    base_composite_update_fps: float = 0.0
+    base_composite_reuse_count: int = 0
+    base_composite_reuse_fps: float = 0.0
+    base_composite_reuse_ratio: float = 0.0
+    exact_final_output_repeat_count: int = 0
+    exact_final_output_repeat_fps: float = 0.0
+    exact_final_output_repeat_ratio: float = 0.0
+    output_send_count: int = 0
+    output_send_fps: float = 0.0
+    last_unique_frame_age_ms: float | None = None
+    capture_timestamp_delta_p50_ms: float | None = None
+    capture_timestamp_delta_p95_ms: float | None = None
+    output_send_delta_p50_ms: float | None = None
+    output_send_delta_p95_ms: float | None = None
+    output_send_jitter_p50_ms: float | None = None
+    output_send_jitter_p95_ms: float | None = None
+    base_composite_delta_p50_ms: float | None = None
+    base_composite_delta_p95_ms: float | None = None
+    cadence_mismatch_active: bool = False
     processing_deadline_misses: int = 0
+    serialized_new_frame_deadline_misses: int = 0
+    output_sink_pacing_events: int = 0
+    output_sink_recovery_events: int = 0
+    application_pacing_events: int = 0
+    output_schedule_late_events: int = 0
     capture_read_ms: float | None = None
     segmentation_ms: float | None = None
     background_ms: float | None = None
@@ -140,7 +560,15 @@ class Stats:
     color_input_assumption: str = "display-referred-srgb-bt709-full-range"
     composite_ms: float | None = None
     output_send_ms: float | None = None
+    output_submission_ms: float | None = None
+    output_sink_pacing_wait_ms: float | None = None
+    application_pacing_wait_ms: float | None = None
+    output_schedule_lateness_ms: float | None = None
     frame_processing_ms: float | None = None
+    new_frame_service_ms: float | None = None
+    new_frame_serialized_loop_ms: float | None = None
+    timing_schema_version: int = TIMING_SCHEMA_VERSION
+    timing_ms: dict[str, float | None] = field(default_factory=_empty_timing_fields)
     output_fallback_active: bool = False
     output_fallback_reason: str = ""
     segmentation_fallback_active: bool = False
@@ -304,6 +732,7 @@ class FrameHub:
         self._remote_clients = 0
         self._remote_session = 0
         self._canvas_size: Size | None = None
+        self._post_base_provenance: dict[str, PostBaseProvenance] = {}
 
     def configure_canvas(self, canvas_size: Size) -> None:
         """Freeze the optional pipeline publication contract for this run."""
@@ -466,13 +895,409 @@ class FrameHub:
         with self._stats_lock:
             self._update_stats_locked(kwargs)
 
+    def publish_post_base_provenance(
+        self,
+        namespace: str,
+        provenance: PostBaseProvenance,
+    ) -> None:
+        """Publish one bounded optional-stage cadence namespace.
+
+        This deliberately separate method prevents an optional downstream
+        stage from writing core cadence fields through a generic mapping.
+        """
+
+        if not isinstance(namespace, str) or not _POST_BASE_NAMESPACE_RE.fullmatch(
+            namespace
+        ):
+            raise ValueError("post-base namespace must match [a-z][a-z0-9-]{0,31}")
+        if not isinstance(provenance, PostBaseProvenance):
+            raise TypeError("post-base provenance must be PostBaseProvenance")
+        with self._stats_lock:
+            if (
+                namespace not in self._post_base_provenance
+                and len(self._post_base_provenance) >= _MAX_POST_BASE_STAGES
+            ):
+                raise ValueError("post-base provenance stage limit reached")
+            self._post_base_provenance[namespace] = provenance
+
     def _update_stats_locked(self, values: Mapping[str, object]) -> None:
+        staged: dict[str, object] = {}
         for key, value in values.items():
             if key == "started_at" or not hasattr(self.stats, key):
                 raise KeyError(f"unknown public stats field: {key}")
+            if key == "timing_schema_version" and value != TIMING_SCHEMA_VERSION:
+                raise ValueError(
+                    f"timing_schema_version must be {TIMING_SCHEMA_VERSION}"
+                )
+            if key == "timing_ms":
+                value = self._validated_timing_fields(value)
+            if key == "segmentation_selection":
+                value = self._validated_segmentation_selection(value)
+            if key == "matte_policy":
+                value = self._validated_matte_policy(value)
             if isinstance(value, (dict, list)):
                 value = copy.deepcopy(value)
+            staged[key] = value
+
+        candidate_selection = staged.get(
+            "segmentation_selection",
+            self.stats.segmentation_selection,
+        )
+        candidate_policy = staged.get("matte_policy", self.stats.matte_policy)
+        if "segmentation_selection" in staged or "matte_policy" in staged:
+            self._validate_selection_policy_pair(
+                candidate_selection,
+                candidate_policy,
+            )
+        for key, value in staged.items():
             setattr(self.stats, key, value)
+
+    @staticmethod
+    def _validate_selection_policy_pair(
+        selection: object,
+        policy: object,
+    ) -> None:
+        if not isinstance(selection, Mapping) or not isinstance(policy, Mapping):
+            raise TypeError("selection and matte policy must be mappings")
+        selected = selection["selected_backend"]
+        expected_kind = _BACKEND_KIND_BY_SELECTED[selected]
+        if policy["selected_backend_kind"] != expected_kind:
+            raise ValueError("selected backend and matte policy kind do not match")
+        passthrough = policy["passthrough"]
+        expected_effective_kind = "null_passthrough" if passthrough else expected_kind
+        if policy["backend_kind"] != expected_effective_kind:
+            raise ValueError("matte policy passthrough/effective kind is inconsistent")
+        if policy["experimental_rvm_generic"] and (
+            expected_kind != "true_alpha_recurrent" or passthrough
+        ):
+            raise ValueError("experimental RVM policy requires active RVM matting")
+
+    @staticmethod
+    def _bounded_public_text(value: object, field_name: str) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) > 240
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise ValueError(f"{field_name} must be bounded one-line text")
+        return value
+
+    @staticmethod
+    def _validated_policy_value(value: object, field_name: str) -> object:
+        if value is None or type(value) is bool:
+            return value
+        if type(value) is int:
+            if abs(value) > 1_000_000_000:
+                raise ValueError(f"{field_name} integer is outside the public bound")
+            return value
+        if type(value) is float:
+            if not math.isfinite(value) or abs(value) > 1_000_000_000.0:
+                raise ValueError(f"{field_name} number is outside the public bound")
+            return value
+        if isinstance(value, str) and value in _MATTE_POLICY_TEXT_VALUES:
+            return value
+        raise ValueError(f"{field_name} is not an allowed public policy value")
+
+    @classmethod
+    def _validated_segmentation_selection(
+        cls,
+        value: object,
+    ) -> dict[str, object]:
+        if not isinstance(value, Mapping) or set(value) != _SELECTION_KEYS:
+            raise ValueError(
+                "segmentation_selection must contain exactly the versioned keys"
+            )
+        if value["schema"] != "custback.backend-selection" or value["version"] != 1:
+            raise ValueError("unsupported segmentation_selection schema")
+        requested = value["requested_backend"]
+        selected = value["selected_backend"]
+        tier = value["quality_tier"]
+        mode = value["selection_mode"]
+        if requested not in {"auto", "rvm", "mediapipe", "heuristic", "none"}:
+            raise ValueError("invalid requested segmentation backend")
+        if selected not in _QUALITY_BY_BACKEND:
+            raise ValueError("invalid selected segmentation backend")
+        if tier != _QUALITY_BY_BACKEND[selected]:
+            raise ValueError("selected backend and quality tier do not match")
+        if mode not in {"automatic", "explicit", "model-format"}:
+            raise ValueError("invalid segmentation selection mode")
+        if mode == "explicit":
+            if requested == "auto" or selected != requested:
+                raise ValueError("explicit selection must select the requested backend")
+            expected_fallback = False
+        elif mode == "automatic":
+            if requested != "auto" or selected == "none":
+                raise ValueError("automatic selection requires an auto backend request")
+            expected_fallback = selected != "rvm"
+        else:
+            if requested != "auto" or selected == "none":
+                raise ValueError(
+                    "model-format selection requires an auto backend request"
+                )
+            expected_fallback = selected == "heuristic"
+        fallback_active = value["fallback_active"]
+        category = value["fallback_category"]
+        if type(fallback_active) is not bool:
+            raise TypeError("segmentation fallback_active must be boolean")
+        if category not in _SELECTION_REASON_CATEGORIES:
+            raise ValueError("invalid segmentation fallback category")
+        if fallback_active != (category != "none"):
+            raise ValueError("segmentation fallback flag/category are inconsistent")
+        if fallback_active != expected_fallback:
+            raise ValueError(
+                "selection mode/backend fallback semantics are inconsistent"
+            )
+        reason = cls._bounded_public_text(
+            value["fallback_reason"], "segmentation fallback reason"
+        )
+        guidance = cls._bounded_public_text(
+            value["guidance"], "segmentation fallback guidance"
+        )
+        if fallback_active and (not reason or not guidance):
+            raise ValueError("active segmentation fallback requires guidance")
+        if not fallback_active and (reason or guidance):
+            raise ValueError("inactive segmentation fallback must have empty guidance")
+        if (reason, guidance) not in _SELECTION_PUBLIC_DIAGNOSTICS[category]:
+            raise ValueError("segmentation fallback diagnostic is not sanitized")
+        for key in ("active_device", "active_provider"):
+            text = cls._bounded_public_text(value[key], f"segmentation {key}")
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", text):
+                raise ValueError(f"segmentation {key} contains unsupported characters")
+
+        raw_attempts = value["attempts"]
+        if not isinstance(raw_attempts, list) or not 1 <= len(raw_attempts) <= 4:
+            raise ValueError("segmentation attempts must contain one to four entries")
+        attempts: list[dict[str, str]] = []
+        seen: set[object] = set()
+        selected_attempts = 0
+        for raw in raw_attempts:
+            if not isinstance(raw, Mapping) or set(raw) != _SELECTION_ATTEMPT_KEYS:
+                raise ValueError("segmentation attempt has unknown or missing keys")
+            backend = raw["backend"]
+            if backend not in _QUALITY_BY_BACKEND or backend in seen:
+                raise ValueError(
+                    "segmentation attempt backend must be valid and unique"
+                )
+            seen.add(backend)
+            if raw["quality_tier"] != _QUALITY_BY_BACKEND[backend]:
+                raise ValueError("segmentation attempt tier does not match backend")
+            if raw["preparation_result"] not in {
+                "ready",
+                "unavailable",
+                "not-run",
+                "not-applicable",
+            }:
+                raise ValueError("invalid segmentation preparation result")
+            activation = raw["activation_result"]
+            if activation not in {"selected", "failed", "not-attempted"}:
+                raise ValueError("invalid segmentation activation result")
+            attempt_category = raw["reason_category"]
+            if attempt_category not in _SELECTION_REASON_CATEGORIES:
+                raise ValueError("invalid segmentation attempt reason category")
+            attempt_reason = cls._bounded_public_text(
+                raw["reason"], "segmentation attempt reason"
+            )
+            attempt_guidance = cls._bounded_public_text(
+                raw["guidance"], "segmentation attempt guidance"
+            )
+            if (attempt_category == "none") != (
+                not attempt_reason and not attempt_guidance
+            ):
+                raise ValueError("attempt reason fields/category are inconsistent")
+            if (
+                attempt_reason,
+                attempt_guidance,
+            ) not in _SELECTION_PUBLIC_DIAGNOSTICS[attempt_category]:
+                raise ValueError("segmentation attempt diagnostic is not sanitized")
+            preparation_result = raw["preparation_result"]
+            if activation == "selected" and (
+                attempt_category != "none" or preparation_result == "unavailable"
+            ):
+                raise ValueError("selected attempt cannot be unavailable or failed")
+            if activation == "failed" and attempt_category == "none":
+                raise ValueError("failed attempt requires a reason category")
+            if preparation_result == "unavailable" and (
+                activation != "not-attempted" or attempt_category == "none"
+            ):
+                raise ValueError(
+                    "unavailable preparation cannot report backend activation"
+                )
+            if activation == "selected":
+                selected_attempts += 1
+                if backend != selected:
+                    raise ValueError("selected attempt does not match selected backend")
+            attempts.append({key: str(raw[key]) for key in _SELECTION_ATTEMPT_KEYS})
+        if selected_attempts != 1:
+            raise ValueError("segmentation attempts must identify one selected backend")
+        attempted_backends = [attempt["backend"] for attempt in attempts]
+        if mode == "explicit":
+            expected_attempts = [selected]
+        elif mode == "automatic":
+            expected_attempts = {
+                "rvm": ["rvm", "mediapipe"],
+                "mediapipe": ["rvm", "mediapipe"],
+                "heuristic": ["rvm", "mediapipe", "heuristic"],
+            }[selected]
+        elif selected == "heuristic":
+            if attempted_backends[0] not in {"rvm", "mediapipe"}:
+                raise ValueError("model-format fallback must retain its ML candidate")
+            expected_attempts = [attempted_backends[0], "heuristic"]
+        else:
+            expected_attempts = [selected]
+        if attempted_backends != expected_attempts:
+            raise ValueError("selection attempts do not match the selection mode")
+        selected_index = attempted_backends.index(selected)
+        if any(
+            attempt["reason_category"] == "none"
+            for attempt in attempts[:selected_index]
+        ):
+            raise ValueError(
+                "preferred candidates before a fallback require diagnostics"
+            )
+
+        validated = dict(value)
+        validated["attempts"] = attempts
+        return validated
+
+    @classmethod
+    def _validated_matte_policy(cls, value: object) -> dict[str, object]:
+        if not isinstance(value, Mapping) or set(value) != _MATTE_POLICY_KEYS:
+            raise ValueError("matte_policy must contain exactly the versioned keys")
+        if value["schema"] != "custback.matte-policy" or value["version"] != 1:
+            raise ValueError("unsupported matte_policy schema")
+        if value["blend_space"] not in {"srgb_legacy", "linear_srgb"}:
+            raise ValueError("invalid matte_policy blend space")
+        backend_kinds = {
+            "true_alpha_recurrent",
+            "confidence_mask_video",
+            "binary_coarse",
+            "null_passthrough",
+        }
+        if (
+            value["selected_backend_kind"] not in backend_kinds
+            or value["backend_kind"] not in backend_kinds
+        ):
+            raise ValueError("invalid matte_policy backend kind")
+        if (
+            type(value["passthrough"]) is not bool
+            or type(value["experimental_rvm_generic"]) is not bool
+        ):
+            raise TypeError("matte_policy flags must be boolean")
+        configured = value["configured"]
+        effective = value["effective"]
+        controls = value["controls"]
+        if (
+            not isinstance(configured, Mapping)
+            or set(configured) != _MATTE_CONFIGURED_KEYS
+        ):
+            raise ValueError("matte_policy configured fields do not match schema")
+        if (
+            not isinstance(effective, Mapping)
+            or set(effective) != _MATTE_EFFECTIVE_KEYS
+        ):
+            raise ValueError("matte_policy effective fields do not match schema")
+        if not isinstance(controls, Mapping) or set(controls) != _MATTE_CONTROL_KEYS:
+            raise ValueError("matte_policy controls do not match schema")
+        validated_configured = {
+            str(key): cls._validated_policy_value(
+                configured[key],
+                f"matte_policy configured {key!r}",
+            )
+            for key in configured
+        }
+        validated_effective = {
+            str(key): cls._validated_policy_value(
+                effective[key],
+                f"matte_policy effective {key!r}",
+            )
+            for key in effective
+        }
+        validated_controls: dict[str, object] = {}
+        for name, raw_control in controls.items():
+            if (
+                not isinstance(raw_control, Mapping)
+                or set(raw_control) != _MATTE_CONTROL_VALUE_KEYS
+            ):
+                raise ValueError(f"matte_policy control {name!r} does not match schema")
+            if raw_control["state"] not in {
+                "effective",
+                "bypassed",
+                "inapplicable",
+            }:
+                raise ValueError(f"matte_policy control {name!r} has invalid state")
+            reason = cls._bounded_public_text(
+                raw_control["reason"], f"matte_policy control {name!r} reason"
+            )
+            if reason not in _MATTE_CONTROL_REASONS:
+                raise ValueError(
+                    f"matte_policy control {name!r} reason is not sanitized"
+                )
+            validated_controls[str(name)] = {
+                "configured": cls._validated_policy_value(
+                    raw_control["configured"],
+                    f"matte_policy control {name!r} configured",
+                ),
+                "effective": cls._validated_policy_value(
+                    raw_control["effective"],
+                    f"matte_policy control {name!r} effective",
+                ),
+                "state": raw_control["state"],
+                "reason": reason,
+            }
+        validated = dict(value)
+        validated["configured"] = validated_configured
+        validated["effective"] = validated_effective
+        validated["controls"] = validated_controls
+        return validated
+
+    @staticmethod
+    def _validated_timing_fields(value: object) -> dict[str, float | None]:
+        if not isinstance(value, Mapping):
+            raise TypeError("timing_ms must be a mapping")
+        if set(value) != _TIMING_FIELD_SET:
+            raise ValueError("timing_ms must contain exactly the versioned timing keys")
+        validated: dict[str, float | None] = {}
+        for key in TIMING_FIELD_NAMES:
+            sample = value[key]
+            if sample is None:
+                validated[key] = None
+                continue
+            if (
+                isinstance(sample, bool)
+                or not isinstance(sample, (int, float))
+                or not math.isfinite(float(sample))
+                or not 0.0 <= float(sample) <= _MAX_PUBLIC_DURATION_MS
+            ):
+                raise ValueError(
+                    f"timing_ms[{key!r}] must be null or a bounded "
+                    "nonnegative finite duration"
+                )
+            validated[key] = float(sample)
+        return validated
+
+    def _post_base_extensions_locked(self) -> dict[str, object]:
+        return {
+            "post_base": {
+                "schema": "custback.post-base-cadence",
+                "version": 1,
+                "stages": [
+                    {
+                        "namespace": namespace,
+                        "update_count": provenance.update_count,
+                        "update_fps": round(float(provenance.update_fps), 3),
+                        "base_reuse_update_count": (provenance.base_reuse_update_count),
+                        "base_reuse_update_fps": round(
+                            float(provenance.base_reuse_update_fps),
+                            3,
+                        ),
+                    }
+                    for namespace, provenance in sorted(
+                        self._post_base_provenance.items()
+                    )
+                ],
+            }
+        }
 
     def stats_dict(self) -> dict:
         with self._stats_lock:
@@ -484,6 +1309,10 @@ class FrameHub:
                 "mode": self.stats.mode,
                 "segmentation_backend": self.stats.segmentation_backend,
                 "segmentation_device": self.stats.segmentation_device,
+                "segmentation_selection": copy.deepcopy(
+                    self.stats.segmentation_selection
+                ),
+                "matte_policy": copy.deepcopy(self.stats.matte_policy),
                 "segmentation_generation": self.stats.segmentation_generation,
                 "capture_sequence": self.stats.capture_sequence,
                 "capture_sequence_gap_count": self.stats.capture_sequence_gap_count,
@@ -578,7 +1407,66 @@ class FrameHub:
                     self.stats.fps_attainment_pct, 1
                 ),
                 "output_repeated_frames": self.stats.output_repeated_frames,
+                "segmentation_update_count": self.stats.segmentation_update_count,
+                "segmentation_update_fps": round(self.stats.segmentation_update_fps, 3),
+                "base_composite_update_count": (self.stats.base_composite_update_count),
+                "base_composite_update_fps": round(
+                    self.stats.base_composite_update_fps, 3
+                ),
+                "base_composite_reuse_count": self.stats.base_composite_reuse_count,
+                "base_composite_reuse_fps": round(
+                    self.stats.base_composite_reuse_fps, 3
+                ),
+                "base_composite_reuse_ratio": round(
+                    self.stats.base_composite_reuse_ratio, 4
+                ),
+                "exact_final_output_repeat_count": (
+                    self.stats.exact_final_output_repeat_count
+                ),
+                "exact_final_output_repeat_fps": round(
+                    self.stats.exact_final_output_repeat_fps, 3
+                ),
+                "exact_final_output_repeat_ratio": round(
+                    self.stats.exact_final_output_repeat_ratio, 4
+                ),
+                "output_send_count": self.stats.output_send_count,
+                "output_send_fps": round(self.stats.output_send_fps, 3),
+                "last_unique_frame_age_ms": self._rounded_optional(
+                    self.stats.last_unique_frame_age_ms, 3
+                ),
+                "capture_timestamp_delta_p50_ms": self._rounded_optional(
+                    self.stats.capture_timestamp_delta_p50_ms, 3
+                ),
+                "capture_timestamp_delta_p95_ms": self._rounded_optional(
+                    self.stats.capture_timestamp_delta_p95_ms, 3
+                ),
+                "output_send_delta_p50_ms": self._rounded_optional(
+                    self.stats.output_send_delta_p50_ms, 3
+                ),
+                "output_send_delta_p95_ms": self._rounded_optional(
+                    self.stats.output_send_delta_p95_ms, 3
+                ),
+                "output_send_jitter_p50_ms": self._rounded_optional(
+                    self.stats.output_send_jitter_p50_ms, 3
+                ),
+                "output_send_jitter_p95_ms": self._rounded_optional(
+                    self.stats.output_send_jitter_p95_ms, 3
+                ),
+                "base_composite_delta_p50_ms": self._rounded_optional(
+                    self.stats.base_composite_delta_p50_ms, 3
+                ),
+                "base_composite_delta_p95_ms": self._rounded_optional(
+                    self.stats.base_composite_delta_p95_ms, 3
+                ),
+                "cadence_mismatch_active": self.stats.cadence_mismatch_active,
                 "processing_deadline_misses": self.stats.processing_deadline_misses,
+                "serialized_new_frame_deadline_misses": (
+                    self.stats.serialized_new_frame_deadline_misses
+                ),
+                "output_sink_pacing_events": self.stats.output_sink_pacing_events,
+                "output_sink_recovery_events": self.stats.output_sink_recovery_events,
+                "application_pacing_events": self.stats.application_pacing_events,
+                "output_schedule_late_events": (self.stats.output_schedule_late_events),
                 "capture_read_ms": self._rounded_optional(
                     self.stats.capture_read_ms, 1
                 ),
@@ -647,9 +1535,32 @@ class FrameHub:
                 "color_input_assumption": self.stats.color_input_assumption,
                 "composite_ms": self._rounded_optional(self.stats.composite_ms, 1),
                 "output_send_ms": self._rounded_optional(self.stats.output_send_ms, 1),
+                "output_submission_ms": self._rounded_optional(
+                    self.stats.output_submission_ms, 3
+                ),
+                "output_sink_pacing_wait_ms": self._rounded_optional(
+                    self.stats.output_sink_pacing_wait_ms, 3
+                ),
+                "application_pacing_wait_ms": self._rounded_optional(
+                    self.stats.application_pacing_wait_ms, 3
+                ),
+                "output_schedule_lateness_ms": self._rounded_optional(
+                    self.stats.output_schedule_lateness_ms, 3
+                ),
                 "frame_processing_ms": self._rounded_optional(
                     self.stats.frame_processing_ms, 1
                 ),
+                "new_frame_service_ms": self._rounded_optional(
+                    self.stats.new_frame_service_ms, 3
+                ),
+                "new_frame_serialized_loop_ms": self._rounded_optional(
+                    self.stats.new_frame_serialized_loop_ms, 3
+                ),
+                "timing_schema_version": self.stats.timing_schema_version,
+                "timing_ms": {
+                    key: self._rounded_optional(self.stats.timing_ms[key], 3)
+                    for key in TIMING_FIELD_NAMES
+                },
                 "output_fallback_active": self.stats.output_fallback_active,
                 "output_fallback_reason": self.stats.output_fallback_reason,
                 "segmentation_fallback_active": self.stats.segmentation_fallback_active,
@@ -714,6 +1625,7 @@ class FrameHub:
                 "background_video_color_overridden_fields": list(
                     self.stats.background_video_color_overridden_fields
                 ),
+                "extensions": self._post_base_extensions_locked(),
                 "uptime_s": round(time.time() - self.stats.started_at, 1),
             }
 

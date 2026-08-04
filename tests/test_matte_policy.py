@@ -3,7 +3,7 @@
 These tests deliberately exercise the typed policy resolver rather than
 reconstructing effective controls from a refiner or from public status fields.
 That keeps one owner for configured-versus-effective and applicability
-semantics while MATTE-4.1 remains responsible for the eventual public schema.
+semantics while the MATTE-4.1 public schema transports the same snapshot.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 import custback.pipeline as pipeline_mod
+from custback.api.server import _MattePolicyResponse
 from custback.capture import CapturedFrame
 from custback.compositor import composite
 from custback.config import (
@@ -787,6 +788,41 @@ def test_pipeline_evidence_projection_consumes_the_typed_snapshot(
     assert projected["light_wrap"] == effective["light_wrap"]
     assert refiner["mask_blur"] == effective["mask_blur"]
     assert refiner["edge_refine"] == effective["edge_refine"]
+
+
+@pytest.mark.parametrize(
+    "backend_kind",
+    [
+        MatteBackendKind.TRUE_ALPHA_RECURRENT,
+        MatteBackendKind.CONFIDENCE_MASK_VIDEO,
+        MatteBackendKind.BINARY_COARSE,
+        MatteBackendKind.NULL_PASSTHROUGH,
+    ],
+)
+def test_public_matte_policy_schema_accepts_every_backend_kind(
+    backend_kind: MatteBackendKind,
+) -> None:
+    cfg = _activation_config("auto")
+    segmenter = _PolicySegmenter(backend_kind, ratio=0.42)
+    if backend_kind is MatteBackendKind.TRUE_ALPHA_RECURRENT:
+        segmenter.last_downsample_ratio = 0.42
+    resources = cast(
+        _Resources,
+        SimpleNamespace(
+            cfg=cfg,
+            segmenter=segmenter,
+            canvas_size=(32, 24),
+        ),
+    )
+
+    public = Pipeline._public_matte_policy(resources)
+    validated = _MattePolicyResponse.model_validate(public)
+
+    assert validated.selected_backend_kind == backend_kind.value
+    assert validated.configured.rvm_downsample_ratio == cfg.segmentation.rvm_downsample
+    assert validated.effective.rvm_downsample_ratio == (
+        0.42 if backend_kind is MatteBackendKind.TRUE_ALPHA_RECURRENT else None
+    )
 
 
 def test_null_runtime_consumes_neutral_compositor_policy() -> None:

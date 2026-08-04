@@ -131,6 +131,37 @@ function probeImport(python, moduleName) {
   return runProbe(python, ['-c', `import ${moduleName}`], { encoding: 'utf8' });
 }
 
+function backendQualityProfile({ mediapipe, rvm }) {
+  if (rvm) {
+    return {
+      level: 'note',
+      label: 'backend quality tier: matting',
+      hint: 'RVM true-alpha matting is installed; confirm the active provider in runtime status',
+    };
+  }
+  if (mediapipe) {
+    return {
+      level: 'note',
+      label: 'backend quality tier: segmentation',
+      hint: [
+        'MediaPipe confidence-mask segmentation is installed; RVM true-alpha matting is optional',
+        'upgrade with: custback rebuild --extras rvm (CPU)',
+        'or custback rebuild --extras gpu (NVIDIA/CUDA)',
+      ].join('; '),
+    };
+  }
+  return {
+    level: 'warn',
+    label: 'backend quality tier: heuristic',
+    hint: [
+      'no model-backed person backend is installed',
+      'install MediaPipe with: custback rebuild --extras mediapipe',
+      'or RVM with: custback rebuild --extras rvm (CPU)',
+      'or custback rebuild --extras gpu (NVIDIA/CUDA)',
+    ].join('; '),
+  };
+}
+
 function doctor() {
   let failures = 0;
   const report = (label, good, hint = '') => {
@@ -192,21 +223,31 @@ function doctor() {
 
   const selected = stamp && Array.isArray(stamp.selectedExtras) ? stamp.selectedExtras : [];
   const requested = stamp && Array.isArray(stamp.requestedExtras) ? stamp.requestedExtras : [];
+  let mediaPipeReady = false;
   if (selected.includes('mediapipe')) {
     const result = probeImport(python, 'mediapipe');
     if (result.status === 0) {
-      report('MediaPipe segmentation', true);
+      mediaPipeReady = true;
+      report('MediaPipe confidence-mask segmentation tier', true);
     } else if (requested.includes('mediapipe')) {
-      report('MediaPipe segmentation', false, (result.stderr || '').trim().split('\n').pop());
+      report(
+        'MediaPipe confidence-mask segmentation tier',
+        false,
+        `import failed; run: custback rebuild --extras mediapipe`,
+      );
     } else {
-      warn('implicit MediaPipe segmentation is unavailable',
-        'heuristic fallback remains available; run custback rebuild to repair it');
+      warn('implicit MediaPipe confidence-mask segmentation is unavailable',
+        'heuristic fallback remains available; repair with: custback rebuild --extras mediapipe');
     }
   } else if (requested.includes('mediapipe')) {
-    report('requested MediaPipe segmentation', false, 'requested extra is absent; run: custback rebuild');
+    report(
+      'requested MediaPipe confidence-mask segmentation tier',
+      false,
+      'requested extra is absent; run: custback rebuild --extras mediapipe',
+    );
   } else {
-    note('MediaPipe segmentation not installed',
-      'optional; heuristic fallback is available (CUSTBACK_EXTRAS=mediapipe custback rebuild)');
+    note('MediaPipe confidence-mask segmentation tier not installed',
+      'heuristic fallback is available; install with: custback rebuild --extras mediapipe');
   }
 
   if (selected.includes('audio2face')) {
@@ -225,31 +266,48 @@ function doctor() {
       'optional; use custback rebuild --extras audio2face');
   }
 
+  let rvmReady = false;
   if (selected.includes('rvm') || selected.includes('gpu')) {
     const cuda = installer.cudaProbe(python);
     if (cuda.onnxruntime) {
-      report('RVM ONNX Runtime', true);
+      rvmReady = true;
+      report('RVM true-alpha matting tier', true);
     } else if (requested.includes('rvm') || requested.includes('gpu')) {
-      report('RVM ONNX Runtime', false, cuda.error || 'ONNX Runtime import failed');
+      const profile = requested.includes('gpu') ? 'gpu' : 'rvm';
+      report(
+        'RVM true-alpha matting tier',
+        false,
+        `ONNX Runtime import failed; run: custback rebuild --extras ${profile}`,
+      );
     } else {
-      warn('implicit RVM ONNX Runtime is unavailable');
+      warn('implicit RVM true-alpha matting tier is unavailable',
+        'repair with: custback rebuild --extras rvm (CPU) or custback rebuild --extras gpu (NVIDIA/CUDA)');
     }
     if (cuda.onnxruntime && selected.includes('gpu')) {
       if (requested.includes('gpu')) {
         report('verified CUDA inference', cuda.cuda_inference,
-          cuda.error || 'GPU extra was requested but execution fell back from CUDA');
+          'CUDA execution was not verified; check the NVIDIA driver, CUDA 12, and cuDNN 9, then run: custback rebuild --extras gpu');
       } else if (!cuda.cuda_inference) {
-        warn('implicit CUDA inference is unavailable', cuda.error);
+        warn('implicit CUDA inference is unavailable',
+          'check the NVIDIA driver, CUDA 12, and cuDNN 9, then run: custback rebuild --extras gpu');
       }
     } else if (cuda.onnxruntime) {
       note(`CUDA provider ${cuda.cuda_provider ? 'registered' : 'not registered'}; CPU RVM is healthy`);
     }
   } else if (requested.includes('rvm') || requested.includes('gpu')) {
-    report('requested RVM backend', false, 'requested extra is absent; run: custback rebuild');
+    const profile = requested.includes('gpu') ? 'gpu' : 'rvm';
+    report(
+      'requested RVM true-alpha matting tier',
+      false,
+      `requested extra is absent; run: custback rebuild --extras ${profile}`,
+    );
   } else {
-    note('RVM matting not installed',
-      'optional; use CUSTBACK_EXTRAS=rvm (CPU) or gpu (NVIDIA) with custback rebuild');
+    note('RVM true-alpha matting tier not installed',
+      'optional; install with: custback rebuild --extras rvm (CPU) or custback rebuild --extras gpu (NVIDIA/CUDA)');
   }
+
+  const qualityProfile = backendQualityProfile({ mediapipe: mediaPipeReady, rvm: rvmReady });
+  (qualityProfile.level === 'warn' ? warn : note)(qualityProfile.label, qualityProfile.hint);
 
   if (process.platform === 'linux') {
     if (!hasCustbackCamera()) {
@@ -356,6 +414,7 @@ module.exports = {
   appPath,
   avatarConfigExportArgs,
   avatarPath,
+  backendQualityProfile,
   bootstrap,
   doctor,
   exportAvatarConfig,

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -31,6 +33,38 @@ SUPPORTED_NATIVE_MODES = frozenset(
         (1920, 1080, 30),
     }
 )
+
+
+@dataclass(frozen=True)
+class OutputSendTiming:
+    """Monotonic timing for one successfully completed sink send.
+
+    ``submitted_at_ns`` is sampled immediately after the frame has been
+    accepted by the sink. ``completed_at_ns`` is sampled after any
+    sink-owned deliberate pacing wait. Both are process-monotonic values for
+    internal correlation only; public status must expose derived durations or
+    deltas rather than these raw timestamps.
+
+    ``recovery_events`` remains zero until a sink implements an explicit,
+    observable recovery contract.
+    """
+
+    submitted_at_ns: int
+    completed_at_ns: int
+    submission_ms: float
+    pacing_wait_ms: float
+    pacing_events: int = 0
+    recovery_events: int = 0
+
+
+def _monotonic_ns_at_or_after(earliest_ns: int) -> int:
+    """Return a monotonic sample without allowing a regressing test clock."""
+
+    return max(earliest_ns, time.monotonic_ns())
+
+
+def _elapsed_ms(started_at_ns: int, finished_at_ns: int) -> float:
+    return max(0, finished_at_ns - started_at_ns) / 1_000_000.0
 
 
 def _validate_sink_frame(
@@ -106,6 +140,25 @@ class VideoOutput(ABC):
     @abstractmethod
     def send(self, frame_bgr: np.ndarray) -> None: ...
 
+    def send_with_timing(self, frame_bgr: np.ndarray) -> OutputSendTiming:
+        """Send through the legacy sink API and return bounded timing.
+
+        Outputs without an internal pacing contract treat successful
+        ``send()`` completion as both submission and completion. This default
+        keeps existing output implementations and test doubles source
+        compatible while allowing paced sinks to override the finer boundary.
+        """
+
+        started_at_ns = time.monotonic_ns()
+        self.send(frame_bgr)
+        completed_at_ns = _monotonic_ns_at_or_after(started_at_ns)
+        return OutputSendTiming(
+            submitted_at_ns=completed_at_ns,
+            completed_at_ns=completed_at_ns,
+            submission_ms=_elapsed_ms(started_at_ns, completed_at_ns),
+            pacing_wait_ms=0.0,
+        )
+
     def close(self) -> None:
         pass
 
@@ -169,6 +222,20 @@ class PyVirtualCamOutput(VideoOutput):
         )
 
     def send(self, frame_bgr: np.ndarray) -> None:
+        self.send_with_timing(frame_bgr)
+
+    def submit_unpaced_with_timing(
+        self,
+        frame_bgr: np.ndarray,
+    ) -> OutputSendTiming:
+        """Run the production validation/submission seam without pacing.
+
+        Normal output must continue through :meth:`send_with_timing`. The
+        unpaced seam exists for fixed-replay capacity qualification, where a
+        sleep would hide compute and sink-submission cost.
+        """
+
+        started_at_ns = time.monotonic_ns()
         _validate_sink_frame(
             frame_bgr,
             self.width,
@@ -176,7 +243,25 @@ class PyVirtualCamOutput(VideoOutput):
             sink="pyvirtualcam",
         )
         self.cam.send(frame_bgr)
+        submitted_at_ns = _monotonic_ns_at_or_after(started_at_ns)
+        return OutputSendTiming(
+            submitted_at_ns=submitted_at_ns,
+            completed_at_ns=submitted_at_ns,
+            submission_ms=_elapsed_ms(started_at_ns, submitted_at_ns),
+            pacing_wait_ms=0.0,
+        )
+
+    def send_with_timing(self, frame_bgr: np.ndarray) -> OutputSendTiming:
+        submission = self.submit_unpaced_with_timing(frame_bgr)
         self.cam.sleep_until_next_frame()
+        completed_at_ns = _monotonic_ns_at_or_after(submission.submitted_at_ns)
+        return OutputSendTiming(
+            submitted_at_ns=submission.submitted_at_ns,
+            completed_at_ns=completed_at_ns,
+            submission_ms=submission.submission_ms,
+            pacing_wait_ms=_elapsed_ms(submission.submitted_at_ns, completed_at_ns),
+            pacing_events=1,
+        )
 
     def close(self) -> None:
         self.cam.close()

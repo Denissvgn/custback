@@ -24,7 +24,7 @@ capture instead of delaying future output. Only unique camera inputs are
 recorded in the frame track—output repeats are never synthesized into model
 inputs. MATTE-0.2 adds a scalar-only `output_timeline` after successful sends.
 It references the unique source/base sequence and records update/reuse and
-exact-repeat provenance without duplicating pixels.
+exact-repeat equality without duplicating pixels.
 The byte limit must be at least 65,536 bytes so the terminal manifest can
 always be committed; the default is 536,870,912 bytes.
 
@@ -45,6 +45,17 @@ overwrite camera, matte, base-update, or send metric namespaces. While recording
 `manifest.partial.json` is atomically replaced after each committed frame. A
 partial manifest without a complete manifest means the recording was
 interrupted and replay rejects it.
+
+The live `exact_final_output_repeat_*` status fields and the timeline's
+`exact_final_repeat` boolean mean that a successful final frame is byte-equal
+to the immediately preceding successful final frame. Live measurement compares
+the in-memory frame bytes without exposing a digest or pixels. The offline
+evaluator obtains the same transition-level equality from retained
+final-artifact digests. Either signal can increment when both outputs came from
+successful unique captures; `base_updated` and base reuse retain the separate
+provenance meaning. Live base/reuse/send semantics and the corresponding typed
+`extensions.post_base` seam are defined by the
+[visual cadence observability contract](cadence-observability.md).
 
 Each `frames/NNNNNNNN/` directory contains lossless NumPy arrays:
 
@@ -86,6 +97,16 @@ without interpreting controls. Frame-derived values remain null until an RVM
 result is fully validated, and a reset clears them. Non-RVM frames record the
 telemetry object as not applicable.
 
+Local composites may carry the complete fixed compositor substage map:
+input/mask validation, edge-band construction, model-foreground replacement,
+backdrop blur/resize, light-wrap temporal filtering and interpolation, final
+blend/conversion, and internal output validation. In `timings_ms`, the
+post-composite validation and final privacy-guard/output-validation boundaries
+remain separate from sink submission/copy, sink/application pacing, schedule
+lateness, and complete new-frame service. Inapplicable compositor substages
+are recorded as zero for a processed local frame; missing instrumentation in
+an older bundle remains missing rather than being inferred.
+
 Full recordings also store the typed backend-policy snapshot beneath
 `effective_controls.matte_policy`. It keeps the actual selected/effective
 backend kinds and, for each matte control, its configured value, effective
@@ -121,9 +142,13 @@ already make the opt-in bundle identifiable. See the
 
 When available, `resource_samples.rss_bytes` records process resident memory
 after the complete frame has passed sink submission. An optional
-`vram_bytes` sample uses the same additive version-1 extension. Missing
-resource instrumentation is preserved as unavailable by the evaluator; it is
-never converted to zero.
+`vram_bytes` sample uses the same additive version-1 extension. The optimized
+legacy compositor also records its known independently owned output allocation
+as `allocation_bytes` and retained generation workspace as `memory_bytes`.
+Those two values are application-visible lower bounds and do not claim to
+measure hidden OpenCV allocations or memory bandwidth. Missing resource
+instrumentation is preserved as unavailable by the evaluator; it is never
+converted to zero.
 
 ## Offline replay
 

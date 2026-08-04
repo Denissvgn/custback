@@ -51,7 +51,7 @@ either an absolute value or a baseline multiplier.
 | --- | --- | --- |
 | Cadence | `unique_input_fps` | `(unique inputs - 1) / elapsed capture-monotonic time`. Capture sequence gaps and implied missing-input count are reported separately. |
 | Cadence | `output_send_fps` | `(send events - 1) / elapsed send-monotonic time`. Null when the older bundle has no scalar output timeline. |
-| Cadence | `output_repeat_ratio` | Consecutive equal final-artifact SHA-256 transitions divided by all output transitions. |
+| Cadence | offline `output_repeat_ratio` | Consecutive equal final-artifact SHA-256 transitions divided by all output transitions. This is the retained-artifact implementation of exact final-output equality. |
 | Cadence | base update/reuse FPS | Update or reuse events after the first send divided by the output observation interval. Counts are also retained. |
 | Temporal alpha | raw/refined absolute difference | Mean absolute alpha difference against the preceding unique input without registration. |
 | Compensated alpha | compensated absolute difference | Mean absolute difference against the previous refined alpha warped by the annotated affine transform. Without annotations, deterministic source-luma phase correlation estimates translation. |
@@ -98,6 +98,16 @@ metrics object. The evaluator copies it only into
 `aggregate.cadence`, alpha, base-update, or send metrics. A later reaction
 stage can therefore add its own measurements without relabeling the
 camera/matte/base contract.
+
+Normal-run status uses the same isolation rule for its typed
+`extensions.post_base` namespace. Its `exact_final_output_repeat_*` fields
+compare each successful final frame's bytes with the immediately preceding
+successful final frame without exposing a digest. The offline
+`output_repeat_ratio` obtains the same equality signal from retained artifact
+digests. Both may observe equality between two successful unique captures and
+remain distinct from the synthesized/no-unread `base_composite_reuse_*`
+provenance clock. See the
+[visual cadence observability contract](cadence-observability.md).
 
 ## Generated evidence
 

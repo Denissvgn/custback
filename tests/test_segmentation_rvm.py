@@ -459,14 +459,85 @@ def _track_candidate_close(
 def test_segment_returns_mask_and_clean_foreground(cpu_ort):
     seg = RVMSegmenter(rvm_cfg())
     frame = bright_center_frame()
+    frame_before = frame.copy()
     mask = seg.segment(frame)
+    expected_src = frame[..., ::-1].astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+    expected_mask = (expected_src[0].mean(axis=0) > 0.5).astype(np.float32)
     assert mask.shape == (72, 128)
     assert mask.dtype == np.float32
     assert mask[36, 64] == 1.0  # bright center = person
     assert mask[2, 2] == 0.0
+    np.testing.assert_array_equal(mask, expected_mask)
+    np.testing.assert_array_equal(frame, frame_before)
+    np.testing.assert_array_equal(seg._session.feeds[-1]["src"], expected_src)
     assert seg.last_foreground is not None
     assert seg.last_foreground.shape == frame.shape
     assert seg.last_foreground.dtype == np.uint8
+    np.testing.assert_array_equal(seg.last_foreground, frame)
+    assert not np.shares_memory(
+        seg.last_foreground,
+        seg._session.feeds[-1]["src"],
+    )
+
+
+def test_feed_conversion_is_exact_contiguous_and_fresh(cpu_ort):
+    seg = RVMSegmenter(rvm_cfg())
+    values = np.arange(17 * 23 * 3, dtype=np.uint16).reshape(17, 23, 3)
+    first_frame = np.asarray(values % 256, dtype=np.uint8)
+    second_frame = np.ascontiguousarray(255 - first_frame)
+    seg._start_temporal_epoch(first_frame.shape[:2])
+
+    first = seg._feeds(first_frame, 0.5)["src"]
+    first_before = first.copy()
+    second = seg._feeds(second_frame, 0.5)["src"]
+    expected_first = (
+        first_frame[..., ::-1].astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+    )
+    expected_second = (
+        second_frame[..., ::-1].astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+    )
+
+    assert first.shape == (1, 3, 17, 23)
+    assert first.dtype == np.float32
+    assert first.flags.c_contiguous
+    assert first.flags.owndata
+    np.testing.assert_array_equal(first, expected_first)
+    np.testing.assert_array_equal(second, expected_second)
+    np.testing.assert_array_equal(first, first_before)
+    assert not np.shares_memory(first, second)
+
+
+def test_alpha_output_is_detached_from_aliased_feed_and_recurrent_state(cpu_ort):
+    seg = RVMSegmenter(rvm_cfg())
+    observed = {}
+
+    def run_with_aliased_alpha(_outputs, feeds):
+        src = feeds["src"]
+        observed["src"] = src
+        alpha = src[:, :1]
+        recurrent = [
+            alpha,
+            *(feeds[name] + 1.0 for name in ("r2i", "r3i", "r4i")),
+        ]
+        return [src, alpha, *recurrent]
+
+    seg._session.run = run_with_aliased_alpha
+    mask = seg.segment(np.full((8, 12, 3), 128, dtype=np.uint8))
+    source = observed["src"]
+    assert seg._rec is not None
+    recurrent = seg._rec[0]
+
+    assert mask.flags.c_contiguous
+    assert mask.flags.owndata
+    assert np.shares_memory(source, recurrent)
+    assert not np.shares_memory(mask, source)
+    assert not np.shares_memory(mask, recurrent)
+    np.testing.assert_array_equal(mask, source[0, 0])
+    retained_source = source.copy()
+    retained = recurrent.copy()
+    mask.fill(0.0)
+    np.testing.assert_array_equal(source, retained_source)
+    np.testing.assert_array_equal(recurrent, retained)
 
 
 def test_success_publishes_typed_content_free_rvm_telemetry(
@@ -929,6 +1000,33 @@ def test_inference_time_recovery_rebuilds_cpu_and_retries_once(monkeypatch):
         assert np.all(seg._session.feeds[1][name] == 1.0)
     assert mod.sessions
     assert all(session.path == _FAKE_MODEL_BYTES for session in mod.sessions)
+
+
+def test_gpu_required_inference_failure_never_degrades_to_cpu(monkeypatch):
+    gpu_ort(monkeypatch, run_error=RuntimeError, gpu_fail_after=1)
+    seg = RVMSegmenter(
+        rvm_cfg(),
+        acceleration=AccelerationConfig(mode="gpu_required"),
+    )
+    failed_gpu_session = seg._session
+    initial_telemetry = seg.rvm_telemetry_snapshot()
+
+    with pytest.raises(
+        GpuRequiredError,
+        match="gpu_required RVM inference failed on the active accelerator",
+    ):
+        seg.segment(bright_center_frame())
+
+    assert seg._session is failed_gpu_session
+    assert seg.device == "cuda"
+    status = seg.accel.status()
+    assert status.active_provider == "cuda"
+    assert status.fallback_active is False
+    assert status.fallback_count == 0
+    assert seg.temporal_reset_count == 0
+    assert seg.last_downsample_ratio is None
+    assert seg.last_foreground is None
+    assert seg.rvm_telemetry_snapshot() == initial_telemetry
 
 
 def test_cpu_inference_failure_is_not_retried(cpu_ort):

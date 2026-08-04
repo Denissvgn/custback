@@ -1,0 +1,57 @@
+{
+  "schema": "custback.capture-runtime-evidence",
+  "version": 1,
+  "device_identity_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DEVICE_IDENTITY",
+  "hardware_identity_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_HOST_IDENTITY",
+  "condition_id": "adequate_diffuse_light",
+  "hardware_verified": true,
+  "one_uninterrupted_run": true,
+  "requested": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30.0,
+    "pixel_format": "mjpeg",
+    "canvas_width": 1280,
+    "canvas_height": 720
+  },
+  "negotiated": {
+    "backend": "REPLACE_RUNTIME_CAPTURE_BACKEND",
+    "pixel_format": "MJPG",
+    "width": 1280,
+    "height": 720,
+    "fps_reported": 30.0,
+    "delivered_width": 1280,
+    "delivered_height": 720
+  },
+  "start": {
+    "run_id": "REPLACE_WITH_SHARED_SAFE_RUN_ID",
+    "uptime_s": "REPLACE_WITH_START_UPTIME_SECONDS",
+    "frames_in": "REPLACE_WITH_START_FRAMES_IN",
+    "frames_out": "REPLACE_WITH_START_FRAMES_OUT",
+    "capture_frames_read": "REPLACE_WITH_START_CAPTURE_FRAMES_READ",
+    "capture_dropped_frames": "REPLACE_WITH_START_CAPTURE_DROPPED_FRAMES",
+    "capture_read_failures": "REPLACE_WITH_START_CAPTURE_READ_FAILURES",
+    "capture_restarts": "REPLACE_WITH_START_CAPTURE_RESTARTS",
+    "processing_deadline_misses": "REPLACE_WITH_START_PROCESSING_DEADLINE_MISSES"
+  },
+  "end": {
+    "run_id": "REPLACE_WITH_SHARED_SAFE_RUN_ID",
+    "uptime_s": "REPLACE_WITH_END_UPTIME_SECONDS_AT_LEAST_5_SECONDS_LATER",
+    "frames_in": "REPLACE_WITH_END_FRAMES_IN",
+    "frames_out": "REPLACE_WITH_END_FRAMES_OUT",
+    "capture_frames_read": "REPLACE_WITH_END_CAPTURE_FRAMES_READ",
+    "capture_dropped_frames": "REPLACE_WITH_END_CAPTURE_DROPPED_FRAMES",
+    "capture_read_failures": "REPLACE_WITH_END_CAPTURE_READ_FAILURES",
+    "capture_restarts": "REPLACE_WITH_END_CAPTURE_RESTARTS",
+    "processing_deadline_misses": "REPLACE_WITH_END_PROCESSING_DEADLINE_MISSES"
+  },
+  "timings_ms": {
+    "capture_read": null,
+    "segmentation": null,
+    "background": null,
+    "color_correction": null,
+    "composite": null,
+    "output_send": null,
+    "frame_processing": null
+  }
+}

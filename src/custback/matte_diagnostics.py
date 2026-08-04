@@ -1118,6 +1118,10 @@ class MatteReplayBundle:
         ):
             raise MatteDiagnosticsError("bundle recording was interrupted")
         payload = _read_private_file(manifest_path, max_bytes=MAX_MANIFEST_BYTES)
+        # Retain the digest from the same no-follow, owner-checked read that is
+        # parsed below. Consumers must not reopen the path to bind evidence:
+        # doing so would create a manifest replacement race.
+        self.manifest_sha256 = hashlib.sha256(payload).hexdigest()
         try:
             manifest = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

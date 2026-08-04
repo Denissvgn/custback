@@ -201,9 +201,11 @@ backend, current configuration, canonical canvas, passthrough state, and latest
 successful RVM ratio. It also reports temporal light-wrap mode as bypassed when
 the current backdrop has no dynamic timeline, even if the candidate is
 configured. Existing flat `GET /status` fields are compatibility projections
-of that snapshot. MATTE-4.1 owns any future public nested policy,
-selection/fallback, OpenAPI, ready-log, or overlay schema; MATTE-2.3 does not
-publish a competing representation.
+of that snapshot. The versioned `matte_policy` status object now publishes the
+same configured/effective/control-state snapshot alongside the versioned
+`segmentation_selection` decision and attempt history. OpenAPI, lifecycle logs,
+the native preview, and the dashboard consume that one representation;
+MATTE-2.3 does not publish a competing policy.
 
 A full owner-only replay bundle stores the JSON-safe snapshot beneath
 `effective_controls.matte_policy`. Its separate `configured_controls` retains

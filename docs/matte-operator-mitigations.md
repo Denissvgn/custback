@@ -92,6 +92,8 @@ api_get config | jq '{
 }'
 api_get status | jq '{
   config_version,
+  segmentation_selection,
+  matte_policy,
   segmentation_backend,
   segmentation_device,
   segmentation_generation,
@@ -112,13 +114,39 @@ api_get status | jq '{
   capture_target_fps,
   capture_fps,
   capture_read_ms,
+  capture_sequence,
+  capture_sequence_gap_count,
+  capture_missing_input_count,
+  capture_dropped_frames,
+  segmentation_update_count,
+  segmentation_update_fps,
+  base_composite_update_count,
+  base_composite_update_fps,
+  base_composite_reuse_count,
+  base_composite_reuse_fps,
+  base_composite_reuse_ratio,
+  exact_final_output_repeat_count,
+  exact_final_output_repeat_fps,
+  exact_final_output_repeat_ratio,
+  output_send_count,
+  output_send_fps,
+  last_unique_frame_age_ms,
   segmentation_ms,
   composite_ms,
   frame_processing_ms,
   processing_deadline_misses,
+  serialized_new_frame_deadline_misses,
+  output_sink_pacing_events,
+  output_sink_recovery_events,
+  application_pacing_events,
+  output_schedule_late_events,
+  cadence_mismatch_active,
   output_target_fps,
   output_effective_fps,
-  output_repeated_frames
+  output_repeated_frames,
+  timing_schema_version,
+  timing_ms,
+  post_base: .extensions.post_base
 }'
 ```
 
@@ -128,11 +156,26 @@ resets RVM recurrence, the MediaPipe task, and refiner temporal state. A
 compositor-only change does not rebuild the segmenter, so that generation must
 stay unchanged.
 
-Trust the exact `segmentation_backend` and `segmentation_device`, not the
-requested `backend: auto` value. An automatic RVM-to-MediaPipe selection is
-visible in those exact fields even when a generic fallback flag is not set.
+Trust `segmentation_selection.selected_backend`, `quality_tier`,
+`active_device`, and `active_provider`, not the requested `backend: auto`
+value. An automatic RVM-to-MediaPipe downgrade sets
+`segmentation_selection.fallback_active` and retains bounded candidate attempts,
+category, reason, and guidance. Explicit MediaPipe and format-constrained
+TFLite selections do not create that warning. Use `matte_policy` for the full
+configured-versus-effective backend/compositor policy.
 Compare measured `capture_fps` with `capture_target_fps`; the driver-reported
 `capture_fps_reported` is not proof of delivered cadence.
+Likewise, compare `base_composite_update_fps` with `output_send_fps`; output can
+remain near target by increasing `base_composite_reuse_count`. A successful
+pixel-identical capture remains a unique base and segmentation update.
+`base_composite_reuse_count` is the synthesized/no-unread provenance clock;
+`exact_final_output_repeat_count` instead counts consecutive successful final
+frames with byte-equal contents. A pixel-identical unique capture can therefore
+increment the segmentation, base-update, and exact-repeat clocks together.
+Treat capture gaps/overwrites, processing or serialized deadline misses,
+sink/application pacing, and sink recovery as independent event classes;
+correlation does not prove causation. See the
+[visual cadence observability contract](cadence-observability.md).
 
 The motion-aware boundary stabilizer is a MATTE-2.1 qualification control, not
 an immediate mitigation. Leave
@@ -151,13 +194,20 @@ same-source model-backed report explicitly selects the candidate. See the
 
 ## Install or rebuild the RVM backend
 
+The default npm profile attempts the MediaPipe confidence-mask
+**segmentation** tier; it does not install RVM/ONNX Runtime. RVM is the
+optional true-alpha **matting** tier, so `segmentation.backend: auto` cannot
+select it until one of the following profiles is installed.
+
 For an npm installation, inspect the existing intent and retain every extra the
 deployment still needs. Rebuilding with an explicit list replaces the extras
 intent:
 
 ```bash
 custback extras --json
-custback rebuild --extras gpu
+# Choose exactly one:
+custback rebuild --extras rvm  # CPU RVM
+custback rebuild --extras gpu  # NVIDIA/CUDA RVM
 custback doctor
 ```
 
@@ -386,29 +436,41 @@ Try a stable, brighter, diffuse scene and observe whether cadence changes.
 Do not automatically force exposure/gain values: support varies by camera and
 bad writes can persist outside custback.
 
-For a lightweight local comparison, temporarily PATCH
-`background.mode: passthrough`, then restore the saved background section.
-Steady passthrough frames skip segmentation, backdrop, and compositing, but the
-normal sink/API remain active. A stricter capture-only run requires stopping
-the normal process and launching a copied owner-only config with the same
-camera mode, local passthrough, null output, API disabled, and preview disabled.
-Passthrough exposes raw local camera pixels; never use it as a remote fallback.
+Passthrough is a useful lightweight comparison, but it is not authoritative
+capture-only evidence: the normal pipeline lifecycle and any configured
+preview, API, or sink still exist. Use the dedicated harness to exclude those
+resources and segmentation, backdrop, and compositor construction.
 
-In that copy, change only:
+Stop the normal process so it releases the physical camera, then run:
 
-```yaml
-background:
-  mode: passthrough
-output:
-  backend: "null"
-  preview: false
-api:
-  enabled: false
+```console
+umask 077
+custback capture-diagnose \
+  --config /private/path/runtime.yaml \
+  --condition-id reported_light \
+  --duration-seconds 10 \
+  --output /private/path/capture-reported-light
 ```
 
-Then run `custback --config /private/path/capture-only.yaml` without `--fps`.
-Compare its bounded startup/shutdown capture health with the full run, discard
-the copy after review, and restart the unchanged normal configuration.
+Repeat with one changed condition or camera-only override at a time. The
+diagnostic `--fps` changes only the camera request, unlike the normal top-level
+shortcut that changes camera and output targets together. Compare
+`pacing.capture` with a strict matched two-snapshot runtime sidecar through
+`--runtime-evidence`; never substitute output repeats for either unique
+cadence. Runtime capture, processed-frame, and output rates use counter deltas
+over the bounded snapshot window, never `frames_in / uptime_s` or another
+lifetime-counter average.
+For native corroboration and the exact 1280x720@30 acceptance rules, follow the
+[capture cadence diagnostic contract](capture-cadence-diagnostics.md).
+
+The harness writes no camera pixels, but its owner-only report can fingerprint
+local mode/backend/control behavior. Do not pass `--hardware-verified` without
+reviewed physical-device evidence. Exact hardware acceptance also requires
+both opaque identity digests and a numeric camera index or recognized local
+camera-device path. Media files, URLs, and other stream/device strings are
+rejected. A successful synthetic or CI test, a reported 30 FPS property, or a
+zero command exit alone does not qualify the hardware; absent real evidence
+the report remains `hardware-evidence-required`.
 
 ### Output-rate diagnosis
 
@@ -426,7 +488,10 @@ not create alpha or unique camera/model observations.
 (compatibility default `output.fps: 30`) and restart again.
 
 **Resource effect:** This is restart-only and reconstructs process resources.
-It is a diagnosis, not a matte-quality fix.
+It is a diagnosis, not a matte-quality fix. Automatic output-rate matte
+interpolation is deliberately not available; exact repeat remains the runtime
+policy under
+[ADR 0002](adr/0002-output-rate-matte-interpolation.md).
 
 ## Privacy and completion rules
 

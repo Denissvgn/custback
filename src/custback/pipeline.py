@@ -7,7 +7,6 @@ import math
 import queue
 import threading
 import time
-from collections import deque
 from collections.abc import Mapping
 from concurrent.futures import (
     Future,
@@ -28,6 +27,7 @@ from .backgrounds import (
     create_backdrop,
 )
 from .capture import CapturedFrame, open_capture
+from .cadence import CadenceTracker
 from .color import (
     ANALYSIS_LONG_EDGE,
     ColorError,
@@ -42,6 +42,7 @@ from .color import (
     _linear_bgr_analysis_raster_prevalidated,
 )
 from .compositor import (
+    LegacyCompositorWorkspace,
     PreparedLightWrap,
     _composite_linear_bgr_prevalidated as composite_linear_predecoded,
     composite,
@@ -58,7 +59,7 @@ from .config import (
 )
 from .diagnostics import sanitized_config_summary
 from .geometry import Size, apply_transform, plan_transform, validate_bgr_frame
-from .hub import FrameHub
+from .hub import FrameHub, TIMING_FIELD_NAMES, TIMING_SCHEMA_VERSION
 from .matte_diagnostics import (
     MatteCaptureMetadata,
     MatteDiagnosticRecorder,
@@ -73,7 +74,6 @@ from .light_wrap import (
     LightWrapStabilizer,
 )
 from .segmentation import (
-    HeuristicSegmenter,
     MaskRefiner,
     NullSegmenter,
     SegmentationFrameContext,
@@ -85,8 +85,9 @@ from .segmentation import (
     create_segmenter,
     refiner_for,
     segmenter_matte_backend_kind,
+    segmenter_selection_status,
 )
-from .vcam import open_output
+from .vcam import OutputSendTiming, open_output
 
 log = logging.getLogger(__name__)
 
@@ -138,14 +139,17 @@ def _acceleration_stats(segmenter: Any) -> dict[str, object]:
     if accel is None:
         return dict(_ACCELERATION_STATS_DEFAULTS)
     status = accel.status()
+    fallback_active = bool(status.fallback_active)
     return {
         "acceleration_mode": status.requested_mode,
         "acceleration_requested_provider": status.requested_provider,
         "acceleration_device_id": status.device_id,
         "acceleration_state": status.state,
         "acceleration_active_provider": status.active_provider,
-        "acceleration_fallback_active": status.fallback_active,
-        "acceleration_fallback_reason": status.fallback_reason,
+        "acceleration_fallback_active": fallback_active,
+        "acceleration_fallback_reason": (
+            "requested accelerator unavailable; using CPU" if fallback_active else ""
+        ),
         "acceleration_fallback_count": status.fallback_count,
         "acceleration_last_transition_ms": status.last_transition_ms,
     }
@@ -737,6 +741,160 @@ def _ewma(previous: float | None, sample: float, alpha: float = 0.1) -> float:
     return sample if previous is None else previous + alpha * (sample - previous)
 
 
+def _send_output_with_timing(
+    output: Any,
+    frame: np.ndarray,
+    *,
+    copy_frame: bool = False,
+) -> OutputSendTiming:
+    """Use the typed sink boundary while retaining duck-typed test outputs."""
+
+    started_at_ns = time.monotonic_ns()
+    payload = frame.copy() if copy_frame else frame
+    copy_completed_at_ns = time.monotonic_ns()
+    sender = getattr(output, "send_with_timing", None)
+    if callable(sender):
+        timing = sender(payload)
+        if isinstance(timing, OutputSendTiming):
+            if not (
+                copy_completed_at_ns <= timing.submitted_at_ns <= timing.completed_at_ns
+            ):
+                raise RuntimeError("output sink returned non-monotonic timing")
+            return OutputSendTiming(
+                submitted_at_ns=timing.submitted_at_ns,
+                completed_at_ns=timing.completed_at_ns,
+                submission_ms=(
+                    (copy_completed_at_ns - started_at_ns) / 1_000_000.0
+                    + timing.submission_ms
+                ),
+                pacing_wait_ms=timing.pacing_wait_ms,
+                pacing_events=timing.pacing_events,
+                recovery_events=timing.recovery_events,
+            )
+        # A legacy/mock output may expose an untyped dynamic attribute. Its
+        # call already performed the send, so derive the conservative boundary
+        # without sending a second time.
+    else:
+        output.send(payload)
+    completed_at_ns = max(started_at_ns, time.monotonic_ns())
+    return OutputSendTiming(
+        submitted_at_ns=completed_at_ns,
+        completed_at_ns=completed_at_ns,
+        submission_ms=(completed_at_ns - started_at_ns) / 1_000_000.0,
+        pacing_wait_ms=0.0,
+    )
+
+
+def _timing_fields(
+    stage_ewma: Mapping[str, float | None],
+    *,
+    capture_health: Any,
+    segmenter: Any,
+) -> dict[str, float | None]:
+    """Project fixed version-1 timer names from the current run-owned EWMAs."""
+
+    rvm = _rvm_telemetry_evidence(segmenter)
+
+    def optional_duration(value: object) -> float | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            return None
+        return min(float(value), 3_600_000.0)
+
+    values: dict[str, float | None] = {
+        "capture.read": optional_duration(getattr(capture_health, "read_ms", None)),
+        "segmentation.total": stage_ewma.get("segmentation_ms"),
+        "segmentation.preprocess": optional_duration(
+            rvm.get("preprocess_ms") if rvm.get("applicable") is True else None
+        ),
+        "segmentation.inference": optional_duration(
+            rvm.get("session_run_ms") if rvm.get("applicable") is True else None
+        ),
+        "segmentation.postprocess": optional_duration(
+            rvm.get("postprocess_ms") if rvm.get("applicable") is True else None
+        ),
+        "background.total": stage_ewma.get("background_ms"),
+        "color_correction.total": stage_ewma.get("color_correction_ms"),
+        "compositor.total": stage_ewma.get("composite_ms"),
+        "compositor.prepare": stage_ewma.get("composite_prepare_ms"),
+        "compositor.blend": stage_ewma.get("composite_blend_ms"),
+        "output.send_total": stage_ewma.get("output_send_ms"),
+        "output.submission": stage_ewma.get("output_submission_ms"),
+        "output.sink_pacing_wait": stage_ewma.get("output_sink_pacing_wait_ms"),
+        "output.application_pacing_wait": stage_ewma.get("application_pacing_wait_ms"),
+        "output.schedule_lateness": stage_ewma.get("output_schedule_lateness_ms"),
+        "pipeline.processing_only": stage_ewma.get("frame_processing_ms"),
+        "pipeline.new_frame_service": stage_ewma.get("new_frame_service_ms"),
+        "pipeline.new_frame_serialized_loop": stage_ewma.get(
+            "new_frame_serialized_loop_ms"
+        ),
+    }
+    if set(values) != set(TIMING_FIELD_NAMES):  # pragma: no cover - schema invariant
+        raise RuntimeError("pipeline timing projection drifted from hub schema")
+    return values
+
+
+def _cadence_status(
+    tracker: CadenceTracker,
+    *,
+    now_ns: int,
+    target_output_fps: int,
+) -> dict[str, object]:
+    """Project tracker truth plus compatibility aliases into public status."""
+
+    snapshot = tracker.snapshot(now_ns=now_ns)
+    values = snapshot.as_dict()
+    # The public contract names successful capture-derived output as a base
+    # update. These tracker-only aliases are useful in unit tests but would
+    # duplicate and blur that stable vocabulary in /status.
+    values.pop("unique_capture_count")
+    values.pop("unique_capture_fps")
+    send_count = snapshot.output_send_count
+    base_count = snapshot.base_composite_update_count
+    send_fps = snapshot.output_send_fps
+    values.update(
+        {
+            "frames_in": base_count,
+            "frames_out": send_count,
+            "fps": send_fps,
+            "output_effective_fps": send_fps,
+            "fps_attainment_pct": (
+                min(100.0, send_fps / target_output_fps * 100.0)
+                if send_count >= 2
+                else None
+            ),
+            "output_repeated_frames": snapshot.base_composite_reuse_count,
+        }
+    )
+    return values
+
+
+def _capture_health_stats(
+    capture_health: Any,
+    *,
+    fallback_frames_read: int,
+) -> dict[str, object]:
+    return {
+        "capture_fps": getattr(capture_health, "capture_fps", 0.0),
+        "capture_target_met": getattr(capture_health, "target_met", None),
+        "capture_frames_read": getattr(
+            capture_health,
+            "frames_read",
+            fallback_frames_read,
+        ),
+        "capture_dropped_frames": getattr(capture_health, "dropped_frames", 0),
+        "capture_read_failures": getattr(capture_health, "read_failures", 0),
+        "capture_restarts": getattr(capture_health, "restarts", 0),
+        "capture_stalled": getattr(capture_health, "stalled", False),
+        "capture_frame_age_ms": getattr(capture_health, "frame_age_ms", None),
+        "capture_read_ms": getattr(capture_health, "read_ms", None),
+    }
+
+
 class RestartRequiredError(RuntimeError):
     """The patch is valid but changes resources that cannot be swapped live."""
 
@@ -991,6 +1149,12 @@ class _Resources:
         init=False,
         repr=False,
     )
+    _legacy_compositor_workspace: LegacyCompositorWorkspace | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _capture_closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.canvas_size = resolved_output_size(self.cfg)
@@ -1053,9 +1217,31 @@ class _Resources:
         self.color_backdrop_analysis_token = None
         self.color_backdrop_analysis_linear_bgr = None
 
+    def legacy_compositor_workspace(self) -> LegacyCompositorWorkspace:
+        """Return the lazily allocated generation-owned legacy work buffers."""
+
+        workspace = self._legacy_compositor_workspace
+        if workspace is None:
+            workspace = LegacyCompositorWorkspace(self.canvas_shape)
+            self._legacy_compositor_workspace = workspace
+        return workspace
+
+    def close_capture(self) -> None:
+        """Stop capture once so terminal health can be sampled without a race."""
+
+        if self._capture_closed:
+            return
+        self._capture_closed = True
+        _safe_close(self.capture, "capture")
+
     def close(self) -> None:
         # Close independently so one faulty backend cannot strand the others.
+        # Capture is stopped first so no further latest-slot overwrite can race
+        # teardown or the final operator-health snapshot.
+        self.close_capture()
         self.invalidate_color_backdrop_analysis()
+        _safe_close(self._legacy_compositor_workspace, "legacy compositor workspace")
+        self._legacy_compositor_workspace = None
         try:
             self.color_analysis_executor.shutdown(wait=True, cancel_futures=True)
         except Exception:
@@ -1065,7 +1251,6 @@ class _Resources:
         _safe_close(self.light_wrap_stabilizer, "light-wrap stabilizer")
         _safe_close(self.refiner, "mask refiner")
         _safe_close(self.segmenter, "segmenter")
-        _safe_close(self.capture, "capture")
 
 
 @dataclass
@@ -1163,7 +1348,21 @@ class _PreflightResult:
     """Already-sent startup output and the capture it consumed."""
 
     output: np.ndarray
-    capture_sequence: int
+    captured: CapturedFrame
+    send_timing: OutputSendTiming
+    base_ready_at_ns: int
+    segmentation_updated: bool
+    frame_processing_ms: float
+    new_frame_service_ms: float
+    new_frame_serialized_loop_ms: float
+    timings: dict[str, float]
+    color_status: dict[str, object]
+    remote_fallback_active: bool
+    remote_fallback_reason: str
+
+    @property
+    def capture_sequence(self) -> int:
+        return self.captured.sequence
 
 
 @dataclass
@@ -1795,6 +1994,7 @@ class Pipeline:
 
     def _run(self) -> None:
         resources: _Resources | None = None
+        cadence_tracker: CadenceTracker | None = None
         try:
             # Reset replay evidence only after every stale renderer lease and
             # queued remote frame have been invalidated at one hub boundary.
@@ -1803,11 +2003,104 @@ class Pipeline:
             resources = self._open_resources(state)
             self._active_state = state
             preflight = self._preflight(resources)
-            self._startup_done.set()
+            frame_interval_ms = 1000.0 / resources.cfg.output.fps
+            cadence_tracker = CadenceTracker(resources.cfg.output.fps)
+            cadence_tracker.record_send(
+                sent_at_ns=preflight.send_timing.submitted_at_ns,
+                capture_sequence=preflight.captured.sequence,
+                captured_at_ns=preflight.captured.captured_at_ns,
+                base_ready_at_ns=preflight.base_ready_at_ns,
+                base_updated=True,
+                segmentation_updated=preflight.segmentation_updated,
+                exact_final_repeat=False,
+                processing_deadline_missed=(
+                    preflight.frame_processing_ms > frame_interval_ms
+                ),
+                serialized_new_frame_deadline_missed=(
+                    preflight.new_frame_serialized_loop_ms > frame_interval_ms + 1.0
+                ),
+                output_sink_pacing_events=preflight.send_timing.pacing_events,
+                output_sink_recovery_events=preflight.send_timing.recovery_events,
+            )
+            stage_ewma: dict[str, float | None] = {
+                **preflight.timings,
+                "output_send_ms": (
+                    preflight.send_timing.submission_ms
+                    + preflight.send_timing.pacing_wait_ms
+                ),
+                "output_submission_ms": preflight.send_timing.submission_ms,
+                "output_sink_pacing_wait_ms": (preflight.send_timing.pacing_wait_ms),
+                "application_pacing_wait_ms": 0.0,
+                "output_schedule_lateness_ms": 0.0,
+                "frame_processing_ms": preflight.frame_processing_ms,
+                "new_frame_service_ms": preflight.new_frame_service_ms,
+                "new_frame_serialized_loop_ms": (
+                    preflight.new_frame_serialized_loop_ms
+                ),
+            }
+            capture_health = (
+                resources.capture.health_snapshot()
+                if hasattr(resources.capture, "health_snapshot")
+                else None
+            )
+            initial_stats = self._identity_stats(
+                resources,
+                capture_health=capture_health,
+                color_status=preflight.color_status,
+            )
+            initial_stats.update(
+                {
+                    **_cadence_status(
+                        cadence_tracker,
+                        now_ns=preflight.send_timing.completed_at_ns,
+                        target_output_fps=resources.cfg.output.fps,
+                    ),
+                    **_capture_health_stats(
+                        capture_health,
+                        fallback_frames_read=1,
+                    ),
+                    "remote_frames_used": 0,
+                    "remote_fallback_active": preflight.remote_fallback_active,
+                    "remote_fallback_count": (
+                        1 if preflight.remote_fallback_active else 0
+                    ),
+                    "remote_fallback_reason": preflight.remote_fallback_reason,
+                    "segmentation_ms": stage_ewma["segmentation_ms"],
+                    "background_ms": stage_ewma["background_ms"],
+                    "color_correction_ms": stage_ewma["color_correction_ms"],
+                    "composite_ms": stage_ewma["composite_ms"],
+                    "output_send_ms": stage_ewma["output_send_ms"],
+                    "output_submission_ms": stage_ewma["output_submission_ms"],
+                    "output_sink_pacing_wait_ms": stage_ewma[
+                        "output_sink_pacing_wait_ms"
+                    ],
+                    "application_pacing_wait_ms": stage_ewma[
+                        "application_pacing_wait_ms"
+                    ],
+                    "output_schedule_lateness_ms": stage_ewma[
+                        "output_schedule_lateness_ms"
+                    ],
+                    "frame_processing_ms": stage_ewma["frame_processing_ms"],
+                    "new_frame_service_ms": stage_ewma["new_frame_service_ms"],
+                    "new_frame_serialized_loop_ms": stage_ewma[
+                        "new_frame_serialized_loop_ms"
+                    ],
+                    "timing_schema_version": TIMING_SCHEMA_VERSION,
+                    "timing_ms": _timing_fields(
+                        stage_ewma,
+                        capture_health=capture_health,
+                        segmenter=resources.segmenter,
+                    ),
+                }
+            )
+            if resources.cfg.background.mode != "remote":
+                self.hub.publish_raw(preflight.captured.pixels)
+            self.hub.publish_output(preflight.output, stats=initial_stats)
             self._loop(
                 resources,
-                initial_output=preflight.output,
-                initial_capture_sequence=preflight.capture_sequence,
+                preflight=preflight,
+                cadence_tracker=cadence_tracker,
+                stage_ewma=stage_ewma,
             )
         except BaseException as exc:
             log.exception("pipeline crashed")
@@ -1819,6 +2112,8 @@ class Pipeline:
                     ReconfigurationUnavailable("pipeline worker stopped")
                 )
             if resources is not None:
+                resources.close_capture()
+                self._publish_terminal_cadence(resources, cadence_tracker)
                 resources.close()
             if self._matte_recorder is not None:
                 self._matte_recorder.close()
@@ -1827,6 +2122,55 @@ class Pipeline:
             # finishes. A blocked close is therefore observed as a surviving
             # startup worker rather than being hidden behind the root error.
             self._startup_done.set()
+
+    def _publish_terminal_cadence(
+        self,
+        resources: _Resources,
+        cadence_tracker: CadenceTracker | None,
+    ) -> None:
+        """Latch final drop/reset/cadence evidence after capture has stopped."""
+
+        if cadence_tracker is None or not hasattr(self.hub, "update_stats"):
+            return
+        try:
+            snapshot = cadence_tracker.snapshot(now_ns=time.monotonic_ns())
+            capture_health = (
+                resources.capture.health_snapshot()
+                if hasattr(resources.capture, "health_snapshot")
+                else None
+            )
+            capture_sequence = resources.capture_sequence_timeline.snapshot()
+            temporal = resources.segmentation_timeline.snapshot()
+            values = _cadence_status(
+                cadence_tracker,
+                now_ns=time.monotonic_ns(),
+                target_output_fps=resources.cfg.output.fps,
+            )
+            values.update(
+                _capture_health_stats(
+                    capture_health,
+                    fallback_frames_read=snapshot.unique_capture_count,
+                )
+            )
+            values.update(
+                {
+                    "capture_sequence": capture_sequence.last_sequence or 0,
+                    "capture_sequence_gap_count": capture_sequence.gap_events,
+                    "capture_missing_input_count": capture_sequence.missing_inputs,
+                    "matte_reset_count": temporal.reset_count,
+                    "matte_last_reset_reason": (
+                        ""
+                        if temporal.last_reset_reason is None
+                        else temporal.last_reset_reason.value
+                    ),
+                }
+            )
+            self.hub.update_stats(**values)
+        except Exception:
+            # Teardown must continue even if a third-party test double violates
+            # the health/status contract. The original pipeline error remains
+            # authoritative.
+            log.exception("cannot publish terminal cadence health")
 
     def _fail_pending(self, error: BaseException) -> None:
         while True:
@@ -2166,16 +2510,26 @@ class Pipeline:
                         else None
                     ),
                 )
-            out = self._composite_prepared_color(
-                activation.candidate,
-                frame,
-                bg,
-                mask,
-                edge_fg,
-                prepared_color,
-                light_wrap=candidate_policy.effective.light_wrap,
-                prepared_light_wrap=prepared_light_wrap,
+            trial_workspace = (
+                LegacyCompositorWorkspace(resources.canvas_shape)
+                if activation.candidate.compositing.blend_space == "srgb_legacy"
+                else None
             )
+            try:
+                out = self._composite_prepared_color(
+                    activation.candidate,
+                    frame,
+                    bg,
+                    mask,
+                    edge_fg,
+                    prepared_color,
+                    light_wrap=candidate_policy.effective.light_wrap,
+                    prepared_light_wrap=prepared_light_wrap,
+                    legacy_workspace=trial_workspace,
+                )
+            finally:
+                if trial_workspace is not None:
+                    trial_workspace.close()
             self._validate_output_frame(out, resources.canvas_size)
             if segmentation_changed:
                 # Trials are validation-only. Never publish recurrence,
@@ -2370,6 +2724,25 @@ class Pipeline:
         self, resources: _Resources, old_cfg: AppConfig
     ) -> None:
         """Run non-critical hub side effects without invalidating a commit."""
+        if (
+            old_cfg.compositing.blend_space == "srgb_legacy"
+            and resources.cfg.compositing.blend_space != "srgb_legacy"
+        ):
+            _safe_close(
+                resources._legacy_compositor_workspace,
+                "legacy compositor workspace",
+            )
+            resources._legacy_compositor_workspace = None
+        if _segmenter_key(old_cfg) != _segmenter_key(resources.cfg):
+            selection = segmenter_selection_status(
+                resources.segmenter,
+                resources.cfg.segmentation.backend,
+            )
+            self._log_fallback_transition(
+                "segmentation",
+                bool(selection["fallback_active"]),
+                str(selection["fallback_reason"]),
+            )
         if old_cfg.background.mode != resources.cfg.background.mode:
             try:
                 self.hub.invalidate_remote_session()
@@ -2614,9 +2987,12 @@ class Pipeline:
         if capture_health is None and hasattr(resources.capture, "health_snapshot"):
             capture_health = resources.capture.health_snapshot()
         output_fallback = bool(getattr(resources.output, "fallback_active", False))
-        segmentation_fallback = cfg.segmentation.backend == "auto" and isinstance(
-            resources.segmenter, HeuristicSegmenter
+        segmentation_selection = segmenter_selection_status(
+            resources.segmenter,
+            cfg.segmentation.backend,
         )
+        segmentation_fallback = bool(segmentation_selection["fallback_active"])
+        segmentation_fallback_reason = str(segmentation_selection["fallback_reason"])
         video_stats = (
             resources.backdrop.stats_dict()
             if resources.backdrop is not None
@@ -2651,9 +3027,13 @@ class Pipeline:
         self._log_fallback_transition(
             "segmentation",
             segmentation_fallback,
-            "ml-backend-unavailable" if segmentation_fallback else "",
+            segmentation_fallback_reason,
         )
-        effective_controls = self._effective_matte_controls(resources)
+        policy_snapshot = self._matte_policy_snapshot(resources)
+        effective_controls = self._effective_matte_controls(
+            resources,
+            policy_snapshot=policy_snapshot,
+        )
         effective_refiner = effective_controls["refiner"]
         if not isinstance(effective_refiner, dict):
             effective_refiner = {}
@@ -2682,10 +3062,16 @@ class Pipeline:
             effective_light_wrap = 0.0
         capture_sequence = resources.capture_sequence_timeline.snapshot()
         temporal = resources.segmentation_timeline.snapshot()
+        matte_policy = self._public_matte_policy(
+            resources,
+            policy_snapshot=policy_snapshot,
+        )
         return {
             "mode": cfg.background.mode,
             "segmentation_backend": type(resources.segmenter).__name__,
             "segmentation_device": resources.segmenter.device,
+            "segmentation_selection": segmentation_selection,
+            "matte_policy": matte_policy,
             "segmentation_generation": resources.segmentation_generation,
             "capture_sequence": capture_sequence.last_sequence or 0,
             "capture_sequence_gap_count": capture_sequence.gap_events,
@@ -2743,9 +3129,7 @@ class Pipeline:
                 else ""
             ),
             "segmentation_fallback_active": segmentation_fallback,
-            "segmentation_fallback_reason": (
-                "ml-backend-unavailable" if segmentation_fallback else ""
-            ),
+            "segmentation_fallback_reason": segmentation_fallback_reason,
             "capture_backend": (
                 getattr(capture_health, "backend", type(resources.capture).__name__)
                 if capture_health is not None
@@ -2801,9 +3185,11 @@ class Pipeline:
     def _update_identity_stats(self, resources: _Resources) -> None:
         cfg = resources.cfg
         output_fallback = bool(getattr(resources.output, "fallback_active", False))
-        segmentation_fallback = cfg.segmentation.backend == "auto" and isinstance(
-            resources.segmenter, HeuristicSegmenter
+        selection = segmenter_selection_status(
+            resources.segmenter,
+            cfg.segmentation.backend,
         )
+        segmentation_fallback = bool(selection["fallback_active"])
         self.hub.update_stats(**self._identity_stats(resources))
         self._log_fallback_transition(
             "output",
@@ -2813,7 +3199,7 @@ class Pipeline:
         self._log_fallback_transition(
             "segmentation",
             segmentation_fallback,
-            "ml-backend-unavailable" if segmentation_fallback else "",
+            str(selection["fallback_reason"]),
         )
 
     def _log_geometry_transitions(
@@ -3306,15 +3692,32 @@ class Pipeline:
         )
 
     @staticmethod
+    def _public_matte_policy(
+        resources: _Resources,
+        *,
+        policy_snapshot: MattePolicySnapshot | None = None,
+    ) -> dict[str, object]:
+        """Return the versioned, path-free configured/effective matte policy."""
+
+        policy = policy_snapshot or Pipeline._matte_policy_snapshot(resources)
+        return {
+            "schema": "custback.matte-policy",
+            "version": 1,
+            "blend_space": resources.cfg.compositing.blend_space,
+            **policy.to_dict(),
+        }
+
+    @staticmethod
     def _effective_matte_controls(
         resources: _Resources,
         *,
         rvm_telemetry: dict[str, object] | None = None,
+        policy_snapshot: MattePolicySnapshot | None = None,
     ) -> dict[str, object]:
         """Project compatibility fields from the typed policy snapshot."""
 
         segmenter = resources.segmenter
-        policy = Pipeline._matte_policy_snapshot(resources)
+        policy = policy_snapshot or Pipeline._matte_policy_snapshot(resources)
         effective = policy.effective
         refiner_cfg = policy.effective_refiner_config(resources.cfg.segmentation)
         return {
@@ -3619,6 +4022,8 @@ class Pipeline:
         *,
         light_wrap: float,
         prepared_light_wrap: PreparedLightWrap | None = None,
+        legacy_workspace: LegacyCompositorWorkspace | None = None,
+        diagnostics: dict[str, float] | None = None,
     ) -> np.ndarray:
         """Render with shared decoded inputs when correction prepared them."""
 
@@ -3645,6 +4050,7 @@ class Pipeline:
                 edge_foreground_linear_bgr=edge_linear,
                 color_transform=prepared.transform,
                 prepared_light_wrap=prepared_light_wrap,
+                diagnostics=diagnostics,
             )
         if (
             compositing.blend_space == "srgb_legacy"
@@ -3667,6 +4073,8 @@ class Pipeline:
                 ),
                 color_transform=prepared.transform,
                 prepared_light_wrap=prepared_light_wrap,
+                workspace=legacy_workspace,
+                diagnostics=diagnostics,
             )
         return composite(
             frame,
@@ -3677,6 +4085,8 @@ class Pipeline:
             blend_space=compositing.blend_space,
             color_transform=prepared.transform,
             prepared_light_wrap=prepared_light_wrap,
+            workspace=legacy_workspace,
+            diagnostics=diagnostics,
         )
 
     def _prepare_color_frame(
@@ -3828,6 +4238,7 @@ class Pipeline:
 
     def _preflight(self, resources: _Resources) -> _PreflightResult:
         """Read and process a real frame before reporting startup readiness."""
+        accepted_started_ns = time.monotonic_ns()
         camera_wait = (
             2.0
             if resources.cfg.camera.synthetic
@@ -3865,9 +4276,18 @@ class Pipeline:
         )
         privacy_reason = ""
         color_outcome: dict[str, object] = {}
-        matte_timings: dict[str, float] | None = (
-            {} if matte_evidence is not None else None
+        timings: dict[str, float] = {
+            "segmentation_ms": 0.0,
+            "background_ms": 0.0,
+            "color_correction_ms": 0.0,
+            "composite_prepare_ms": 0.0,
+            "composite_blend_ms": 0.0,
+            "composite_ms": 0.0,
+        }
+        segmentation_sequence_before = (
+            resources.segmentation_timeline.snapshot().last_sequence
         )
+        process_started_ns = time.monotonic_ns()
         try:
             if resources.cfg.background.mode == "passthrough":
                 # Passthrough does not need a mask to render, but the segmenter
@@ -3889,6 +4309,7 @@ class Pipeline:
                     frame,
                     captured=captured,
                     privacy_safe=True,
+                    timings=timings,
                     color_outcome=color_outcome,
                 )
                 out = self._privacy_slate(frame.shape)
@@ -3900,30 +4321,70 @@ class Pipeline:
                     captured,
                     color_outcome=color_outcome,
                     matte_evidence=matte_evidence,
-                    timings=matte_timings,
+                    timings=timings,
                 )
+            validation_started_ns = time.monotonic_ns()
             self._validate_output_frame(out, resources.canvas_size)
+            if matte_evidence is not None:
+                matte_evidence.timings_ms["pre_guard_output_validation_ms"] = (
+                    time.monotonic_ns() - validation_started_ns
+                ) / 1_000_000.0
         except _PrivacyViolation as exc:
             raise ActivationError(f"invalid mask: {exc}") from exc
+        segmentation_updated = (
+            resources.segmentation_timeline.snapshot().last_sequence
+            != segmentation_sequence_before
+        )
+        frame_processing_ms = (time.monotonic_ns() - process_started_ns) / 1_000_000.0
         # The privacy gate sits at the final publication boundary. Startup uses
         # the same fail-closed path as the steady-state loop, so a bad mask or
         # raw-looking preflight result can never reach the real output backend.
+        guard_started_ns = time.monotonic_ns()
         out, gate_reason = self._guard_remote_output(
             out,
             frame,
             privacy_safe=remote_mode,
         )
         privacy_reason = gate_reason or privacy_reason
+        self._validate_output_frame(out, resources.canvas_size)
+        guard_output_validation_ms = (
+            time.monotonic_ns() - guard_started_ns
+        ) / 1_000_000.0
+        base_ready_at_ns = time.monotonic_ns()
         send_started = time.monotonic_ns()
-        resources.output.send(out.copy() if remote_mode else out)
-        sent_monotonic_ns = time.monotonic_ns()
+        send_timing = _send_output_with_timing(
+            resources.output,
+            out,
+            copy_frame=remote_mode,
+        )
+        output_send_ms = (send_timing.completed_at_ns - send_started) / 1_000_000.0
+        new_frame_service_ms = (
+            send_timing.submitted_at_ns - accepted_started_ns
+        ) / 1_000_000.0
+        new_frame_serialized_loop_ms = (
+            send_timing.completed_at_ns - accepted_started_ns
+        ) / 1_000_000.0
         if matte_evidence is not None:
-            matte_evidence.timings_ms["output_send_ms"] = (
-                sent_monotonic_ns - send_started
-            ) / 1_000_000.0
+            matte_evidence.timings_ms["output_send_ms"] = output_send_ms
+            matte_evidence.timings_ms["guard_output_validation_ms"] = (
+                guard_output_validation_ms
+            )
+            matte_evidence.timings_ms["output_submission_ms"] = (
+                send_timing.submission_ms
+            )
+            matte_evidence.timings_ms["output_sink_pacing_wait_ms"] = (
+                send_timing.pacing_wait_ms
+            )
+            matte_evidence.timings_ms["application_pacing_wait_ms"] = 0.0
+            matte_evidence.timings_ms["output_schedule_lateness_ms"] = 0.0
+            matte_evidence.timings_ms["frame_processing_ms"] = frame_processing_ms
+            matte_evidence.timings_ms["new_frame_service_ms"] = new_frame_service_ms
+            matte_evidence.timings_ms["new_frame_serialized_loop_ms"] = (
+                new_frame_serialized_loop_ms
+            )
             if diagnostic_frame_started_ns is not None:
                 matte_evidence.timings_ms["frame_total_ms"] = (
-                    sent_monotonic_ns - diagnostic_frame_started_ns
+                    send_timing.completed_at_ns - diagnostic_frame_started_ns
                 ) / 1_000_000.0
             rss_bytes = process_rss_bytes()
             if rss_bytes is not None:
@@ -3934,7 +4395,7 @@ class Pipeline:
             recorder = self._matte_recorder
             assert recorder is not None
             recorder.submit_output_event(
-                sent_monotonic_ns=sent_monotonic_ns,
+                sent_monotonic_ns=send_timing.submitted_at_ns,
                 source_bundle_sequence=self._matte_last_source_sequence,
                 base_updated=True,
                 exact_final_repeat=False,
@@ -3949,7 +4410,20 @@ class Pipeline:
         self._record_color_output(resources, color_outcome, processed=True)
         if privacy_reason:
             log.warning("remote privacy fallback active reason=%s", privacy_reason)
-        return _PreflightResult(out, captured.sequence)
+        return _PreflightResult(
+            output=out,
+            captured=captured,
+            send_timing=send_timing,
+            base_ready_at_ns=base_ready_at_ns,
+            segmentation_updated=segmentation_updated,
+            frame_processing_ms=frame_processing_ms,
+            new_frame_service_ms=new_frame_service_ms,
+            new_frame_serialized_loop_ms=new_frame_serialized_loop_ms,
+            timings=timings,
+            color_status=color_outcome,
+            remote_fallback_active=remote_mode,
+            remote_fallback_reason=("no-client" if remote_mode else ""),
+        )
 
     def _local_composite(
         self,
@@ -4074,8 +4548,21 @@ class Pipeline:
                 prepared_color = _PreparedColorFrame()
                 if timings is not None:
                     timings["color_correction_ms"] = 0.0
-            started = time.monotonic_ns()
+            composite_started_ns = time.monotonic_ns()
+            prepare_started_ns = composite_started_ns
+            compositor_diagnostics = (
+                matte_evidence.compositor_substages_ms
+                if matte_evidence is not None
+                else None
+            )
+            blend_started_ns: int | None = None
             next_light_wrap_stabilizer: LightWrapStabilizer | None = None
+            legacy_workspace = (
+                resources.legacy_compositor_workspace()
+                if cfg.compositing.blend_space == "srgb_legacy"
+                and isinstance(resources, _Resources)
+                else None
+            )
             try:
                 prepared_light_wrap: PreparedLightWrap | None = None
                 active_light_wrap_stabilizer = getattr(
@@ -4120,7 +4607,13 @@ class Pipeline:
                                 if cfg.compositing.blend_space == "linear_srgb"
                                 else None
                             ),
+                            diagnostics=compositor_diagnostics,
                         )
+                if timings is not None:
+                    timings["composite_prepare_ms"] = (
+                        time.monotonic_ns() - prepare_started_ns
+                    ) / 1_000_000.0
+                blend_started_ns = time.monotonic_ns()
                 rendered = self._composite_prepared_color(
                     cfg,
                     frame,
@@ -4130,6 +4623,8 @@ class Pipeline:
                     prepared_color,
                     light_wrap=matte_policy.effective.light_wrap,
                     prepared_light_wrap=prepared_light_wrap,
+                    legacy_workspace=legacy_workspace,
+                    diagnostics=compositor_diagnostics,
                 )
             except ColorError as exc:
                 # A photometric transform/conversion failure follows the same
@@ -4144,6 +4639,12 @@ class Pipeline:
                 # that did not consume the prepared sample cannot publish its
                 # candidate temporal history.
                 next_light_wrap_stabilizer = None
+                if blend_started_ns is None:
+                    if timings is not None:
+                        timings["composite_prepare_ms"] = (
+                            time.monotonic_ns() - prepare_started_ns
+                        ) / 1_000_000.0
+                    blend_started_ns = time.monotonic_ns()
                 rendered = composite(
                     frame,
                     bg,
@@ -4153,6 +4654,8 @@ class Pipeline:
                     blend_space=cfg.compositing.blend_space,
                     color_transform=IDENTITY_TRANSFORM,
                     prepared_light_wrap=None,
+                    workspace=legacy_workspace,
+                    diagnostics=compositor_diagnostics,
                 )
                 if color_outcome is not None:
                     color_outcome.update(
@@ -4172,11 +4675,25 @@ class Pipeline:
                             applied_transform=prepared_color.transform,
                         )
                     )
+            if timings is not None:
+                assert blend_started_ns is not None
+                timings["composite_blend_ms"] = (
+                    time.monotonic_ns() - blend_started_ns
+                ) / 1_000_000.0
+            validation_started_ns = (
+                time.monotonic_ns() if matte_evidence is not None else 0
+            )
             self._validate_output_frame(rendered, resources.canvas_size)
+            if matte_evidence is not None:
+                matte_evidence.timings_ms["post_composite_validation_ms"] = (
+                    time.monotonic_ns() - validation_started_ns
+                ) / 1_000_000.0
             if next_light_wrap_stabilizer is not None:
                 resources.light_wrap_stabilizer = next_light_wrap_stabilizer
             if timings is not None:
-                timings["composite_ms"] = (time.monotonic_ns() - started) / 1_000_000.0
+                timings["composite_ms"] = (
+                    time.monotonic_ns() - composite_started_ns
+                ) / 1_000_000.0
             if matte_evidence is not None and not privacy_safe:
                 matte_evidence.raw_mask = raw_mask
                 matte_evidence.refined_mask = mask
@@ -4190,6 +4707,18 @@ class Pipeline:
                     resources,
                     rvm_telemetry=rvm_telemetry,
                 )
+                legacy_workspace = resources._legacy_compositor_workspace
+                if legacy_workspace is not None:
+                    workspace_snapshot = legacy_workspace.snapshot()
+                    # These are application-visible lower bounds: retained
+                    # workspace bytes plus the known independently owned output
+                    # allocation. Native OpenCV internals are not guessed.
+                    matte_evidence.resource_samples["memory_bytes"] = (
+                        workspace_snapshot.retained_bytes
+                    )
+                    matte_evidence.resource_samples["allocation_bytes"] = (
+                        workspace_snapshot.last_known_allocation_bytes
+                    )
                 if diagnostic_stage_timings is not None:
                     matte_evidence.timings_ms.update(diagnostic_stage_timings)
                 if timings is not None:
@@ -4231,46 +4760,92 @@ class Pipeline:
         self,
         resources: _Resources,
         *,
-        initial_output: np.ndarray | None = None,
-        initial_capture_sequence: int | None = None,
+        preflight: _PreflightResult | None = None,
+        cadence_tracker: CadenceTracker | None = None,
+        stage_ewma: dict[str, float | None] | None = None,
     ) -> None:
-        frame_interval = 1.0 / resources.cfg.output.fps
-        fps_window: deque[float] = deque()
-        initial_sends = 1 if initial_output is not None else 0
-        frames_in = frames_out = initial_sends
+        frame_interval_ns = round(1_000_000_000 / resources.cfg.output.fps)
+        frame_interval_ms = frame_interval_ns / 1_000_000.0
+        if cadence_tracker is None:
+            cadence_tracker = CadenceTracker(resources.cfg.output.fps)
+        if stage_ewma is None:
+            stage_ewma = {
+                "segmentation_ms": None,
+                "background_ms": None,
+                "color_correction_ms": None,
+                "composite_prepare_ms": None,
+                "composite_blend_ms": None,
+                "composite_ms": None,
+                "output_send_ms": None,
+                "output_submission_ms": None,
+                "output_sink_pacing_wait_ms": None,
+                "application_pacing_wait_ms": None,
+                "output_schedule_lateness_ms": None,
+                "frame_processing_ms": None,
+                "new_frame_service_ms": None,
+                "new_frame_serialized_loop_ms": None,
+            }
+        else:
+            # Older embedders and focused tests may provide the schema-v0
+            # stage map. The fixed public timing schema is nullable, so add
+            # the new compositor split without breaking those callers.
+            stage_ewma.setdefault("composite_prepare_ms", None)
+            stage_ewma.setdefault("composite_blend_ms", None)
         initial_remote_slate = (
-            initial_output is not None and resources.cfg.background.mode == "remote"
+            preflight is not None and resources.cfg.background.mode == "remote"
         )
         remote_used = 0
         fallback_count = 1 if initial_remote_slate else 0
-        repeated_frames = deadline_misses = 0
-        last_output = initial_output
+        last_output = None if preflight is None else preflight.output
         fallback_active = initial_remote_slate
         fallback_reason = "startup-slate" if initial_remote_slate else ""
-        last_capture_sequence = initial_capture_sequence
-        if (
-            initial_capture_sequence is not None
-            and resources.capture_sequence_timeline.snapshot().last_sequence is None
-        ):
-            resources.capture_sequence_timeline.observe(initial_capture_sequence)
-        previous_remote_fallback: tuple[bool, str] = (False, "")
-        last_color_status = _color_stats(
-            resources.cfg,
-            resources.harmonizer.snapshot()
-            if resources.harmonizer is not None
-            else None,
+        last_capture_sequence = (
+            None if preflight is None else preflight.capture_sequence
         )
-        stage_ewma: dict[str, float | None] = {
-            "segmentation_ms": None,
-            "background_ms": None,
-            "color_correction_ms": None,
-            "composite_ms": None,
-            "output_send_ms": None,
-            "frame_processing_ms": None,
-        }
+        previous_remote_fallback: tuple[bool, str] = (
+            fallback_active,
+            fallback_reason,
+        )
+        last_color_status = (
+            _color_stats(
+                resources.cfg,
+                resources.harmonizer.snapshot()
+                if resources.harmonizer is not None
+                else None,
+            )
+            if preflight is None
+            else preflight.color_status
+        )
+        loop_clock_ns = time.monotonic_ns()
+        next_cycle_start_ns = (
+            loop_clock_ns
+            if preflight is None
+            else preflight.send_timing.submitted_at_ns + frame_interval_ns
+        )
+        next_output_deadline_ns = (
+            loop_clock_ns + frame_interval_ns
+            if preflight is None
+            else next_cycle_start_ns
+        )
 
         while not self._stop.is_set():
-            loop_start = time.monotonic()
+            serialized_started_ns = time.monotonic_ns()
+            application_pacing_wait_ms = 0.0
+            application_pacing_events = 0
+            if not resources.output.paces:
+                pacing_started_ns = time.monotonic_ns()
+                remaining_ns = next_cycle_start_ns - pacing_started_ns
+                if remaining_ns > 0:
+                    self._stop.wait(remaining_ns / 1_000_000_000.0)
+                    pacing_completed_ns = time.monotonic_ns()
+                    application_pacing_wait_ms = max(
+                        0.0,
+                        (pacing_completed_ns - pacing_started_ns) / 1_000_000.0,
+                    )
+                    application_pacing_events = 1
+                    if self._stop.is_set():
+                        break
+            service_started_ns = time.monotonic_ns()
             captured = resources.capture.read()
             if captured is not None and last_capture_sequence is not None:
                 if captured.sequence < last_capture_sequence:
@@ -4290,9 +4865,14 @@ class Pipeline:
                 "segmentation_ms": 0.0,
                 "background_ms": 0.0,
                 "color_correction_ms": 0.0,
+                "composite_prepare_ms": 0.0,
+                "composite_blend_ms": 0.0,
                 "composite_ms": 0.0,
             }
             processed = frame is not None
+            segmentation_updated = False
+            processing_deadline_missed = False
+            frame_processing_ms: float | None = None
             diagnostic_frame_started_ns = (
                 time.monotonic_ns()
                 if (
@@ -4311,9 +4891,11 @@ class Pipeline:
                     boundary="capture",
                 )
                 resources.capture_sequence_timeline.observe(captured.sequence)
-                frames_in += 1
                 last_capture_sequence = captured.sequence
                 self.hub.publish_raw(frame)
+                segmentation_sequence_before = (
+                    resources.segmentation_timeline.snapshot().last_sequence
+                )
 
                 # A real current frame is the activation trial input. No candidate
                 # is committed until this preflight succeeds.
@@ -4368,7 +4950,6 @@ class Pipeline:
                         # fails closed to the input-independent slate.
                         out_frame = self._privacy_slate(frame.shape)
                         fallback_active = True
-                        fallback_count += 1
                 elif mode == "passthrough" or resources.backdrop is None:
                     out_frame = frame
                 else:
@@ -4390,6 +4971,10 @@ class Pipeline:
                             else None,
                         )
                     )
+                segmentation_updated = (
+                    resources.segmentation_timeline.snapshot().last_sequence
+                    != segmentation_sequence_before
+                )
                 last_color_status = color_outcome
                 frame_processing_ms = (
                     time.monotonic_ns() - process_started
@@ -4398,8 +4983,7 @@ class Pipeline:
                     matte_evidence.timings_ms["frame_processing_ms"] = (
                         frame_processing_ms
                     )
-                if frame_processing_ms / 1000.0 > frame_interval:
-                    deadline_misses += 1
+                processing_deadline_missed = frame_processing_ms > frame_interval_ms
                 samples = (
                     *timings.items(),
                     ("frame_processing_ms", frame_processing_ms),
@@ -4408,10 +4992,9 @@ class Pipeline:
                     stage_ewma[name] = _ewma(stage_ewma[name], sample)
             else:
                 if last_output is None:
-                    self._stop.wait(min(0.01, frame_interval))
+                    self._stop.wait(min(0.01, frame_interval_ms / 1000.0))
                     continue
                 out_frame = last_output
-                repeated_frames += 1
 
             mode = resources.cfg.background.mode
             guard_source = frame if frame is not None else self._latest_raw_frame
@@ -4419,33 +5002,158 @@ class Pipeline:
                 # Defensive invariant: startup preflight always establishes the
                 # source associated with ``initial_output`` before this loop.
                 raise RuntimeError("output publication has no associated source frame")
+            guard_started_ns = time.monotonic_ns()
             out_frame, privacy_reason = self._guard_remote_output(
                 out_frame,
                 guard_source,
                 privacy_safe=mode == "remote",
             )
             if privacy_reason:
-                if not fallback_active:
-                    fallback_count += 1
                 fallback_active = True
                 fallback_reason = privacy_reason
                 used_remote_candidate = False
-            if used_remote_candidate:
-                remote_used += 1
             # Repeats retain only the already-guarded output, so loss of camera
             # input cannot resurrect an unsafe pre-gate candidate.
             self._validate_output_frame(out_frame, resources.canvas_size)
+            base_ready_at_ns = time.monotonic_ns() if processed else None
+            exact_final_repeat = last_output is not None and np.array_equal(
+                out_frame, last_output
+            )
+
+            if mode == "remote" and processed:
+                assert frame is not None
+                # A renderer may connect or publish while sink/application
+                # pacing waits. Re-read the latest-only slot at the final send
+                # boundary so a stale decision cannot obscure a newer
+                # invalid/valid candidate for one extra output interval.
+                latest_remote, latest_reason = self.hub.remote_frame_status(
+                    max_age_s=resources.cfg.api.remote_timeout_ms / 1000.0
+                )
+                if latest_remote is not None:
+                    if (
+                        latest_remote.dtype != np.uint8
+                        or latest_remote.ndim != 3
+                        or latest_remote.shape[2] != 3
+                    ):
+                        latest_remote = None
+                        latest_reason = "invalid"
+                    elif latest_remote.shape != resources.canvas_shape:
+                        latest_remote = None
+                        latest_reason = "wrong-size"
+                if latest_remote is None:
+                    out_frame = self._privacy_slate(frame.shape)
+                    fallback_active = True
+                    fallback_reason = latest_reason
+                    used_remote_candidate = False
+                else:
+                    out_frame = latest_remote
+                    fallback_active = False
+                    fallback_reason = ""
+                    used_remote_candidate = True
+                out_frame, privacy_reason = self._guard_remote_output(
+                    out_frame,
+                    frame,
+                    privacy_safe=True,
+                )
+                if privacy_reason:
+                    fallback_active = True
+                    fallback_reason = privacy_reason
+                    used_remote_candidate = False
+                self._validate_output_frame(out_frame, resources.canvas_size)
+                base_ready_at_ns = time.monotonic_ns()
+                exact_final_repeat = np.array_equal(out_frame, last_output)
+            guard_output_validation_ms = (
+                time.monotonic_ns() - guard_started_ns
+            ) / 1_000_000.0
+            send_started_ns = time.monotonic_ns()
+            send_timing = _send_output_with_timing(
+                resources.output,
+                out_frame,
+                copy_frame=mode == "remote",
+            )
+            output_send_ms = (
+                send_timing.completed_at_ns - send_started_ns
+            ) / 1_000_000.0
+            schedule_lateness_ms = max(
+                0.0,
+                (send_timing.submitted_at_ns - next_output_deadline_ns) / 1_000_000.0,
+            )
+            schedule_late = schedule_lateness_ms > 1.0
+            new_frame_service_ms: float | None = None
+            new_frame_serialized_loop_ms: float | None = None
+            serialized_deadline_missed = False
+            if processed:
+                new_frame_service_ms = max(
+                    0.0,
+                    (send_timing.submitted_at_ns - service_started_ns) / 1_000_000.0,
+                )
+                new_frame_serialized_loop_ms = max(
+                    0.0,
+                    (send_timing.completed_at_ns - serialized_started_ns) / 1_000_000.0,
+                )
+                serialized_deadline_missed = (
+                    new_frame_serialized_loop_ms > frame_interval_ms + 1.0
+                )
+
+            cadence_tracker.record_send(
+                sent_at_ns=send_timing.submitted_at_ns,
+                capture_sequence=(captured.sequence if captured is not None else None),
+                captured_at_ns=(
+                    captured.captured_at_ns if captured is not None else None
+                ),
+                base_ready_at_ns=base_ready_at_ns,
+                base_updated=processed,
+                segmentation_updated=segmentation_updated,
+                exact_final_repeat=exact_final_repeat,
+                processing_deadline_missed=processing_deadline_missed,
+                serialized_new_frame_deadline_missed=serialized_deadline_missed,
+                output_sink_pacing_events=send_timing.pacing_events,
+                output_sink_recovery_events=send_timing.recovery_events,
+                application_pacing_events=application_pacing_events,
+                output_schedule_late=schedule_late,
+            )
+            if processed and mode == "remote":
+                if used_remote_candidate:
+                    remote_used += 1
+                elif fallback_active:
+                    fallback_count += 1
+            # Preserve the legacy total-loop pacing contract: a fast cycle
+            # waits only for its remaining budget, while an over-budget cycle
+            # starts the next capture immediately instead of adding a full
+            # interval of avoidable delay. The wait is carried to the top of
+            # the next cycle so capture is sampled after, never before, pacing.
+            next_cycle_start_ns = service_started_ns + frame_interval_ns
+            next_output_deadline_ns = send_timing.submitted_at_ns + frame_interval_ns
             last_output = out_frame
 
-            send_started = time.monotonic_ns()
-            resources.output.send(out_frame.copy() if mode == "remote" else out_frame)
-            sent_monotonic_ns = time.monotonic_ns()
-            output_send_ms = (sent_monotonic_ns - send_started) / 1_000_000.0
             if matte_evidence is not None:
                 matte_evidence.timings_ms["output_send_ms"] = output_send_ms
+                matte_evidence.timings_ms["guard_output_validation_ms"] = (
+                    guard_output_validation_ms
+                )
+                matte_evidence.timings_ms["output_submission_ms"] = (
+                    send_timing.submission_ms
+                )
+                matte_evidence.timings_ms["output_sink_pacing_wait_ms"] = (
+                    send_timing.pacing_wait_ms
+                )
+                matte_evidence.timings_ms["application_pacing_wait_ms"] = (
+                    application_pacing_wait_ms
+                )
+                matte_evidence.timings_ms["output_schedule_lateness_ms"] = (
+                    schedule_lateness_ms
+                )
+                if new_frame_service_ms is not None:
+                    matte_evidence.timings_ms["new_frame_service_ms"] = (
+                        new_frame_service_ms
+                    )
+                if new_frame_serialized_loop_ms is not None:
+                    matte_evidence.timings_ms["new_frame_serialized_loop_ms"] = (
+                        new_frame_serialized_loop_ms
+                    )
                 if diagnostic_frame_started_ns is not None:
                     matte_evidence.timings_ms["frame_total_ms"] = (
-                        sent_monotonic_ns - diagnostic_frame_started_ns
+                        send_timing.completed_at_ns - diagnostic_frame_started_ns
                     ) / 1_000_000.0
                 rss_bytes = process_rss_bytes()
                 if rss_bytes is not None:
@@ -4457,30 +5165,40 @@ class Pipeline:
             recorder = self._matte_recorder
             if recorder is not None and self._matte_last_source_sequence is not None:
                 recorder.submit_output_event(
-                    sent_monotonic_ns=sent_monotonic_ns,
+                    sent_monotonic_ns=send_timing.submitted_at_ns,
                     source_bundle_sequence=self._matte_last_source_sequence,
-                    base_updated=processed and matte_evidence is not None,
-                    exact_final_repeat=not processed,
+                    base_updated=processed,
+                    exact_final_repeat=exact_final_repeat,
                 )
             stage_ewma["output_send_ms"] = _ewma(
                 stage_ewma["output_send_ms"], output_send_ms
             )
-            frames_out += 1
-
-            now = time.monotonic()
-            fps_window.append(now)
-            while fps_window and now - fps_window[0] > 2.0:
-                fps_window.popleft()
-            if len(fps_window) >= 2:
-                span = fps_window[-1] - fps_window[0]
-                measured_fps = (len(fps_window) - 1) / span if span > 0 else 0.0
-            else:
-                measured_fps = 0.0
-            attainment = (
-                min(100.0, measured_fps / resources.cfg.output.fps * 100.0)
-                if len(fps_window) >= 2
-                else None
+            stage_ewma["output_submission_ms"] = _ewma(
+                stage_ewma["output_submission_ms"],
+                send_timing.submission_ms,
             )
+            stage_ewma["output_sink_pacing_wait_ms"] = _ewma(
+                stage_ewma["output_sink_pacing_wait_ms"],
+                send_timing.pacing_wait_ms,
+            )
+            stage_ewma["application_pacing_wait_ms"] = _ewma(
+                stage_ewma["application_pacing_wait_ms"],
+                application_pacing_wait_ms,
+            )
+            stage_ewma["output_schedule_lateness_ms"] = _ewma(
+                stage_ewma["output_schedule_lateness_ms"],
+                schedule_lateness_ms,
+            )
+            if new_frame_service_ms is not None:
+                stage_ewma["new_frame_service_ms"] = _ewma(
+                    stage_ewma["new_frame_service_ms"],
+                    new_frame_service_ms,
+                )
+            if new_frame_serialized_loop_ms is not None:
+                stage_ewma["new_frame_serialized_loop_ms"] = _ewma(
+                    stage_ewma["new_frame_serialized_loop_ms"],
+                    new_frame_serialized_loop_ms,
+                )
             capture_health = (
                 resources.capture.health_snapshot()
                 if hasattr(resources.capture, "health_snapshot")
@@ -4509,45 +5227,53 @@ class Pipeline:
             )
             frame_stats.update(
                 {
-                    "frames_in": frames_in,
-                    "frames_out": frames_out,
+                    **_cadence_status(
+                        cadence_tracker,
+                        now_ns=send_timing.completed_at_ns,
+                        target_output_fps=resources.cfg.output.fps,
+                    ),
+                    **_capture_health_stats(
+                        capture_health,
+                        fallback_frames_read=(
+                            cadence_tracker.snapshot(
+                                now_ns=send_timing.completed_at_ns
+                            ).unique_capture_count
+                        ),
+                    ),
                     "remote_frames_used": remote_used,
                     "remote_fallback_active": fallback_active,
                     "remote_fallback_count": fallback_count,
                     "remote_fallback_reason": fallback_reason,
-                    "fps": measured_fps,
-                    "output_effective_fps": measured_fps,
-                    "fps_attainment_pct": attainment,
-                    "output_repeated_frames": repeated_frames,
-                    "processing_deadline_misses": deadline_misses,
-                    "capture_fps": getattr(capture_health, "capture_fps", 0.0),
-                    "capture_target_met": getattr(capture_health, "target_met", None),
-                    "capture_frames_read": getattr(
-                        capture_health, "frames_read", frames_in
-                    ),
-                    "capture_dropped_frames": getattr(
-                        capture_health, "dropped_frames", 0
-                    ),
-                    "capture_read_failures": getattr(
-                        capture_health, "read_failures", 0
-                    ),
-                    "capture_restarts": getattr(capture_health, "restarts", 0),
-                    "capture_stalled": getattr(capture_health, "stalled", False),
-                    "capture_frame_age_ms": getattr(
-                        capture_health, "frame_age_ms", None
-                    ),
-                    "capture_read_ms": getattr(capture_health, "read_ms", None),
                     "segmentation_ms": stage_ewma["segmentation_ms"],
                     "background_ms": stage_ewma["background_ms"],
                     "color_correction_ms": stage_ewma["color_correction_ms"],
                     "composite_ms": stage_ewma["composite_ms"],
                     "output_send_ms": stage_ewma["output_send_ms"],
+                    "output_submission_ms": stage_ewma["output_submission_ms"],
+                    "output_sink_pacing_wait_ms": stage_ewma[
+                        "output_sink_pacing_wait_ms"
+                    ],
+                    "application_pacing_wait_ms": stage_ewma[
+                        "application_pacing_wait_ms"
+                    ],
+                    "output_schedule_lateness_ms": stage_ewma[
+                        "output_schedule_lateness_ms"
+                    ],
                     "frame_processing_ms": stage_ewma["frame_processing_ms"],
+                    "new_frame_service_ms": stage_ewma["new_frame_service_ms"],
+                    "new_frame_serialized_loop_ms": stage_ewma[
+                        "new_frame_serialized_loop_ms"
+                    ],
+                    "timing_schema_version": TIMING_SCHEMA_VERSION,
+                    "timing_ms": _timing_fields(
+                        stage_ewma,
+                        capture_health=capture_health,
+                        segmenter=resources.segmenter,
+                    ),
                 }
             )
             self.hub.publish_output(out_frame, stats=frame_stats)
-
-            if not resources.output.paces:
-                elapsed = time.monotonic() - loop_start
-                if elapsed < frame_interval:
-                    self._stop.wait(frame_interval - elapsed)
+            # Preflight status is installed before readiness. Waiting through
+            # one steady-state publication prevents startup callers from
+            # racing an already-sent preflight slot with their first command.
+            self._startup_done.set()

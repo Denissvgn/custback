@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -23,7 +24,13 @@ from custback.color import (
 )
 from custback.config import AppConfig, RuntimeConfig
 from custback.geometry import plan_transform
-from custback.hub import FrameHub, Stats
+from custback.hub import (
+    TIMING_FIELD_NAMES,
+    TIMING_SCHEMA_VERSION,
+    FrameHub,
+    PostBaseProvenance,
+    Stats,
+)
 from custback.pipeline import (
     Pipeline,
     _Resources,
@@ -446,9 +453,11 @@ def test_geometry_and_color_logs_are_transition_only_and_path_free(caplog):
 
 
 def test_status_model_and_openapi_schema_have_exact_hub_key_parity():
-    hub_keys = set(FrameHub().stats_dict())
+    hub_status = FrameHub().stats_dict()
+    hub_keys = set(hub_status)
     model_keys = set(_StatusResponse.model_fields)
-    schema_keys = set(_StatusResponse.model_json_schema()["properties"])
+    model_schema = _StatusResponse.model_json_schema()
+    schema_keys = set(model_schema["properties"])
     assert {
         "capture_sequence",
         "capture_sequence_gap_count",
@@ -457,8 +466,190 @@ def test_status_model_and_openapi_schema_have_exact_hub_key_parity():
         "matte_last_reset_reason",
     } <= hub_keys
     assert model_keys == schema_keys == hub_keys | {"native_ring"}
-    _StatusResponse.model_validate(
-        {**FrameHub().stats_dict(), "native_ring": "unsupported"}
+    assert set(model_schema["required"]) == schema_keys
+
+    timing_schema = model_schema["$defs"]["_TimingFieldsResponse"]
+    timing_keys = set(TIMING_FIELD_NAMES)
+    assert set(hub_status["timing_ms"]) == timing_keys
+    assert set(timing_schema["properties"]) == timing_keys
+    assert set(timing_schema["required"]) == timing_keys
+    assert timing_schema["additionalProperties"] is False
+
+    extensions = hub_status["extensions"]
+    assert set(extensions) == {"post_base"}
+    post_base = extensions["post_base"]
+    assert set(post_base) == {"schema", "version", "stages"}
+    assert post_base == {
+        "schema": "custback.post-base-cadence",
+        "version": 1,
+        "stages": [],
+    }
+    extensions_schema = model_schema["$defs"]["_StatusExtensionsResponse"]
+    assert set(extensions_schema["properties"]) == {"post_base"}
+    assert set(extensions_schema["required"]) == {"post_base"}
+    assert extensions_schema["additionalProperties"] is False
+    post_base_schema = model_schema["$defs"]["_PostBaseResponse"]
+    assert set(post_base_schema["properties"]) == {"schema", "version", "stages"}
+    assert set(post_base_schema["required"]) == {"schema", "version", "stages"}
+    assert post_base_schema["properties"]["stages"]["maxItems"] == 8
+    assert post_base_schema["additionalProperties"] is False
+    stage_fields = {
+        "namespace",
+        "update_count",
+        "update_fps",
+        "base_reuse_update_count",
+        "base_reuse_update_fps",
+    }
+    stage_schema = model_schema["$defs"]["_PostBaseStageResponse"]
+    assert set(stage_schema["properties"]) == stage_fields
+    assert set(stage_schema["required"]) == stage_fields
+    assert stage_schema["additionalProperties"] is False
+    _StatusResponse.model_validate({**hub_status, "native_ring": "unsupported"})
+
+
+def test_timing_registry_validates_exact_keys_bounds_and_copies_values():
+    hub = FrameHub()
+    timing = dict.fromkeys(TIMING_FIELD_NAMES)
+    timing["capture.read"] = 12.34567
+    timing["pipeline.new_frame_serialized_loop"] = 3_600_000
+
+    hub.update_stats(
+        timing_schema_version=TIMING_SCHEMA_VERSION,
+        timing_ms=timing,
+    )
+    timing["capture.read"] = 999.0
+    public = hub.stats_dict()
+    assert public["timing_schema_version"] == TIMING_SCHEMA_VERSION
+    assert public["timing_ms"]["capture.read"] == 12.346
+    assert public["timing_ms"]["pipeline.new_frame_serialized_loop"] == 3_600_000.0
+
+    public["timing_ms"]["capture.read"] = 777.0
+    assert hub.stats_dict()["timing_ms"]["capture.read"] == 12.346
+
+    missing = dict.fromkeys(TIMING_FIELD_NAMES)
+    missing.pop("capture.read")
+    with pytest.raises(ValueError, match="exactly"):
+        hub.update_stats(timing_ms=missing)
+    extra: dict[str, object] = {str(key): None for key in TIMING_FIELD_NAMES}
+    extra["private.stage"] = 1.0
+    with pytest.raises(ValueError, match="exactly"):
+        hub.update_stats(timing_ms=extra)
+    with pytest.raises(TypeError, match="mapping"):
+        hub.update_stats(timing_ms=[])
+    with pytest.raises(ValueError, match="timing_schema_version"):
+        hub.update_stats(timing_schema_version=TIMING_SCHEMA_VERSION + 1)
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        True,
+        -0.001,
+        float("nan"),
+        float("inf"),
+        3_600_000.001,
+        "12.3",
+    ],
+)
+def test_timing_registry_rejects_unbounded_or_non_numeric_samples(sample):
+    hub = FrameHub()
+    timing = dict.fromkeys(TIMING_FIELD_NAMES)
+    timing["capture.read"] = sample
+    with pytest.raises(ValueError, match="bounded nonnegative finite duration"):
+        hub.update_stats(timing_ms=timing)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("update_count", True),
+        ("update_count", -1),
+        ("update_count", 2**63),
+        ("base_reuse_update_count", 1.5),
+        ("update_fps", float("nan")),
+        ("update_fps", 10_000.001),
+        ("base_reuse_update_fps", True),
+    ],
+)
+def test_post_base_provenance_rejects_invalid_typed_values(field, value):
+    with pytest.raises(ValueError, match=f"post-base {field}"):
+        PostBaseProvenance(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "namespace",
+    ["", "Upper", "bad_name", "a" * 33, 3],
+)
+def test_post_base_provenance_rejects_invalid_namespaces(namespace):
+    with pytest.raises(ValueError, match="namespace"):
+        FrameHub().publish_post_base_provenance(namespace, PostBaseProvenance())
+
+
+def test_post_base_stage_limit_and_core_cadence_isolation():
+    hub = FrameHub()
+    hub.update_stats(
+        segmentation_update_count=11,
+        base_composite_update_count=10,
+        base_composite_reuse_count=4,
+        exact_final_output_repeat_count=3,
+        output_send_count=14,
+    )
+    core_fields = {
+        "segmentation_update_count",
+        "base_composite_update_count",
+        "base_composite_reuse_count",
+        "exact_final_output_repeat_count",
+        "output_send_count",
+    }
+    core_before = {key: hub.stats_dict()[key] for key in core_fields}
+
+    for index in range(8):
+        hub.publish_post_base_provenance(
+            f"stage-{index}",
+            PostBaseProvenance(
+                update_count=index,
+                update_fps=index + 0.12345,
+                base_reuse_update_count=index // 2,
+                base_reuse_update_fps=index / 3,
+            ),
+        )
+    hub.publish_post_base_provenance(
+        "stage-0",
+        PostBaseProvenance(update_count=99, update_fps=1.25),
+    )
+    with pytest.raises(ValueError, match="stage limit"):
+        hub.publish_post_base_provenance("stage-8", PostBaseProvenance())
+
+    with pytest.raises(TypeError, match="PostBaseProvenance"):
+        hub.publish_post_base_provenance(
+            "reaction",
+            cast(PostBaseProvenance, {"output_send_count": 999}),
+        )
+    with pytest.raises(KeyError, match="extensions"):
+        hub.update_stats(
+            extensions={
+                "post_base": {
+                    "stages": [{"namespace": "reaction", "output_send_count": 999}]
+                }
+            }
+        )
+
+    public = hub.stats_dict()
+    assert {key: public[key] for key in core_fields} == core_before
+    stages = public["extensions"]["post_base"]["stages"]
+    assert [stage["namespace"] for stage in stages] == [
+        f"stage-{index}" for index in range(8)
+    ]
+    assert stages[0] == {
+        "namespace": "stage-0",
+        "update_count": 99,
+        "update_fps": 1.25,
+        "base_reuse_update_count": 0,
+        "base_reuse_update_fps": 0.0,
+    }
+    stages[0]["update_count"] = 1_000
+    assert (
+        hub.stats_dict()["extensions"]["post_base"]["stages"][0]["update_count"] == 99
     )
 
 
@@ -538,7 +729,7 @@ def test_preview_hud_renders_geometry_color_and_confidence_warnings():
     assert warnings == ["COLOR CORRECTION STALE: decaying to identity"]
 
 
-def test_shutdown_summary_includes_geometry_and_correction_totals(caplog):
+def test_shutdown_summary_includes_geometry_correction_and_cadence_totals(caplog):
     hub = FrameHub()
     hub.update_stats(
         capture_generation=4,
@@ -548,9 +739,95 @@ def test_shutdown_summary_includes_geometry_and_correction_totals(caplog):
         color_correction_bypassed_frames=5,
         color_correction_scene_cuts=2,
         color_correction_transitions=6,
+        base_composite_update_count=541,
+        segmentation_update_count=541,
+        output_send_count=1105,
+        base_composite_reuse_count=564,
+        base_composite_reuse_ratio=564 / 1105,
+        exact_final_output_repeat_count=563,
+        capture_sequence_gap_count=3,
+        capture_missing_input_count=7,
+        capture_dropped_frames=9,
+        processing_deadline_misses=11,
+        serialized_new_frame_deadline_misses=13,
+        output_sink_pacing_events=17,
+        output_sink_recovery_events=19,
+        application_pacing_events=23,
+        output_schedule_late_events=29,
+        matte_reset_count=31,
+        matte_last_reset_reason="capture-gap",
     )
     with caplog.at_level("INFO", logger="custback"):
         _log_shutdown_summary(hub, "test", 0)
     assert "capture_generation=4 camera_geometry=3 background_geometry=2" in caplog.text
     assert "corrections_applied=11 corrections_bypassed=5" in caplog.text
     assert "color_scene_cuts=2 color_transitions=6" in caplog.text
+    assert (
+        "unique_updates=541 segmentation_updates=541 output_sends=1105" in caplog.text
+    )
+    assert "safe_base_reuses=564 safe_base_reuse_pct=51.0" in caplog.text
+    assert "exact_final_repeats=563 capture_gaps=3 capture_missing=7" in caplog.text
+    assert "capture_slot_overwrites=9 processing_deadline_misses=11" in caplog.text
+    assert "serialized_deadline_misses=13 sink_pacing_events=17" in caplog.text
+    assert "sink_recovery_events=19 application_pacing_events=23" in caplog.text
+    assert "schedule_late_events=29 matte_resets=31" in caplog.text
+    assert "matte_last_reset=capture-gap" in caplog.text
+
+
+def test_shutdown_summary_reports_backend_quality_and_effective_policy(caplog):
+    hub = FrameHub()
+    selection = {
+        "schema": "custback.backend-selection",
+        "version": 1,
+        "requested_backend": "auto",
+        "selected_backend": "rvm",
+        "quality_tier": "matting",
+        "selection_mode": "automatic",
+        "fallback_active": False,
+        "fallback_category": "none",
+        "fallback_reason": "",
+        "guidance": "",
+        "active_device": "cuda",
+        "active_provider": "cuda",
+        "attempts": [
+            {
+                "backend": "rvm",
+                "quality_tier": "matting",
+                "preparation_result": "ready",
+                "activation_result": "selected",
+                "reason_category": "none",
+                "reason": "",
+                "guidance": "",
+            },
+            {
+                "backend": "mediapipe",
+                "quality_tier": "segmentation",
+                "preparation_result": "ready",
+                "activation_result": "not-attempted",
+                "reason_category": "none",
+                "reason": "",
+                "guidance": "",
+            },
+        ],
+    }
+    matte_policy = hub.stats_dict()["matte_policy"]
+    matte_policy["selected_backend_kind"] = "true_alpha_recurrent"
+    matte_policy["backend_kind"] = "true_alpha_recurrent"
+    matte_policy["blend_space"] = "linear_srgb"
+    matte_policy["effective"]["rvm_downsample_ratio"] = 0.4
+    matte_policy["effective"]["raw_alpha_mode"] = "native_soft_alpha"
+    matte_policy["effective"]["residual_temporal_mode"] = "model_only"
+    matte_policy["effective"]["light_wrap"] = 0.1
+    hub.update_stats(
+        segmentation_selection=selection,
+        matte_policy=matte_policy,
+    )
+
+    with caplog.at_level("INFO", logger="custback"):
+        _log_shutdown_summary(hub, "test", 0)
+
+    assert "backend=auto->rvm tier=matting device=cuda provider=cuda" in caplog.text
+    assert "backend_fallback=False backend_fallback_category=none" in caplog.text
+    assert "rvm_ratio=0.4 alpha_policy=native_soft_alpha" in caplog.text
+    assert "temporal_policy=model_only light_wrap=0.1" in caplog.text
+    assert "blend_space=linear_srgb" in caplog.text

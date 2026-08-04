@@ -4,9 +4,9 @@ Persisted segmentation and compositing values describe configured intent.  The
 active backend can legitimately make some of those values effective, bypassed,
 or inapplicable.  This module is the single authority for that distinction.
 
-The complete snapshot is intentionally an internal runtime/evidence contract.
-MATTE-4.1 owns its eventual public status transport; callers may continue to
-project the existing flat compatibility fields from this snapshot meanwhile.
+The complete snapshot is the sole runtime/evidence policy contract. MATTE-4.1
+publishes that same path-free snapshot through the versioned status transport;
+the older flat status fields remain compatibility projections of it.
 """
 
 from __future__ import annotations

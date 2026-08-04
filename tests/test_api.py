@@ -39,7 +39,7 @@ from custback.api.security import SESSION_COOKIE, SecurityPolicy
 import custback.api.server as server_mod
 from custback.api.server import _UploadLimits, _UploadStore, create_app
 from custback.config import AppConfig, ConfigState, RuntimeConfig
-from custback.hub import FrameHub
+from custback.hub import TIMING_FIELD_NAMES, FrameHub, PostBaseProvenance
 from custback.pipeline import Pipeline
 
 
@@ -376,6 +376,199 @@ def test_status_and_config_with_bearer(stack):
     assert "token_file" not in config.json()["avatar"]
 
 
+def test_status_fails_closed_when_internal_policy_breaks_openapi(
+    stack,
+    monkeypatch,
+    caplog,
+):
+    private_detail = "/private/models/rvm.onnx"
+    body = stack.hub.stats_dict()
+    policy = cast(dict[str, Any], body["matte_policy"])
+    effective = cast(dict[str, Any], policy["effective"])
+    effective["raw_alpha_mode"] = private_detail
+    monkeypatch.setattr(stack.hub, "stats_dict", lambda: body)
+
+    with caplog.at_level("ERROR", logger="custback.api.server"):
+        response = stack.get("/status", headers=AUTH)
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "internal_error"
+    assert private_detail not in response.text
+    assert private_detail not in caplog.text
+    assert "public status failed schema validation" in caplog.text
+
+
+def test_status_openapi_matches_cadence_and_exposes_no_raw_timestamps_or_paths(
+    stack,
+):
+    stack.hub.publish_post_base_provenance(
+        "reaction",
+        PostBaseProvenance(
+            update_count=7,
+            update_fps=2.3456,
+            base_reuse_update_count=3,
+            base_reuse_update_fps=1.2345,
+        ),
+    )
+    response = stack.get("/status", headers=AUTH)
+    assert response.status_code == 200
+    body = response.json()
+    openapi = stack.get("/openapi.json", headers=AUTH).json()
+    schemas = openapi["components"]["schemas"]
+    status_schema = schemas["_StatusResponse"]
+
+    assert (
+        set(status_schema["properties"]) == set(status_schema["required"]) == set(body)
+    )
+    assert status_schema["properties"]["timing_schema_version"]["const"] == 1
+
+    selection = body["segmentation_selection"]
+    selection_schema = schemas["_SegmentationSelectionResponse"]
+    assert (
+        set(selection)
+        == set(selection_schema["properties"])
+        == set(selection_schema["required"])
+        == {
+            "schema",
+            "version",
+            "requested_backend",
+            "selected_backend",
+            "quality_tier",
+            "selection_mode",
+            "fallback_active",
+            "fallback_category",
+            "fallback_reason",
+            "guidance",
+            "active_device",
+            "active_provider",
+            "attempts",
+        }
+    )
+    assert selection_schema["additionalProperties"] is False
+    assert selection_schema["properties"]["schema"]["const"] == (
+        "custback.backend-selection"
+    )
+    assert selection_schema["properties"]["version"]["const"] == 1
+    assert selection_schema["properties"]["quality_tier"]["enum"] == [
+        "matting",
+        "segmentation",
+        "heuristic",
+        "none",
+    ]
+    assert selection_schema["properties"]["attempts"]["minItems"] == 1
+    assert selection_schema["properties"]["attempts"]["maxItems"] == 4
+    attempt_schema = schemas["_SegmentationSelectionAttemptResponse"]
+    assert (
+        set(selection["attempts"][0])
+        == set(attempt_schema["properties"])
+        == set(attempt_schema["required"])
+    )
+    assert attempt_schema["additionalProperties"] is False
+
+    matte_policy = body["matte_policy"]
+    matte_policy_schema = schemas["_MattePolicyResponse"]
+    assert (
+        set(matte_policy)
+        == set(matte_policy_schema["properties"])
+        == set(matte_policy_schema["required"])
+        == {
+            "schema",
+            "version",
+            "blend_space",
+            "selected_backend_kind",
+            "backend_kind",
+            "passthrough",
+            "experimental_rvm_generic",
+            "configured",
+            "effective",
+            "controls",
+        }
+    )
+    assert matte_policy_schema["additionalProperties"] is False
+    assert matte_policy_schema["properties"]["schema"]["const"] == (
+        "custback.matte-policy"
+    )
+    assert matte_policy_schema["properties"]["version"]["const"] == 1
+    assert set(matte_policy["configured"]) == set(
+        schemas["_MattePolicyConfiguredResponse"]["properties"]
+    )
+    assert set(matte_policy["effective"]) == set(
+        schemas["_MattePolicyEffectiveResponse"]["properties"]
+    )
+    assert set(matte_policy["controls"]) == set(
+        schemas["_MattePolicyControlsResponse"]["properties"]
+    )
+
+    timing_schema = schemas["_TimingFieldsResponse"]
+    timing_keys = set(TIMING_FIELD_NAMES)
+    assert set(body["timing_ms"]) == timing_keys
+    assert set(timing_schema["properties"]) == timing_keys
+    assert set(timing_schema["required"]) == timing_keys
+    assert timing_schema["additionalProperties"] is False
+
+    extensions_schema = schemas["_StatusExtensionsResponse"]
+    assert (
+        set(body["extensions"])
+        == set(extensions_schema["properties"])
+        == set(extensions_schema["required"])
+        == {"post_base"}
+    )
+    assert extensions_schema["additionalProperties"] is False
+
+    post_base = body["extensions"]["post_base"]
+    post_base_schema = schemas["_PostBaseResponse"]
+    assert (
+        set(post_base)
+        == set(post_base_schema["properties"])
+        == set(post_base_schema["required"])
+        == {"schema", "version", "stages"}
+    )
+    assert post_base_schema["properties"]["stages"]["maxItems"] == 8
+    assert post_base_schema["additionalProperties"] is False
+    assert post_base["schema"] == "custback.post-base-cadence"
+    assert post_base["version"] == 1
+
+    stage = post_base["stages"][0]
+    stage_schema = schemas["_PostBaseStageResponse"]
+    assert (
+        set(stage) == set(stage_schema["properties"]) == set(stage_schema["required"])
+    )
+    assert stage_schema["additionalProperties"] is False
+    assert stage == {
+        "namespace": "reaction",
+        "update_count": 7,
+        "update_fps": 2.346,
+        "base_reuse_update_count": 3,
+        "base_reuse_update_fps": 1.234,
+    }
+
+    def serialized_keys(value):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                yield key
+                yield from serialized_keys(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from serialized_keys(nested)
+
+    keys = set(serialized_keys(body))
+    assert {
+        "capture_timestamp_delta_p50_ms",
+        "capture_timestamp_delta_p95_ms",
+    } <= keys
+    assert {
+        "timestamp",
+        "timestamp_s",
+        "capture_timestamp_s",
+        "output_timestamp_s",
+        "monotonic_timestamp_s",
+        "started_at",
+        "path",
+    }.isdisjoint(keys)
+    assert not any(key.endswith("_path") for key in keys)
+    assert str(stack.upload_dir) not in response.text
+
+
 def test_public_config_exposes_only_backdrop_target_ids():
     secret_source = "/run/operator/private/camera-device"
     cfg = AppConfig.from_dict(
@@ -643,6 +836,31 @@ def test_unavailable_reconfiguration_is_standardized_503(stack, monkeypatch):
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "reconfiguration_unavailable"
     assert response.headers["x-config-version"] == "0"
+
+
+def test_backend_activation_error_does_not_disclose_private_exception(
+    stack,
+    monkeypatch,
+):
+    private_detail = "/private/models/rvm.onnx provider traceback"
+
+    def fail_segmenter(*_args, **_kwargs):
+        raise RuntimeError(private_detail)
+
+    monkeypatch.setattr("custback.pipeline.create_segmenter", fail_segmenter)
+    response = stack.patch(
+        "/config",
+        json={"segmentation": {"backend": "none"}},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "activation_failed",
+        "message": "candidate configuration could not be activated",
+    }
+    assert private_detail not in response.text
+    assert stack.runtime.version == 0
 
 
 def test_snapshot_returns_jpeg(stack):

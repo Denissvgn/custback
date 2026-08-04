@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -157,6 +158,10 @@ def test_full_bundle_round_trip_and_frozen_replay_are_exact(tmp_path):
     recorder.close()
 
     bundle = MatteReplayBundle(bundle_dir)
+    assert (
+        bundle.manifest_sha256
+        == hashlib.sha256((bundle_dir / "manifest.json").read_bytes()).hexdigest()
+    )
     assert [frame["sequence"] for frame in bundle.frames] == [0, 1]
     assert [frame["capture_sequence"] for frame in bundle.frames] == [10, 11]
     assert [frame["capture_monotonic_ns"] for frame in bundle.frames] == [

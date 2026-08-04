@@ -1,0 +1,34 @@
+{
+  "schema": "custback.native-capture-evidence",
+  "version": 1,
+  "device_identity_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DEVICE_IDENTITY",
+  "hardware_identity_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_HOST_IDENTITY",
+  "condition_id": "adequate_diffuse_light",
+  "hardware_verified": true,
+  "tool": {
+    "name": "REPLACE_NATIVE_TOOL",
+    "version": "REPLACE_TOOL_VERSION",
+    "capture_api": "REPLACE_CAPTURE_API"
+  },
+  "requested": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30.0,
+    "pixel_format": "mjpeg"
+  },
+  "delivered": {
+    "width": 1280,
+    "height": 720,
+    "pixel_format": "MJPG"
+  },
+  "timestamp_kind": "host-read-completion",
+  "one_uninterrupted_run": true,
+  "output_rate_conversion": false,
+  "camera_control_writes": false,
+  "completion_offsets_ms": [
+    0.0,
+    "REPLACE_WITH_EVERY_STRICTLY_INCREASING_HOST_COMPLETION_OFFSET",
+    "REPLACE_WITH_FINAL_OFFSET_AT_OR_AFTER_5000_MS"
+  ],
+  "failures": 0
+}
