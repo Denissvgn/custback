@@ -621,6 +621,7 @@ def run(
     security = None
     pipeline: Pipeline | None = None
     api_runner: _ApiRunner | None = None
+    matte_monitor = None
     try:
         if cfg.api.enabled:
             # Resolve token and validate the bind policy before activating hardware,
@@ -646,6 +647,10 @@ def run(
             if not available:
                 log.warning("preview disabled: %s", reason)
                 cfg.output.preview = False
+            else:
+                from .matte_live_diagnostics import LocalMatteDiagnosticMonitor
+
+                matte_monitor = LocalMatteDiagnosticMonitor()
 
         runtime = RuntimeConfig(cfg)
         if exit_code == 0 and not stop.is_set():
@@ -654,6 +659,7 @@ def run(
                 hub,
                 model_preparation=model_preparation,
                 matte_recorder=matte_recorder,
+                matte_monitor=matte_monitor,
             )
             try:
                 pipeline.start()
@@ -784,7 +790,13 @@ def run(
                     daemon=True,
                 )
                 watchdog.start()
-                user_quit = run_preview(runtime, hub, stop, coordinator=pipeline)
+                user_quit = run_preview(
+                    runtime,
+                    hub,
+                    stop,
+                    coordinator=pipeline,
+                    matte_monitor=matte_monitor,
+                )
                 failure_code, failure_reason = _classify_service_failure(
                     pipeline, api_runner
                 )
@@ -836,6 +848,8 @@ def run(
                     shutdown_reason = "pipeline-failure"
         elif matte_recorder is not None:
             matte_recorder.close()
+        if matte_monitor is not None:
+            matte_monitor.close()
         if api_runner is not None and getattr(api_runner, "failed", False):
             exit_code = EXIT_API
             shutdown_reason = "api-failure"

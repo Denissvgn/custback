@@ -1,8 +1,8 @@
-"""On-screen preview window for verifying the processed output locally.
+"""On-screen preview window for output and explicit local matte diagnosis.
 
-Shows exactly what the virtual camera sends, with keyboard controls to
-change background mode, cycle background files, and adjust blur strength
-live — the same knobs as `PATCH /config`, without leaving the window.
+The default view shows exactly what the virtual camera sends. The ``d`` key
+explicitly selects a private, pre-reaction diagnostic sink that is never
+published to the virtual camera, FrameHub, WebUI, or API.
 
 Must run on the main thread: OpenCV's GUI (highgui) requires that on macOS,
 so `run_preview` is called from `__main__.run()` in place of the idle wait
@@ -15,11 +15,13 @@ Controls (also drawn on screen as a hint bar):
   [ / ]       decrease / increase blur strength
   n / p       next / previous background file (image+video mode) or
               color preset (color mode)
+  d / D       next / previous local matte diagnostic view; cycles back to output
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -40,8 +42,14 @@ _QT_ENV_BEFORE_CV2 = {
 }
 
 from .backgrounds import DEFAULT_BACKGROUNDS_DIR, IMAGE_EXTS, list_background_files
+from .compositor import COMPOSITOR_SUBSTAGE_NAMES
 from .config import RuntimeConfig
 from .hub import FrameHub
+from .matte_live_diagnostics import (
+    LocalMatteDiagnosticFrame,
+    LocalMatteDiagnosticMonitor,
+    diagnostic_view_spec,
+)
 
 try:
     import cv2 as _cv2
@@ -59,6 +67,7 @@ QUIT_KEYS = (ord("q"), 27)  # q, ESC
 HELP_KEY = ord("h")
 NEXT_KEY, PREV_KEY = ord("n"), ord("p")
 BLUR_DOWN_KEY, BLUR_UP_KEY = ord("["), ord("]")
+DIAGNOSTIC_NEXT_KEY, DIAGNOSTIC_PREV_KEY = ord("d"), ord("D")
 MODE_KEYS = {
     ord("0"): "passthrough",
     ord("1"): "blur",
@@ -100,12 +109,13 @@ _HIGHGUI_PROBE = (
 
 HINT_LINE = (
     "[0-5] mode(passthru/blur/color/image/video/cam)  [n/p] file or color  "
-    "[ [ ] ] blur  [h] help  [q] quit"
+    "[ [ ] ] blur  [d/D] matte view  [h] help  [q] quit"
 )
 HELP_LINES = [
     "0 passthrough   1 blur   2 color   3 image   4 video   5 camera",
     "n / p    next / previous background file (image+video) or color preset",
     "[  /  ]  decrease / increase blur strength",
+    "d / D    next / previous LOCAL-ONLY pre-reaction matte view; cycles to output",
     "h        toggle this help",
     "q / ESC  quit",
 ]
@@ -420,10 +430,12 @@ class _PreviewController:
         runtime: RuntimeConfig,
         backgrounds_dir: Path | None,
         coordinator=None,
+        matte_monitor: LocalMatteDiagnosticMonitor | None = None,
     ):
         self.runtime = runtime
         self.backgrounds_dir = backgrounds_dir
         self.coordinator = coordinator
+        self.matte_monitor = matte_monitor
         self.show_help = False
         self._message: tuple[str, float] | None = None
 
@@ -445,9 +457,28 @@ class _PreviewController:
                 self._adjust_blur(-BLUR_STEP if key == BLUR_DOWN_KEY else BLUR_STEP)
             elif key in (NEXT_KEY, PREV_KEY):
                 self._cycle(+1 if key == NEXT_KEY else -1)
+            elif key in (DIAGNOSTIC_NEXT_KEY, DIAGNOSTIC_PREV_KEY):
+                self._cycle_diagnostic(reverse=key == DIAGNOSTIC_PREV_KEY)
         except Exception as exc:
             log.warning("preview config update rejected: %s", exc)
             self.flash(f"change rejected: {exc}")
+
+    @property
+    def diagnostic_view(self) -> str | None:
+        monitor = self.matte_monitor
+        return None if monitor is None else monitor.selected_view
+
+    def _cycle_diagnostic(self, *, reverse: bool) -> None:
+        monitor = self.matte_monitor
+        if monitor is None:
+            self.flash("local matte diagnostics are unavailable")
+            return
+        view = monitor.select_next(reverse=reverse)
+        if view is None:
+            self.flash("matte diagnostics off — showing production output")
+            return
+        spec = diagnostic_view_spec(view)
+        self.flash(f"LOCAL matte view -> {spec.label}")
 
     def _update(self, patch: dict) -> None:
         if self.coordinator is None or not hasattr(
@@ -526,6 +557,14 @@ def _as_float(value: object) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number >= 0 else None
+
+
+def _signed_metric_text(value: object) -> str:
+    try:
+        number = float(cast(Any, value))
+    except (TypeError, ValueError, OverflowError):
+        return "n/a"
+    return f"{number:.4f}" if math.isfinite(number) else "n/a"
 
 
 def _as_int(value: object) -> int | None:
@@ -749,6 +788,140 @@ def _status_overlay_lines(
     return status, warnings
 
 
+def _metric_text(value: object, *, scale: float = 1.0, suffix: str = "") -> str:
+    number = _as_float(value)
+    return "n/a" if number is None else f"{number * scale:.4f}{suffix}"
+
+
+def _timing_text(values: Mapping[str, object], name: str) -> str:
+    value = _as_float(values.get(name))
+    return "n/a" if value is None else f"{value:.2f}"
+
+
+def _diagnostic_overlay_lines(
+    diagnostic: LocalMatteDiagnosticFrame | None,
+    *,
+    selected_view: str | None,
+    stats: Mapping[str, object],
+) -> tuple[list[str], list[str]]:
+    """Build frame-local lines while reusing public policy/status semantics."""
+
+    if selected_view is None:
+        return [], []
+    if diagnostic is None or diagnostic.view != selected_view:
+        label = (
+            diagnostic_view_spec(cast(Any, selected_view)).label
+            if selected_view
+            else "diagnostic"
+        )
+        return (
+            [f"LOCAL MATTE DIAGNOSTIC — {label} — waiting for a unique input"],
+            [],
+        )
+
+    temporal = diagnostic.temporal.to_dict()
+    sequence_delta = temporal["capture_sequence_delta"]
+    timestamp_delta = temporal["capture_timestamp_delta_ms"]
+    delta_text = "n/a" if sequence_delta is None else str(sequence_delta)
+    timestamp_delta_value = _as_float(timestamp_delta)
+    dt_text = (
+        "n/a" if timestamp_delta_value is None else f"{timestamp_delta_value:.2f} ms"
+    )
+    lines = [
+        "LOCAL MATTE DIAGNOSTIC — "
+        f"{diagnostic.label} — PRE-REACTION / NEVER SENT TO OUTPUT",
+        f"INPUT seq {diagnostic.capture_sequence}  delta {delta_text}  "
+        f"dt {dt_text}  history {temporal['history_state']}",
+        "TEMP ALPHA raw "
+        f"{_metric_text(temporal['raw_alpha_abs_diff'])} "
+        f"(registered "
+        f"{_metric_text(temporal['raw_alpha_compensated_abs_diff'])})  "
+        "refined "
+        f"{_metric_text(temporal['refined_alpha_abs_diff'])} "
+        f"(registered "
+        f"{_metric_text(temporal['refined_alpha_compensated_abs_diff'])})",
+        "TEMP EDGE downstream contribution RGB "
+        f"{_metric_text(temporal['edge_colour_abs_diff'])}  "
+        f"state {temporal['edge_colour_state']}",
+        f"REGISTRATION {temporal['registration_state']} "
+        f"dx {_signed_metric_text(temporal['registration_dx_px'])} "
+        f"dy {_signed_metric_text(temporal['registration_dy_px'])} "
+        f"response {_metric_text(temporal['registration_response'])} "
+        f"overlap {_metric_text(temporal['registration_overlap_fraction'])}",
+    ]
+
+    raw_policy = stats.get("matte_policy")
+    policy = raw_policy if isinstance(raw_policy, Mapping) else {}
+    raw_effective = policy.get("effective")
+    effective = raw_effective if isinstance(raw_effective, Mapping) else {}
+    ratio = effective.get("rvm_downsample_ratio")
+    ratio_text = "n/a" if ratio is None else _metric_text(ratio)
+    lines.append(
+        "EFFECTIVE "
+        f"RVM ratio {ratio_text}  shift {effective.get('mask_shift', 'n/a')}  "
+        "model foreground "
+        f"{'on' if effective.get('use_model_foreground') is True else 'off'}  "
+        f"wrap {_metric_text(effective.get('light_wrap'))}  "
+        f"blend {policy.get('blend_space', 'unknown')}"
+    )
+    lines.append(
+        "RESET count "
+        f"{stats.get('matte_reset_count', 0)}  reason "
+        f"{stats.get('matte_last_reset_reason') or 'none'}"
+    )
+
+    frame_timings = diagnostic.timings_ms
+    lines.append(
+        "FRAME SEG ms "
+        f"backend {_timing_text(frame_timings, 'backend_inference_ms')}  "
+        f"RVM-pre {_timing_text(frame_timings, 'rvm_preprocess_ms')}  "
+        f"RVM-run {_timing_text(frame_timings, 'rvm_session_run_ms')}  "
+        f"RVM-post {_timing_text(frame_timings, 'rvm_postprocess_ms')}  "
+        f"refine {_timing_text(frame_timings, 'refinement_ms')}  "
+        f"total {_timing_text(frame_timings, 'segmentation_ms')}"
+    )
+    lines.append(
+        "FRAME COMPOSITOR ms "
+        f"background {_timing_text(frame_timings, 'background_ms')}  "
+        f"color {_timing_text(frame_timings, 'color_correction_ms')}  "
+        f"prepare {_timing_text(frame_timings, 'composite_prepare_ms')}  "
+        f"blend {_timing_text(frame_timings, 'composite_blend_ms')}  "
+        f"total {_timing_text(frame_timings, 'composite_ms')}  "
+        "validate "
+        f"{_timing_text(frame_timings, 'post_composite_validation_ms')}"
+    )
+    raw_public_timing = stats.get("timing_ms")
+    public_timing = raw_public_timing if isinstance(raw_public_timing, Mapping) else {}
+    lines.append(
+        "PUBLIC EWMA ms "
+        f"seg {_timing_text(public_timing, 'segmentation.total')}  "
+        f"compositor {_timing_text(public_timing, 'compositor.total')}  "
+        f"new-frame {_timing_text(public_timing, 'pipeline.new_frame_service')}"
+    )
+    substages = diagnostic.compositor_substages_ms
+    for offset in range(0, len(COMPOSITOR_SUBSTAGE_NAMES), 4):
+        names = COMPOSITOR_SUBSTAGE_NAMES[offset : offset + 4]
+        lines.append(
+            "COMPOSITOR SUBSTAGES ms "
+            + "  ".join(
+                f"{name.replace('_', '-')} {_timing_text(substages, name)}"
+                for name in names
+            )
+        )
+    warnings = []
+    if not diagnostic.available:
+        warnings.append(
+            "VIEW UNAVAILABLE: "
+            + (diagnostic.unavailable_reason or "required evidence is absent")
+        )
+    elif "proxy" in diagnostic.interpretation:
+        warnings.append(
+            "NON-AUTHORITATIVE LIVE PROXY — use private replay annotations "
+            "for qualification"
+        )
+    return lines, warnings
+
+
 def _draw_bar(
     frame,
     y0: int,
@@ -774,11 +947,23 @@ def _draw_bar(
         )
 
 
-def _draw_overlay(frame, stats: dict, controller: _PreviewController):
+def _draw_overlay(
+    frame,
+    stats: dict,
+    controller: _PreviewController,
+    diagnostic: LocalMatteDiagnosticFrame | None = None,
+):
     labeled = frame.copy()
     h, _w = labeled.shape[:2]
 
     status_lines, warning_lines = _status_overlay_lines(stats)
+    diagnostic_lines, diagnostic_warnings = _diagnostic_overlay_lines(
+        diagnostic,
+        selected_view=controller.diagnostic_view,
+        stats=stats,
+    )
+    status_lines = diagnostic_lines + status_lines
+    warning_lines = diagnostic_warnings + warning_lines
     top_lines = status_lines + warning_lines
     top_h = 22 * len(top_lines) + 12
     colors = [(0, 255, 0)] + [(255, 255, 255)] * (len(status_lines) - 1)
@@ -808,6 +993,7 @@ def run_preview(
     stop: threading.Event,
     backgrounds_dir: Path | None = None,
     coordinator=None,
+    matte_monitor: LocalMatteDiagnosticMonitor | None = None,
 ) -> bool:
     """Display output frames with interactive controls until `stop` is set
     or the user quits.
@@ -819,12 +1005,16 @@ def run_preview(
     the local exception guard remains for failures after that probe.
     """
     if cv2 is None:
+        if matte_monitor is not None:
+            matte_monitor.deactivate()
         log.warning("opencv-python not installed; preview disabled")
         return False
 
     try:
         _named_window_with_filtered_qt_stderr()
     except cv2.error as exc:
+        if matte_monitor is not None:
+            matte_monitor.deactivate()
         log.warning("no GUI available, preview disabled (%s)", exc)
         return False
 
@@ -832,16 +1022,62 @@ def run_preview(
         runtime,
         backgrounds_dir or DEFAULT_BACKGROUNDS_DIR,
         coordinator=coordinator,
+        matte_monitor=matte_monitor,
     )
-    log.info("preview window open — press h for controls, q or ESC to quit")
-    seq = -1
+    log.info(
+        "preview window open — press h for controls, d for local matte views, "
+        "q or ESC to quit"
+    )
+    output_sequence = -1
+    diagnostic_sequence = -1
+    last_output = None
+    last_diagnostic: LocalMatteDiagnosticFrame | None = None
     user_quit = False
     try:
         while not stop.is_set():
-            frame, seq = hub.output.get(seq, timeout=0.2)
+            frame = None
+            selected_view = controller.diagnostic_view
+            if selected_view is None or (
+                last_diagnostic is not None and last_diagnostic.view != selected_view
+            ):
+                last_diagnostic = None
+            diagnostic = None
+            if selected_view is not None and matte_monitor is not None:
+                diagnostic, diagnostic_sequence = matte_monitor.get(
+                    diagnostic_sequence,
+                    timeout=0.05,
+                )
+                if diagnostic is not None:
+                    last_diagnostic = diagnostic
+                elif (
+                    last_diagnostic is not None
+                    and last_diagnostic.view == selected_view
+                ):
+                    diagnostic = last_diagnostic
+                frame = diagnostic.pixels if diagnostic is not None else last_output
+            else:
+                new_output, output_sequence = hub.output.get(
+                    output_sequence,
+                    timeout=0.2,
+                )
+                if new_output is not None:
+                    last_output = new_output
+                frame = last_output
+                diagnostic = None
             if frame is not None:
+                stats = (
+                    dict(diagnostic.status)
+                    if diagnostic is not None
+                    else hub.stats_dict()
+                )
                 cv2.imshow(
-                    WINDOW_TITLE, _draw_overlay(frame, hub.stats_dict(), controller)
+                    WINDOW_TITLE,
+                    _draw_overlay(
+                        frame,
+                        stats,
+                        controller,
+                        diagnostic=diagnostic,
+                    ),
                 )
             # waitKey pumps the GUI event loop; required even without frames.
             key = cv2.waitKey(1) & 0xFF
@@ -856,6 +1092,8 @@ def run_preview(
     except cv2.error as exc:
         log.warning("preview disabled after a display failure: %s", exc)
     finally:
+        if matte_monitor is not None:
+            matte_monitor.deactivate()
         if user_quit:
             stop.set()
         try:

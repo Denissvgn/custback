@@ -215,6 +215,46 @@ raw exceptions, or frame timestamps. Older version-1 bundles without the
 nested snapshot remain valid and continue to use their recorded compatibility
 controls.
 
+## Operator controls and evidence-gated presets
+
+The quality panel consumes the active `segmentation_selection` and
+`matte_policy.controls` objects rather than guessing from the configured
+`segmentation.backend`. This matters when `auto` falls back, while RVM is still
+resolving its automatic ratio, and when passthrough makes an otherwise
+constructed backend inapplicable. The panel uses a policy snapshot only when
+its `config_version` matches the configuration being displayed; controls remain
+disabled with a synchronization explanation between activation and the next
+current status sample. Configuration bodies are paired with their
+`X-Config-Version` response header, and an older asynchronous refresh cannot
+replace a newer committed browser snapshot.
+
+Each advanced control shows configured and effective values. A control is
+editable when its state is `effective`, or when it is `bypassed` specifically
+because its supported value is `configured-off`. Backend-neutralized,
+superseded, and `inapplicable` controls remain visible but disabled with a
+plain-language explanation. The MediaPipe delegate is enabled only when the
+actual selected matte path is MediaPipe. Segmentation controls are marked as
+rebuild/reset changes; model-foreground and light-wrap values remain live
+compositor changes.
+
+The WebUI contains a version-1 preset catalog, but it is intentionally empty.
+The checked-in MATTE-2.5 evidence selects no portable profiles:
+
+```text
+performance = unavailable
+balanced = unavailable
+quality = unavailable
+```
+
+The panel therefore reports `Custom` and disables those three names instead of
+turning generated proxy evidence into product claims. A future qualified
+catalog entry must set the catalog evidence state to `qualified` and contain
+one non-empty concrete merge patch; definitions otherwise remain inert. The UI
+submits that patch through the existing single transactional `PATCH /config`
+path, so candidate staging, config-versioning, commit, and rollback remain the
+same as manual multi-field activation. A preset name is not persisted
+separately and cannot drift away from its expanded values.
+
 ## Transactional activation
 
 Backend and segmentation-policy changes continue to use the existing staged

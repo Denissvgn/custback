@@ -66,6 +66,10 @@ def test_page_targets_both_control_planes():
         '"/avatar/rigs/" + encodeURIComponent(rig.name)',
     ):
         assert operation in WEBUI_HTML, operation
+    # Matte silhouettes remain native-preview-only. The remotely bindable
+    # management page must never acquire a mask image route by accident.
+    assert "/video/matte" not in WEBUI_HTML
+    assert "/diagnostics/matte" not in WEBUI_HTML
 
 
 def test_every_scripted_element_id_exists_in_the_markup():
@@ -188,14 +192,95 @@ def test_polling_and_external_refreshes_are_race_guarded():
     assert "state.avatarStatusOutage = true" in WEBUI_HTML
     assert "const recovering = state.avatarStatusOutage" in WEBUI_HTML
     assert "state.avatarStatusOutage = false" in WEBUI_HTML
-    assert (
-        "loadCore().then(() => {\n        state.coreVersion = observedVersion"
-        in WEBUI_HTML
-    )
+    assert "const snapshot = await loadCoreConfig();" in WEBUI_HTML
+    assert "if (snapshot.version < state.coreVersion) return false;" in WEBUI_HTML
+    assert "state.coreVersion = snapshot.version;" in WEBUI_HTML
+    assert "refreshCoreConfig().then(() => {\n        renderAll();" in WEBUI_HTML
     assert "loadAvatar().then((loaded) => {\n        if (!loaded) return;" in WEBUI_HTML
     assert "state.avatarVersion = observedVersion" in WEBUI_HTML
     assert "status.run_id !== state.runId" in WEBUI_HTML
     assert "location.reload();" in WEBUI_HTML
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_core_config_refresh_keeps_body_version_pair_and_rejects_stale_completion():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    loader = (
+        "async function loadCoreConfig"
+        + script.split("async function loadCoreConfig", 1)[1].split(
+            "async function loadAvatar", 1
+        )[0]
+    )
+    harness = r"""
+class ApiError extends Error {
+  constructor(status, code, message) {
+    super(message); this.status = status; this.code = code;
+  }
+}
+function plainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+const state = {
+  core: {value: "initial"},
+  coreVersion: 1,
+  coreFiles: {files: []},
+};
+let nextConfig;
+let backgroundsFail = false;
+async function api(method, path, body, contentType, responseInfo) {
+  if (path === "/config") {
+    const snapshot = await nextConfig;
+    responseInfo.configVersion = snapshot.version;
+    return snapshot.config;
+  }
+  if (path === "/backgrounds" && backgroundsFail) throw new Error("files failed");
+  return {files: ["ok"]};
+}
+let resolveOld;
+nextConfig = new Promise((resolve) => { resolveOld = resolve; });
+const oldRefresh = refreshCoreConfig();
+commitCoreSnapshot({config: {value: "new patch"}, version: 4});
+resolveOld({config: {value: "old GET"}, version: 3});
+(async () => {
+  await oldRefresh;
+  const afterOld = {value: state.core.value, version: state.coreVersion};
+
+  backgroundsFail = true;
+  nextConfig = Promise.resolve({config: {value: "new GET"}, version: 5});
+  let filesFailed = false;
+  try { await loadCore(); } catch (err) { filesFailed = true; }
+  const afterFilesFailure = {
+    value: state.core.value, version: state.coreVersion, filesFailed,
+  };
+
+  nextConfig = Promise.resolve({config: {value: "unversioned"}, version: null});
+  let invalidCode = "";
+  try { await loadCoreConfig(); } catch (err) { invalidCode = err.code; }
+  process.stdout.write(JSON.stringify({
+    afterOld, afterFilesFailure, invalidCode,
+  }));
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+    result = subprocess.run(
+        ["node"],
+        input=loader + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    assert values == {
+        "afterOld": {"value": "new patch", "version": 4},
+        "afterFilesFailure": {
+            "value": "new GET",
+            "version": 5,
+            "filesFailed": True,
+        },
+        "invalidCode": "invalid_response",
+    }
+    assert 'response.headers.get("x-config-version")' in script
+    assert "responseInfo.configVersion = Number.isSafeInteger" in script
 
 
 def test_interface_exposes_the_existing_user_controls():
@@ -353,11 +438,10 @@ def test_core_control_failure_restores_effective_config():
         "async function patchAvatar", 1
     )[0]
     assert "[409, 422, 503].includes(err.status)" in helper
-    assert 'state.core = await api("GET", "/config")' in helper
+    assert "const snapshot = await loadCoreConfig();" in helper
+    assert "commitCoreSnapshot(snapshot);" in helper
     assert "renderAll();" in helper
-    assert helper.index('state.core = await api("GET", "/config")') < helper.index(
-        "renderAll();"
-    )
+    assert helper.index("commitCoreSnapshot(snapshot);") < helper.index("renderAll();")
     assert helper.index("renderAll();") < helper.index("throw err;")
 
     quality = script.split("// -- camera quality", 1)[1].split(
@@ -365,6 +449,498 @@ def test_core_control_failure_restores_effective_config():
     )[0]
     assert "patchCore(" not in quality
     assert quality.count("patchCoreControl(") >= 10
+
+
+def test_matte_presets_are_versioned_evidence_gated_and_atomic():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    quality = script.split("// -- camera quality", 1)[1].split(
+        "// -- diagnostics and safe runtime settings", 1
+    )[0]
+
+    assert 'schema: "custback.matte-quality-presets"' in script
+    assert "version: 1" in script
+    assert 'evidenceStatus: "not_qualified"' in script
+    assert "presets: Object.freeze({})" in script
+    assert "checked-in evidence has not qualified portable model-backed profiles" in (
+        script
+    )
+    for name in ("performance", "balanced", "quality"):
+        button = re.search(
+            rf'<button[^>]+data-quality-preset="{name}"[^>]*>', WEBUI_HTML
+        )
+        assert button is not None
+        assert "disabled" in button.group()
+        assert f">{name.title()}<" in WEBUI_HTML
+    assert 'data-quality-preset="custom"' in WEBUI_HTML
+    assert 'id="quality-preset-help" role="status"' in WEBUI_HTML
+
+    # A future qualified definition expands to one detached concrete patch and
+    # uses the same atomic activation/rollback helper as individual controls.
+    assert "return JSON.parse(JSON.stringify(definition.patch));" in quality
+    assert 'withBusy(button, "Applying…", () => patchCoreControl(patch))' in quality
+    assert 'api("PATCH", "/config"' not in quality
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_matte_preset_expansion_matches_concrete_values_without_alias_state():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    helpers = (
+        "function plainObject"
+        + script.split("function plainObject", 1)[1].split(
+            "function renderQualityPresets", 1
+        )[0]
+    )
+    harness = r"""
+const MATTE_PRESET_NAMES = ["performance", "balanced", "quality"];
+const catalog = {
+  schema: "custback.matte-quality-presets",
+  version: 1,
+  evidenceStatus: "qualified",
+  presets: {
+    balanced: {patch: {
+      segmentation: {rvm_downsample: 0.5, mask_shift: 0},
+      compositing: {light_wrap: 0.1},
+    }},
+  },
+};
+const config = {
+  segmentation: {backend: "auto", rvm_downsample: 0.5, mask_shift: 0},
+  compositing: {light_wrap: 0.1, use_model_foreground: true},
+};
+const patch = qualityPresetPatch("balanced", catalog);
+patch.segmentation.rvm_downsample = 0.9;
+process.stdout.write(JSON.stringify({
+  detached: catalog.presets.balanced.patch.segmentation.rvm_downsample,
+  matched: matchingQualityPreset(config, catalog),
+  custom: matchingQualityPreset({...config,
+    segmentation: {...config.segmentation, rvm_downsample: 0.4}}, catalog),
+  badVersion: qualityPresetPatch("balanced", {...catalog, version: 2}),
+  badEvidence: qualityPresetPatch("balanced",
+    {...catalog, evidenceStatus: "not_qualified"}),
+}));
+"""
+    result = subprocess.run(
+        ["node"],
+        input="const MATTE_PRESET_CATALOG = {};\n" + helpers + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    assert values == {
+        "detached": 0.5,
+        "matched": "balanced",
+        "custom": "custom",
+        "badVersion": None,
+        "badEvidence": None,
+    }
+
+
+def test_matte_controls_expose_runtime_truth_and_lifecycle():
+    for element_id in (
+        "quality-runtime",
+        "quality-backend-policy",
+        "quality-delegate-policy",
+        "quality-threshold-policy",
+        "quality-rvm-downsample-policy",
+        "quality-mask-blur-policy",
+        "quality-mask-shift-policy",
+        "quality-smoothing-policy",
+        "quality-light-wrap-policy",
+        "quality-edge-refine-policy",
+        "quality-model-foreground-policy",
+    ):
+        assert f'id="{element_id}"' in WEBUI_HTML
+    for element_id in (
+        "quality-delegate",
+        "quality-threshold",
+        "quality-rvm-downsample",
+        "quality-mask-blur",
+        "quality-mask-shift",
+        "quality-smoothing",
+        "quality-light-wrap",
+        "quality-edge-refine",
+        "quality-model-foreground",
+    ):
+        control = re.search(
+            rf'<(?:input|select)[^>]+id="{element_id}"[^>]*>', WEBUI_HTML
+        )
+        assert control is not None
+        assert "disabled" in control.group()
+
+    assert "<summary>Advanced matte controls</summary>" in WEBUI_HTML
+    assert WEBUI_HTML.count("Rebuild + reset") >= 7
+    assert "applies live without a matte reset" in WEBUI_HTML.lower()
+    assert "configured " in WEBUI_HTML
+    assert "effective " in WEBUI_HTML
+
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    quality = script.split("// -- camera quality", 1)[1].split(
+        "// -- diagnostics and safe runtime settings", 1
+    )[0]
+    for key in (
+        "segmentation_selection",
+        "matte_policy",
+        "qualityTier",
+        "activeDevice",
+        "activeProvider",
+        "segmentation_update_fps",
+        "base_composite_update_fps",
+        "cadence_mismatch_active",
+    ):
+        assert key in script
+    for element_id, policy_key in (
+        ("quality-threshold", "threshold"),
+        ("quality-rvm-downsample", "rvm_downsample_ratio"),
+        ("quality-mask-blur", "mask_blur"),
+        ("quality-mask-shift", "mask_shift"),
+        ("quality-smoothing", "temporal_smoothing"),
+        ("quality-light-wrap", "light_wrap"),
+        ("quality-edge-refine", "edge_refine"),
+        ("quality-model-foreground", "use_model_foreground"),
+    ):
+        assert f'["{element_id}", "{policy_key}"' in quality
+    assert "status.config_version !== configVersion" in quality
+    assert 'policy.backend_kind !== "null_passthrough"' in quality
+    assert 'selection.selectedBackend.toLowerCase() === "mediapipe"' in quality
+    assert "renderMatteQualityRuntime();" in quality
+    assert "renderMatteControlPolicy();" in quality
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_backend_aware_matte_control_matrix_and_stale_status_gate():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    plain_object = (
+        "function plainObject"
+        + script.split("function plainObject", 1)[1].split(
+            "function qualityPresetPatch", 1
+        )[0]
+    )
+    policy = (
+        "function currentMattePolicy"
+        + script.split("function currentMattePolicy", 1)[1].split(
+            "function updateFpsText", 1
+        )[0]
+    )
+    harness = r"""
+const ids = [
+  "quality-threshold", "quality-rvm-downsample", "quality-mask-blur",
+  "quality-mask-shift", "quality-smoothing", "quality-light-wrap",
+  "quality-edge-refine", "quality-model-foreground",
+];
+const elements = {
+  "quality-backend-policy": {},
+  "quality-delegate": {},
+  "quality-delegate-policy": {},
+};
+for (const id of ids) {
+  elements[id] = {};
+  elements[id + "-policy"] = {};
+}
+function $(id) { return elements[id]; }
+function titleCase(value) { return String(value); }
+function backendDisplayName(value) { return String(value); }
+function deviceDisplayName(value) { return String(value).toUpperCase(); }
+function segmentationSelection(status) { return status.selection; }
+const state = {
+  coreVersion: 7,
+  core: {segmentation: {backend: "auto", delegate: "cpu"}},
+  status: null,
+};
+const c = (configured, effective, state, reason) => ({
+  configured, effective, state, reason,
+});
+const common = {
+  mask_shift: c(0, 0, "bypassed", "configured-off"),
+  light_wrap: c(0.25, 0.25, "effective", "configured-active"),
+};
+function status(kind, selected, controls) {
+  return {
+    config_version: 7,
+    matte_policy: {
+      schema: "custback.matte-policy",
+      version: 1,
+      backend_kind: kind,
+      effective: {},
+      controls,
+    },
+    selection: {
+      structured: true,
+      selectedBackend: selected,
+      activeDevice: "cpu",
+      fallbackActive: false,
+    },
+  };
+}
+function disabled() {
+  return Object.fromEntries([...ids, "quality-delegate"].map(
+    (id) => [id, elements[id].disabled]
+  ));
+}
+
+state.status = status("true_alpha_recurrent", "rvm", {
+  rvm_downsample_ratio: c(0, 0.4, "effective", "runtime-auto-ratio"),
+  threshold: c(0.5, null, "inapplicable",
+    "rvm-native-alpha-is-never-hard-thresholded"),
+  mask_blur: c(7, 0, "bypassed",
+    "rvm-native-alpha-bypasses-generic-blur"),
+  edge_refine: c(true, false, "bypassed",
+    "rvm-native-alpha-bypasses-generic-edge-refinement"),
+  temporal_smoothing: c(0.35, 0, "bypassed",
+    "rvm-recurrence-bypasses-generic-ema"),
+  use_model_foreground: c(true, true, "effective", "configured-active"),
+  ...common,
+});
+renderMatteControlPolicy();
+const rvm = disabled();
+const rvmBlurHelp = elements["quality-mask-blur-policy"].textContent;
+
+state.status = status("confidence_mask_video", "mediapipe", {
+  rvm_downsample_ratio: c(0, null, "inapplicable",
+    "selected-backend-does-not-use-rvm-ratio"),
+  threshold: c(0.5, null, "inapplicable",
+    "mediapipe-confidence-mask-does-not-use-threshold"),
+  mask_blur: c(7, 7, "effective", "configured-active"),
+  edge_refine: c(true, true, "effective", "configured-active"),
+  temporal_smoothing: c(0.35, 0.35, "effective", "configured-active"),
+  use_model_foreground: c(true, false, "inapplicable",
+    "selected-backend-does-not-produce-clean-foreground"),
+  ...common,
+});
+renderMatteControlPolicy();
+const mediapipe = disabled();
+
+state.status = status("null_passthrough", "mediapipe",
+  Object.fromEntries([
+    ["rvm_downsample_ratio", c(0, null, "inapplicable",
+      "null-or-passthrough-has-no-rvm-inference")],
+    ["threshold", c(0.5, null, "inapplicable",
+      "null-or-passthrough-has-no-mask-threshold")],
+    ["mask_blur", c(7, 0, "inapplicable",
+      "null-or-passthrough-has-no-matte-refiner")],
+    ["edge_refine", c(true, false, "inapplicable",
+      "null-or-passthrough-has-no-matte-refiner")],
+    ["mask_shift", c(0, 0, "inapplicable",
+      "null-or-passthrough-has-no-matte-refiner")],
+    ["temporal_smoothing", c(0.35, 0, "inapplicable",
+      "null-or-passthrough-has-no-temporal-matte")],
+    ["use_model_foreground", c(true, false, "inapplicable",
+      "null-or-passthrough-has-no-model-foreground")],
+    ["light_wrap", c(0.25, 0, "inapplicable",
+      "null-or-passthrough-has-no-soft-edge-composite")],
+  ]));
+renderMatteControlPolicy();
+const passthrough = disabled();
+
+state.coreVersion = 8;
+renderMatteControlPolicy();
+const stale = disabled();
+
+process.stdout.write(JSON.stringify({
+  rvm, mediapipe, passthrough, stale, rvmBlurHelp,
+}));
+"""
+    result = subprocess.run(
+        ["node"],
+        input=plain_object + policy + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    assert values["rvm"] == {
+        "quality-threshold": True,
+        "quality-rvm-downsample": False,
+        "quality-mask-blur": True,
+        "quality-mask-shift": False,
+        "quality-smoothing": True,
+        "quality-light-wrap": False,
+        "quality-edge-refine": True,
+        "quality-model-foreground": False,
+        "quality-delegate": True,
+    }
+    assert values["mediapipe"] == {
+        "quality-threshold": True,
+        "quality-rvm-downsample": True,
+        "quality-mask-blur": False,
+        "quality-mask-shift": False,
+        "quality-smoothing": False,
+        "quality-light-wrap": False,
+        "quality-edge-refine": False,
+        "quality-model-foreground": True,
+        "quality-delegate": False,
+    }
+    assert all(values["passthrough"].values())
+    assert all(values["stale"].values())
+    assert "configured 7; effective 0" in values["rvmBlurHelp"]
+    assert "RVM preserves native soft alpha" in values["rvmBlurHelp"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_quality_runtime_does_not_call_selected_backend_active_in_passthrough():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    runtime = (
+        "function updateFpsText"
+        + script.split("function updateFpsText", 1)[1].split(
+            "function colorCorrectionSummary", 1
+        )[0]
+    )
+    harness = r"""
+const state = {coreVersion: 4, status: null};
+let rendered = [];
+function $(id) { return {id}; }
+function currentMattePolicy(status) { return status && status.matte_policy; }
+function segmentationSelection(status) { return status.selection; }
+function backendDisplayName(value) { return String(value).toUpperCase(); }
+function deviceDisplayName(value) { return String(value).toUpperCase(); }
+function titleCase(value) { return String(value); }
+function mattePolicySummary() {
+  return ["Effective matte policy", "opaque passthrough", ""];
+}
+function segmentationFallbackRows() { return []; }
+function renderDiagnosticList(node, rows) { rendered = rows; }
+const selection = {
+  selectedBackend: "rvm", qualityTier: "matting", activeDevice: "cuda",
+  activeProvider: "cuda", fallbackActive: false,
+};
+const base = {
+  config_version: 4,
+  segmentation_update_fps: 0,
+  base_composite_update_fps: 29.8,
+  cadence_mismatch_active: false,
+  selection,
+};
+state.status = {...base, matte_policy: {
+  backend_kind: "null_passthrough", passthrough: true,
+}};
+renderMatteQualityRuntime();
+const passthrough = rendered;
+state.status = {...base, matte_policy: {
+  backend_kind: "true_alpha_recurrent", passthrough: false,
+}};
+renderMatteQualityRuntime();
+process.stdout.write(JSON.stringify({passthrough, active: rendered}));
+"""
+    result = subprocess.run(
+        ["node"],
+        input=runtime + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    assert values["passthrough"][0] == [
+        "Matte path",
+        "No active matte · passthrough output",
+        "",
+    ]
+    assert values["passthrough"][1][0] == "Selected backend (bypassed)"
+    assert all(row[0] != "Active backend" for row in values["passthrough"])
+    assert values["active"][0] == ["Active backend", "RVM · matting tier", "good"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_configured_off_is_editable_but_backend_bypass_is_not():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    plain_object = (
+        "function plainObject"
+        + script.split("function plainObject", 1)[1].split(
+            "function qualityPresetPatch", 1
+        )[0]
+    )
+    helpers = (
+        "function matteReasonCopy"
+        + script.split("function matteReasonCopy", 1)[1].split(
+            "const MATTE_CONTROL_BINDINGS", 1
+        )[0]
+    )
+    harness = r"""
+function titleCase(value) { return String(value); }
+const result = {
+  off: matteControlPresentation({
+    configured: 0, effective: 0, state: "bypassed", reason: "configured-off",
+  }, formatPolicyShift),
+  overridden: matteControlPresentation({
+    configured: 7, effective: 0, state: "bypassed",
+    reason: "rvm-native-alpha-bypasses-generic-blur",
+  }, String),
+  threshold: matteControlPresentation({
+    configured: 0.5, effective: 0.4, state: "effective",
+    reason: "heuristic-score-cutoff",
+  }, (value) => formatPolicyNumber(value)),
+  awaiting: matteControlPresentation({
+    configured: 0, effective: null, state: "effective",
+    reason: "awaiting-first-rvm-inference",
+  }, formatPolicyRatio),
+};
+process.stdout.write(JSON.stringify(result));
+"""
+    result = subprocess.run(
+        ["node"],
+        input=plain_object + helpers + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    assert values["off"]["editable"] is True
+    assert values["overridden"]["editable"] is False
+    assert "configured 7; effective 0" in values["overridden"]["text"]
+    assert values["threshold"]["editable"] is True
+    assert "configured 0.50; effective 0.40" in values["threshold"]["text"]
+    assert values["awaiting"]["editable"] is True
+    assert "effective pending first frame" in values["awaiting"]["text"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_mask_blur_slider_emits_only_distinct_canonical_kernel_values():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    canonical = (
+        "function canonicalMaskBlur"
+        + script.split("function canonicalMaskBlur", 1)[1].split(
+            "function mattePolicyValue", 1
+        )[0]
+    )
+    harness = r"""
+const previousValues = [0, 1, 3, 7, 149, 151];
+const moves = [];
+for (const previous of previousValues) {
+  if (previous > 0) {
+    moves.push([previous, previous - 1,
+      canonicalMaskBlur(previous - 1, previous)]);
+  }
+  if (previous < 151) {
+    moves.push([previous, previous + 1,
+      canonicalMaskBlur(previous + 1, previous)]);
+  }
+}
+process.stdout.write(JSON.stringify({
+  moves,
+  directDown: canonicalMaskBlur(8, 9),
+  directUp: canonicalMaskBlur(10, 9),
+}));
+"""
+    result = subprocess.run(
+        ["node"],
+        input=canonical + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    for previous, _raw, emitted in values["moves"]:
+        assert emitted == 0 or emitted % 2 == 1
+        assert emitted != previous
+    assert values["directDown"] == 7
+    assert values["directUp"] == 11
+    assert "dataset.canonicalValue = String(segmentation.mask_blur)" in script
+    assert "mask_blur: updateMaskBlur(event)" in script
+    assert 'setAttribute("aria-valuetext", formatted)' in script
 
 
 def test_color_diagnostic_never_mislabels_held_or_stale_state_as_active():
@@ -468,26 +1044,35 @@ def test_core_control_runtime_restores_rejected_changes():
         )[0]
     )
     harness = r"""
-const state = {core: {value: "old"}};
+const state = {core: {value: "old"}, coreVersion: 0};
 const calls = [];
 let renderCount = 0;
 let rejectedStatus = 409;
 async function patchCore() {
   throw new ApiError(rejectedStatus, "rejected", "rejected");
 }
-async function api(method, path) {
-  calls.push([method, path]);
-  return {value: "effective-" + rejectedStatus};
+async function loadCoreConfig() {
+  calls.push(["GET", "/config"]);
+  return {
+    config: {value: "effective-" + rejectedStatus},
+    version: rejectedStatus,
+  };
+}
+function commitCoreSnapshot(snapshot) {
+  state.core = snapshot.config;
+  state.coreVersion = snapshot.version;
 }
 function renderAll() { renderCount += 1; }
 (async () => {
   const results = {};
+  const versions = {};
   for (const status of [409, 422, 503]) {
     rejectedStatus = status;
     try { await patchCoreControl({camera: {fit_mode: "cover"}}); } catch (err) {}
     results[status] = state.core.value;
+    versions[status] = state.coreVersion;
   }
-  process.stdout.write(JSON.stringify({results, calls, renderCount}));
+  process.stdout.write(JSON.stringify({results, versions, calls, renderCount}));
 })().catch((err) => { console.error(err); process.exit(1); });
 """
     result = subprocess.run(
@@ -504,6 +1089,7 @@ function renderAll() { renderCount += 1; }
         "422": "effective-422",
         "503": "effective-503",
     }
+    assert values["versions"] == {"409": 409, "422": 422, "503": 503}
     assert values["calls"] == [["GET", "/config"]] * 3
     assert values["renderCount"] == 3
 

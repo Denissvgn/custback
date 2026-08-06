@@ -319,6 +319,28 @@ def test_every_data_route_requires_auth(stack):
     assert not stack.upload_dir.exists()
 
 
+def test_no_matte_image_route_or_openapi_operation_exists(stack):
+    forbidden = (
+        "/video/matte",
+        "/video/matte.png",
+        "/video/matte/mjpeg",
+        "/diagnostics/matte",
+        "/diagnostics/matte/raw",
+    )
+
+    for path in forbidden:
+        assert stack.get(path, headers=AUTH).status_code == 404
+
+    paths = stack.get("/openapi.json", headers=AUTH).json()["paths"]
+    assert not any(
+        path == "/video/matte"
+        or path.startswith("/video/matte/")
+        or path == "/diagnostics/matte"
+        or path.startswith("/diagnostics/matte/")
+        for path in paths
+    )
+
+
 def test_unauthenticated_root_exposes_only_login_shell(stack):
     response = stack.get("/")
     assert response.status_code == 401

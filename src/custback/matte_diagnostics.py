@@ -33,7 +33,7 @@ import numpy as np
 
 from . import _platform as platform_fs
 from .color import ColorTransform, IDENTITY_TRANSFORM
-from .compositor import composite
+from .compositor import PreparedLightWrap, composite
 from .config import (
     AccelerationConfig,
     BlendSpace,
@@ -90,6 +90,10 @@ class MatteFrameEvidence:
     clean_foreground: np.ndarray | None = None
     backdrop_frame: np.ndarray | None = None
     base_composite: np.ndarray | None = None
+    # Live native-preview diagnostics may retain the exact immutable wrap
+    # sample consumed by the compositor. It is intentionally not serialized
+    # into schema-v1 replay bundles.
+    prepared_light_wrap: PreparedLightWrap | None = None
     configured_controls: dict[str, Any] = field(default_factory=dict)
     effective_controls: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, float] = field(default_factory=dict)

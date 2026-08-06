@@ -208,6 +208,7 @@ code,pre,.tnum{font-family:var(--font-display);font-variant-numeric:tabular-nums
 .field{display:grid;align-content:start;gap:var(--space-xs);min-width:0}
 .field>label,.field>legend{color:var(--color-ink);font-size:var(--text-sm);font-weight:650}
 .field small{display:block;min-height:1lh;color:var(--color-muted);font-size:var(--text-xs)}
+.control-policy.unavailable{color:var(--color-warning)}
 fieldset.field{margin:0;padding:0;border:0}
 select,input[type="text"],input[type="url"],input[type="number"]{width:100%;min-width:0;height:2.75rem;
   border:var(--rule-thin) solid var(--color-rule-strong);border-radius:var(--radius-control);
@@ -492,6 +493,20 @@ source:
     <div class="view-panel" id="view-quality" data-panel="quality" role="tabpanel" aria-labelledby="tab-quality" hidden>
       <header class="panel-head"><h2>Tune camera quality</h2><p>Match foreground colour, frame the scene, and adjust subject separation. Defaults are a good starting point for most cameras.</p></header>
       <section class="control-section">
+        <div class="section-copy"><h3>Matte quality profile</h3><p>Runtime facts below describe the active backend, including automatic fallback. They are not inferred from the configured backend.</p></div>
+        <fieldset class="field" aria-describedby="quality-preset-help">
+          <legend>Qualified preset</legend>
+          <div class="seg" id="quality-presets">
+            <button type="button" id="quality-preset-custom" data-quality-preset="custom" class="active" aria-pressed="true" disabled>Custom</button>
+            <button type="button" id="quality-preset-performance" data-quality-preset="performance" aria-pressed="false" disabled>Performance</button>
+            <button type="button" id="quality-preset-balanced" data-quality-preset="balanced" aria-pressed="false" disabled>Balanced</button>
+            <button type="button" id="quality-preset-quality" data-quality-preset="quality" aria-pressed="false" disabled>Quality</button>
+          </div>
+          <small id="quality-preset-help" role="status">Checking qualified preset evidence…</small>
+        </fieldset>
+        <dl class="diagnostic-list" id="quality-runtime"></dl>
+      </section>
+      <section class="control-section">
         <div class="section-copy"><h3>Colour match</h3><p>Gently adapt the camera foreground to supported image, video, or secondary-camera backgrounds.</p></div>
         <div class="inline-toggle"><label for="quality-color-auto">Automatic colour correction<small>Applies only when the pipeline has a reliable background estimate.</small></label>
           <span class="switch"><input type="checkbox" id="quality-color-auto"><span></span></span></div>
@@ -520,26 +535,39 @@ source:
       <section class="control-section">
         <div class="section-copy"><h3>Subject detection</h3><p>The backend finds you in each frame before custback replaces the room.</p></div>
         <div class="field-grid two">
-          <div class="field"><label for="quality-backend">Detection backend</label>
-            <select id="quality-backend"><option value="auto">Automatic</option><option value="rvm">RVM matting</option><option value="mediapipe">MediaPipe</option><option value="heuristic">Basic heuristic</option><option value="none">Disabled</option></select>
-            <small>Automatic uses the best installed option.</small></div>
-          <div class="field"><label for="quality-delegate">Processor</label>
-            <select id="quality-delegate"><option value="cpu">CPU</option><option value="gpu">GPU</option></select>
-            <small>MediaPipe only. Automatic uses this setting only if MediaPipe is selected.</small></div>
-          <div class="field"><label for="quality-threshold">Subject threshold</label><div class="range-line"><input type="range" id="quality-threshold" min="0" max="1" step="0.01"><span class="value" id="quality-threshold-value"></span></div><small>Basic heuristic only. RVM and MediaPipe preserve their soft alpha or confidence masks.</small></div>
-          <div class="field"><label for="quality-rvm-downsample">RVM detail scale</label><div class="range-line"><input type="range" id="quality-rvm-downsample" min="0" max="1" step="0.05"><span class="value" id="quality-rvm-downsample-value"></span></div><small>RVM only. Zero lets the model choose automatically.</small></div>
+          <div class="field"><label for="quality-backend">Detection backend <span class="restart-tag">Rebuild + reset</span></label>
+            <select id="quality-backend" aria-describedby="quality-backend-help quality-backend-policy"><option value="auto">Automatic</option><option value="rvm">RVM matting</option><option value="mediapipe">MediaPipe</option><option value="heuristic">Basic heuristic</option><option value="none">Disabled</option></select>
+            <small id="quality-backend-help">Changing this rebuilds subject detection and resets its temporal state.</small>
+            <small class="control-policy" id="quality-backend-policy">Waiting for the active backend…</small></div>
+          <div class="field"><label for="quality-delegate">MediaPipe processor <span class="restart-tag">Rebuild + reset</span></label>
+            <select id="quality-delegate" aria-describedby="quality-delegate-help quality-delegate-policy" disabled><option value="cpu">CPU</option><option value="gpu">GPU</option></select>
+            <small id="quality-delegate-help">Used only when the active backend is MediaPipe.</small>
+            <small class="control-policy unavailable" id="quality-delegate-policy">Waiting for the active backend…</small></div>
         </div>
       </section>
       <section class="control-section">
-        <div class="section-copy"><h3>Edges and motion</h3><p>Use these controls when hair edges flicker, the mask trails, or the subject looks cut out.</p></div>
-        <div class="field-grid two">
-          <div class="field"><label for="quality-mask-blur">Mask softness</label><div class="range-line"><input type="range" id="quality-mask-blur" min="0" max="151" step="1"><span class="value" id="quality-mask-blur-value"></span></div><small>MediaPipe and basic heuristic only. RVM preserves its native soft alpha.</small></div>
-          <div class="field"><label for="quality-mask-shift">Mask expansion</label><div class="range-line"><input type="range" id="quality-mask-shift" min="-20" max="20" step="1"><span class="value" id="quality-mask-shift-value"></span></div><small>Applies to RVM, MediaPipe, and basic heuristic; zero is an exact bypass.</small></div>
-          <div class="field"><label for="quality-smoothing">Temporal smoothing</label><div class="range-line"><input type="range" id="quality-smoothing" min="0" max="0.95" step="0.01"><span class="value" id="quality-smoothing-value"></span></div><small>Compatibility filter for MediaPipe and basic heuristic. RVM uses its own recurrent state.</small></div>
-          <div class="field"><label for="quality-light-wrap">Light wrap</label><div class="range-line"><input type="range" id="quality-light-wrap" min="0" max="1" step="0.01"><span class="value" id="quality-light-wrap-value"></span></div><small>Applies to local matte/segmentation composites; zero is an exact bypass.</small></div>
-        </div>
-        <div class="inline-toggle"><label for="quality-edge-refine">Refine subject edges<small>MediaPipe and basic heuristic only. RVM bypasses generic edge refinement.</small></label><span class="switch"><input type="checkbox" id="quality-edge-refine"><span></span></span></div>
-        <div class="inline-toggle"><label for="quality-model-foreground">Use model foreground<small>RVM only. Uses its clean-foreground prediction to reduce edge spill.</small></label><span class="switch"><input type="checkbox" id="quality-model-foreground"><span></span></span></div>
+        <details>
+          <summary>Advanced matte controls</summary>
+          <div class="advanced-grid">
+            <div class="section-copy"><h3>Edges and motion</h3><p>These diagnostic controls remain visible but are enabled only when the active backend can use them. Every detection control marked below rebuilds the segmenter and resets temporal state.</p></div>
+            <div class="field-grid two">
+              <div class="field"><label for="quality-threshold">Foreground confidence <span class="restart-tag">Rebuild + reset</span></label><div class="range-line"><input type="range" id="quality-threshold" min="0" max="1" step="0.01" aria-describedby="quality-threshold-help quality-threshold-policy" disabled><span class="value" id="quality-threshold-value"></span></div>
+                <small id="quality-threshold-help">Controls how strongly the basic heuristic must recognise the subject.</small><small class="control-policy unavailable" id="quality-threshold-policy">Waiting for the active policy…</small></div>
+              <div class="field"><label for="quality-rvm-downsample">Fine-detail resolution <span class="restart-tag">Rebuild + reset</span></label><div class="range-line"><input type="range" id="quality-rvm-downsample" min="0" max="1" step="0.05" aria-describedby="quality-rvm-downsample-help quality-rvm-downsample-policy" disabled><span class="value" id="quality-rvm-downsample-value"></span></div>
+                <small id="quality-rvm-downsample-help">RVM only. Automatic chooses a ratio from the active frame size.</small><small class="control-policy unavailable" id="quality-rvm-downsample-policy">Waiting for the active policy…</small></div>
+              <div class="field"><label for="quality-mask-blur">Edge softness <span class="restart-tag">Rebuild + reset</span></label><div class="range-line"><input type="range" id="quality-mask-blur" min="0" max="151" step="1" aria-describedby="quality-mask-blur-help quality-mask-blur-policy" disabled><span class="value" id="quality-mask-blur-value"></span></div>
+                <small id="quality-mask-blur-help">Softens MediaPipe and basic-heuristic edges; RVM preserves native soft alpha.</small><small class="control-policy unavailable" id="quality-mask-blur-policy">Waiting for the active policy…</small></div>
+              <div class="field"><label for="quality-mask-shift">Silhouette expansion <span class="restart-tag">Rebuild + reset</span></label><div class="range-line"><input type="range" id="quality-mask-shift" min="-20" max="20" step="1" aria-describedby="quality-mask-shift-help quality-mask-shift-policy" disabled><span class="value" id="quality-mask-shift-value"></span></div>
+                <small id="quality-mask-shift-help">Grows positive or shrinks negative; zero is an exact bypass.</small><small class="control-policy unavailable" id="quality-mask-shift-policy">Waiting for the active policy…</small></div>
+              <div class="field"><label for="quality-smoothing">Motion steadiness <span class="restart-tag">Rebuild + reset</span></label><div class="range-line"><input type="range" id="quality-smoothing" min="0" max="0.95" step="0.01" aria-describedby="quality-smoothing-help quality-smoothing-policy" disabled><span class="value" id="quality-smoothing-value"></span></div>
+                <small id="quality-smoothing-help">Compatibility smoothing for MediaPipe and the basic heuristic; higher values can trail motion.</small><small class="control-policy unavailable" id="quality-smoothing-policy">Waiting for the active policy…</small></div>
+              <div class="field"><label for="quality-light-wrap">Backdrop edge light</label><div class="range-line"><input type="range" id="quality-light-wrap" min="0" max="1" step="0.01" aria-describedby="quality-light-wrap-help quality-light-wrap-policy" disabled><span class="value" id="quality-light-wrap-value"></span></div>
+                <small id="quality-light-wrap-help">Applies live without a matte reset; zero is an exact bypass.</small><small class="control-policy unavailable" id="quality-light-wrap-policy">Waiting for the active policy…</small></div>
+            </div>
+            <div class="inline-toggle"><label for="quality-edge-refine"><span>Follow visible subject edges <span class="restart-tag">Rebuild + reset</span></span><small id="quality-edge-refine-help">MediaPipe and basic heuristic only; RVM bypasses generic edge refinement.</small><small class="control-policy unavailable" id="quality-edge-refine-policy">Waiting for the active policy…</small></label><span class="switch"><input type="checkbox" id="quality-edge-refine" aria-describedby="quality-edge-refine-help quality-edge-refine-policy" disabled><span></span></span></div>
+            <div class="inline-toggle"><label for="quality-model-foreground"><span>Clean colour around hair and edges</span><small id="quality-model-foreground-help">Uses an RVM clean-foreground prediction and applies live without a matte reset.</small><small class="control-policy unavailable" id="quality-model-foreground-policy">Waiting for the active policy…</small></label><span class="switch"><input type="checkbox" id="quality-model-foreground" aria-describedby="quality-model-foreground-help quality-model-foreground-policy" disabled><span></span></span></div>
+          </div>
+        </details>
       </section>
       <section class="control-section">
         <details><summary>Advanced colour and canvas controls</summary>
@@ -627,6 +655,17 @@ const FOLLOW_DESCRIPTIONS = {
   voice: "Animates from the configured Audio2Face voice service.",
   presence: "Keeps a steady idle pose without following camera or voice.",
 };
+// MATTE-2.5's checked-in evidence is generated proxy/template evidence. It
+// explicitly selects no portable named profiles. Keep the catalog versioned
+// and empty until reviewed model-backed cross-device evidence can supply each
+// preset as one exact merge patch.
+const MATTE_PRESET_CATALOG = Object.freeze({
+  schema: "custback.matte-quality-presets",
+  version: 1,
+  evidenceStatus: "not_qualified",
+  presets: Object.freeze({}),
+});
+const MATTE_PRESET_NAMES = ["performance", "balanced", "quality"];
 
 const state = {
   core: null,            // core /config body
@@ -690,7 +729,7 @@ class ApiError extends Error {
   }
 }
 
-async function api(method, path, body, contentType) {
+async function api(method, path, body, contentType, responseInfo) {
   const init = {method, headers: {}};
   if (body !== undefined && body !== null) {
     if (body instanceof Blob || body instanceof FormData) {
@@ -719,6 +758,13 @@ async function api(method, path, body, contentType) {
       message = "restart required to apply: " + (detail.fields || []).join(", ");
     }
     throw new ApiError(response.status, detail.code || "error", message);
+  }
+  if (responseInfo && typeof responseInfo === "object") {
+    const rawVersion = response.headers.get("x-config-version");
+    const parsedVersion = rawVersion !== null && /^(0|[1-9]\d*)$/.test(rawVersion)
+      ? Number(rawVersion) : null;
+    responseInfo.configVersion = Number.isSafeInteger(parsedVersion)
+      ? parsedVersion : null;
   }
   if (response.status === 204) return null;
   const kind = response.headers.get("content-type") || "";
@@ -798,8 +844,7 @@ $("signout").addEventListener("click", async (event) => {
 
 async function patchCore(patch) {
   const body = await api("PATCH", "/config", patch);
-  state.core = body.config;
-  state.coreVersion = body.config_version;
+  commitCoreSnapshot({config: body.config, version: body.config_version});
   renderAll();
 }
 
@@ -810,7 +855,8 @@ async function patchCoreControl(patch) {
     let refreshError = null;
     if (err instanceof ApiError && [409, 422, 503].includes(err.status)) {
       try {
-        state.core = await api("GET", "/config");
+        const snapshot = await loadCoreConfig();
+        commitCoreSnapshot(snapshot);
       } catch (caught) {
         refreshError = caught;
       }
@@ -835,8 +881,37 @@ async function patchAvatar(patch) {
 
 // -- data loading -------------------------------------------------------------
 
+async function loadCoreConfig() {
+  const responseInfo = {};
+  const config = await api(
+    "GET", "/config", undefined, undefined, responseInfo
+  );
+  if (!Number.isSafeInteger(responseInfo.configVersion)) {
+    throw new ApiError(502, "invalid_response",
+      "custback returned an unversioned configuration");
+  }
+  return {config, version: responseInfo.configVersion};
+}
+
+function commitCoreSnapshot(snapshot) {
+  if (!snapshot || !plainObject(snapshot.config)
+      || !Number.isSafeInteger(snapshot.version)) {
+    throw new ApiError(502, "invalid_response",
+      "custback returned an invalid configuration snapshot");
+  }
+  if (snapshot.version < state.coreVersion) return false;
+  state.core = snapshot.config;
+  state.coreVersion = snapshot.version;
+  return true;
+}
+
+async function refreshCoreConfig() {
+  const snapshot = await loadCoreConfig();
+  return commitCoreSnapshot(snapshot);
+}
+
 async function loadCore() {
-  state.core = await api("GET", "/config");
+  await refreshCoreConfig();
   state.coreFiles = await api("GET", "/backgrounds");
 }
 
@@ -895,9 +970,7 @@ function applyStatus(status, avatarStatus) {
     if (status.config_version !== state.coreVersion
         && !state.coreRefreshPending) {
       state.coreRefreshPending = true;
-      const observedVersion = status.config_version;
-      loadCore().then(() => {
-        state.coreVersion = observedVersion;
+      refreshCoreConfig().then(() => {
         renderAll();
       }).catch(reportError).finally(() => { state.coreRefreshPending = false; });
     }
@@ -1318,7 +1391,7 @@ $("bg-upload").addEventListener("change", async (event) => {
     pending = toast("Uploading " + file.name + "…");
     await withBusy(button, "Uploading…", async () => {
       if (cameraUpload) {
-        state.core = await api("GET", "/config");
+        await refreshCoreConfig();
         if (state.core.background.mode === "remote") {
           throw new ApiError(409, "avatar_active",
             "Turn avatar output off before uploading camera background media.");
@@ -1787,6 +1860,305 @@ function formatAnchor(value, axis) {
   return percent;
 }
 
+function plainObject(value) {
+  return Boolean(value && typeof value === "object"
+    && !Array.isArray(value));
+}
+
+function qualityPresetPatch(name, catalog = MATTE_PRESET_CATALOG) {
+  if (!plainObject(catalog)
+      || catalog.schema !== "custback.matte-quality-presets"
+      || catalog.version !== 1
+      || catalog.evidenceStatus !== "qualified"
+      || !plainObject(catalog.presets)) return null;
+  const definition = catalog.presets[name];
+  if (!plainObject(definition) || !plainObject(definition.patch)
+      || !Object.keys(definition.patch).length) return null;
+  return JSON.parse(JSON.stringify(definition.patch));
+}
+
+function configContainsPatch(config, patch) {
+  if (Array.isArray(patch)) {
+    return Array.isArray(config)
+      && JSON.stringify(config) === JSON.stringify(patch);
+  }
+  if (plainObject(patch)) {
+    if (!plainObject(config)) return false;
+    return Object.entries(patch).every(([key, value]) =>
+      Object.prototype.hasOwnProperty.call(config, key)
+      && configContainsPatch(config[key], value));
+  }
+  return Object.is(config, patch);
+}
+
+function matchingQualityPreset(config, catalog = MATTE_PRESET_CATALOG) {
+  for (const name of MATTE_PRESET_NAMES) {
+    const patch = qualityPresetPatch(name, catalog);
+    if (patch && configContainsPatch(config, patch)) return name;
+  }
+  return "custom";
+}
+
+function renderQualityPresets() {
+  if (!state.core) return;
+  const active = matchingQualityPreset(state.core);
+  for (const button of $("quality-presets").querySelectorAll(
+    "[data-quality-preset]"
+  )) {
+    const name = button.dataset.qualityPreset;
+    const available = name === "custom"
+      || qualityPresetPatch(name) !== null;
+    const selected = name === active;
+    // Custom describes unmatched concrete values; it is never an action.
+    button.disabled = name === "custom" || !available;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  const availableNames = MATTE_PRESET_NAMES.filter(
+    (name) => qualityPresetPatch(name) !== null
+  );
+  if (!availableNames.length) {
+    $("quality-preset-help").textContent =
+      "Custom settings · preset catalog v" + MATTE_PRESET_CATALOG.version
+      + ". Performance, Balanced, and Quality remain unavailable because "
+      + "checked-in evidence has not qualified portable model-backed profiles.";
+    return;
+  }
+  $("quality-preset-help").textContent =
+    "Catalog v" + MATTE_PRESET_CATALOG.version
+    + " · each preset expands to one concrete, atomic configuration patch.";
+}
+
+function currentMattePolicy(status, configVersion) {
+  if (!status || !Number.isInteger(configVersion) || configVersion < 0
+      || status.config_version !== configVersion) return null;
+  const policy = status.matte_policy;
+  if (!plainObject(policy)
+      || policy.schema !== "custback.matte-policy"
+      || policy.version !== 1
+      || !plainObject(policy.controls)
+      || !plainObject(policy.effective)) return null;
+  return policy;
+}
+
+function matteReasonCopy(reason) {
+  const messages = {
+    "configured-active": "This configured value is active.",
+    "configured-off": "The active backend supports this control; it is currently at its exact off value.",
+    "awaiting-first-rvm-inference": "The automatic RVM ratio resolves after the first successful frame.",
+    "runtime-auto-ratio": "RVM resolved the automatic ratio from the active frame size.",
+    "configured-ratio-resolved": "RVM exercised the configured detail ratio.",
+    "heuristic-score-cutoff": "The basic heuristic converts the configured confidence into its effective score cutoff.",
+    "rvm-native-alpha-is-never-hard-thresholded": "RVM preserves native soft alpha instead of applying a hard confidence cutoff.",
+    "mediapipe-confidence-mask-does-not-use-threshold": "MediaPipe preserves its confidence mask instead of applying this cutoff.",
+    "rvm-native-alpha-bypasses-generic-blur": "RVM preserves native soft alpha and bypasses generic edge blur.",
+    "rvm-native-alpha-bypasses-generic-edge-refinement": "RVM bypasses generic edge refinement.",
+    "rvm-recurrence-bypasses-generic-ema": "RVM uses recurrent temporal state and bypasses generic frame smoothing.",
+    "replaced-by-motion-aware": "The selected motion-aware policy owns temporal stabilization.",
+    "selected-backend-does-not-use-rvm-ratio": "The active backend does not use an RVM detail ratio.",
+    "selected-backend-does-not-produce-clean-foreground": "The active backend does not provide a clean-foreground prediction.",
+  };
+  if (messages[reason]) return messages[reason];
+  if (String(reason).startsWith("null-or-passthrough-")) {
+    return "The current path is passthrough or has no matte to adjust.";
+  }
+  return reason ? titleCase(reason) + "." : "Runtime applicability is unavailable.";
+}
+
+function formatPolicyNumber(value, digits = 2) {
+  return Number(value).toFixed(digits);
+}
+
+function formatPolicyRatio(value) {
+  return Number(value) === 0 ? "automatic" : formatPolicyNumber(value);
+}
+
+function formatPolicyShift(value) {
+  const numeric = Number(value);
+  return (numeric > 0 ? "+" : "") + numeric;
+}
+
+function formatPolicyBoolean(value) {
+  return value ? "on" : "off";
+}
+
+function canonicalMaskBlur(value, previous) {
+  const numeric = Math.max(0, Math.min(151, Math.round(Number(value))));
+  if (numeric === 0 || numeric % 2 === 1) return numeric;
+  return numeric < Number(previous) ? numeric - 1 : numeric + 1;
+}
+
+function mattePolicyValue(value, formatter, pending = false) {
+  if (value === null || value === undefined) {
+    return pending ? "pending first frame" : "not used";
+  }
+  return formatter(value);
+}
+
+function matteControlPresentation(control, formatter) {
+  if (!plainObject(control)
+      || !["effective", "bypassed", "inapplicable"].includes(control.state)) {
+    return {
+      editable: false,
+      text: "Effective value unavailable. Waiting for a current runtime policy.",
+    };
+  }
+  const reason = String(control.reason || "");
+  const editable = control.state === "effective"
+    || (control.state === "bypassed" && reason === "configured-off");
+  const configured = mattePolicyValue(control.configured, formatter);
+  const effective = mattePolicyValue(
+    control.effective,
+    formatter,
+    reason === "awaiting-first-rvm-inference"
+  );
+  return {
+    editable,
+    text: (editable ? "Available" : "Unavailable")
+      + " · configured " + configured + "; effective " + effective + ". "
+      + matteReasonCopy(reason),
+  };
+}
+
+const MATTE_CONTROL_BINDINGS = [
+  ["quality-threshold", "threshold", (value) => formatPolicyNumber(value)],
+  ["quality-rvm-downsample", "rvm_downsample_ratio", formatPolicyRatio],
+  ["quality-mask-blur", "mask_blur", (value) => String(Number(value))],
+  ["quality-mask-shift", "mask_shift", formatPolicyShift],
+  ["quality-smoothing", "temporal_smoothing", (value) => formatPolicyNumber(value)],
+  ["quality-light-wrap", "light_wrap", (value) => formatPolicyNumber(value)],
+  ["quality-edge-refine", "edge_refine", formatPolicyBoolean],
+  ["quality-model-foreground", "use_model_foreground", formatPolicyBoolean],
+];
+
+function renderMatteControlPolicy() {
+  if (!state.core) return;
+  const policy = currentMattePolicy(state.status, state.coreVersion);
+  for (const [id, key, formatter] of MATTE_CONTROL_BINDINGS) {
+    const input = $(id);
+    const output = $(id + "-policy");
+    if (!policy) {
+      input.disabled = true;
+      output.className = "control-policy unavailable";
+      output.textContent =
+        "Effective value pending · synchronizing the active runtime policy.";
+      continue;
+    }
+    const presentation = matteControlPresentation(policy.controls[key], formatter);
+    input.disabled = !presentation.editable;
+    output.className = "control-policy"
+      + (presentation.editable ? "" : " unavailable");
+    output.textContent = presentation.text;
+  }
+
+  const backendOutput = $("quality-backend-policy");
+  const delegate = $("quality-delegate");
+  const delegateOutput = $("quality-delegate-policy");
+  if (!policy) {
+    backendOutput.className = "control-policy unavailable";
+    backendOutput.textContent =
+      "Configured " + backendDisplayName(state.core.segmentation.backend)
+      + "; active selection pending.";
+    delegate.disabled = true;
+    delegateOutput.className = "control-policy unavailable";
+    delegateOutput.textContent =
+      "Configured " + deviceDisplayName(state.core.segmentation.delegate)
+      + "; effective processor pending.";
+    return;
+  }
+  const selection = segmentationSelection(state.status);
+  backendOutput.className = "control-policy"
+    + (selection.fallbackActive ? " unavailable" : "");
+  backendOutput.textContent =
+    "Configured " + backendDisplayName(state.core.segmentation.backend)
+    + "; active " + backendDisplayName(selection.selectedBackend)
+    + (selection.fallbackActive ? " after automatic fallback." : ".");
+
+  const mediaPipeActive = policy.backend_kind !== "null_passthrough"
+    && selection.structured
+    && selection.selectedBackend.toLowerCase() === "mediapipe";
+  delegate.disabled = !mediaPipeActive;
+  delegateOutput.className = "control-policy"
+    + (mediaPipeActive ? "" : " unavailable");
+  delegateOutput.textContent = mediaPipeActive
+    ? "Available · configured "
+      + deviceDisplayName(state.core.segmentation.delegate) + "; effective "
+      + deviceDisplayName(selection.activeDevice) + "."
+    : "Unavailable · configured "
+      + deviceDisplayName(state.core.segmentation.delegate)
+      + "; effective not used. The active path is not MediaPipe matte processing.";
+}
+
+function updateFpsText(value, label) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(1) + " fps " + label : "";
+}
+
+function renderMatteQualityRuntime() {
+  const policy = currentMattePolicy(state.status, state.coreVersion);
+  if (!state.status) {
+    renderDiagnosticList($("quality-runtime"), [
+      ["Active matte policy", "Waiting for pipeline status…", "warn"],
+    ]);
+    return;
+  }
+  if (!policy) {
+    renderDiagnosticList($("quality-runtime"), [
+      ["Active matte policy", "Synchronizing with the effective configuration…", "warn"],
+    ]);
+    return;
+  }
+  const selection = segmentationSelection(state.status);
+  const provider = selection.activeProvider
+    ? " · provider " + deviceDisplayName(selection.activeProvider) : "";
+  const fps = [
+    updateFpsText(state.status.segmentation_update_fps, "matte"),
+    updateFpsText(state.status.base_composite_update_fps, "visual"),
+  ].filter(Boolean).join(" · ") || "Not measured";
+  const summary = mattePolicySummary(state.status);
+  const matteActive = policy.backend_kind !== "null_passthrough";
+  const rows = matteActive
+    ? [
+        [
+          "Active backend",
+          backendDisplayName(selection.selectedBackend) + " · "
+            + titleCase(selection.qualityTier || "unknown") + " tier",
+          selection.fallbackActive ? "warn" : "good",
+        ],
+        [
+          "Device",
+          deviceDisplayName(selection.activeDevice) + provider,
+          "",
+        ],
+      ]
+    : [
+        [
+          "Matte path",
+          policy.passthrough
+            ? "No active matte · passthrough output"
+            : "No active matte · subject detection disabled",
+          "",
+        ],
+        [
+          "Selected backend (bypassed)",
+          backendDisplayName(selection.selectedBackend) + " · "
+            + titleCase(selection.qualityTier || "unknown") + " tier · device "
+            + deviceDisplayName(selection.activeDevice) + provider,
+          "",
+        ],
+      ];
+  rows.push(
+    [
+      "Unique updates",
+      fps,
+      state.status.cadence_mismatch_active ? "warn" : "",
+    ],
+    summary || ["Effective matte policy", "Unavailable", "warn"],
+  );
+  rows.push(...segmentationFallbackRows(state.status));
+  renderDiagnosticList($("quality-runtime"), rows);
+}
+
 function colorCorrectionSummary(status) {
   if (!status || status.color_correction_state === undefined) {
     return ["Waiting for detailed colour-correction status…", "warn"];
@@ -1872,8 +2244,6 @@ function renderQuality() {
   $("quality-output-height").setAttribute("aria-invalid", "false");
   $("quality-backend").value = segmentation.backend;
   $("quality-delegate").value = segmentation.delegate;
-  const gpu = $("quality-delegate").querySelector('option[value="gpu"]');
-  gpu.disabled = ["rvm", "heuristic", "none"].includes(segmentation.backend);
   for (const [id, value, output, formatter] of [
     ["quality-color-strength", correction.strength, "quality-color-strength-value", (v) => Math.round(Number(v) * 100) + "%"],
     ["quality-background-anchor-x", background.anchor_x, "quality-background-anchor-x-value", (v) => formatAnchor(v, "x")],
@@ -1889,12 +2259,29 @@ function renderQuality() {
     ["quality-light-wrap", compositing.light_wrap, "quality-light-wrap-value", (v) => Number(v).toFixed(2)],
   ]) {
     $(id).value = value;
-    $(output).textContent = formatter(value);
+    const formatted = formatter(value);
+    $(output).textContent = formatted;
+    if (id === "quality-rvm-downsample") {
+      $(id).setAttribute("aria-valuetext", formatted);
+    }
   }
+  $("quality-mask-blur").dataset.canonicalValue = String(segmentation.mask_blur);
   $("quality-edge-refine").checked = segmentation.edge_refine;
   $("quality-model-foreground").checked = compositing.use_model_foreground;
+  renderQualityPresets();
+  renderMatteQualityRuntime();
+  renderMatteControlPolicy();
   renderColorCorrectionStatus();
 }
+
+$("quality-presets").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-quality-preset]");
+  if (!button || button.dataset.qualityPreset === "custom") return;
+  const patch = qualityPresetPatch(button.dataset.qualityPreset);
+  if (!patch) return;
+  withBusy(button, "Applying…", () => patchCoreControl(patch))
+    .catch(reportError);
+});
 
 $("quality-color-auto").addEventListener("change", (event) => {
   patchCoreControl({compositing: {color_correction: {
@@ -1976,19 +2363,37 @@ $("quality-delegate").addEventListener("change", (event) => {
 for (const [id, output, section, field, parse, format] of [
   ["quality-threshold", "quality-threshold-value", "segmentation", "threshold", parseFloat, (v) => Number(v).toFixed(2)],
   ["quality-rvm-downsample", "quality-rvm-downsample-value", "segmentation", "rvm_downsample", parseFloat, (v) => Number(v) === 0 ? "Auto" : Number(v).toFixed(2)],
-  ["quality-mask-blur", "quality-mask-blur-value", "segmentation", "mask_blur", (v) => parseInt(v, 10), String],
   ["quality-mask-shift", "quality-mask-shift-value", "segmentation", "mask_shift", (v) => parseInt(v, 10), (v) => (Number(v) > 0 ? "+" : "") + v],
   ["quality-smoothing", "quality-smoothing-value", "segmentation", "temporal_smoothing", parseFloat, (v) => Number(v).toFixed(2)],
   ["quality-light-wrap", "quality-light-wrap-value", "compositing", "light_wrap", parseFloat, (v) => Number(v).toFixed(2)],
 ]) {
   $(id).addEventListener("input", (event) => {
-    $(output).textContent = format(event.target.value);
+    const formatted = format(event.target.value);
+    $(output).textContent = formatted;
+    if (id === "quality-rvm-downsample") {
+      event.target.setAttribute("aria-valuetext", formatted);
+    }
   });
   $(id).addEventListener("change", (event) => {
     patchCoreControl({[section]: {[field]: parse(event.target.value)}})
       .catch(reportError);
   });
 }
+function updateMaskBlur(event) {
+  const input = event.target;
+  const canonical = canonicalMaskBlur(
+    input.value, input.dataset.canonicalValue
+  );
+  input.value = String(canonical);
+  input.dataset.canonicalValue = String(canonical);
+  $("quality-mask-blur-value").textContent = String(canonical);
+  return canonical;
+}
+$("quality-mask-blur").addEventListener("input", updateMaskBlur);
+$("quality-mask-blur").addEventListener("change", (event) => {
+  patchCoreControl({segmentation: {mask_blur: updateMaskBlur(event)}})
+    .catch(reportError);
+});
 $("quality-edge-refine").addEventListener("change", (event) => {
   patchCoreControl({segmentation: {edge_refine: event.target.checked}})
     .catch(reportError);
@@ -2390,6 +2795,8 @@ function videoColorSummary(status) {
 function renderDiagnostics() {
   const status = state.status;
   renderColorCorrectionStatus();
+  renderMatteQualityRuntime();
+  renderMatteControlPolicy();
   if (status) {
     const dimensions = status.capture_width && status.capture_height
       ? status.capture_width + " × " + status.capture_height : "Negotiating";

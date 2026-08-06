@@ -67,6 +67,7 @@ from .matte_diagnostics import (
     process_rss_bytes,
     segmenter_diagnostics_snapshot,
 )
+from .matte_live_diagnostics import LocalMatteDiagnosticMonitor
 from .matte_policy import MattePolicySnapshot, resolve_matte_policy
 from .light_wrap import (
     LightWrapFrameContext,
@@ -1359,6 +1360,10 @@ class _PreflightResult:
     color_status: dict[str, object]
     remote_fallback_active: bool
     remote_fallback_reason: str
+    matte_evidence: MatteFrameEvidence | None = field(
+        default=None,
+        repr=False,
+    )
 
     @property
     def capture_sequence(self) -> int:
@@ -1465,6 +1470,7 @@ class Pipeline:
         model_preparation: SegmenterPreparation | None = None,
         raw_fingerprint_capacity: int = _RAW_FINGERPRINT_HISTORY,
         matte_recorder: MatteDiagnosticRecorder | None = None,
+        matte_monitor: LocalMatteDiagnosticMonitor | None = None,
     ):
         if (
             not isinstance(raw_fingerprint_capacity, int)
@@ -1500,6 +1506,7 @@ class Pipeline:
         self._runtime_writer = runtime._coordinator_writer()
         self._model_preparation = model_preparation
         self._matte_recorder = matte_recorder
+        self._matte_monitor = matte_monitor
         self._matte_bundle_sequence = 0
         self._matte_last_source_sequence: int | None = None
         self._fallback_log_states: dict[str, tuple[bool, str]] = {}
@@ -2096,6 +2103,10 @@ class Pipeline:
             if resources.cfg.background.mode != "remote":
                 self.hub.publish_raw(preflight.captured.pixels)
             self.hub.publish_output(preflight.output, stats=initial_stats)
+            self._submit_live_matte_evidence(
+                preflight.matte_evidence,
+                status=initial_stats,
+            )
             self._loop(
                 resources,
                 preflight=preflight,
@@ -2117,6 +2128,8 @@ class Pipeline:
                 resources.close()
             if self._matte_recorder is not None:
                 self._matte_recorder.close()
+            if self._matte_monitor is not None:
+                self._matte_monitor.clear_history()
             self._drain_deferred_closes()
             # On startup failure, readiness is not published until teardown
             # finishes. A blocked close is therefore observed as a surviving
@@ -3631,13 +3644,20 @@ class Pipeline:
             )
         return result
 
+    def _matte_evidence_requested(self) -> bool:
+        recorder = self._matte_recorder
+        monitor = self._matte_monitor
+        return bool(
+            (recorder is not None and recorder.accepting)
+            or (monitor is not None and monitor.accepting)
+        )
+
     def _new_matte_evidence(
         self,
         resources: _Resources,
         captured: CapturedFrame,
     ) -> MatteFrameEvidence | None:
-        recorder = self._matte_recorder
-        if recorder is None or not recorder.accepting:
+        if not self._matte_evidence_requested():
             return None
         metadata = MatteCaptureMetadata(
             bundle_sequence=self._matte_bundle_sequence,
@@ -3832,10 +3852,33 @@ class Pipeline:
         evidence: MatteFrameEvidence | None,
         final_composite: np.ndarray,
     ) -> bool:
+        """Submit persistent replay evidence without involving live preview."""
+
         recorder = self._matte_recorder
         if recorder is not None and evidence is not None:
             return recorder.submit(evidence, final_composite)
         return False
+
+    def _submit_live_matte_evidence(
+        self,
+        evidence: MatteFrameEvidence | None,
+        *,
+        status: Mapping[str, object],
+    ) -> None:
+        """Fan out to the explicit local sink after matching output/status.
+
+        The diagnostic monitor is intentionally independent from FrameHub and
+        the configured output sink. A monitor failure must never replace or
+        delay an already-published production frame.
+        """
+
+        monitor = self._matte_monitor
+        if monitor is None or evidence is None or not monitor.accepting:
+            return
+        try:
+            monitor.submit(evidence, status=status)
+        except Exception:
+            log.exception("cannot submit local matte diagnostic evidence")
 
     @staticmethod
     def _raw_fingerprint(frame: np.ndarray) -> _RawFingerprint:
@@ -4255,9 +4298,7 @@ class Pipeline:
         if captured is None:
             raise ActivationError("capture returned no frame during startup preflight")
         diagnostic_frame_started_ns = (
-            time.monotonic_ns()
-            if self._matte_recorder is not None and self._matte_recorder.accepting
-            else None
+            time.monotonic_ns() if self._matte_evidence_requested() else None
         )
         frame = captured.pixels
         try:
@@ -4423,6 +4464,7 @@ class Pipeline:
             color_status=color_outcome,
             remote_fallback_active=remote_mode,
             remote_fallback_reason=("no-client" if remote_mode else ""),
+            matte_evidence=matte_evidence,
         )
 
     def _local_composite(
@@ -4557,6 +4599,8 @@ class Pipeline:
             )
             blend_started_ns: int | None = None
             next_light_wrap_stabilizer: LightWrapStabilizer | None = None
+            diagnostic_prepared_light_wrap: PreparedLightWrap | None = None
+            diagnostic_color_transform = prepared_color.transform
             legacy_workspace = (
                 resources.legacy_compositor_workspace()
                 if cfg.compositing.blend_space == "srgb_legacy"
@@ -4626,6 +4670,7 @@ class Pipeline:
                     legacy_workspace=legacy_workspace,
                     diagnostics=compositor_diagnostics,
                 )
+                diagnostic_prepared_light_wrap = prepared_light_wrap
             except ColorError as exc:
                 # A photometric transform/conversion failure follows the same
                 # bounded correction fallback, while structural ValueError
@@ -4639,6 +4684,7 @@ class Pipeline:
                 # that did not consume the prepared sample cannot publish its
                 # candidate temporal history.
                 next_light_wrap_stabilizer = None
+                diagnostic_color_transform = IDENTITY_TRANSFORM
                 if blend_started_ns is None:
                     if timings is not None:
                         timings["composite_prepare_ms"] = (
@@ -4700,6 +4746,7 @@ class Pipeline:
                 matte_evidence.clean_foreground = backend_clean_foreground
                 matte_evidence.backdrop_frame = bg
                 matte_evidence.base_composite = rendered
+                matte_evidence.prepared_light_wrap = diagnostic_prepared_light_wrap
                 matte_evidence.segmentation_diagnostics = (
                     segmenter_diagnostics_snapshot(resources.segmenter)
                 )
@@ -4726,7 +4773,7 @@ class Pipeline:
                 matte_evidence.backdrop_identity = self._backdrop_diagnostic_identity(
                     resources
                 )
-                matte_evidence.color_transform = prepared_color.transform
+                matte_evidence.color_transform = diagnostic_color_transform
                 matte_evidence.matte_authoritative = True
                 matte_evidence.insufficiency_reason = ""
             return (
@@ -4875,11 +4922,7 @@ class Pipeline:
             frame_processing_ms: float | None = None
             diagnostic_frame_started_ns = (
                 time.monotonic_ns()
-                if (
-                    processed
-                    and self._matte_recorder is not None
-                    and self._matte_recorder.accepting
-                )
+                if processed and self._matte_evidence_requested()
                 else None
             )
             if processed:
@@ -5273,6 +5316,10 @@ class Pipeline:
                 }
             )
             self.hub.publish_output(out_frame, stats=frame_stats)
+            self._submit_live_matte_evidence(
+                matte_evidence,
+                status=frame_stats,
+            )
             # Preflight status is installed before readiness. Waiting through
             # one steady-state publication prevents startup callers from
             # racing an already-sent preflight slot with their first command.

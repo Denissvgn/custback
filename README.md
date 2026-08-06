@@ -183,10 +183,12 @@ rates separately. Short capture stalls keep the last safe processed frame on
 the virtual camera while the device is reopened; the default
 `camera.recovery_timeout_s: 10` then fails clearly instead of freezing forever.
 
-`--preview` opens a window showing exactly what the virtual camera sends,
-with the active mode and fps overlaid — the quickest way to verify
-functionality before joining a meeting. (Headless alternative: the MJPEG
-preview at <http://127.0.0.1:8710/>.)
+`--preview` opens on exactly what the virtual camera sends, with the active
+mode and fps overlaid — the quickest way to verify functionality before
+joining a meeting. Its explicit `d` / `D` cycle switches only that native
+window to private, pre-reaction matte views; those frames never enter the
+virtual camera, frame hub, browser preview, or API. (Headless output-preview
+alternative: the MJPEG preview at <http://127.0.0.1:8710/>.)
 
 The window is interactive — a hint bar at the bottom is always visible, and
 `h` expands it into full help:
@@ -196,6 +198,7 @@ The window is interactive — a hint bar at the bottom is always visible, and
 | `0`–`5` | switch mode: passthrough / blur / color / image / video / camera |
 | `n` / `p` | next / previous background file (image+video mode) or color preset (color mode) |
 | `[` / `]` | decrease / increase blur strength |
+| `d` / `D` | next / previous local matte diagnostic view; cycles back to production output |
 | `h` | toggle the help overlay |
 | `q` / `ESC` | quit (stops the whole app) |
 
@@ -205,6 +208,13 @@ Background files for `n`/`p` cycling are read from
 through the API show up in the preview's cycling immediately. Pressing `3`
 (image) or `4` (video) with no files there yet shows an on-screen hint
 instead of silently doing nothing.
+
+Matte views include raw/refined alpha, RVM foreground, the exact backdrop,
+boundary/defect proxies, compositor counterfactuals, and registered temporal
+instability. They are on-demand local inspection tools, not qualification
+evidence; morphology and motion caveats, telemetry meanings, privacy
+boundaries, and the Run-B attribution workflow are documented in
+[Local live matte diagnostics](docs/matte-live-diagnostics.md).
 
 Open <http://127.0.0.1:8710/> and enter the local API token for a live
 preview. The authenticated local API index at
@@ -256,7 +266,9 @@ change the automatic default. See
 [docs/matte-replay-bundle.md](docs/matte-replay-bundle.md) for the privacy,
 format, and command contract, and
 [docs/matte-rvm-profiles.md](docs/matte-rvm-profiles.md) for the formal
-qualification matrix.
+qualification matrix. The separate native-preview-only workflow is described
+in [docs/matte-live-diagnostics.md](docs/matte-live-diagnostics.md); enabling
+it does not persist a bundle.
 The 720p compositor/service budget is measured separately with
 `custback matte-performance PRIVATE_BUNDLE --output NEW_DIR`. It runs the
 eight-cell compositor matrix without capture or output pacing and remains
@@ -746,11 +758,12 @@ This release intentionally breaks the old unauthenticated control plane:
 | `cadence.py` | bounded unique-base/reuse/exact-repeat/send cadence and interval health |
 | `capture_diagnostics.py` | bounded, pixel-free capture-only cadence measurement and native/runtime evidence comparison |
 | `matte_diagnostics.py` | opt-in private bounded matte recorder and offline frozen/model replay |
+| `matte_live_diagnostics.py` | on-demand, native-preview-only matte views and frame-paired temporal telemetry |
 | `matte_quality.py` / `matte_attribution.py` / `matte_ablation.py` | digest-bound metrics, four-boundary RVM attribution, and bounded same-source screening |
 | `gpu_probe.py` | real CUDA inference/profile capability probe for installer and doctor |
 | `vcam.py` | virtual camera output (pyvirtualcam → v4l2loopback / OBS extension) |
 | `hub.py` | thread-safe frame exchange between pipeline and API |
-| `preview.py` | interactive on-screen verification window (main thread; mode/file/blur controls, q/ESC quits) |
+| `preview.py` | interactive on-screen output verification and explicit local matte-diagnostic sink |
 | `pipeline.py` | main loop; transactional frame-boundary reconfiguration |
 | `api/server.py` | authenticated FastAPI control, uploads, MJPEG, and WebSockets |
 | `avatar/` | stage-2 avatar service (`custback avatar`): drivers (`drivers.py`, `audio2face.py`), rigs (`rig.py`), composition (`renderer.py`), WS client loop (`service.py`), control API (`api.py`) |

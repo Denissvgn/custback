@@ -35,6 +35,7 @@ from custback.matte_diagnostics import (
     MatteFrameEvidence,
     MatteReplayBundle,
 )
+from custback.matte_live_diagnostics import LocalMatteDiagnosticMonitor
 from custback.matte_policy import MatteBackendKind
 from custback.light_wrap import LightWrapFrameContext, LightWrapStabilizer
 from custback.pipeline import (
@@ -4182,6 +4183,77 @@ def test_live_light_wrap_preparation_error_falls_back_without_advancing_state(
     assert stabilizer.snapshot() == before
 
 
+def test_private_live_evidence_retains_exact_consumed_prepared_light_wrap(
+    monkeypatch,
+):
+    cfg = _color_integration_config(
+        "video",
+        correction_mode="off",
+        blend_space="linear_srgb",
+    ).patched(
+        {
+            "compositing": {
+                "light_wrap": 0.8,
+                "light_wrap_stabilization": {
+                    "mode": "temporal_bounded",
+                    "time_constant_s": 0.2,
+                },
+            }
+        }
+    )
+    frame = np.full((24, 32, 3), 80, np.uint8)
+    background = np.full((24, 32, 3), 20, np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+
+    class TimedBackdrop(_FixedBackdrop):
+        @staticmethod
+        def temporal_frame_timing():
+            return pipeline_mod.BackdropFrameTiming(1, 1_000_000_000)
+
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        TimedBackdrop(background),
+        None,
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    evidence = MatteFrameEvidence(
+        metadata=MatteCaptureMetadata(
+            bundle_sequence=0,
+            capture_sequence=1,
+            capture_monotonic_ns=1_000_000_000,
+            timestamp_source="test",
+            capture_generation=0,
+            geometry_generation=0,
+        ),
+        raw_frame=frame,
+    )
+    consumed: dict[str, object] = {}
+    real_composite = pipeline._composite_prepared_color
+
+    def capture_prepared(*args, **kwargs):
+        consumed["prepared"] = kwargs["prepared_light_wrap"]
+        return real_composite(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_composite_prepared_color", capture_prepared)
+
+    rendered, reason = pipeline._local_composite(
+        resources,
+        frame,
+        privacy_safe=False,
+        matte_evidence=evidence,
+    )
+
+    assert reason == ""
+    assert rendered.shape == frame.shape
+    assert isinstance(consumed["prepared"], compositor_mod.PreparedLightWrap)
+    assert evidence.prepared_light_wrap is consumed["prepared"]
+    assert evidence.color_transform.is_identity
+
+
 @pytest.mark.parametrize("operation", ["transform", "encode"])
 def test_opencv_photometric_error_retries_identity_exactly_once(
     monkeypatch,
@@ -4236,14 +4308,28 @@ def test_opencv_photometric_error_retries_identity_exactly_once(
         return real_identity_composite(*args, **kwargs)
 
     monkeypatch.setattr(pipeline_mod, "composite", identity_retry)
+    evidence = MatteFrameEvidence(
+        metadata=MatteCaptureMetadata(
+            bundle_sequence=0,
+            capture_sequence=1,
+            capture_monotonic_ns=1_000_000_000,
+            timestamp_source="test",
+            capture_generation=0,
+            geometry_generation=0,
+        ),
+        raw_frame=frame,
+    )
     rendered, _ = pipeline._local_composite(
         resources,
         frame,
         privacy_safe=False,
+        matte_evidence=evidence,
     )
 
     assert np.array_equal(rendered, expected)
     assert calls == {"photometric_failure": 1, "identity_retry": 1}
+    assert evidence.prepared_light_wrap is None
+    assert evidence.color_transform.is_identity
 
 
 @pytest.mark.parametrize("failure", ["structural", "invalid-output"])
@@ -4587,6 +4673,123 @@ def test_color_correction_has_a_separate_deterministic_timing_bucket(monkeypatch
         "composite_blend_ms": 2.0,
         "composite_ms": 3.0,
     }
+
+
+def test_inactive_live_matte_monitor_keeps_evidence_fast_path_off():
+    cfg = _color_integration_config("image")
+    monitor = LocalMatteDiagnosticMonitor()
+    pipeline = Pipeline(
+        RuntimeConfig(cfg),
+        FrameHub(),
+        matte_monitor=monitor,
+    )
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.full((24, 32, 3), 20, np.uint8)),
+        None,
+    )
+    raw = np.full((24, 32, 3), 80, np.uint8)
+    try:
+        assert not monitor.accepting
+        assert pipeline._new_matte_evidence(resources, _captured(raw)) is None
+    finally:
+        monitor.close()
+        resources.close()
+
+
+def test_live_matte_view_never_reaches_output_or_normal_hub_slots():
+    cfg = _color_integration_config("image")
+    source = np.empty((24, 32, 3), np.uint8)
+    source[..., 0] = 11
+    source[..., 1] = 73
+    source[..., 2] = 191
+    mask = np.full((24, 32), 0.25, np.float32)
+    backdrop = np.full((24, 32, 3), (201, 31, 7), np.uint8)
+    hub = FrameHub()
+    monitor = LocalMatteDiagnosticMonitor()
+    assert monitor.select("raw_alpha") == "raw_alpha"
+    pipeline = Pipeline(
+        RuntimeConfig(cfg),
+        hub,
+        matte_monitor=monitor,
+    )
+    output = _StopAfterOutput(pipeline, 1)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([source]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(backdrop),
+        output,
+    )
+
+    try:
+        pipeline._loop(resources)
+        diagnostic, _sequence = monitor.get(-1, timeout=2.0)
+        assert diagnostic is not None
+        assert diagnostic.view == "raw_alpha"
+        assert np.all(diagnostic.pixels == 64)
+        assert diagnostic.status["capture_sequence"] == diagnostic.capture_sequence
+
+        published_output, _timestamp = hub.output.latest()
+        published_raw, _timestamp = hub.raw.latest()
+        assert published_output is not None
+        assert published_raw is not None
+        assert len(output.frames) == 1
+        np.testing.assert_array_equal(published_output, output.frames[0])
+        np.testing.assert_array_equal(published_raw, source)
+        assert not np.array_equal(output.frames[0], diagnostic.pixels)
+        assert not np.array_equal(published_raw, diagnostic.pixels)
+        assert "matte_diagnostic" not in repr(hub.stats_dict())
+    finally:
+        monitor.close()
+        resources.close()
+
+
+def test_live_matte_view_does_not_force_segmentation_in_passthrough():
+    cfg = _color_integration_config("passthrough")
+    source = np.full((24, 32, 3), (17, 83, 149), np.uint8)
+
+    class ForbiddenSegmenter(_FixedMaskSegmenter):
+        def segment(self, *_args, **_kwargs):
+            pytest.fail("diagnostic view advanced bypassed segmentation state")
+
+    hub = FrameHub()
+    monitor = LocalMatteDiagnosticMonitor()
+    monitor.select("raw_alpha")
+    pipeline = Pipeline(
+        RuntimeConfig(cfg),
+        hub,
+        matte_monitor=monitor,
+    )
+    output = _StopAfterOutput(pipeline, 1)
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([source]),
+        ForbiddenSegmenter(np.zeros((24, 32), np.float32)),
+        _IdentityRefiner(),
+        None,
+        output,
+    )
+
+    try:
+        pipeline._loop(resources)
+        diagnostic, _sequence = monitor.get(-1, timeout=2.0)
+        assert diagnostic is not None
+        assert not diagnostic.available
+        assert diagnostic.unavailable_reason == "raw model alpha is unavailable"
+        np.testing.assert_array_equal(output.frames[0], source)
+        np.testing.assert_array_equal(hub.output.latest()[0], source)
+        np.testing.assert_array_equal(hub.raw.latest()[0], source)
+    finally:
+        monitor.close()
+        resources.close()
 
 
 def test_private_matte_frame_total_includes_sink_send_and_samples_rss(
