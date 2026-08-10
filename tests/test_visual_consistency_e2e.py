@@ -639,11 +639,15 @@ def test_real_color_pairs_cross_pipeline_without_changing_raw(
     hub = FrameHub()
     hub.configure_canvas((width, height))
     pipeline = Pipeline(RuntimeConfig(cfg), hub)
-    output = _StopOutput(pipeline, 2, (width, height))
+    # WB deliberately requires 0.5 s of sustained estimator authority. Keep
+    # this end-to-end lane alive past that boundary instead of asserting the
+    # historical two-frame acquisition behavior.
+    frame_count = 8
+    output = _StopOutput(pipeline, frame_count, (width, height))
     resources = _Resources(
         cfg,
         0,
-        _SequenceCapture([foreground.copy(), foreground.copy()]),
+        _SequenceCapture([foreground.copy() for _ in range(frame_count)]),
         _MaskSegmenter(mask),
         _IdentityRefiner(),
         _CanvasBackdrop(backdrop_pixels),
@@ -1659,7 +1663,13 @@ def test_remote_privacy_slate_is_identical_at_preview_mjpeg_and_vcam_sinks(
     )
     session = hub.remote_client_connected()
     try:
-        assert hub.push_remote_frame(candidate, session)
+        hub.publish_remote_raw(raw_frames[0], 1)
+        pipeline._record_remote_raw_frame(raw_frames[0])
+        assert hub.push_remote_frame(
+            candidate,
+            raw_epoch=1,
+            session_id=session,
+        )
         pipeline._loop(resources)
 
         slate = Pipeline._privacy_slate((height, width, 3))

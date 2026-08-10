@@ -43,6 +43,9 @@ TARGET_DILATION_SIZE = 19
 MIN_SAMPLES = 96
 MIN_MASK_COVERAGE = 0.01
 MIN_CONFIDENCE = 0.45
+WB_ENTER_CONFIDENCE = 0.50
+WB_HOLD_CONFIDENCE = 0.40
+WB_CONFIDENCE_SUSTAIN_S = 0.5
 NEAR_BLACK = 0.02
 NEAR_CLIP = 0.98
 NEUTRAL_SATURATION_MAX = 0.30
@@ -469,6 +472,8 @@ class ColorEstimate:
     target_is_local: bool
     reliable: bool
     signature: ColorSceneSignature | None = None
+    exposure_clamped: bool = False
+    white_balance_clamped: bool = False
 
     @property
     def exposure_ev(self) -> float:
@@ -671,6 +676,23 @@ def _neutral_pixels(pixels: np.ndarray, valid: np.ndarray) -> np.ndarray:
     minimum = np.min(pixels, axis=1)
     saturation = (maximum - minimum) / np.maximum(maximum, 1e-6)
     return np.ascontiguousarray(valid & (saturation <= NEUTRAL_SATURATION_MAX))
+
+
+def _white_balance_target_is_eligible(
+    *,
+    target_is_local: bool,
+    neutral_source: int,
+    neutral_target: int,
+    confidence: float,
+) -> bool:
+    """Return whether an estimate carries a usable temporal WB target."""
+
+    return bool(
+        target_is_local
+        and neutral_source >= MIN_SAMPLES
+        and neutral_target >= MIN_SAMPLES
+        and confidence >= WB_HOLD_CONFIDENCE
+    )
 
 
 def _centered_log_chroma(pixels: np.ndarray) -> tuple[float, float, float]:
@@ -951,6 +973,7 @@ def _estimate_color_transform(
             target_luminance,
         )
         raw_ev = signature.target_log_luminance - signature.source_log_luminance
+        exposure_clamped = abs(raw_ev) > float(exposure_limit_ev)
         exposure_transform = bounded_color_transform(
             raw_ev,
             strength=float(strength),
@@ -985,11 +1008,11 @@ def _estimate_color_transform(
             else 0.0
         )
         wb_confidence = float(exposure_confidence * neutral_availability)
-        can_adapt_wb = (
-            target_is_local
-            and neutral_source >= MIN_SAMPLES
-            and neutral_target >= MIN_SAMPLES
-            and wb_confidence >= MIN_CONFIDENCE
+        can_adapt_wb = _white_balance_target_is_eligible(
+            target_is_local=target_is_local,
+            neutral_source=neutral_source,
+            neutral_target=neutral_target,
+            confidence=wb_confidence,
         )
         if not can_adapt_wb:
             reason = (
@@ -1011,11 +1034,20 @@ def _estimate_color_transform(
                 target_is_local=target_is_local,
                 reliable=True,
                 signature=signature,
+                exposure_clamped=exposure_clamped,
             )
 
         source_rgb = np.median(source[source_neutral], axis=0)
         target_rgb = np.median(target[target_neutral], axis=0)
         raw_gains = target_rgb / np.maximum(source_rgb, 1e-6)
+        if not bool(np.isfinite(raw_gains).all()) or bool(np.any(raw_gains <= 0.0)):
+            raise ColorError("raw white-balance gains are invalid")
+        normalized_raw_gains = np.asarray(raw_gains, dtype=np.float64)
+        normalized_raw_gains /= np.exp(np.mean(np.log(normalized_raw_gains)))
+        white_balance_clamped = bool(
+            np.any(normalized_raw_gains < WB_GAIN_MIN)
+            or np.any(normalized_raw_gains > WB_GAIN_MAX)
+        )
         transform = bounded_color_transform(
             raw_ev,
             (
@@ -1041,6 +1073,8 @@ def _estimate_color_transform(
             target_is_local=True,
             reliable=True,
             signature=signature,
+            exposure_clamped=exposure_clamped,
+            white_balance_clamped=white_balance_clamped,
         )
     except (ColorError, ValueError, TypeError, OverflowError, FloatingPointError):
         return ColorEstimate.identity(ColorReason.INVALID)
@@ -1378,6 +1412,9 @@ class ColorHarmonizer:
         self._last_timestamp_s: float | None = None
         self._last_reliable_s: float | None = None
         self._low_confidence_since_s: float | None = None
+        self._wb_authoritative = False
+        self._wb_enter_since_s: float | None = None
+        self._wb_low_confidence_since_s: float | None = None
         self._fast_until_s: float | None = None
         self._source_generation: int | None = None
         self._signature: ColorSceneSignature | None = None
@@ -1410,8 +1447,17 @@ class ColorHarmonizer:
             signature=self._signature,
         )
 
-    def clone(self) -> ColorHarmonizer:
-        cloned = ColorHarmonizer(self.adaptation_time_s, mode=self.mode)
+    def clone(
+        self,
+        *,
+        adaptation_time_s: float | None = None,
+    ) -> ColorHarmonizer:
+        """Copy temporal state, optionally adopting a new smoothing policy."""
+
+        cloned = ColorHarmonizer(
+            self.adaptation_time_s if adaptation_time_s is None else adaptation_time_s,
+            mode=self.mode,
+        )
         cloned._exposure_ev = self._exposure_ev
         cloned._wb_log2 = self._wb_log2
         cloned._phase = self._phase
@@ -1421,10 +1467,34 @@ class ColorHarmonizer:
         cloned._last_timestamp_s = self._last_timestamp_s
         cloned._last_reliable_s = self._last_reliable_s
         cloned._low_confidence_since_s = self._low_confidence_since_s
+        cloned._wb_authoritative = self._wb_authoritative
+        cloned._wb_enter_since_s = self._wb_enter_since_s
+        cloned._wb_low_confidence_since_s = self._wb_low_confidence_since_s
         cloned._fast_until_s = self._fast_until_s
         cloned._source_generation = self._source_generation
         cloned._signature = self._signature
         return cloned
+
+    def clamp_exposure(self, exposure_limit_ev: float) -> bool:
+        """Apply a lowered hard EV bound without disturbing temporal history."""
+
+        if (
+            isinstance(exposure_limit_ev, bool)
+            or not isinstance(exposure_limit_ev, (int, float))
+            or not math.isfinite(float(exposure_limit_ev))
+            or not 0.0 <= float(exposure_limit_ev) <= MAX_EXPOSURE_EV
+        ):
+            raise ColorError("exposure_limit_ev must be in [0, 1]")
+        bounded = float(
+            np.clip(
+                self._exposure_ev,
+                -float(exposure_limit_ev),
+                float(exposure_limit_ev),
+            )
+        )
+        changed = bounded != self._exposure_ev
+        self._exposure_ev = bounded
+        return changed
 
     def reset(
         self,
@@ -1447,6 +1517,9 @@ class ColorHarmonizer:
         self._last_timestamp_s = now
         self._last_reliable_s = None
         self._low_confidence_since_s = None
+        self._wb_authoritative = False
+        self._wb_enter_since_s = None
+        self._wb_low_confidence_since_s = None
         self._fast_until_s = None
         self._source_generation = source_generation
         self._signature = None
@@ -1495,6 +1568,117 @@ class ColorHarmonizer:
         upper = math.log2(WB_GAIN_MAX)
         self._wb_log2 = tuple(float(np.clip(value, lower, upper)) for value in wb_log2)
 
+    def _install_exposure(self, exposure_ev: float) -> None:
+        self._exposure_ev = float(
+            np.clip(exposure_ev, -MAX_EXPOSURE_EV, MAX_EXPOSURE_EV)
+        )
+
+    def _install_white_balance(self, wb_log2: tuple[float, ...]) -> None:
+        lower = math.log2(WB_GAIN_MIN)
+        upper = math.log2(WB_GAIN_MAX)
+        self._wb_log2 = tuple(float(np.clip(value, lower, upper)) for value in wb_log2)
+
+    def _clear_white_balance_authority(self) -> None:
+        self._install_white_balance((0.0, 0.0, 0.0))
+        self._wb_authoritative = False
+        self._wb_enter_since_s = None
+        self._wb_low_confidence_since_s = None
+
+    def _update_white_balance(
+        self,
+        estimate: ColorEstimate,
+        now: float,
+        dt: float,
+        *,
+        tau: float,
+        slew_per_s: float,
+    ) -> None:
+        """Advance WB under an independent confidence Schmitt trigger."""
+
+        has_wb_target = (
+            estimate.reliable
+            and estimate.behavior is ColorBehavior.EXPOSURE_WHITE_BALANCE
+        )
+        confidence = estimate.white_balance_confidence if has_wb_target else 0.0
+
+        if self._wb_authoritative:
+            self._wb_enter_since_s = None
+            if has_wb_target and confidence >= WB_HOLD_CONFIDENCE:
+                self._wb_low_confidence_since_s = None
+                target_logs = tuple(
+                    math.log2(value) for value in estimate.transform.wb_gains
+                )
+                self._install_white_balance(
+                    tuple(
+                        _bounded_step(
+                            current,
+                            target,
+                            dt=dt,
+                            tau=tau,
+                            deadband=WB_DEADBAND_LOG2,
+                            slew_per_s=slew_per_s,
+                        )
+                        for current, target in zip(
+                            self._wb_log2,
+                            target_logs,
+                            strict=True,
+                        )
+                    )
+                )
+                return
+
+            if self._wb_low_confidence_since_s is None:
+                self._wb_low_confidence_since_s = now
+            elapsed = now - self._wb_low_confidence_since_s
+            if elapsed <= LOW_CONFIDENCE_FREEZE_S:
+                return
+            if elapsed >= STALE_CLEAR_S:
+                self._clear_white_balance_authority()
+                return
+            decay_dt = min(dt, max(0.0, elapsed - LOW_CONFIDENCE_FREEZE_S))
+            alpha = (
+                -math.expm1(-decay_dt / STALE_DECAY_TAU_S) if decay_dt > 0.0 else 0.0
+            )
+            self._install_white_balance(
+                tuple(value * (1.0 - alpha) for value in self._wb_log2)
+            )
+            return
+
+        self._wb_low_confidence_since_s = None
+        if not has_wb_target or confidence < WB_ENTER_CONFIDENCE:
+            self._wb_enter_since_s = None
+            return
+        if self._wb_enter_since_s is None:
+            self._wb_enter_since_s = now
+        elapsed = now - self._wb_enter_since_s
+        if elapsed < WB_CONFIDENCE_SUSTAIN_S:
+            return
+
+        self._wb_authoritative = True
+        self._wb_enter_since_s = None
+        target_logs = tuple(math.log2(value) for value in estimate.transform.wb_gains)
+        # A sparse sample may cross the sustain boundary.  Apply only the
+        # elapsed portion after authority was established, matching dense
+        # cadence and avoiding a catch-up jump at the threshold.
+        adaptation_dt = min(dt, max(0.0, elapsed - WB_CONFIDENCE_SUSTAIN_S))
+        self._install_white_balance(
+            tuple(
+                _bounded_step(
+                    current,
+                    target,
+                    dt=adaptation_dt,
+                    tau=tau,
+                    deadband=WB_DEADBAND_LOG2,
+                    slew_per_s=slew_per_s,
+                )
+                for current, target in zip(
+                    self._wb_log2,
+                    target_logs,
+                    strict=True,
+                )
+            )
+        )
+
     def _decay_or_freeze(
         self,
         estimate: ColorEstimate,
@@ -1503,8 +1687,15 @@ class ColorHarmonizer:
     ) -> ColorTransform:
         self._reason = estimate.reason
         self._confidence = estimate.confidence
+        self._update_white_balance(
+            estimate,
+            now,
+            dt,
+            tau=STALE_DECAY_TAU_S,
+            slew_per_s=STEADY_WB_SLEW_LOG2_S,
+        )
         if not self._reliable:
-            self._install_transform(0.0, (0.0, 0.0, 0.0))
+            self._install_exposure(0.0)
             self._phase = HarmonizerPhase.IDENTITY
             self._last_timestamp_s = now
             return self.transform
@@ -1516,7 +1707,8 @@ class ColorHarmonizer:
             self._last_timestamp_s = now
             return self.transform
         if elapsed >= STALE_CLEAR_S:
-            self._install_transform(0.0, (0.0, 0.0, 0.0))
+            self._install_exposure(0.0)
+            self._clear_white_balance_authority()
             self._phase = HarmonizerPhase.IDENTITY
             self._reliable = False
             self._last_reliable_s = None
@@ -1529,10 +1721,7 @@ class ColorHarmonizer:
         # not make the frozen interval count as stale decay.
         decay_dt = min(dt, max(0.0, elapsed - LOW_CONFIDENCE_FREEZE_S))
         alpha = -math.expm1(-decay_dt / STALE_DECAY_TAU_S) if decay_dt > 0.0 else 0.0
-        self._install_transform(
-            self._exposure_ev * (1.0 - alpha),
-            tuple(value * (1.0 - alpha) for value in self._wb_log2),
-        )
+        self._install_exposure(self._exposure_ev * (1.0 - alpha))
         self._phase = HarmonizerPhase.STALE_DECAY
         self._last_timestamp_s = now
         return self.transform
@@ -1576,6 +1765,9 @@ class ColorHarmonizer:
             self._reliable = False
             self._last_reliable_s = None
             self._low_confidence_since_s = None
+            self._wb_authoritative = False
+            self._wb_enter_since_s = None
+            self._wb_low_confidence_since_s = None
             self._fast_until_s = None
             self._signature = None
             dt = 0.0
@@ -1594,6 +1786,8 @@ class ColorHarmonizer:
             self._reason = estimate.reason
             self._confidence = estimate.confidence
             self._low_confidence_since_s = None
+            self._wb_enter_since_s = None
+            self._wb_low_confidence_since_s = None
             self._last_reliable_s = now
             self._fast_until_s = now + FAST_ACQUISITION_S
             self._last_timestamp_s = now
@@ -1610,6 +1804,13 @@ class ColorHarmonizer:
             self._low_confidence_since_s = None
             self._last_reliable_s = now
             self._fast_until_s = now + FAST_ACQUISITION_S
+            self._update_white_balance(
+                estimate,
+                now,
+                dt,
+                tau=_fast_tau(self.adaptation_time_s),
+                slew_per_s=FAST_WB_SLEW_LOG2_S,
+            )
             self._last_timestamp_s = now
             return self.transform
 
@@ -1627,7 +1828,6 @@ class ColorHarmonizer:
                 exposure_slew *= CAMERA_SLEW_MULTIPLIER
                 wb_slew *= CAMERA_SLEW_MULTIPLIER
 
-        target_logs = tuple(math.log2(value) for value in estimate.transform.wb_gains)
         new_exposure = _bounded_step(
             self._exposure_ev,
             estimate.transform.exposure_ev,
@@ -1636,18 +1836,14 @@ class ColorHarmonizer:
             deadband=EXPOSURE_DEADBAND_EV,
             slew_per_s=exposure_slew,
         )
-        new_logs = tuple(
-            _bounded_step(
-                current,
-                target,
-                dt=dt,
-                tau=tau,
-                deadband=WB_DEADBAND_LOG2,
-                slew_per_s=wb_slew,
-            )
-            for current, target in zip(self._wb_log2, target_logs, strict=True)
+        self._install_exposure(new_exposure)
+        self._update_white_balance(
+            estimate,
+            now,
+            dt,
+            tau=tau,
+            slew_per_s=wb_slew,
         )
-        self._install_transform(new_exposure, new_logs)
         self._signature = estimate.signature
         self._phase = HarmonizerPhase.WARMING if fast else HarmonizerPhase.ACTIVE
         self._reason = estimate.reason

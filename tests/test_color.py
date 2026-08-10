@@ -21,6 +21,9 @@ from custback.color import (
     LOW_CONFIDENCE_FREEZE_S,
     MIN_CONFIDENCE,
     STALE_CLEAR_S,
+    WB_CONFIDENCE_SUSTAIN_S,
+    WB_ENTER_CONFIDENCE,
+    WB_HOLD_CONFIDENCE,
     ColorBehavior,
     ColorError,
     ColorEstimate,
@@ -109,6 +112,35 @@ def _reliable_estimate(
         target_is_local=True,
         reliable=True,
         signature=signature or _signature(),
+    )
+
+
+def _wb_confidence_estimate(
+    confidence: float,
+    *,
+    exposure_ev: float = 0.40,
+    wb_gains: tuple[float, float, float] = (1.10, 1.0, 0.90),
+    behavior: ColorBehavior = ColorBehavior.EXPOSURE_WHITE_BALANCE,
+) -> ColorEstimate:
+    reason = (
+        ColorReason.OK
+        if behavior is ColorBehavior.EXPOSURE_WHITE_BALANCE
+        else ColorReason.INSUFFICIENT_NEUTRAL
+    )
+    return ColorEstimate(
+        transform=ColorTransform(exposure_ev, wb_gains),
+        behavior=behavior,
+        reason=reason,
+        confidence=0.95,
+        exposure_confidence=0.95,
+        white_balance_confidence=confidence,
+        usable_source=512,
+        usable_target=512,
+        neutral_source=256 if behavior is ColorBehavior.EXPOSURE_WHITE_BALANCE else 0,
+        neutral_target=256 if behavior is ColorBehavior.EXPOSURE_WHITE_BALANCE else 0,
+        target_is_local=True,
+        reliable=True,
+        signature=_signature(),
     )
 
 
@@ -515,6 +547,31 @@ def test_estimator_recovers_symmetric_exposure_pairs_with_ratified_clamp(ev: flo
     assert estimate.behavior is ColorBehavior.EXPOSURE_WHITE_BALANCE
     assert estimate.exposure_ev == pytest.approx(math.copysign(0.425, ev), abs=0.005)
     assert estimate.transform.wb_gains == pytest.approx((1.0, 1.0, 1.0), abs=1e-5)
+    assert estimate.exposure_clamped is True
+    assert estimate.white_balance_clamped is False
+
+
+def test_estimator_reports_pre_strength_white_balance_clamping():
+    height, width = 180, 320
+    foreground = np.empty((height, width, 3), np.float32)
+    foreground[:] = (0.20, 0.20, 0.20)
+    backdrop = np.empty_like(foreground)
+    backdrop[:] = (0.26, 0.32, 0.24)
+
+    estimate = estimate_color_transform_linear(
+        foreground,
+        backdrop,
+        _ellipse_mask(height, width),
+        mode="image",
+    )
+
+    assert estimate.reliable
+    assert estimate.behavior is ColorBehavior.EXPOSURE_WHITE_BALANCE
+    assert estimate.exposure_clamped is False
+    assert estimate.white_balance_clamped is True
+    # The diagnostic describes the pre-strength clamp even though the default
+    # strength keeps the applied gain strictly inside the raw endpoint.
+    assert max(estimate.wb_gains) < color.WB_GAIN_MAX
 
 
 def test_estimator_external_and_predecoded_entrypoints_agree():
@@ -854,6 +911,36 @@ def test_temporal_sequences_are_cadence_equivalent():
         )
 
 
+def test_harmonizer_clone_reconfigures_tau_and_clamps_only_exposure_state():
+    harmonizer = ColorHarmonizer()
+    estimate = _reliable_estimate(0.7, (1.10, 1.0, 0.90))
+    for index in range(121):
+        harmonizer.update(estimate, index / 30.0, source_generation=3)
+    before = harmonizer.snapshot()
+
+    cloned = harmonizer.clone(adaptation_time_s=1.7)
+    assert cloned is not harmonizer
+    assert cloned.adaptation_time_s == 1.7
+    assert cloned.snapshot() == before
+    assert cloned.clamp_exposure(0.3) is True
+
+    after = cloned.snapshot()
+    assert after.transform.exposure_ev == pytest.approx(0.3)
+    assert after.transform.wb_gains == before.transform.wb_gains
+    assert after.phase == before.phase
+    assert after.reason == before.reason
+    assert after.confidence == before.confidence
+    assert after.reliable == before.reliable
+    assert after.last_timestamp_s == before.last_timestamp_s
+    assert after.last_reliable_s == before.last_reliable_s
+    assert after.low_confidence_since_s == before.low_confidence_since_s
+    assert after.fast_until_s == before.fast_until_s
+    assert after.source_generation == before.source_generation
+    assert after.signature == before.signature
+    assert cloned.clamp_exposure(0.3) is False
+    assert harmonizer.snapshot() == before
+
+
 def test_temporal_static_noise_stays_below_jitter_gate():
     rng = np.random.default_rng(2401)
     harmonizer = ColorHarmonizer()
@@ -882,6 +969,132 @@ def test_temporal_static_noise_stays_below_jitter_gate():
     ]
     assert float(np.percentile(ev_delta, 95)) <= 0.002
     assert float(np.percentile(gain_delta, 95)) <= 0.002
+
+
+def test_white_balance_requires_sustained_enter_and_holds_at_lower_confidence():
+    harmonizer = ColorHarmonizer()
+    timestamp = 0.0
+    for index in range(21):
+        confidence = WB_ENTER_CONFIDENCE + (0.01 if index % 2 == 0 else -0.01)
+        harmonizer.update(
+            _wb_confidence_estimate(confidence),
+            timestamp,
+            source_generation=1,
+        )
+        timestamp += 0.1
+
+    assert harmonizer.transform.exposure_ev > 0.1
+    assert harmonizer.transform.wb_gains == pytest.approx((1.0, 1.0, 1.0))
+
+    sustained_steps = round(WB_CONFIDENCE_SUSTAIN_S / 0.1) + 2
+    for _index in range(sustained_steps):
+        harmonizer.update(
+            _wb_confidence_estimate(WB_ENTER_CONFIDENCE + 0.01),
+            timestamp,
+            source_generation=1,
+        )
+        timestamp += 0.1
+    acquired = harmonizer.transform
+    assert acquired.wb_gains[0] > 1.0
+    assert acquired.wb_gains[2] < 1.0
+
+    for _index in range(10):
+        harmonizer.update(
+            _wb_confidence_estimate(WB_HOLD_CONFIDENCE),
+            timestamp,
+            source_generation=1,
+        )
+        timestamp += 0.1
+    held = harmonizer.transform
+    assert held.wb_gains[0] >= acquired.wb_gains[0]
+    assert held.wb_gains[2] <= acquired.wb_gains[2]
+
+
+def test_estimator_hold_band_reaches_authoritative_white_balance_state():
+    hold_confidence = (WB_HOLD_CONFIDENCE + MIN_CONFIDENCE) / 2.0
+    estimate = _wb_confidence_estimate(
+        hold_confidence,
+        exposure_ev=-0.40,
+        wb_gains=(0.90, 1.0, 1.10),
+    )
+    assert WB_HOLD_CONFIDENCE <= hold_confidence < MIN_CONFIDENCE
+    assert color._white_balance_target_is_eligible(
+        target_is_local=estimate.target_is_local,
+        neutral_source=estimate.neutral_source,
+        neutral_target=estimate.neutral_target,
+        confidence=estimate.white_balance_confidence,
+    )
+
+    harmonizer = ColorHarmonizer()
+    for index in range(8):
+        harmonizer.update(
+            _wb_confidence_estimate(
+                WB_ENTER_CONFIDENCE + 0.10,
+                exposure_ev=0.40,
+                wb_gains=(1.10, 1.0, 0.90),
+            ),
+            index / 10.0,
+            source_generation=1,
+        )
+    acquired = harmonizer.transform
+
+    held = harmonizer.update(estimate, 0.8, source_generation=1)
+
+    assert held.wb_gains[0] < acquired.wb_gains[0]
+    assert held.wb_gains[2] > acquired.wb_gains[2]
+    assert held.exposure_ev < acquired.exposure_ev
+
+
+def test_insufficient_neutral_freezes_wb_while_exposure_keeps_adapting():
+    harmonizer = ColorHarmonizer()
+    for index in range(21):
+        harmonizer.update(
+            _wb_confidence_estimate(0.90),
+            index / 10.0,
+            source_generation=1,
+        )
+    active = harmonizer.transform
+    insufficient_neutral = _wb_confidence_estimate(
+        0.0,
+        exposure_ev=-0.40,
+        wb_gains=(1.0, 1.0, 1.0),
+        behavior=ColorBehavior.EXPOSURE_ONLY,
+    )
+    start = 2.1
+
+    first = harmonizer.update(
+        insufficient_neutral,
+        start,
+        source_generation=1,
+    )
+    held = harmonizer.update(
+        insufficient_neutral,
+        start + 0.4,
+        source_generation=1,
+    )
+
+    assert first.exposure_ev < active.exposure_ev
+    assert held.exposure_ev < first.exposure_ev
+    assert first.wb_gains == active.wb_gains
+    assert held.wb_gains == active.wb_gains
+
+    decaying = harmonizer.update(
+        insufficient_neutral,
+        start + 0.8,
+        source_generation=1,
+    )
+    assert max(abs(math.log2(value)) for value in decaying.wb_gains) < max(
+        abs(math.log2(value)) for value in active.wb_gains
+    )
+
+    cleared = harmonizer.update(
+        insufficient_neutral,
+        start + STALE_CLEAR_S + 0.1,
+        source_generation=1,
+    )
+    assert cleared.wb_gains == (1.0, 1.0, 1.0)
+    assert cleared.exposure_ev < 0.0
+    assert harmonizer.snapshot().reliable
 
 
 def test_scene_cut_holds_cut_frame_then_fast_acquires_inside_clamps():

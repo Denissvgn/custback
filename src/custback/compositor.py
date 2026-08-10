@@ -40,6 +40,7 @@ COMPOSITOR_P95_SUB_BUDGET_MS = 22.0
 
 COMPOSITOR_SUBSTAGE_NAMES = (
     "input_mask_validation",
+    "color_transform_application",
     "edge_band",
     "model_foreground_replacement",
     "backdrop_blur_resize",
@@ -100,6 +101,19 @@ class LegacyCompositorWorkspace:
         )
         self._weight_bgr: np.ndarray | None = np.empty(shape, dtype=np.float32)
         self._working_bgr: np.ndarray | None = np.empty(shape, dtype=np.float32)
+        self._transformed_foreground_bgr: np.ndarray | None = np.empty(
+            shape,
+            dtype=np.uint8,
+        )
+        self._transformed_edge_bgr: np.ndarray | None = np.empty(
+            shape,
+            dtype=np.uint8,
+        )
+        self._color_transform_lut_bgr: np.ndarray | None = np.empty(
+            (256, 1, 3),
+            dtype=np.uint8,
+        )
+        self._color_transform_key: tuple[float, float, float, float] | None = None
         self._blur_small_bgr: np.ndarray | None = np.empty(
             (max(4, height // 8), max(4, width // 8), 3),
             dtype=np.uint8,
@@ -118,6 +132,9 @@ class LegacyCompositorWorkspace:
             self._scalar_inverse,
             self._weight_bgr,
             self._working_bgr,
+            self._transformed_foreground_bgr,
+            self._transformed_edge_bgr,
+            self._color_transform_lut_bgr,
             self._blur_small_bgr,
         )
         return LegacyCompositorWorkspaceSnapshot(
@@ -137,6 +154,10 @@ class LegacyCompositorWorkspace:
         self._scalar_inverse = None
         self._weight_bgr = None
         self._working_bgr = None
+        self._transformed_foreground_bgr = None
+        self._transformed_edge_bgr = None
+        self._color_transform_lut_bgr = None
+        self._color_transform_key = None
         self._blur_small_bgr = None
         self._last_known_allocation_bytes = 0
         self._closed = True
@@ -179,6 +200,62 @@ class LegacyCompositorWorkspace:
         opencv: Any,
     ) -> None:
         opencv.merge((scalar, scalar, scalar), dst=destination)
+
+    def transform_encoded(
+        self,
+        foreground_bgr: np.ndarray,
+        edge_foreground_bgr: np.ndarray | None,
+        transform: ColorTransform,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Apply the diagonal linear-sRGB transform through a retained LUT.
+
+        The transform is separable by channel. Build its 256-entry BGR LUT
+        with the deterministic public reference arithmetic, then let OpenCV
+        write the full-frame result directly into generation-owned buffers.
+        This is exact at alpha endpoints and avoids every transform-sized
+        temporary on the steady path.
+        """
+
+        if self._closed:
+            raise RuntimeError("legacy compositor workspace is closed")
+        if foreground_bgr.shape != self._shape or (
+            edge_foreground_bgr is not None and edge_foreground_bgr.shape != self._shape
+        ):
+            raise ValueError("legacy compositor workspace shape mismatch")
+        opencv = cv2
+        if opencv is None:  # pragma: no cover - package dependency invariant
+            raise ColorError("opencv-python is required for compositor workspace")
+        transformed_foreground = self._transformed_foreground_bgr
+        transformed_edge = self._transformed_edge_bgr
+        lut = self._color_transform_lut_bgr
+        if transformed_foreground is None or transformed_edge is None or lut is None:
+            raise RuntimeError("legacy compositor workspace is incomplete")
+        red, green, blue = transform.wb_gains
+        key = (
+            float(transform.exposure_ev),
+            float(red),
+            float(green),
+            float(blue),
+        )
+        if self._color_transform_key != key:
+            ramp = np.repeat(
+                np.arange(256, dtype=np.uint8).reshape(1, 256, 1),
+                3,
+                axis=2,
+            )
+            reference = linear_rgb_to_bgr_u8(
+                apply_color_transform(
+                    bgr_u8_to_linear_rgb(ramp),
+                    transform,
+                )
+            )
+            np.copyto(lut[:, 0, :], reference[0])
+            self._color_transform_key = key
+        opencv.LUT(foreground_bgr, lut, dst=transformed_foreground)
+        if edge_foreground_bgr is None:
+            return transformed_foreground, None
+        opencv.LUT(edge_foreground_bgr, lut, dst=transformed_edge)
+        return transformed_foreground, transformed_edge
 
     def blend(
         self,
@@ -392,6 +469,62 @@ def _downscaled_blur(image: np.ndarray, scale: int = 8, kernel: int = 9) -> np.n
     small = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA)
     small = cv2.GaussianBlur(small, (kernel, kernel), 0)
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+
+def prepare_static_light_wrap(
+    backdrop_bgr: np.ndarray,
+    *,
+    blend_space: BlendSpace,
+    backdrop_linear_bgr: np.ndarray | None = None,
+    diagnostics: MutableMapping[str, float] | None = None,
+) -> PreparedLightWrap:
+    """Prepare one immutable-backdrop wrap sample for generation caching.
+
+    Unlike :func:`prepare_light_wrap`, this helper has no temporal authority.
+    It is valid only when the caller has established that the backdrop pixels
+    cannot advance.  Its resize/blur sequence is the exact stateless reference
+    path, so a cached result changes cost and ownership, never pixels.
+    """
+
+    backdrop_bgr = _validate_frame(backdrop_bgr, name="backdrop_bgr")
+    if blend_space not in ("srgb_legacy", "linear_srgb"):
+        raise ValueError("blend_space must be 'srgb_legacy' or 'linear_srgb'")
+    if cv2 is None:
+        raise ColorError("opencv-python is required for light wrap")
+    if diagnostics is not None:
+        for name in COMPOSITOR_SUBSTAGE_NAMES:
+            diagnostics.setdefault(name, 0.0)
+    if blend_space == "srgb_legacy":
+        if backdrop_linear_bgr is not None:
+            raise ValueError(
+                "backdrop_linear_bgr is only valid for linear_srgb light wrap"
+            )
+        working = backdrop_bgr
+    else:
+        working = (
+            _bgr_u8_to_linear_bgr_prevalidated(backdrop_bgr)
+            if backdrop_linear_bgr is None
+            else _validate_prevalidated_linear_bgr(
+                backdrop_linear_bgr,
+                name="backdrop_linear_bgr",
+                expected_shape=backdrop_bgr.shape,
+            )
+        )
+    started_ns = time.perf_counter_ns() if diagnostics is not None else 0
+    try:
+        pixels = np.ascontiguousarray(_downscaled_blur(working), dtype=np.float32)
+    except cv2.error as exc:
+        raise ColorError("OpenCV light-wrap preparation failed") from exc
+    if diagnostics is not None:
+        diagnostics["backdrop_blur_resize"] += (
+            time.perf_counter_ns() - started_ns
+        ) / 1_000_000.0
+    pixels.setflags(write=False)
+    return PreparedLightWrap(
+        pixels_bgr=pixels,
+        blend_space=blend_space,
+        stabilized=False,
+    )
 
 
 def prepare_light_wrap(
@@ -695,22 +828,30 @@ def _legacy_composite(
         transformed_edge = edge_foreground
     else:
         assert color_transform is not None
-        transformed_foreground = linear_rgb_to_bgr_u8(
-            apply_color_transform(
-                bgr_u8_to_linear_rgb(foreground),
+        started_ns = time.perf_counter_ns() if diagnostics is not None else 0
+        if workspace is not None and cv2 is not None:
+            transformed_foreground, transformed_edge = workspace.transform_encoded(
+                foreground,
+                edge_foreground,
                 color_transform,
             )
-        )
-        transformed_edge = (
-            None
-            if edge_foreground is None
-            else linear_rgb_to_bgr_u8(
-                apply_color_transform(
-                    bgr_u8_to_linear_rgb(edge_foreground),
+        else:
+            transformed_foreground = _encode_transformed_linear_bgr_prevalidated(
+                _bgr_u8_to_linear_bgr_prevalidated(foreground),
+                color_transform,
+            )
+            transformed_edge = (
+                None
+                if edge_foreground is None
+                else _encode_transformed_linear_bgr_prevalidated(
+                    _bgr_u8_to_linear_bgr_prevalidated(edge_foreground),
                     color_transform,
                 )
             )
-        )
+        if diagnostics is not None:
+            diagnostics["color_transform_application"] += (
+                time.perf_counter_ns() - started_ns
+            ) / 1_000_000.0
     return _legacy_blend_encoded(
         transformed_foreground,
         backdrop,
@@ -785,19 +926,31 @@ def composite_legacy_predecoded(
         transformed_edge = edge_foreground_bgr
     else:
         assert color_transform is not None
-        transformed_foreground = linear_rgb_to_bgr_u8(
-            apply_color_transform(foreground_linear_rgb, color_transform)
-        )
-        transformed_edge = (
-            None
-            if edge_foreground_linear_rgb is None
-            else linear_rgb_to_bgr_u8(
-                apply_color_transform(
-                    edge_foreground_linear_rgb,
-                    color_transform,
+        started_ns = time.perf_counter_ns() if diagnostics is not None else 0
+        if workspace is not None and cv2 is not None:
+            transformed_foreground, transformed_edge = workspace.transform_encoded(
+                foreground_bgr,
+                edge_foreground_bgr,
+                color_transform,
+            )
+        else:
+            transformed_foreground = linear_rgb_to_bgr_u8(
+                apply_color_transform(foreground_linear_rgb, color_transform)
+            )
+            transformed_edge = (
+                None
+                if edge_foreground_linear_rgb is None
+                else linear_rgb_to_bgr_u8(
+                    apply_color_transform(
+                        edge_foreground_linear_rgb,
+                        color_transform,
+                    )
                 )
             )
-        )
+        if diagnostics is not None:
+            diagnostics["color_transform_application"] += (
+                time.perf_counter_ns() - started_ns
+            ) / 1_000_000.0
     return _legacy_blend_encoded(
         transformed_foreground,
         backdrop_bgr,
@@ -882,6 +1035,7 @@ def composite_linear_predecoded(
         transformed_edge = edge_foreground_linear_rgb
     else:
         assert color_transform is not None
+        started_ns = time.perf_counter_ns() if diagnostics is not None else 0
         transformed_foreground = apply_color_transform(
             foreground_linear_rgb,
             color_transform,
@@ -894,6 +1048,10 @@ def composite_linear_predecoded(
                 color_transform,
             )
         )
+        if diagnostics is not None:
+            diagnostics["color_transform_application"] += (
+                time.perf_counter_ns() - started_ns
+            ) / 1_000_000.0
 
     alpha = mask[..., None]
     working_foreground = transformed_foreground
@@ -1020,6 +1178,139 @@ def _apply_color_transform_linear_bgr_prevalidated(
     return np.ascontiguousarray(cv2.transform(linear_bgr, matrix), dtype=np.float32)
 
 
+def _encode_transformed_linear_bgr_prevalidated(
+    linear_bgr: np.ndarray,
+    transform: ColorTransform,
+) -> np.ndarray:
+    """Apply and encode a trusted linear-BGR foreground.
+
+    OpenCV keeps the production path in native BGR order and compiled code.
+    The deterministic NumPy fallback deliberately uses the public RGB
+    reference operations so platforms without OpenCV retain the same bounded
+    numerical contract.
+    """
+
+    if cv2 is None:
+        linear_rgb = np.ascontiguousarray(linear_bgr[..., ::-1], dtype=np.float32)
+        return linear_rgb_to_bgr_u8(apply_color_transform(linear_rgb, transform))
+    transformed = _apply_color_transform_linear_bgr_prevalidated(
+        linear_bgr,
+        transform,
+    )
+    return _consume_linear_bgr_to_bgr_u8_prevalidated(transformed)
+
+
+def _composite_legacy_bgr_prevalidated(
+    foreground_bgr: np.ndarray,
+    backdrop_bgr: np.ndarray,
+    mask: np.ndarray,
+    *,
+    foreground_linear_bgr: np.ndarray,
+    light_wrap: float = 0.0,
+    edge_foreground_bgr: np.ndarray | None = None,
+    edge_foreground_linear_bgr: np.ndarray | None = None,
+    color_transform: ColorTransform | None = None,
+    prepared_light_wrap: PreparedLightWrap | None = None,
+    workspace: LegacyCompositorWorkspace | None = None,
+    diagnostics: MutableMapping[str, float] | None = None,
+) -> np.ndarray:
+    """Legacy encoded blending over prevalidated linear-BGR foregrounds.
+
+    This is the production integration seam for callers that already decoded
+    the foreground.  It avoids channel-reversal copies and the NumPy transform
+    path while preserving the public RGB predecoded API above.
+    """
+
+    validation_started_ns = time.perf_counter_ns() if diagnostics is not None else 0
+    foreground_bgr = _validate_frame(foreground_bgr, name="foreground_bgr")
+    backdrop_bgr = _validate_frame(
+        backdrop_bgr,
+        name="backdrop_bgr",
+        expected_shape=foreground_bgr.shape,
+    )
+    if (
+        not isinstance(mask, np.ndarray)
+        or mask.dtype != np.float32
+        or mask.ndim != 2
+        or mask.shape != foreground_bgr.shape[:2]
+        or mask.size == 0
+        or not mask.flags.c_contiguous
+    ):
+        raise ValueError("mask must satisfy the prevalidated float32 contract")
+    light_wrap = _validated_light_wrap(light_wrap)
+    color_transform = _validate_color_transform(color_transform)
+    foreground_linear_bgr = _validate_prevalidated_linear_bgr(
+        foreground_linear_bgr,
+        name="foreground_linear_bgr",
+        expected_shape=foreground_bgr.shape,
+    )
+    if (edge_foreground_bgr is None) != (edge_foreground_linear_bgr is None):
+        raise ValueError(
+            "edge_foreground_bgr and edge_foreground_linear_bgr "
+            "must be provided together"
+        )
+    if edge_foreground_bgr is not None:
+        edge_foreground_bgr = _validate_frame(
+            edge_foreground_bgr,
+            name="edge_foreground_bgr",
+            expected_shape=foreground_bgr.shape,
+        )
+        edge_foreground_linear_bgr = _validate_prevalidated_linear_bgr(
+            edge_foreground_linear_bgr,
+            name="edge_foreground_linear_bgr",
+            expected_shape=foreground_bgr.shape,
+        )
+    if workspace is not None and workspace.shape != foreground_bgr.shape:
+        raise ValueError("legacy compositor workspace shape mismatch")
+    if diagnostics is not None:
+        for name in COMPOSITOR_SUBSTAGE_NAMES:
+            diagnostics.setdefault(name, 0.0)
+        diagnostics["input_mask_validation"] += (
+            time.perf_counter_ns() - validation_started_ns
+        ) / 1_000_000.0
+
+    if _is_identity_transform(color_transform):
+        transformed_foreground = foreground_bgr
+        transformed_edge = edge_foreground_bgr
+    else:
+        assert color_transform is not None
+        started_ns = time.perf_counter_ns() if diagnostics is not None else 0
+        if workspace is not None and cv2 is not None:
+            transformed_foreground, transformed_edge = workspace.transform_encoded(
+                foreground_bgr,
+                edge_foreground_bgr,
+                color_transform,
+            )
+        else:
+            transformed_foreground = _encode_transformed_linear_bgr_prevalidated(
+                foreground_linear_bgr,
+                color_transform,
+            )
+            transformed_edge = (
+                None
+                if edge_foreground_linear_bgr is None
+                else _encode_transformed_linear_bgr_prevalidated(
+                    edge_foreground_linear_bgr,
+                    color_transform,
+                )
+            )
+        if diagnostics is not None:
+            diagnostics["color_transform_application"] += (
+                time.perf_counter_ns() - started_ns
+            ) / 1_000_000.0
+
+    return _legacy_blend_encoded(
+        transformed_foreground,
+        backdrop_bgr,
+        mask,
+        light_wrap=light_wrap,
+        edge_foreground=transformed_edge,
+        prepared_light_wrap=prepared_light_wrap,
+        workspace=workspace,
+        diagnostics=diagnostics,
+    )
+
+
 def _composite_linear_bgr_prevalidated(
     foreground_bgr: np.ndarray,
     backdrop_bgr: np.ndarray,
@@ -1122,6 +1413,7 @@ def _composite_linear_bgr_prevalidated(
             transformed_edge = edge_foreground_linear_bgr
         else:
             assert color_transform is not None
+            started_ns = time.perf_counter_ns() if diagnostics is not None else 0
             transformed_foreground = _apply_color_transform_linear_bgr_prevalidated(
                 foreground_linear_bgr,
                 color_transform,
@@ -1134,6 +1426,10 @@ def _composite_linear_bgr_prevalidated(
                     color_transform,
                 )
             )
+            if diagnostics is not None:
+                diagnostics["color_transform_application"] += (
+                    time.perf_counter_ns() - started_ns
+                ) / 1_000_000.0
 
         working_foreground = transformed_foreground
         if light_wrap > 0.0 or transformed_edge is not None:

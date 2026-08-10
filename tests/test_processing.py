@@ -496,6 +496,100 @@ class TestCompositor:
 
         assert np.array_equal(out, expected)
 
+    def test_legacy_linear_bgr_transform_matches_reference_and_endpoints(self):
+        pytest.importorskip("cv2")
+        rng = np.random.default_rng(0xC0104)
+        fg = rng.integers(0, 256, size=(32, 48, 3), dtype=np.uint8)
+        bg = rng.integers(0, 256, size=fg.shape, dtype=np.uint8)
+        mask = rng.random(fg.shape[:2], dtype=np.float32)
+        mask[0] = 0.0
+        mask[-1] = 1.0
+        transform = ColorTransform(
+            exposure_ev=0.65,
+            wb_gains=(1.12, 0.94, 0.88),
+        )
+        foreground_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(fg)
+        transformed_reference = linear_rgb_to_bgr_u8(
+            apply_color_transform(bgr_u8_to_linear_rgb(fg), transform)
+        )
+        expected = legacy_composite_reference(
+            transformed_reference,
+            bg,
+            mask,
+        )
+        diagnostics = {}
+
+        actual = compositor_mod._composite_legacy_bgr_prevalidated(
+            fg,
+            bg,
+            mask,
+            foreground_linear_bgr=foreground_linear_bgr,
+            color_transform=transform,
+            workspace=compositor_mod.LegacyCompositorWorkspace(fg.shape),
+            diagnostics=diagnostics,
+        )
+        transformed_compiled = (
+            compositor_mod._encode_transformed_linear_bgr_prevalidated(
+                foreground_linear_bgr,
+                transform,
+            )
+        )
+
+        assert np.max(np.abs(actual.astype(np.int16) - expected.astype(np.int16))) <= 1
+        np.testing.assert_array_equal(actual[mask == 0.0], bg[mask == 0.0])
+        np.testing.assert_array_equal(
+            actual[mask == 1.0],
+            transformed_reference[mask == 1.0],
+        )
+        assert (
+            np.max(
+                np.abs(transformed_compiled.astype(np.int16) - transformed_reference)
+            )
+            <= 1
+        )
+        assert diagnostics["color_transform_application"] > 0.0
+
+    def test_legacy_linear_bgr_numpy_fallback_is_deterministic(
+        self,
+        monkeypatch,
+    ):
+        rng = np.random.default_rng(0xFA11BAC)
+        fg = rng.integers(0, 256, size=(12, 20, 3), dtype=np.uint8)
+        bg = rng.integers(0, 256, size=fg.shape, dtype=np.uint8)
+        mask = rng.random(fg.shape[:2], dtype=np.float32)
+        transform = ColorTransform(
+            exposure_ev=-0.35,
+            wb_gains=(0.92, 1.04, 1.10),
+        )
+        foreground_linear_bgr = compositor_mod._bgr_u8_to_linear_bgr_prevalidated(fg)
+        transformed_reference = linear_rgb_to_bgr_u8(
+            apply_color_transform(bgr_u8_to_linear_rgb(fg), transform)
+        )
+        expected = legacy_composite_reference(
+            transformed_reference,
+            bg,
+            mask,
+        )
+        monkeypatch.setattr(compositor_mod, "cv2", None)
+
+        first = compositor_mod._composite_legacy_bgr_prevalidated(
+            fg,
+            bg,
+            mask,
+            foreground_linear_bgr=foreground_linear_bgr,
+            color_transform=transform,
+        )
+        second = compositor_mod._composite_legacy_bgr_prevalidated(
+            fg,
+            bg,
+            mask,
+            foreground_linear_bgr=foreground_linear_bgr,
+            color_transform=transform,
+        )
+
+        np.testing.assert_array_equal(first, expected)
+        np.testing.assert_array_equal(second, first)
+
     def test_linear_transform_applies_identically_to_camera_and_rvm_foreground(self):
         fg = frame(h=4, w=6, value=48)
         bg = frame(h=4, w=6, value=8)
@@ -1639,7 +1733,7 @@ def test_legacy_workspace_does_not_swallow_structural_failure(monkeypatch):
         )
 
 
-def test_legacy_workspace_reports_bounded_retained_and_transient_bytes():
+def test_legacy_workspace_reports_bounded_retained_and_transient_bytes(monkeypatch):
     shape = (24, 40, 3)
     height, width, _channels = shape
     workspace = compositor_mod.LegacyCompositorWorkspace(shape)
@@ -1647,6 +1741,8 @@ def test_legacy_workspace_reports_bounded_retained_and_transient_bytes():
     expected_retained = (
         2 * height * width * np.dtype(np.float32).itemsize
         + 2 * height * width * 3 * np.dtype(np.float32).itemsize
+        + 2 * height * width * 3 * np.dtype(np.uint8).itemsize
+        + 256 * 3 * np.dtype(np.uint8).itemsize
         + max(4, height // 8) * max(4, width // 8) * 3
     )
 
@@ -1655,16 +1751,34 @@ def test_legacy_workspace_reports_bounded_retained_and_transient_bytes():
     assert initial.calls == 0
     assert initial.closed is False
 
+    foreground = frame(h=height, w=width, value=200)
+    full_frame_allocations = []
+    real_empty = compositor_mod.np.empty
+
+    def tracked_empty(*args, **kwargs):
+        value = real_empty(*args, **kwargs)
+        if value.nbytes >= foreground.nbytes:
+            full_frame_allocations.append(value.nbytes)
+        return value
+
+    monkeypatch.setattr(compositor_mod.np, "empty", tracked_empty)
     output = composite(
-        frame(h=height, w=width, value=200),
+        foreground,
         frame(h=height, w=width, value=10),
         np.full((height, width), 0.5, np.float32),
+        edge_foreground=frame(h=height, w=width, value=180),
+        light_wrap=0.25,
+        color_transform=ColorTransform(
+            exposure_ev=0.5,
+            wb_gains=(1.1, 0.95, 0.9),
+        ),
         workspace=workspace,
     )
     used = workspace.snapshot()
 
     assert used.retained_bytes == expected_retained
     assert used.last_known_allocation_bytes == output.nbytes
+    assert full_frame_allocations == [output.nbytes]
     assert used.calls == 1
     assert used.closed is False
 
