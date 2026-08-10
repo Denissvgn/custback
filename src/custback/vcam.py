@@ -15,6 +15,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
@@ -252,7 +253,32 @@ class PyVirtualCamOutput(VideoOutput):
         )
 
     def send_with_timing(self, frame_bgr: np.ndarray) -> OutputSendTiming:
+        return self.send_with_acceptance_timing(frame_bgr, lambda _timing: None)
+
+    def send_with_acceptance_timing(
+        self,
+        frame_bgr: np.ndarray,
+        on_accepted: Callable[[OutputSendTiming], None],
+    ) -> OutputSendTiming:
+        """Publish acceptance before the sink-owned pacing wait.
+
+        The frame is already irrevocably submitted after ``cam.send``.  The
+        publisher uses this boundary to update FrameHub with identical pixels
+        while this thread remains inside pyvirtualcam's pacing contract.
+        """
+
+        if not callable(on_accepted):
+            raise TypeError("accepted-frame callback must be callable")
         submission = self.submit_unpaced_with_timing(frame_bgr)
+        on_accepted(
+            OutputSendTiming(
+                submitted_at_ns=submission.submitted_at_ns,
+                completed_at_ns=submission.submitted_at_ns,
+                submission_ms=submission.submission_ms,
+                pacing_wait_ms=0.0,
+                pacing_events=1,
+            )
+        )
         self.cam.sleep_until_next_frame()
         completed_at_ns = _monotonic_ns_at_or_after(submission.submitted_at_ns)
         return OutputSendTiming(
