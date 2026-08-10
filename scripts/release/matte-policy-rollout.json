@@ -1,0 +1,146 @@
+{
+  "schema": "custback.matte-quality-rollout",
+  "version": 1,
+  "active_stage": "compatibility_hold",
+  "decision": "held_pending_physical_qualification",
+  "default_schema_version": 1,
+  "compatibility_policy": {
+    "patch_id": "matte-legacy-v1",
+    "patch_sha256": "27638e419a0dcf5955d52e2eb4ead2dafbdca7f2bbe0535108aa7c56c1f2f60d",
+    "patch": {
+      "segmentation": {
+        "backend": "auto",
+        "delegate": "cpu",
+        "rvm_downsample": 0.0,
+        "threshold": 0.5,
+        "mask_blur": 7,
+        "edge_refine": true,
+        "mask_shift": 0,
+        "temporal_smoothing": 0.35,
+        "boundary_stabilization": {
+          "mode": "off",
+          "time_constant_s": 0.1,
+          "max_motion_px_per_s": 720.0
+        },
+        "spatial_edge_refinement": {
+          "mode": "legacy_watershed",
+          "reference_short_edge_px": 720,
+          "radius_at_reference_px": 8,
+          "min_radius_px": 2,
+          "max_radius_px": 12
+        }
+      },
+      "acceleration": {
+        "mode": "auto",
+        "provider": "auto",
+        "device_id": 0
+      },
+      "compositing": {
+        "light_wrap": 0.25,
+        "use_model_foreground": true,
+        "blend_space": "srgb_legacy",
+        "light_wrap_stabilization": {
+          "mode": "off",
+          "time_constant_s": 0.12
+        },
+        "color_correction": {
+          "mode": "off",
+          "strength": 0.5,
+          "exposure_limit_ev": 0.85,
+          "white_balance_strength": 0.5,
+          "adaptation_time_s": 0.8
+        }
+      }
+    }
+  },
+  "preset_catalog": {
+    "schema": "custback.matte-quality-presets",
+    "version": 1,
+    "evidence_status": "not_qualified",
+    "preset_ids": []
+  },
+  "promotion": {
+    "status": "pending",
+    "authority": "none-v1-physical-evidence-pending",
+    "physical_provenance_required": true,
+    "generated_evidence_can_qualify": false,
+    "candidate_id": null,
+    "candidate_build_sha256": null,
+    "candidate_patch_sha256": null,
+    "change_commit": null,
+    "evidence": [
+      {
+        "id": "baseline",
+        "schema": "custback.matte-quality-report",
+        "report": null,
+        "file_sha256": null,
+        "evidence_sha256": null,
+        "status": "pending"
+      },
+      {
+        "id": "ablation",
+        "schema": "custback.matte-ablation-report",
+        "report": null,
+        "file_sha256": null,
+        "evidence_sha256": null,
+        "status": "pending"
+      },
+      {
+        "id": "visual",
+        "schema": "custback.matte-visual-qualification-report",
+        "report": null,
+        "file_sha256": null,
+        "evidence_sha256": null,
+        "status": "pending"
+      },
+      {
+        "id": "performance",
+        "schema": "custback.matte-performance-report",
+        "report": null,
+        "file_sha256": null,
+        "evidence_sha256": null,
+        "status": "pending"
+      },
+      {
+        "id": "platform",
+        "schema": "custback.matte-platform-qualification-report",
+        "report": null,
+        "file_sha256": null,
+        "evidence_sha256": null,
+        "status": "pending"
+      },
+      {
+        "id": "privacy",
+        "schema": "custback.matte-rollout-privacy-review",
+        "report": null,
+        "file_sha256": null,
+        "evidence_sha256": null,
+        "status": "pending"
+      },
+      {
+        "id": "migration",
+        "schema": "custback.matte-rollout-migration-report",
+        "report": null,
+        "file_sha256": null,
+        "evidence_sha256": null,
+        "status": "pending"
+      }
+    ],
+    "limitations": [
+      "upstream-build-binding-owner-attested",
+      "physical-origin-owner-attested"
+    ]
+  },
+  "rollback": {
+    "patch_id": "matte-legacy-v1",
+    "patch_sha256": "27638e419a0dcf5955d52e2eb4ead2dafbdca7f2bbe0535108aa7c56c1f2f60d",
+    "retain_schema_version": true,
+    "delete_user_config": false,
+    "delete_model_cache": false,
+    "minimum_stable_releases": 1
+  },
+  "reactions": {
+    "included": false,
+    "required_for_matte_qualification": false
+  }
+}

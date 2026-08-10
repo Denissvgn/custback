@@ -408,7 +408,7 @@ def _safe_legacy_source(value: Any) -> tuple[bool, int | str | None]:
 
 
 def _materialize_visual_schema_v1(raw: dict[str, Any]) -> dict[str, Any]:
-    """Return an explicit schema-v1 document without changing pinned values."""
+    """Return an explicit visual/matte schema-v1 document without policy changes."""
 
     return materialize_config_schema_defaults(copy.deepcopy(raw))
 
@@ -447,7 +447,8 @@ def _plan_config_migration(raw: dict[str, Any], target_id: str) -> _ConfigPlan:
                 ) from exc
             return _ConfigPlan(
                 MigrationStatus.MIGRATED,
-                "configuration materialized with explicit visual schema-v1 policy",
+                "configuration materialized with explicit visual/matte "
+                "schema-v1 policy",
                 encoded,
             )
         return _ConfigPlan(

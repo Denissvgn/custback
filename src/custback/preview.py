@@ -659,6 +659,27 @@ def _status_overlay_lines(
             matte_parts.append(f"LIGHT WRAP {light_wrap:.2f}".rstrip("0").rstrip("."))
         status.append("MATTE " + "  ".join(matte_parts))
 
+    raw_rollout = stats.get("matte_rollout")
+    rollout = raw_rollout if isinstance(raw_rollout, Mapping) else None
+    rollout_version = rollout.get("config_version") if rollout is not None else None
+    status_version = stats.get("config_version")
+    if (
+        rollout is not None
+        and type(rollout_version) is int
+        and type(status_version) is int
+        and rollout_version == status_version
+    ):
+        stage = _compact_status_text(rollout.get("stage"), "unknown")
+        decision = _compact_status_text(rollout.get("decision"), "unknown")
+        attempts = _as_int(rollout.get("patch_attempts")) or 0
+        successes = _as_int(rollout.get("patch_successes")) or 0
+        failures = _as_int(rollout.get("patch_failures")) or 0
+        rollbacks = _as_int(rollout.get("legacy_rollbacks")) or 0
+        status.append(
+            f"MATTE ROLLOUT {stage}  {decision}  "
+            f"PATCHES {attempts}/{successes}/{failures}  ROLLBACKS {rollbacks}"
+        )
+
     capture_parts: list[str] = []
     width, height = stats.get("capture_width"), stats.get("capture_height")
     if width and height:

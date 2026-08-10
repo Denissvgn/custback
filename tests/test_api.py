@@ -8,6 +8,7 @@ AnyIO's blocking portal, which is unavailable in some restricted runtimes.
 import asyncio
 import contextlib
 import errno
+import json
 import os
 import stat
 import sys
@@ -38,7 +39,12 @@ else:  # Starlette < 1 uses the original httpx client contract.
 from custback.api.security import SESSION_COOKIE, SecurityPolicy
 import custback.api.server as server_mod
 from custback.api.server import _UploadLimits, _UploadStore, create_app
-from custback.config import AppConfig, ConfigState, RuntimeConfig
+from custback.config import (
+    AppConfig,
+    ConfigState,
+    RuntimeConfig,
+    legacy_matte_policy_patch,
+)
 from custback.hub import TIMING_FIELD_NAMES, FrameHub, PostBaseProvenance
 from custback.pipeline import Pipeline
 
@@ -367,6 +373,7 @@ def test_status_and_config_with_bearer(stack):
         "capture_frame_age_ms",
         "matte_reset_count",
         "matte_last_reset_reason",
+        "matte_rollout",
         "output_target_fps",
         "output_repeated_frames",
         "processing_deadline_misses",
@@ -382,6 +389,31 @@ def test_status_and_config_with_bearer(stack):
     assert body["capture_missing_input_count"] == 0
     assert body["matte_reset_count"] >= 1
     assert body["matte_last_reset_reason"] == "initial"
+    assert body["matte_rollout"] == {
+        "schema": "custback.matte-rollout-status",
+        "version": 1,
+        "stage": "compatibility_hold",
+        "decision": "held_pending_physical_qualification",
+        "configured_schema_version": 1,
+        "config_version": body["config_version"],
+        "qualified_default_active": False,
+        "preset_catalog_version": 1,
+        "preset_evidence_status": "not_qualified",
+        "legacy_policy_available": True,
+        "legacy_policy_active": False,
+        "rollback_patch_id": "matte-legacy-v1",
+        "patch_attempts": 0,
+        "patch_in_flight": 0,
+        "patch_successes": 0,
+        "patch_failures": 0,
+        "legacy_rollbacks": 0,
+        "last_outcome": "none",
+    }
+    rollout_json = json.dumps(body["matte_rollout"], sort_keys=True)
+    assert all(
+        forbidden not in rollout_json
+        for forbidden in ("model_path", "package", "device", "/", "\\")
+    )
     assert body["output_fallback_active"] is False
     if sys.platform == "win32":
         assert body["native_ring"] in {"section absent", "section present"}
@@ -420,6 +452,23 @@ def test_status_fails_closed_when_internal_policy_breaks_openapi(
     assert "public status failed schema validation" in caplog.text
 
 
+def test_status_fails_closed_when_rollout_generation_is_misaligned(
+    stack,
+    monkeypatch,
+    caplog,
+):
+    body = stack.hub.stats_dict()
+    body["matte_rollout"]["config_version"] = body["config_version"] + 1
+    monkeypatch.setattr(stack.hub, "stats_dict", lambda: body)
+
+    with caplog.at_level("ERROR", logger="custback.api.server"):
+        response = stack.get("/status", headers=AUTH)
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "internal_error"
+    assert "public status failed schema validation" in caplog.text
+
+
 def test_status_openapi_matches_cadence_and_exposes_no_raw_timestamps_or_paths(
     stack,
 ):
@@ -443,6 +492,14 @@ def test_status_openapi_matches_cadence_and_exposes_no_raw_timestamps_or_paths(
         set(status_schema["properties"]) == set(status_schema["required"]) == set(body)
     )
     assert status_schema["properties"]["timing_schema_version"]["const"] == 1
+    rollout = body["matte_rollout"]
+    rollout_schema = schemas["_MatteRolloutResponse"]
+    assert (
+        set(rollout)
+        == set(rollout_schema["properties"])
+        == set(rollout_schema["required"])
+    )
+    assert rollout["config_version"] == body["config_version"]
 
     selection = body["segmentation_selection"]
     selection_schema = schemas["_SegmentationSelectionResponse"]
@@ -817,6 +874,74 @@ def test_invalid_patch_is_422(stack):
     malformed = stack.patch("/config", json=["not", "an", "object"], headers=AUTH)
     assert malformed.status_code == 422
     assert malformed.json()["detail"]["code"] == "invalid_content"
+
+
+def test_live_matte_patch_and_rollback_publish_terminal_rollout_status(stack):
+    rejected = stack.patch(
+        "/config",
+        json={"segmentation": {"threshold": 2.0}},
+        headers=AUTH,
+    )
+    assert rejected.status_code == 422
+    after_failure = stack.get("/status", headers=AUTH).json()
+    assert after_failure["matte_rollout"]["config_version"] == 0
+    assert after_failure["matte_rollout"]["patch_failures"] == 1
+    assert after_failure["matte_rollout"]["last_outcome"] == "failure"
+
+    applied = stack.patch(
+        "/config",
+        json={"segmentation": {"threshold": 0.61}},
+        headers=AUTH,
+    )
+    assert applied.status_code == 200
+    applied_version = applied.json()["config_version"]
+
+    def wait_for_rollout(version, outcome):
+        deadline = time.monotonic() + 5.0
+        latest = None
+        while time.monotonic() < deadline:
+            latest = stack.get("/status", headers=AUTH).json()
+            rollout = latest["matte_rollout"]
+            if (
+                latest["config_version"] == rollout["config_version"] == version
+                and rollout["last_outcome"] == outcome
+                and rollout["patch_in_flight"] == 0
+            ):
+                return latest
+            time.sleep(0.01)
+        pytest.fail(f"rollout status did not reach {version}/{outcome}: {latest}")
+
+    after_apply = wait_for_rollout(applied_version, "success")
+    assert after_apply["matte_rollout"]["patch_successes"] == 1
+
+    rolled_back = stack.patch(
+        "/config",
+        json=legacy_matte_policy_patch(),
+        headers=AUTH,
+    )
+    assert rolled_back.status_code == 200
+    rollback_version = rolled_back.json()["config_version"]
+    after_rollback = wait_for_rollout(rollback_version, "rollback")
+    assert after_rollback["matte_rollout"] == {
+        "schema": "custback.matte-rollout-status",
+        "version": 1,
+        "stage": "compatibility_hold",
+        "decision": "held_pending_physical_qualification",
+        "configured_schema_version": 1,
+        "config_version": rollback_version,
+        "qualified_default_active": False,
+        "preset_catalog_version": 1,
+        "preset_evidence_status": "not_qualified",
+        "legacy_policy_available": True,
+        "legacy_policy_active": True,
+        "rollback_patch_id": "matte-legacy-v1",
+        "patch_attempts": 3,
+        "patch_in_flight": 0,
+        "patch_successes": 2,
+        "patch_failures": 1,
+        "legacy_rollbacks": 1,
+        "last_outcome": "rollback",
+    }
 
 
 def test_invalid_config_response_never_echoes_sensitive_input(stack):

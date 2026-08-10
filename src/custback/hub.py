@@ -22,6 +22,10 @@ from typing import Callable, Mapping
 import numpy as np
 
 from .geometry import Size, validate_bgr_frame
+from .matte_rollout import (
+    empty_matte_rollout_status,
+    validate_matte_rollout_status,
+)
 
 
 TIMING_SCHEMA_VERSION = 1
@@ -424,6 +428,7 @@ class Stats:
         default_factory=_empty_segmentation_selection
     )
     matte_policy: dict[str, object] = field(default_factory=_empty_matte_policy)
+    matte_rollout: dict[str, object] = field(default_factory=empty_matte_rollout_status)
     segmentation_generation: int = 0
     capture_sequence: int = 0
     capture_sequence_gap_count: int = 0
@@ -935,6 +940,8 @@ class FrameHub:
                 value = self._validated_segmentation_selection(value)
             if key == "matte_policy":
                 value = self._validated_matte_policy(value)
+            if key == "matte_rollout":
+                value = validate_matte_rollout_status(value)
             if isinstance(value, (dict, list)):
                 value = copy.deepcopy(value)
             staged[key] = value
@@ -1313,6 +1320,7 @@ class FrameHub:
                     self.stats.segmentation_selection
                 ),
                 "matte_policy": copy.deepcopy(self.stats.matte_policy),
+                "matte_rollout": copy.deepcopy(self.stats.matte_rollout),
                 "segmentation_generation": self.stats.segmentation_generation,
                 "capture_sequence": self.stats.capture_sequence,
                 "capture_sequence_gap_count": self.stats.capture_sequence_gap_count,

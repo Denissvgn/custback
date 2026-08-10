@@ -6,6 +6,10 @@
 # opt-in until VIS-4.2 calibrated and physical approval advances the
 # commit-bound gate in scripts/release/visual-policy-rollout.json. Versionless
 # and schema-1 persisted files always retain the compatibility meanings below.
+# MATTE-5.2/5.3 generated evidence is deliberately non-authorizing, so this
+# release also retains the existing automatic backend selector and exact
+# schema-1 matte/postprocess policy. No quality preset or higher-detail default
+# is promoted without private physical platform qualification.
 
 schema_version: 1
 
@@ -60,8 +64,9 @@ background:
 backdrop_targets: {}
 
 segmentation:
-  # auto picks the best available: rvm (matting, needs the [rvm] or [gpu]
-  # extra) > mediapipe > heuristic
+  # Existing schema-1 compatibility selector: auto tries rvm (matting, needs
+  # the [rvm] or [gpu] extra) > mediapipe > heuristic. This is not a new RVM
+  # default promotion or a claim that every detected provider is sustainable.
   backend: auto        # auto | rvm | mediapipe | heuristic | none
   model_path: ""       # optional model override (.onnx for rvm, .tflite for mediapipe)
   delegate: cpu        # cpu | gpu — mediapipe inference device; rvm picks

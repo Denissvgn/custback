@@ -15,9 +15,11 @@ from custback.config import (
     ConfigVersionConflictError,
     RuntimeConfig,
     SpatialEdgeRefinementConfig,
+    legacy_matte_policy_patch,
     materialize_config_schema_defaults,
     resolved_output_size,
     spatial_edge_refinement_radius,
+    uses_legacy_matte_policy,
 )
 
 
@@ -67,6 +69,7 @@ def test_defaults_valid():
         max_radius_px=12,
     )
     assert cfg.api.renderer_token_file == "~/.config/custback/renderer-token"
+    assert uses_legacy_matte_policy(cfg) is True
 
 
 def test_packaged_default_yaml_pins_compatibility_visual_policy():
@@ -150,41 +153,37 @@ def test_schema_v1_absent_fields_are_bound_before_model_defaults():
         "anchor_y": 0.5,
         "rotation": 0,
     }
-    assert materialized["compositing"] == {
-        "color_correction": {
-            "strength": 0.7,
-            "mode": "off",
-            "exposure_limit_ev": 0.85,
-            "white_balance_strength": 0.5,
-            "adaptation_time_s": 0.8,
-        },
-        "blend_space": "srgb_legacy",
-        "light_wrap_stabilization": {
-            "mode": "off",
-            "time_constant_s": 0.12,
-        },
-    }
+    legacy = legacy_matte_policy_patch()
+    expected_compositing = legacy["compositing"]
+    expected_compositing["color_correction"]["strength"] = 0.7
+    assert materialized["compositing"] == expected_compositing
     assert materialized["background"]["fit_mode"] == "cover"
     assert materialized["output"] == {"width": None, "height": None}
-    assert materialized["segmentation"] == {
-        "boundary_stabilization": {
-            "mode": "off",
-            "time_constant_s": 0.1,
-            "max_motion_px_per_s": 720.0,
-        },
-        "spatial_edge_refinement": {
-            "mode": "legacy_watershed",
-            "reference_short_edge_px": 720,
-            "radius_at_reference_px": 8,
-            "min_radius_px": 2,
-            "max_radius_px": 12,
-        },
-    }
+    expected_segmentation = legacy_matte_policy_patch()["segmentation"]
+    expected_segmentation["model_path"] = ""
+    assert materialized["segmentation"] == expected_segmentation
+    assert materialized["acceleration"] == legacy_matte_policy_patch()["acceleration"]
     assert raw == {
         "schema_version": 1,
         "camera": {"width": 640, "height": 480},
         "compositing": {"color_correction": {"strength": 0.7}},
     }
+
+
+def test_versionless_omitted_matte_policy_materializes_complete_schema_v1():
+    raw = {"background": {"mode": "blur"}}
+    legacy = legacy_matte_policy_patch()
+    expected_segmentation = legacy["segmentation"]
+    expected_segmentation["model_path"] = ""
+
+    materialized = materialize_config_schema_defaults(raw)
+
+    assert materialized["schema_version"] == LEGACY_CONFIG_SCHEMA_VERSION
+    assert materialized["segmentation"] == expected_segmentation
+    assert materialized["acceleration"] == legacy["acceleration"]
+    assert materialized["compositing"] == legacy["compositing"]
+    assert uses_legacy_matte_policy(AppConfig.from_dict(raw)) is True
+    assert raw == {"background": {"mode": "blur"}}
 
 
 def test_schema_v1_partial_spatial_edge_policy_binds_all_legacy_parameters():
@@ -205,6 +204,48 @@ def test_schema_v1_partial_spatial_edge_policy_binds_all_legacy_parameters():
         "max_radius_px": 12,
     }
     assert raw["segmentation"]["spatial_edge_refinement"] == {"mode": "stable_guided"}
+
+
+def test_schema_v1_partial_temporal_and_compositor_modes_bind_legacy_parameters():
+    raw = {
+        "schema_version": 1,
+        "segmentation": {
+            "boundary_stabilization": {"mode": "motion_aware"},
+        },
+        "compositing": {
+            "light_wrap_stabilization": {"mode": "temporal_bounded"},
+            "color_correction": {"mode": "auto"},
+        },
+    }
+
+    materialized = materialize_config_schema_defaults(raw)
+
+    assert materialized["segmentation"]["boundary_stabilization"] == {
+        "mode": "motion_aware",
+        "time_constant_s": 0.1,
+        "max_motion_px_per_s": 720.0,
+    }
+    assert materialized["compositing"]["light_wrap_stabilization"] == {
+        "mode": "temporal_bounded",
+        "time_constant_s": 0.12,
+    }
+    assert materialized["compositing"]["color_correction"] == {
+        "mode": "auto",
+        "strength": 0.5,
+        "exposure_limit_ev": 0.85,
+        "white_balance_strength": 0.5,
+        "adaptation_time_s": 0.8,
+    }
+    assert raw == {
+        "schema_version": 1,
+        "segmentation": {
+            "boundary_stabilization": {"mode": "motion_aware"},
+        },
+        "compositing": {
+            "light_wrap_stabilization": {"mode": "temporal_bounded"},
+            "color_correction": {"mode": "auto"},
+        },
+    }
 
 
 def test_avatar_proxy_cli_overrides_map_atomically_into_runtime(tmp_path):
@@ -683,6 +724,49 @@ def test_atomic_read_and_compare_and_swap_commit():
     assert committed.config.background.mode == "color"
     with pytest.raises(ConfigVersionConflictError):
         writer.commit(candidate, base.version)
+
+
+def test_legacy_matte_rollback_commit_is_transactional_with_activation():
+    candidate = AppConfig.from_dict(
+        {
+            "segmentation": {
+                "backend": "mediapipe",
+                "mask_blur": 0,
+                "temporal_smoothing": 0.0,
+                "boundary_stabilization": {"mode": "motion_aware"},
+                "spatial_edge_refinement": {"mode": "stable_guided"},
+            },
+            "compositing": {
+                "blend_space": "linear_srgb",
+                "light_wrap_stabilization": {"mode": "temporal_bounded"},
+            },
+        }
+    )
+    runtime = RuntimeConfig(candidate)
+    writer = runtime._coordinator_writer()
+    base = runtime.read()
+    rollback = base.config.patched(legacy_matte_policy_patch())
+
+    def reject(_version):
+        raise RuntimeError("candidate activation failed")
+
+    with pytest.raises(RuntimeError, match="activation failed"):
+        writer.commit_with_activation(rollback, base.version, reject)
+    rejected = runtime.read()
+    assert rejected.version == base.version
+    assert rejected.config == candidate
+    assert uses_legacy_matte_policy(rejected.config) is False
+
+    activated_versions = []
+    committed = writer.commit_with_activation(
+        rollback,
+        base.version,
+        activated_versions.append,
+    )
+    assert activated_versions == [1]
+    assert committed.version == 1
+    assert uses_legacy_matte_policy(committed.config) is True
+    assert uses_legacy_matte_policy(runtime.read().config) is True
 
 
 def test_commit_with_activation_hides_candidate_until_resource_swap():

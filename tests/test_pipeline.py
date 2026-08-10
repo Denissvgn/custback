@@ -47,7 +47,9 @@ from custback.pipeline import (
 from custback.pipeline import ConfigConflictError, _restart_only_changes
 from custback.segmentation import (
     HeuristicSegmenter,
+    MediaPipeSegmenter,
     RVMTelemetry,
+    Segmenter,
     segmenter_selection_status,
 )
 from custback.vcam import NullOutput, OutputSendTiming
@@ -1413,6 +1415,157 @@ def test_runtime_privacy_gate_protects_vcam_and_preview(monkeypatch):
     finally:
         hub.remote_client_disconnected(session)
         pipeline.stop()
+
+
+@pytest.mark.parametrize(
+    "mask_path",
+    [
+        pytest.param("motion-aware-refiner", id="motion-aware-refiner"),
+        pytest.param("mediapipe-resized-mask", id="mediapipe-resized-mask"),
+        pytest.param("rvm-raw-alpha", id="rvm-raw-alpha"),
+        pytest.param("rvm-post-shift-alpha", id="rvm-post-shift-alpha"),
+        pytest.param("rvm-model-foreground", id="rvm-model-foreground"),
+    ],
+)
+def test_new_matte_paths_fail_closed_at_sink_and_hub(mask_path):
+    """Every shipped matte path retains the final remote privacy boundary."""
+
+    raw = np.arange(24 * 32 * 3, dtype=np.uint32).reshape(24, 32, 3)
+    raw = (raw % 251).astype(np.uint8)
+    backdrop = np.full(raw.shape, (3, 5, 7), np.uint8)
+    valid_alpha = np.full(raw.shape[:2], 0.5, np.float32)
+    cfg = _color_integration_config("remote")
+    segmentation_patch: dict[str, Any] = {
+        "backend": "rvm" if mask_path.startswith("rvm-") else "mediapipe",
+        "mask_blur": 0,
+        "edge_refine": False,
+        "temporal_smoothing": 0.0,
+    }
+    if mask_path == "motion-aware-refiner":
+        segmentation_patch["boundary_stabilization"] = {"mode": "motion_aware"}
+    elif mask_path == "rvm-post-shift-alpha":
+        segmentation_patch["mask_shift"] = 2
+    cfg = cfg.patched(
+        {
+            "segmentation": segmentation_patch,
+            "compositing": {
+                "use_model_foreground": mask_path == "rvm-model-foreground"
+            },
+        }
+    )
+
+    class PathSegmenter(Segmenter):
+        device = "cpu"
+        last_downsample_ratio = 0.5
+
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.produces_matte = mask_path.startswith("rvm-")
+            self.matte_backend_kind = (
+                MatteBackendKind.TRUE_ALPHA_RECURRENT
+                if self.produces_matte
+                else MatteBackendKind.CONFIDENCE_MASK_VIDEO
+            )
+            self.last_foreground = (
+                np.zeros((23, 32, 3), np.uint8)
+                if mask_path == "rvm-model-foreground"
+                else None
+            )
+
+        def segment(self, _frame, *, context=None):
+            self._accept_frame_context(context, _frame.shape[:2])
+            self.calls += 1
+            if mask_path == "rvm-raw-alpha":
+                return np.full(raw.shape[:2], np.nan, np.float32)
+            if mask_path == "motion-aware-refiner":
+                return np.ones(raw.shape[:2], np.float32)
+            if mask_path == "mediapipe-resized-mask":
+                resized, interpolation = MediaPipeSegmenter._resize_soft_mask(
+                    np.ones((12, 16), np.float32),
+                    raw.shape[:2],
+                )
+                assert interpolation == "linear"
+                return resized
+            if mask_path == "rvm-post-shift-alpha":
+                alpha = np.ones(raw.shape[:2], np.float32)
+                alpha[[0, -1], :] = 0.0
+                alpha[:, [0, -1]] = 0.0
+                return alpha
+            return valid_alpha.copy()
+
+        def close(self):
+            pass
+
+    class RecordingOutput:
+        paces = False
+        fallback_active = False
+        fallback_reason = ""
+
+        def __init__(self):
+            self.frames = []
+
+        def send(self, frame):
+            self.frames.append(frame.copy())
+
+        def close(self):
+            pass
+
+    segmenter = PathSegmenter()
+    refiner = pipeline_mod.refiner_for(cfg.segmentation, segmenter)
+    assert (refiner.cfg.boundary_stabilization.mode == "motion_aware") is (
+        mask_path == "motion-aware-refiner"
+    )
+    output = RecordingOutput()
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        segmenter,
+        refiner,
+        _FixedBackdrop(backdrop),
+        output,
+    )
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub)
+    expected_reason = (
+        "local-failure"
+        if mask_path == "rvm-model-foreground"
+        else (
+            "segmentation-invalid-mask"
+            if mask_path == "rvm-raw-alpha"
+            else "segmentation-all-foreground"
+        )
+    )
+    slate = Pipeline._privacy_slate(raw.shape)
+
+    try:
+        guarded, reason = pipeline._local_composite(
+            resources,
+            raw,
+            privacy_safe=True,
+        )
+        assert reason == expected_reason
+        np.testing.assert_array_equal(guarded, slate)
+        if mask_path == "rvm-raw-alpha":
+            # Raw validation happens before the real refiner, so rejected
+            # non-finite backend alpha cannot enter temporal history.
+            assert refiner._prev is None
+
+        pipeline_mod._send_output_with_timing(
+            output,
+            guarded,
+            copy_frame=True,
+        )
+        hub.publish_output(guarded)
+
+        assert segmenter.calls == 1
+        assert output.frames
+        np.testing.assert_array_equal(output.frames[-1], slate)
+        np.testing.assert_array_equal(hub.output.latest()[0], slate)
+        assert not np.array_equal(raw, slate)
+    finally:
+        resources.close()
 
 
 def test_privacy_capacity_exhaustion_revokes_renderer_and_slates_all_sinks(

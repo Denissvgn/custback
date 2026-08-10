@@ -726,6 +726,102 @@ def test_concrete_rvm_telemetry_round_trips_through_private_replay_bundle(
     assert frame["timings_ms"]["rvm_postprocess_ms"] == telemetry["postprocess_ms"]
 
 
+def test_concrete_rvm_evidence_separates_native_alpha_from_post_shift_policy(
+    cpu_ort,
+    tmp_path,
+):
+    cfg = _temporal_app_config().patched(
+        {
+            "segmentation": {
+                "rvm_downsample": 0.5,
+                "mask_shift": 1,
+            }
+        }
+    )
+    segmenter = RVMSegmenter(cfg.segmentation)
+    refiner = refiner_for(cfg.segmentation, segmenter)
+    captured = _captured_frame(7, 1_750_000_000)
+    native_alpha = np.zeros(captured.pixels.shape[:2], dtype=np.float32)
+    native_alpha[5:11, 6:10] = 0.25
+    native_alpha[7:9, 7:9] = 0.75
+    original_run = segmenter._session.run
+
+    def run_with_native_alpha(outputs, feeds):
+        result = original_run(outputs, feeds)
+        result[1] = native_alpha[None, None].copy()
+        return result
+
+    segmenter._session.run = run_with_native_alpha
+
+    class Backdrop:
+        @staticmethod
+        def frame(width, height):
+            return np.full((height, width, 3), 20, dtype=np.uint8)
+
+        @staticmethod
+        def close():
+            return None
+
+    resources = _Resources(
+        cfg,
+        0,
+        cast(Any, object()),
+        segmenter,
+        refiner,
+        Backdrop(),
+        None,
+    )
+    recorder = MatteDiagnosticRecorder(
+        tmp_path / "rvm-alpha-attribution",
+        max_bytes=4_000_000,
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub(), matte_recorder=recorder)
+    evidence = pipeline._new_matte_evidence(resources, captured)
+    assert evidence is not None
+    try:
+        rendered, reason = pipeline._local_composite(
+            resources,
+            captured.pixels,
+            captured=captured,
+            privacy_safe=False,
+            matte_evidence=evidence,
+        )
+    finally:
+        recorder.close()
+        resources.close()
+
+    assert reason == ""
+    assert rendered.shape == captured.pixels.shape
+    assert evidence.metadata.capture_sequence == captured.sequence
+    assert evidence.metadata.capture_monotonic_ns == captured.captured_at_ns
+    assert evidence.raw_mask is not None
+    assert evidence.refined_mask is not None
+    expected_refined = segmentation_mod.cv2.dilate(
+        native_alpha,
+        segmentation_mod.cv2.getStructuringElement(
+            segmentation_mod.cv2.MORPH_ELLIPSE,
+            (3, 3),
+        ),
+    )
+    np.testing.assert_array_equal(evidence.raw_mask, native_alpha)
+    np.testing.assert_array_equal(evidence.refined_mask, expected_refined)
+    assert not np.array_equal(evidence.raw_mask, evidence.refined_mask)
+
+    effective_controls = evidence.effective_controls
+    assert effective_controls["rvm_downsample_ratio"] == 0.5
+    assert effective_controls["mask_shift"] == 1
+    telemetry = effective_controls["rvm_telemetry"]
+    assert isinstance(telemetry, dict)
+    assert telemetry["resolved_downsample_ratio"] == 0.5
+    matte_policy = effective_controls["matte_policy"]
+    assert isinstance(matte_policy, dict)
+    effective_policy = matte_policy["effective"]
+    assert isinstance(effective_policy, dict)
+    assert effective_policy["raw_alpha_mode"] == "native_soft_alpha"
+    assert effective_policy["rvm_downsample_ratio"] == 0.5
+    assert effective_policy["mask_shift"] == 1
+
+
 def test_device_cpu_and_cuda(cpu_ort, monkeypatch):
     assert RVMSegmenter(rvm_cfg()).device == "cpu"
     monkeypatch.setitem(

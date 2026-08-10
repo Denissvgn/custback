@@ -491,9 +491,9 @@ source:
     </div>
 
     <div class="view-panel" id="view-quality" data-panel="quality" role="tabpanel" aria-labelledby="tab-quality" hidden>
-      <header class="panel-head"><h2>Tune camera quality</h2><p>Match foreground colour, frame the scene, and adjust subject separation. Defaults are a good starting point for most cameras.</p></header>
+      <header class="panel-head"><h2>Tune camera quality</h2><p>Match foreground colour, frame the scene, and inspect subject separation. Matte defaults remain on the compatibility policy until physical qualification authorizes a rollout.</p></header>
       <section class="control-section">
-        <div class="section-copy"><h3>Matte quality profile</h3><p>Runtime facts below describe the active backend, including automatic fallback. They are not inferred from the configured backend.</p></div>
+        <div class="section-copy"><h3>Matte quality profile</h3><p>Runtime facts below separate the rollout decision from the active backend and automatic fallback. An installed backend or available control is not a qualified default.</p></div>
         <fieldset class="field" aria-describedby="quality-preset-help">
           <legend>Qualified preset</legend>
           <div class="seg" id="quality-presets">
@@ -533,7 +533,7 @@ source:
         </div>
       </section>
       <section class="control-section">
-        <div class="section-copy"><h3>Subject detection</h3><p>The backend finds you in each frame before custback replaces the room.</p></div>
+        <div class="section-copy"><h3>Subject detection</h3><p>The backend finds you in each frame before custback replaces the room. Automatic selection can change when optional packages are installed; verify the effective backend above.</p></div>
         <div class="field-grid two">
           <div class="field"><label for="quality-backend">Detection backend <span class="restart-tag">Rebuild + reset</span></label>
             <select id="quality-backend" aria-describedby="quality-backend-help quality-backend-policy"><option value="auto">Automatic</option><option value="rvm">RVM matting</option><option value="mediapipe">MediaPipe</option><option value="heuristic">Basic heuristic</option><option value="none">Disabled</option></select>
@@ -549,7 +549,7 @@ source:
         <details>
           <summary>Advanced matte controls</summary>
           <div class="advanced-grid">
-            <div class="section-copy"><h3>Edges and motion</h3><p>These diagnostic controls remain visible but are enabled only when the active backend can use them. Every detection control marked below rebuilds the segmenter and resets temporal state.</p></div>
+            <div class="section-copy"><h3>Edges and motion</h3><p>These diagnostic controls are not recommendations. They remain visible but are enabled only when the active backend can use them. Every detection control marked below rebuilds the segmenter and resets temporal state.</p></div>
             <div class="field-grid two">
               <div class="field"><label for="quality-threshold">Foreground confidence <span class="restart-tag">Rebuild + reset</span></label><div class="range-line"><input type="range" id="quality-threshold" min="0" max="1" step="0.01" aria-describedby="quality-threshold-help quality-threshold-policy" disabled><span class="value" id="quality-threshold-value"></span></div>
                 <small id="quality-threshold-help">Controls how strongly the basic heuristic must recognise the subject.</small><small class="control-policy unavailable" id="quality-threshold-policy">Waiting for the active policy…</small></div>
@@ -604,7 +604,7 @@ source:
     </div>
 
     <div class="view-panel" id="view-system" data-panel="system" role="tabpanel" aria-labelledby="tab-system" hidden>
-      <header class="panel-head"><h2>System status</h2><p>Inspect the live pipeline, provider connection, and browser-safe effective configuration.</p></header>
+      <header class="panel-head"><h2>System status</h2><p>Inspect the live pipeline, provider connection, held-or-qualified matte rollout decision, and browser-safe effective configuration.</p></header>
       <section class="control-section">
         <div class="section-copy"><h3>Camera pipeline</h3><p>Live measurements update every three seconds.</p></div>
         <dl class="diagnostic-list" id="core-diagnostics"></dl>
@@ -1921,12 +1921,15 @@ function renderQualityPresets() {
     $("quality-preset-help").textContent =
       "Custom settings · preset catalog v" + MATTE_PRESET_CATALOG.version
       + ". Performance, Balanced, and Quality remain unavailable because "
-      + "checked-in evidence has not qualified portable model-backed profiles.";
+      + "checked-in evidence has not qualified portable model-backed profiles. "
+      + "Rollback uses the matte-legacy-v1 policy as one atomic patch; it does "
+      + "not require deleting configuration or the model cache.";
     return;
   }
   $("quality-preset-help").textContent =
     "Catalog v" + MATTE_PRESET_CATALOG.version
-    + " · each preset expands to one concrete, atomic configuration patch.";
+    + " · each preset expands to one concrete, atomic configuration patch. "
+    + "The matte-legacy-v1 rollback remains one separate atomic patch.";
 }
 
 function currentMattePolicy(status, configVersion) {
@@ -2094,6 +2097,81 @@ function updateFpsText(value, label) {
   return Number.isFinite(numeric) ? numeric.toFixed(1) + " fps " + label : "";
 }
 
+function currentMatteRollout(status, configVersion) {
+  if (!status || !Number.isInteger(configVersion) || configVersion < 0
+      || status.config_version !== configVersion) return null;
+  const rollout = status.matte_rollout;
+  if (!rollout || typeof rollout !== "object" || Array.isArray(rollout)) {
+    return null;
+  }
+  const exactKeys = [
+    "config_version", "configured_schema_version", "decision",
+    "last_outcome", "legacy_policy_active", "legacy_policy_available",
+    "legacy_rollbacks", "patch_attempts", "patch_failures",
+    "patch_in_flight", "patch_successes", "preset_catalog_version",
+    "preset_evidence_status", "qualified_default_active",
+    "rollback_patch_id", "schema", "stage", "version",
+  ];
+  const actualKeys = Object.keys(rollout).sort();
+  if (JSON.stringify(actualKeys) !== JSON.stringify(exactKeys)
+      || rollout.schema !== "custback.matte-rollout-status"
+      || rollout.version !== 1
+      || rollout.stage !== "compatibility_hold"
+      || rollout.decision !== "held_pending_physical_qualification"
+      || rollout.config_version !== configVersion
+      || !Number.isInteger(rollout.configured_schema_version)
+      || rollout.configured_schema_version < 1
+      || rollout.qualified_default_active !== false
+      || rollout.preset_catalog_version !== 1
+      || rollout.preset_evidence_status !== "not_qualified"
+      || rollout.legacy_policy_available !== true
+      || typeof rollout.legacy_policy_active !== "boolean"
+      || rollout.rollback_patch_id !== "matte-legacy-v1"
+      || !["none", "attempt", "success", "failure", "rollback"].includes(
+        rollout.last_outcome
+      )) return null;
+  for (const key of [
+    "patch_attempts", "patch_in_flight", "patch_successes",
+    "patch_failures", "legacy_rollbacks",
+  ]) {
+    if (!Number.isSafeInteger(rollout[key]) || rollout[key] < 0) return null;
+  }
+  if (rollout.patch_attempts !== rollout.patch_in_flight
+      + rollout.patch_successes + rollout.patch_failures
+      || rollout.legacy_rollbacks > rollout.patch_successes) return null;
+  return rollout;
+}
+
+function matteRolloutRows(status, configVersion) {
+  const rollout = currentMatteRollout(status, configVersion);
+  if (!rollout) {
+    return [[
+      "Matte rollout",
+      "Unavailable or synchronizing with the effective configuration",
+      "warn",
+    ]];
+  }
+  const policy = rollout.legacy_policy_active
+    ? "legacy policy active"
+    : "explicit custom policy active";
+  const changes = [
+    rollout.patch_attempts + " attempted",
+    rollout.patch_successes + " succeeded",
+    rollout.patch_failures + " failed",
+    rollout.patch_in_flight + " in flight",
+    rollout.legacy_rollbacks + " rolled back",
+  ].join(" · ");
+  return [
+    [
+      "Matte rollout",
+      "Compatibility hold · physical qualification pending · presets unavailable · "
+        + policy,
+      "warn",
+    ],
+    ["Matte rollout changes", changes, rollout.patch_failures ? "warn" : ""],
+  ];
+}
+
 function renderMatteQualityRuntime() {
   const policy = currentMattePolicy(state.status, state.coreVersion);
   if (!state.status) {
@@ -2105,6 +2183,7 @@ function renderMatteQualityRuntime() {
   if (!policy) {
     renderDiagnosticList($("quality-runtime"), [
       ["Active matte policy", "Synchronizing with the effective configuration…", "warn"],
+      ...matteRolloutRows(state.status, state.coreVersion),
     ]);
     return;
   }
@@ -2156,6 +2235,7 @@ function renderMatteQualityRuntime() {
     summary || ["Effective matte policy", "Unavailable", "warn"],
   );
   rows.push(...segmentationFallbackRows(state.status));
+  rows.push(...matteRolloutRows(state.status, state.coreVersion));
   renderDiagnosticList($("quality-runtime"), rows);
 }
 
@@ -2810,6 +2890,7 @@ function renderDiagnostics() {
     coreRows.push(...segmentationFallbackRows(status));
     const mattePolicy = mattePolicySummary(status);
     if (mattePolicy) coreRows.push(mattePolicy);
+    coreRows.push(...matteRolloutRows(status, state.coreVersion));
     coreRows.push(...visualCadenceRows(status));
     // Acceleration is only meaningful for the RVM/ONNX Runtime backend; other
     // segmenters report an empty active provider. Show the truthful post-

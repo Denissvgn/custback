@@ -684,6 +684,41 @@ class _MattePolicyResponse(BaseModel):
     controls: _MattePolicyControlsResponse
 
 
+class _MatteRolloutResponse(BaseModel):
+    """Path-free process-local MATTE-5.4 canary and rollback telemetry."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_: Literal["custback.matte-rollout-status"] = Field(alias="schema")
+    version: Literal[1]
+    stage: Literal["compatibility_hold"]
+    decision: Literal["held_pending_physical_qualification"]
+    configured_schema_version: int = Field(ge=1)
+    config_version: int = Field(ge=0)
+    qualified_default_active: Literal[False]
+    preset_catalog_version: Literal[1]
+    preset_evidence_status: Literal["not_qualified"]
+    legacy_policy_available: Literal[True]
+    legacy_policy_active: bool
+    rollback_patch_id: Literal["matte-legacy-v1"]
+    patch_attempts: int = Field(ge=0)
+    patch_in_flight: int = Field(ge=0)
+    patch_successes: int = Field(ge=0)
+    patch_failures: int = Field(ge=0)
+    legacy_rollbacks: int = Field(ge=0)
+    last_outcome: Literal["none", "attempt", "success", "failure", "rollback"]
+
+    @model_validator(mode="after")
+    def _counters_are_consistent(self) -> "_MatteRolloutResponse":
+        if self.patch_attempts != (
+            self.patch_in_flight + self.patch_successes + self.patch_failures
+        ):
+            raise ValueError("matte rollout attempt counters are inconsistent")
+        if self.legacy_rollbacks > self.patch_successes:
+            raise ValueError("matte rollout rollback count exceeds successes")
+        return self
+
+
 class _StatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -696,6 +731,7 @@ class _StatusResponse(BaseModel):
     segmentation_device: str
     segmentation_selection: _SegmentationSelectionResponse
     matte_policy: _MattePolicyResponse
+    matte_rollout: _MatteRolloutResponse
     segmentation_generation: int
     capture_sequence: int
     capture_sequence_gap_count: int
@@ -897,6 +933,10 @@ class _StatusResponse(BaseModel):
             expected_kind != "true_alpha_recurrent" or policy.passthrough
         ):
             raise ValueError("experimental RVM policy requires active RVM matting")
+        if self.matte_rollout.config_version != self.config_version:
+            raise ValueError(
+                "matte rollout and public config_version must describe one frame"
+            )
         return self
 
 

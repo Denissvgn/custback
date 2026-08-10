@@ -69,6 +69,11 @@ from .matte_diagnostics import (
 )
 from .matte_live_diagnostics import LocalMatteDiagnosticMonitor
 from .matte_policy import MattePolicySnapshot, resolve_matte_policy
+from .matte_rollout import (
+    MatteRolloutAttempt,
+    MatteRolloutTelemetry,
+    classify_matte_patch,
+)
 from .light_wrap import (
     LightWrapFrameContext,
     LightWrapSnapshot,
@@ -1385,6 +1390,7 @@ class _PatchRequest:
     error: BaseException | None = None
     storage_epoch: int = 0
     prepared_activation: _Activation | None = None
+    rollout_attempt: MatteRolloutAttempt | None = None
 
     def cancel_and_take_activation(self) -> tuple[bool, _Activation | None]:
         """Cancel and reclaim an activation not yet claimed by the frame lane."""
@@ -1401,6 +1407,8 @@ class _PatchRequest:
         with self.lock:
             if self.result is None and self.error is None:
                 self.error = error
+                if self.rollout_attempt is not None:
+                    self.rollout_attempt.fail()
         self.done.set()
 
 
@@ -1509,6 +1517,17 @@ class Pipeline:
         self._matte_monitor = matte_monitor
         self._matte_bundle_sequence = 0
         self._matte_last_source_sequence: int | None = None
+        self._matte_rollout = MatteRolloutTelemetry()
+        initial_state = self.runtime.read()
+        update_hub_stats = getattr(self.hub, "update_stats", None)
+        if callable(update_hub_stats):
+            update_hub_stats(
+                config_version=initial_state.version,
+                matte_rollout=self._matte_rollout.snapshot(
+                    initial_state.config,
+                    initial_state.version,
+                ),
+            )
         self._fallback_log_states: dict[str, tuple[bool, str]] = {}
         self._geometry_log_states: dict[str, tuple[object, ...]] = {}
         self._color_log_state: tuple[object, ...] | None = None
@@ -1627,6 +1646,46 @@ class Pipeline:
         *,
         origin: str = "internal",
     ) -> ConfigState:
+        """Apply one patch and record only sanitized matte rollout outcomes."""
+
+        rollout_kind = classify_matte_patch(patch)
+        if rollout_kind is None:
+            return self._apply_config_patch(patch, timeout, origin=origin)
+        rollout_attempt = self._matte_rollout.begin(rollout_kind)
+        try:
+            state = self._apply_config_patch(
+                patch,
+                timeout,
+                origin=origin,
+                rollout_attempt=rollout_attempt,
+            )
+        except BaseException:
+            if rollout_attempt.fail():
+                current = self.runtime.read()
+                self.hub.update_stats(
+                    matte_rollout=self._matte_rollout.snapshot(
+                        current.config,
+                        current.version,
+                    )
+                )
+            raise
+        if rollout_attempt.succeed():
+            self.hub.update_stats(
+                matte_rollout=self._matte_rollout.snapshot(
+                    state.config,
+                    state.version,
+                )
+            )
+        return state
+
+    def _apply_config_patch(
+        self,
+        patch: dict[str, Any],
+        timeout: float = 5.0,
+        *,
+        origin: str = "internal",
+        rollout_attempt: MatteRolloutAttempt | None = None,
+    ) -> ConfigState:
         """Validate, activate, commit, and acknowledge a hot configuration patch."""
         if isinstance(patch, dict):
             restart_fields = []
@@ -1675,6 +1734,7 @@ class Pipeline:
             base.version,
             origin=origin,
             storage_epoch=self._read_storage_epoch(),
+            rollout_attempt=rollout_attempt,
         )
         self._prepare_patch_request(request, base.config, deadline)
         return self._submit_prepared_patch(request, deadline)
@@ -2197,6 +2257,8 @@ class Pipeline:
                     request.prepared_activation = None
                     if request.result is None and request.error is None:
                         request.error = error
+                        if request.rollout_attempt is not None:
+                            request.rollout_attempt.fail()
                 request.done.set()
                 self._schedule_discard_activation(activation)
             else:
@@ -2864,15 +2926,21 @@ class Pipeline:
                 request.error = ConfigConflictError(
                     exc.expected_version, exc.current_version
                 )
+                if request.rollout_attempt is not None:
+                    request.rollout_attempt.fail()
             except BaseException as exc:
                 self._schedule_discard_activation(activation)
                 request.error = exc
+                if request.rollout_attempt is not None:
+                    request.rollout_attempt.fail()
             else:
                 # From here onward the candidate belongs exclusively to live
                 # resources. Detach it before any best-effort side effect can
                 # fail and accidentally route it through candidate cleanup.
                 activation.mark_promoted()
                 request.result = committed
+                if request.rollout_attempt is not None:
+                    request.rollout_attempt.succeed()
                 if old_cfg is not None:
                     try:
                         self._post_install_activation(resources, old_cfg)
@@ -3085,6 +3153,7 @@ class Pipeline:
             "segmentation_device": resources.segmenter.device,
             "segmentation_selection": segmentation_selection,
             "matte_policy": matte_policy,
+            "matte_rollout": self._matte_rollout.snapshot(cfg, resources.version),
             "segmentation_generation": resources.segmentation_generation,
             "capture_sequence": capture_sequence.last_sequence or 0,
             "capture_sequence_gap_count": capture_sequence.gap_events,

@@ -136,7 +136,11 @@ function backendQualityProfile({ mediapipe, rvm }) {
     return {
       level: 'note',
       label: 'backend quality tier: matting',
-      hint: 'RVM true-alpha matting is installed; confirm the active provider in runtime status',
+      hint: [
+        'RVM true-alpha matting is installed',
+        'installed capability is not an evidence-qualified default',
+        'confirm the active provider and matte rollout decision in runtime status',
+      ].join('; '),
     };
   }
   if (mediapipe) {
@@ -145,6 +149,7 @@ function backendQualityProfile({ mediapipe, rvm }) {
       label: 'backend quality tier: segmentation',
       hint: [
         'MediaPipe confidence-mask segmentation is installed; RVM true-alpha matting is optional',
+        'installed capability is not an evidence-qualified default',
         'upgrade with: custback rebuild --extras rvm (CPU)',
         'or custback rebuild --extras gpu (NVIDIA/CUDA)',
       ].join('; '),
@@ -155,6 +160,7 @@ function backendQualityProfile({ mediapipe, rvm }) {
     label: 'backend quality tier: heuristic',
     hint: [
       'no model-backed person backend is installed',
+      'heuristic fallback is not a named quality preset',
       'install MediaPipe with: custback rebuild --extras mediapipe',
       'or RVM with: custback rebuild --extras rvm (CPU)',
       'or custback rebuild --extras gpu (NVIDIA/CUDA)',

@@ -74,10 +74,14 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/matte_ablation.py',
   'custback/matte_attribution.py',
   'custback/matte_diagnostics.py',
+  'custback/matte_live_diagnostics.py',
   'custback/matte_policy.py',
   'custback/matte_performance.py',
+  'custback/matte_platform_qualification.py',
   'custback/matte_quality.py',
   'custback/matte_rvm_qualification.py',
+  'custback/matte_rollout.py',
+  'custback/matte_visual_qualification.py',
   'custback/migration.py',
   'custback/pipeline.py',
   'custback/preview.py',
@@ -119,11 +123,15 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_matte_attribution.py',
   'tests/test_matte_diagnostics.py',
   'tests/test_matte_interpolation_decision.py',
+  'tests/test_matte_live_diagnostics.py',
   'tests/test_matte_operator_mitigations.py',
   'tests/test_matte_performance.py',
+  'tests/test_matte_platform_qualification.py',
   'tests/test_matte_policy.py',
   'tests/test_matte_quality.py',
   'tests/test_matte_rvm_qualification.py',
+  'tests/test_matte_rollout.py',
+  'tests/test_matte_visual_qualification.py',
   'tests/test_matte_stabilizer.py',
   'tests/test_mediapipe_segmenter.py',
   'tests/test_model_acquisition.py',
@@ -157,6 +165,8 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/matte_ablation_evidence.py',
   'tests/matte_quality_evidence.py',
   'tests/matte_rvm_qualification_evidence.py',
+  'tests/matte_platform_qualification_evidence.py',
+  'tests/matte_visual_qualification_evidence.py',
   'tests/visual_consistency_evidence.py',
   'tests/fixtures/migration/expected-0.4.0-local-camera.yaml',
   'tests/fixtures/migration/legacy-0.3.0-default.yaml',
@@ -167,6 +177,7 @@ const REVIEWED_PYTHON_SDIST_DATA = [
   'config/default.yaml',
   'docs/adr/0002-output-rate-matte-interpolation.md',
   'docs/adr/0003-720p-compositor-budget.md',
+  'docs/adr/0004-matte-quality-rollout.md',
   'docs/cadence-observability.md',
   'docs/capture-cadence-diagnostics.md',
   'docs/capture-native-evidence-local-template.json',
@@ -175,24 +186,32 @@ const REVIEWED_PYTHON_SDIST_DATA = [
   'docs/matte-ablation-local-reference-template.json',
   'docs/matte-backend-policies.md',
   'docs/matte-boundary-stabilization.md',
+  'docs/matte-deterministic-regression-gate.md',
   'docs/matte-light-wrap.md',
+  'docs/matte-live-diagnostics.md',
   'docs/matte-operator-mitigations.md',
   'docs/matte-performance.md',
   'docs/matte-performance-local-template.json',
+  'docs/matte-platform-qualification.md',
+  'docs/matte-platform-qualification-local-template.json',
   'docs/matte-alpha-attribution.md',
   'docs/matte-alpha-attribution-local-template.json',
   'docs/matte-quality-baseline.md',
   'docs/matte-quality-local-qualification-template.json',
   'docs/matte-quality-metrics.md',
+  'docs/matte-quality-rollout.md',
   'docs/matte-replay-bundle.md',
   'docs/matte-rvm-profiles.md',
   'docs/matte-rvm-qualification-local-template.json',
   'docs/matte-spatial-refinement.md',
+  'docs/matte-visual-qualification.md',
+  'docs/matte-visual-qualification-local-template.json',
   'docs/visual-consistency-phase4-qualification-runbook.md',
   'docs/visual-consistency-phase4-qualification-template.json',
   'docs/visual-consistency-rollout.md',
   'scripts/release/visual-qualification-manifest.json',
   'scripts/release/visual-policy-rollout.json',
+  'scripts/release/matte-policy-rollout.json',
   'scripts/release/visual_consistency_qualification.py',
 ];
 const REVIEWED_NPM_PAYLOAD = [
@@ -207,6 +226,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'docs/adr/0001-visual-consistency-contract.md',
   'docs/adr/0002-output-rate-matte-interpolation.md',
   'docs/adr/0003-720p-compositor-budget.md',
+  'docs/adr/0004-matte-quality-rollout.md',
   'docs/camera-control-characterization.md',
   'docs/cadence-observability.md',
   'docs/capture-cadence-diagnostics.md',
@@ -216,19 +236,26 @@ const REVIEWED_NPM_PAYLOAD = [
   'docs/matte-ablation-local-reference-template.json',
   'docs/matte-backend-policies.md',
   'docs/matte-boundary-stabilization.md',
+  'docs/matte-deterministic-regression-gate.md',
   'docs/matte-light-wrap.md',
+  'docs/matte-live-diagnostics.md',
   'docs/matte-operator-mitigations.md',
   'docs/matte-performance.md',
   'docs/matte-performance-local-template.json',
+  'docs/matte-platform-qualification.md',
+  'docs/matte-platform-qualification-local-template.json',
   'docs/matte-alpha-attribution.md',
   'docs/matte-alpha-attribution-local-template.json',
   'docs/matte-quality-baseline.md',
   'docs/matte-quality-local-qualification-template.json',
   'docs/matte-quality-metrics.md',
+  'docs/matte-quality-rollout.md',
   'docs/matte-replay-bundle.md',
   'docs/matte-rvm-profiles.md',
   'docs/matte-rvm-qualification-local-template.json',
   'docs/matte-spatial-refinement.md',
+  'docs/matte-visual-qualification.md',
+  'docs/matte-visual-qualification-local-template.json',
   'docs/remote-deployment.md',
   'docs/visual-consistency-phase0-baseline.json',
   'docs/visual-consistency-phase0-contact-sheet.png',
@@ -276,6 +303,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'scripts/release/two-host/probe.py',
   'scripts/release/visual-qualification-manifest.json',
   'scripts/release/visual-policy-rollout.json',
+  'scripts/release/matte-policy-rollout.json',
   'scripts/release/visual_consistency_qualification.py',
   'scripts/release/windows-acceleration-gate.py',
   'scripts/release/verify-clean-tree.js',
@@ -1182,6 +1210,47 @@ function verifyDocs(root = ROOT) {
       fail(`visual-consistency rollout guide is missing ${description}`);
     }
   }
+  if (!readme.includes('(docs/matte-quality-rollout.md)') ||
+      !readme.includes('(docs/adr/0004-matte-quality-rollout.md)')) {
+    fail('README must link the MATTE-5.4 rollout guide and ADR');
+  }
+  const matteRollout = fs.readFileSync(
+    path.join(root, 'docs', 'matte-quality-rollout.md'), 'utf8',
+  );
+  const matteAdr = fs.readFileSync(
+    path.join(root, 'docs', 'adr', '0004-matte-quality-rollout.md'), 'utf8',
+  );
+  const matteRolloutRequirements = [
+    [/compatibility hold/i, 'compatibility hold'],
+    [/versionless.*schema-1/is, 'legacy schema semantics'],
+    [/generated.*pending/is, 'generated-evidence limitation'],
+    [/baseline.*ablation.*visual.*performance.*platform.*privacy.*migration/is,
+      'complete release-evidence chain'],
+    [/sanitized rollout telemetry/i, 'sanitized canary telemetry'],
+    [/`matte_rollout`/, 'runtime rollout status'],
+    [/one-patch rollback/i, 'one-patch rollback'],
+    [/does not.*delete.*config/is, 'non-destructive config rollback'],
+    [/model cache/i, 'non-destructive model-cache rollback'],
+    [/Reactions are outside/i, 'reaction separation'],
+    [/27638e419a0dcf5955d52e2eb4ead2dafbdca7f2bbe0535108aa7c56c1f2f60d/,
+      'canonical rollback digest'],
+  ];
+  for (const [pattern, description] of matteRolloutRequirements) {
+    if (!pattern.test(matteRollout)) {
+      fail(`matte-quality rollout guide is missing ${description}`);
+    }
+  }
+  for (const [pattern, description] of [
+    [/timestamp and reset ownership/i, 'timestamp/reset contract'],
+    [/backend-specific effective policy/i, 'backend-effective policies'],
+    [/light-wrap temporal policy/i, 'light-wrap temporal policy'],
+    [/quality tiers and default disposition/i, 'quality/default decision'],
+    [/performance, privacy, and evidence gates/i, 'performance/privacy gates'],
+  ]) {
+    if (!pattern.test(matteAdr)) {
+      fail(`MATTE-5.4 ADR is missing ${description}`);
+    }
+  }
 }
 
 function trustedReleaseSourceContext(
@@ -1562,6 +1631,342 @@ function verifyVisualPolicyRollout(root = ROOT, options = {}) {
   return manifest;
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(
+      (key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    ).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function yamlScalarAt(source, fieldPath) {
+  const wanted = fieldPath.split('.');
+  const stack = [];
+  for (const line of source.split(/\r?\n/)) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    const match = line.match(/^(\s*)([a-z][a-z0-9_]*):(?:\s*(.*))?$/i);
+    if (!match) continue;
+    const indent = match[1].length;
+    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
+    const names = [...stack.map((entry) => entry.name), match[2]];
+    const raw = (match[3] || '').split('#', 1)[0].trim();
+    if (isDeepStrictEqual(names, wanted)) {
+      const unquoted = raw.replace(/^(["'])(.*)\1$/, '$2');
+      if (unquoted === 'true') return true;
+      if (unquoted === 'false') return false;
+      if (unquoted === 'null') return null;
+      if (/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(unquoted)) {
+        return Number(unquoted);
+      }
+      return unquoted;
+    }
+    if (!raw) stack.push({ indent, name: match[2] });
+  }
+  fail(`default config is missing ${fieldPath}`);
+}
+
+function verifyMattePolicyRollout(root = ROOT, options = {}) {
+  const sourceContext = trustedReleaseSourceContext(
+    root,
+    options.env || process.env,
+    options.gitRunner || spawnSync,
+  );
+  const relativeManifest = 'scripts/release/matte-policy-rollout.json';
+  if (sourceContext) {
+    for (const relativePath of [
+      'config/default.yaml',
+      relativeManifest,
+      'src/custback/api/webui.py',
+      'src/custback/config.py',
+      'src/custback/default.yaml',
+      'src/custback/matte_rollout.py',
+    ]) {
+      verifyTrustedReleaseSourceFile(sourceContext, relativePath);
+    }
+  }
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(root, relativeManifest), 'utf8'),
+  );
+  const expectedTopKeys = [
+    'active_stage',
+    'compatibility_policy',
+    'decision',
+    'default_schema_version',
+    'preset_catalog',
+    'promotion',
+    'reactions',
+    'rollback',
+    'schema',
+    'version',
+  ];
+  if (!isDeepStrictEqual(Object.keys(manifest).sort(), expectedTopKeys) ||
+      manifest.schema !== 'custback.matte-quality-rollout' ||
+      manifest.version !== 1 ||
+      manifest.active_stage !== 'compatibility_hold' ||
+      manifest.decision !== 'held_pending_physical_qualification' ||
+      manifest.default_schema_version !== 1) {
+    fail('matte-policy rollout manifest header is invalid');
+  }
+
+  const expectedPatch = {
+    segmentation: {
+      backend: 'auto',
+      delegate: 'cpu',
+      rvm_downsample: 0.0,
+      threshold: 0.5,
+      mask_blur: 7,
+      edge_refine: true,
+      mask_shift: 0,
+      temporal_smoothing: 0.35,
+      boundary_stabilization: {
+        mode: 'off',
+        time_constant_s: 0.1,
+        max_motion_px_per_s: 720.0,
+      },
+      spatial_edge_refinement: {
+        mode: 'legacy_watershed',
+        reference_short_edge_px: 720,
+        radius_at_reference_px: 8,
+        min_radius_px: 2,
+        max_radius_px: 12,
+      },
+    },
+    acceleration: {
+      mode: 'auto',
+      provider: 'auto',
+      device_id: 0,
+    },
+    compositing: {
+      light_wrap: 0.25,
+      use_model_foreground: true,
+      blend_space: 'srgb_legacy',
+      light_wrap_stabilization: {
+        mode: 'off',
+        time_constant_s: 0.12,
+      },
+      color_correction: {
+        mode: 'off',
+        strength: 0.5,
+        exposure_limit_ev: 0.85,
+        white_balance_strength: 0.5,
+        adaptation_time_s: 0.8,
+      },
+    },
+  };
+  const expectedPatchDigest = crypto.createHash('sha256')
+    .update(canonicalJson(expectedPatch)).digest('hex');
+  let runtime = options.runtimeContract;
+  if (runtime === undefined) {
+    const python = options.python || process.env.CUSTBACK_RELEASE_PYTHON ||
+      (process.platform === 'win32' ? 'python' : 'python3');
+    const pythonPath = [
+      path.join(root, 'src'),
+      (options.env || process.env).PYTHONPATH || '',
+    ].filter(Boolean).join(path.delimiter);
+    const runtimeContract = spawnSync(
+      python,
+      [
+        '-c',
+      `import ast
+import json
+from pathlib import Path
+
+def value(node, names):
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in names:
+        return names[node.id]
+    if isinstance(node, ast.Dict):
+        return {value(k, names): value(v, names) for k, v in zip(node.keys, node.values)}
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [value(item, names) for item in node.elts]
+    raise ValueError(f"unsupported contract expression: {ast.dump(node)}")
+
+def returned(tree, function_name, names):
+    function = next(
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == function_name
+    )
+    result = next(node for node in function.body if isinstance(node, ast.Return))
+    return value(result.value, names)
+
+config_tree = ast.parse(Path("src/custback/config.py").read_text(encoding="utf-8"))
+rollout_tree = ast.parse(Path("src/custback/matte_rollout.py").read_text(encoding="utf-8"))
+names = {}
+for node in rollout_tree.body:
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        try:
+            names[node.targets[0].id] = value(node.value, names)
+        except ValueError:
+            pass
+contract = {
+    "patch": returned(config_tree, "legacy_matte_policy_patch", {}),
+    "status": returned(rollout_tree, "empty_matte_rollout_status", names),
+}
+print(json.dumps(contract, sort_keys=True, separators=(",", ":")))`,
+      ],
+      {
+        cwd: root,
+        env: { ...(options.env || process.env), PYTHONPATH: pythonPath },
+        encoding: 'utf8',
+        timeout: Math.min(COMMAND_TIMEOUT_MS, 30 * 1000),
+      },
+    );
+    if (runtimeContract.error || runtimeContract.status !== 0) {
+      fail(
+        'matte-policy runtime contract could not be evaluated: ' +
+        (runtimeContract.error?.message || runtimeContract.stderr || '').trim()
+      );
+    }
+    try {
+      runtime = JSON.parse(runtimeContract.stdout);
+    } catch (_error) {
+      fail('matte-policy runtime contract did not return canonical JSON');
+    }
+  }
+  const expectedStatus = {
+    schema: 'custback.matte-rollout-status',
+    version: 1,
+    stage: 'compatibility_hold',
+    decision: 'held_pending_physical_qualification',
+    configured_schema_version: 1,
+    config_version: 0,
+    qualified_default_active: false,
+    preset_catalog_version: 1,
+    preset_evidence_status: 'not_qualified',
+    legacy_policy_available: true,
+    legacy_policy_active: true,
+    rollback_patch_id: 'matte-legacy-v1',
+    patch_attempts: 0,
+    patch_in_flight: 0,
+    patch_successes: 0,
+    patch_failures: 0,
+    legacy_rollbacks: 0,
+    last_outcome: 'none',
+  };
+  if (!runtime || !isDeepStrictEqual(runtime.patch, expectedPatch) ||
+      !isDeepStrictEqual(runtime.status, expectedStatus)) {
+    fail('matte-policy Python rollback/status contract disagrees with the ledger');
+  }
+  const compatibility = manifest.compatibility_policy;
+  if (!compatibility || !isDeepStrictEqual(
+    Object.keys(compatibility).sort(), ['patch', 'patch_id', 'patch_sha256'],
+  ) || compatibility.patch_id !== 'matte-legacy-v1' ||
+      !isDeepStrictEqual(compatibility.patch, expectedPatch) ||
+      compatibility.patch_sha256 !== expectedPatchDigest) {
+    fail('matte-policy compatibility patch or digest is invalid');
+  }
+
+  const repositoryConfig = fs.readFileSync(
+    path.join(root, 'config', 'default.yaml'), 'utf8',
+  );
+  const packagedConfig = fs.readFileSync(
+    path.join(root, 'src', 'custback', 'default.yaml'), 'utf8',
+  );
+  if (repositoryConfig !== packagedConfig ||
+      yamlScalarAt(repositoryConfig, 'schema_version') !== 1) {
+    fail('matte-policy distributed default files are not byte-identical schema 1');
+  }
+  const visitPatch = (value, parts = []) => {
+    for (const [name, child] of Object.entries(value)) {
+      const next = [...parts, name];
+      if (child && typeof child === 'object' && !Array.isArray(child)) {
+        visitPatch(child, next);
+      } else if (!isDeepStrictEqual(
+        yamlScalarAt(repositoryConfig, next.join('.')), child,
+      )) {
+        fail(`distributed default config disagrees with matte policy at ${next.join('.')}`);
+      }
+    }
+  };
+  visitPatch(expectedPatch);
+
+  if (!isDeepStrictEqual(manifest.preset_catalog, {
+    schema: 'custback.matte-quality-presets',
+    version: 1,
+    evidence_status: 'not_qualified',
+    preset_ids: [],
+  })) {
+    fail('matte-policy preset catalog must remain empty and not qualified');
+  }
+  const webui = fs.readFileSync(
+    path.join(root, 'src', 'custback', 'api', 'webui.py'), 'utf8',
+  );
+  if (!/schema:\s*"custback\.matte-quality-presets"/.test(webui) ||
+      !/evidenceStatus:\s*"not_qualified"/.test(webui) ||
+      !/presets:\s*Object\.freeze\(\{\}\)/.test(webui)) {
+    fail('WebUI matte preset catalog disagrees with the held rollout decision');
+  }
+
+  const promotion = manifest.promotion;
+  const expectedPromotionKeys = [
+    'authority',
+    'candidate_build_sha256',
+    'candidate_id',
+    'candidate_patch_sha256',
+    'change_commit',
+    'evidence',
+    'generated_evidence_can_qualify',
+    'limitations',
+    'physical_provenance_required',
+    'status',
+  ];
+  const expectedEvidence = [
+    ['baseline', 'custback.matte-quality-report'],
+    ['ablation', 'custback.matte-ablation-report'],
+    ['visual', 'custback.matte-visual-qualification-report'],
+    ['performance', 'custback.matte-performance-report'],
+    ['platform', 'custback.matte-platform-qualification-report'],
+    ['privacy', 'custback.matte-rollout-privacy-review'],
+    ['migration', 'custback.matte-rollout-migration-report'],
+  ];
+  if (!promotion || !isDeepStrictEqual(
+    Object.keys(promotion).sort(), expectedPromotionKeys,
+  ) || promotion.status !== 'pending' ||
+      promotion.authority !== 'none-v1-physical-evidence-pending' ||
+      promotion.physical_provenance_required !== true ||
+      promotion.generated_evidence_can_qualify !== false ||
+      promotion.candidate_id !== null ||
+      promotion.candidate_build_sha256 !== null ||
+      promotion.candidate_patch_sha256 !== null ||
+      promotion.change_commit !== null ||
+      !isDeepStrictEqual(promotion.limitations, [
+        'upstream-build-binding-owner-attested',
+        'physical-origin-owner-attested',
+      ]) || !Array.isArray(promotion.evidence) ||
+      promotion.evidence.length !== expectedEvidence.length) {
+    fail('matte-policy promotion must remain fail-closed pending physical evidence');
+  }
+  promotion.evidence.forEach((evidence, index) => {
+    const [id, schema] = expectedEvidence[index];
+    if (!evidence || !isDeepStrictEqual(Object.keys(evidence).sort(), [
+      'evidence_sha256', 'file_sha256', 'id', 'report', 'schema', 'status',
+    ]) || evidence.id !== id || evidence.schema !== schema ||
+        evidence.status !== 'pending' || evidence.report !== null ||
+        evidence.file_sha256 !== null || evidence.evidence_sha256 !== null) {
+      fail(`matte-policy ${id} evidence slot must remain explicit and pending`);
+    }
+  });
+
+  if (!isDeepStrictEqual(manifest.rollback, {
+    patch_id: 'matte-legacy-v1',
+    patch_sha256: expectedPatchDigest,
+    retain_schema_version: true,
+    delete_user_config: false,
+    delete_model_cache: false,
+    minimum_stable_releases: 1,
+  }) || !isDeepStrictEqual(manifest.reactions, {
+    included: false,
+    required_for_matte_qualification: false,
+  })) {
+    fail('matte-policy rollback or reaction separation is invalid');
+  }
+  return manifest;
+}
+
 function verifyCiWorkflow(root = ROOT) {
   const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
   const uses = [...workflow.matchAll(/^\s*-\s+uses:\s+([^\s#]+)/gm)]
@@ -1805,6 +2210,7 @@ function verifyPack(version, root = ROOT) {
       'scripts/release/package-smoke.js',
       'scripts/release/visual-qualification-manifest.json',
       'scripts/release/visual-policy-rollout.json',
+      'scripts/release/matte-policy-rollout.json',
       'scripts/release/visual_consistency_qualification.py',
       'scripts/release/verify-release.js',
       'scripts/release/remediation-blockers.json',
@@ -2293,6 +2699,7 @@ function verifyPackageSmoke(root = ROOT) {
   verifyCoreConfigTemplate(root);
   verifyDocs(root);
   verifyVisualPolicyRollout(root);
+  verifyMattePolicyRollout(root);
   verifyCiWorkflow(root);
   verifyPhase6Contracts(root);
   verifyPlatformScope(root);
@@ -2328,6 +2735,7 @@ function main(argv = process.argv.slice(2)) {
     verifyCoreConfigTemplate();
     verifyDocs();
     verifyVisualPolicyRollout();
+    verifyMattePolicyRollout();
     verifyCiWorkflow();
     verifyPhase6Contracts();
     verifyPlatformScope();
@@ -2382,6 +2790,7 @@ module.exports = {
   verifyBlockerRegressionCoverage,
   verifyCiWorkflow,
   verifyLicenseMetadata,
+  verifyMattePolicyRollout,
   verifyNpmArtifactLicense,
   verifyNpmArtifactInstall,
   verifyNpmMetadata,

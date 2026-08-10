@@ -536,6 +536,79 @@ def test_zero_confidence_occlusion_is_local_while_other_boundary_stabilizes(
     )
 
 
+def test_zero_confidence_disocclusion_uses_exact_new_foreground_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shape = (128, 192)
+    previous_left = _soft_box(
+        shape=shape,
+        bounds=(18, 35, 58, 94),
+        feather_px=3.0,
+    )
+    previous_right = _soft_box(
+        shape=shape,
+        bounds=(132, 35, 172, 94),
+        feather_px=3.0,
+    )
+    previous_right[:, 151:] = 0.0
+    previous = np.maximum(previous_left, previous_right).astype(np.float32)
+
+    # The left contour has ordinary estimator jitter. The missing half of the
+    # right subject is newly revealed and deliberately has no correspondence.
+    current_left = _soft_box(
+        shape=shape,
+        bounds=(19, 35, 59, 94),
+        feather_px=3.0,
+    )
+    current_right = _soft_box(
+        shape=shape,
+        bounds=(132, 35, 172, 94),
+        feather_px=3.0,
+    )
+    current = np.maximum(current_left, current_right).astype(np.float32)
+    confidence = np.ones(shape, dtype=np.float32)
+    confidence[:, shape[1] // 2 :] = 0.0
+
+    refiner = MaskRefiner(_motion_config(time_constant_s=0.5))
+    monkeypatch.setattr(
+        refiner,
+        "_motion_guide",
+        lambda frame: np.zeros(frame.shape[:2], dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        refiner,
+        "_estimate_boundary_motion",
+        lambda *_args, **_kwargs: (
+            np.zeros((*shape, 2), dtype=np.float32),
+            confidence,
+        ),
+    )
+    frame = _dummy_frame(shape)
+    refiner.refine(
+        previous,
+        frame,
+        context=_context(0, 0, shape),
+    )
+    output = refiner.refine(
+        current,
+        frame,
+        context=_context(1, 33_333_333, shape),
+    )
+
+    midpoint = shape[1] // 2
+    np.testing.assert_array_equal(output[:, midpoint:], current[:, midpoint:])
+    newly_revealed = (previous <= 0.05) & (current >= 0.95)
+    assert np.any(newly_revealed[:, midpoint:])
+    np.testing.assert_array_equal(output[newly_revealed], current[newly_revealed])
+    left_output = output[:, :midpoint]
+    left_current = current[:, :midpoint]
+    left_previous = previous[:, :midpoint]
+    assert np.count_nonzero(np.abs(left_output - left_current) > 1e-5) > 0
+    assert np.mean(np.abs(left_output - left_previous)) < np.mean(
+        np.abs(left_current - left_previous)
+    )
+
+
 def test_stabilization_changes_only_the_boundary_and_preserves_output_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -578,6 +651,79 @@ def test_stabilization_changes_only_the_boundary_and_preserves_output_contract(
     assert np.all(np.diff(output[shape[0] // 2]) <= 1e-6)
 
 
+def test_connected_hair_like_soft_feature_survives_temporal_stabilization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cv2 = pytest.importorskip("cv2")
+    shape = (96, 128)
+    body = _soft_box(
+        shape=shape,
+        bounds=(38, 38, 90, 84),
+        feather_px=3.0,
+    )
+    previous = body.copy()
+    current = body.copy()
+    tip_row = 10
+    join_row = 41
+    core_column = 64
+    feature_rows = slice(tip_row, join_row + 1)
+    previous[feature_rows, core_column] = 1.0
+    current[feature_rows, core_column] = 1.0
+    previous[feature_rows, core_column - 1] = np.maximum(
+        previous[feature_rows, core_column - 1],
+        0.65,
+    )
+    previous[feature_rows, core_column + 1] = np.maximum(
+        previous[feature_rows, core_column + 1],
+        0.65,
+    )
+    current[feature_rows, core_column - 1] = np.maximum(
+        current[feature_rows, core_column - 1],
+        0.35,
+    )
+    current[feature_rows, core_column + 1] = np.maximum(
+        current[feature_rows, core_column + 1],
+        0.35,
+    )
+    previous = np.ascontiguousarray(previous, dtype=np.float32)
+    current = np.ascontiguousarray(current, dtype=np.float32)
+
+    refiner = MaskRefiner(_motion_config(time_constant_s=0.5))
+    _install_exact_motion(monkeypatch, refiner)
+    frame = _dummy_frame(shape)
+    refiner.refine(
+        previous,
+        frame,
+        context=_context(0, 0, shape),
+    )
+    output = refiner.refine(
+        current,
+        frame,
+        context=_context(1, 33_333_333, shape),
+    )
+
+    exposed_feature_rows = slice(tip_row, 38)
+    flank = np.zeros(shape, dtype=bool)
+    flank[exposed_feature_rows, core_column - 1] = True
+    flank[exposed_feature_rows, core_column + 1] = True
+    assert np.any(np.abs(output[flank] - current[flank]) > 1e-5)
+    assert np.all(output[flank] > 0.35)
+    assert np.all(output[flank] < 0.65)
+    np.testing.assert_array_equal(
+        output[feature_rows, core_column],
+        np.ones(join_row - tip_row + 1, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        output[tip_row - 1, core_column - 1 : core_column + 2],
+        np.zeros(3, dtype=np.float32),
+    )
+    assert cv2.connectedComponents((current >= 0.5).astype(np.uint8))[0] - 1 == 1
+    assert cv2.connectedComponents((output >= 0.5).astype(np.uint8))[0] - 1 == 1
+    assert output.dtype == np.float32
+    assert output.flags.c_contiguous
+    assert np.isfinite(output).all()
+
+
 @pytest.mark.parametrize("case", ("zero", "one", "tiny", "invalid"))
 def test_degenerate_and_invalid_masks_return_a_finite_contiguous_unit_alpha(
     case: str,
@@ -608,6 +754,49 @@ def test_degenerate_and_invalid_masks_return_a_finite_contiguous_unit_alpha(
     assert float(output.max()) <= 1.0
     if case in ("zero", "one", "tiny"):
         np.testing.assert_array_equal(output, mask)
+
+
+def test_fail_soft_invalid_mask_cannot_poison_following_temporal_history() -> None:
+    """Direct callers are sanitized even though pipeline boundaries reject this."""
+
+    shape = (12, 20)
+    invalid_row = np.asarray(
+        [np.nan, np.inf, -np.inf, 2.0, -1.0],
+        dtype=np.float32,
+    )
+    invalid = np.ascontiguousarray(np.tile(invalid_row, (shape[0], 4)))
+    expected_row = np.asarray([0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    expected = np.ascontiguousarray(np.tile(expected_row, (shape[0], 4)))
+    valid = np.full(shape, 0.5, dtype=np.float32)
+    refiner = MaskRefiner(
+        SegmentationConfig(
+            mask_blur=0,
+            edge_refine=False,
+            temporal_smoothing=0.75,
+        )
+    )
+
+    sanitized = refiner.refine(
+        invalid,
+        _dummy_frame(shape),
+        context=_context(0, 0, shape),
+    )
+    np.testing.assert_array_equal(sanitized, expected)
+    np.testing.assert_array_equal(refiner._prev, expected)
+
+    # Every sanitized-history value differs from the valid matte by 0.5, so the
+    # legacy disagreement gate releases it instead of propagating bad history.
+    output = refiner.refine(
+        valid,
+        _dummy_frame(shape, phase=1),
+        context=_context(1, 33_333_333, shape),
+    )
+
+    np.testing.assert_array_equal(output, valid)
+    np.testing.assert_array_equal(refiner._prev, valid)
+    assert np.isfinite(refiner._prev).all()
+    assert refiner.last_input_sequence == 1
+    assert refiner.last_input_timestamp_ns == _BASE_TIMESTAMP_NS + 33_333_333
 
 
 def test_nonfinite_flow_falls_back_to_exact_current_alpha(
@@ -747,6 +936,53 @@ def test_every_reset_reason_clears_motion_state_before_the_boundary_frame(
     assert refiner.last_temporal_reset_timestamp_ns == reset_timestamp_ns
     assert refiner.last_input_sequence == 0
     assert refiner.last_input_timestamp_ns == reset_timestamp_ns
+
+
+def test_close_clears_populated_temporal_state_without_reset_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shape = (48, 64)
+    reset_timestamp_ns = _BASE_TIMESTAMP_NS
+    refiner = MaskRefiner(_motion_config(time_constant_s=0.5))
+    _install_exact_motion(monkeypatch, refiner)
+    refiner.reset_temporal_state(
+        TemporalResetReason.SEGMENTATION_CONFIG,
+        reset_timestamp_ns,
+    )
+    refiner.refine(
+        _soft_vertical_edge(shape=shape, edge_x=30),
+        _dummy_frame(shape),
+        context=_context(0, 0, shape),
+    )
+
+    assert refiner._prev is not None
+    assert refiner._prev_guide is not None
+    assert refiner._prev_motion_timestamp_ns is not None
+    assert refiner._motion_hold_age is not None
+    assert refiner._motion_direction is not None
+    telemetry = (
+        refiner.temporal_reset_count,
+        refiner.last_temporal_reset_reason,
+        refiner.last_temporal_reset_timestamp_ns,
+    )
+
+    refiner.close()
+
+    assert refiner._prev is None
+    assert refiner._prev_guide is None
+    assert refiner._prev_motion_timestamp_ns is None
+    assert refiner._motion_hold_age is None
+    assert refiner._motion_direction is None
+    assert refiner.last_input_sequence is None
+    assert refiner.last_input_timestamp_ns is None
+    assert (
+        refiner.temporal_reset_count,
+        refiner.last_temporal_reset_reason,
+        refiner.last_temporal_reset_timestamp_ns,
+    ) == telemetry
+
+    # Teardown may race with another owner; close remains safe and idempotent.
+    refiner.close()
 
 
 def test_flow_estimator_exception_seeds_current_for_the_next_valid_frame(

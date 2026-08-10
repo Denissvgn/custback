@@ -12,7 +12,11 @@ import pytest
 import yaml
 
 import custback.migration as migration
-from custback.config import AppConfig
+from custback.config import (
+    AppConfig,
+    legacy_matte_policy_patch,
+    uses_legacy_matte_policy,
+)
 from custback.storage_tx import OwnershipLedger
 
 
@@ -70,6 +74,13 @@ def test_golden_config_migration_is_private_atomic_and_idempotent(tmp_path):
     assert loaded.compositing.blend_space == "srgb_legacy"
     assert loaded.compositing.color_correction.mode == "off"
     assert (loaded.output.width, loaded.output.height) == (None, None)
+    assert uses_legacy_matte_policy(loaded) is True
+    legacy = legacy_matte_policy_patch()
+    expected_segmentation = legacy["segmentation"]
+    expected_segmentation["model_path"] = ""
+    assert loaded.segmentation.model_dump(mode="python") == expected_segmentation
+    assert loaded.acceleration.model_dump(mode="python") == legacy["acceleration"]
+    assert loaded.compositing.model_dump(mode="python") == legacy["compositing"]
 
     before = {
         path: (path.lstat().st_ino, path.lstat().st_mtime_ns, path.read_bytes())
@@ -161,6 +172,12 @@ def test_explicit_schema_v1_migration_materializes_absent_visual_policy(tmp_path
         "min_radius_px": 2,
         "max_radius_px": 12,
     }
+    legacy = legacy_matte_policy_patch()
+    expected_segmentation = legacy["segmentation"]
+    expected_segmentation["model_path"] = ""
+    assert raw["segmentation"] == expected_segmentation
+    assert raw["acceleration"] == legacy["acceleration"]
+    assert raw["compositing"] == legacy["compositing"]
     assert raw["output"] == {"width": None, "height": None}
     again = migration.migrate_config(config, "legacy-camera")
     assert again.status is migration.MigrationStatus.ALREADY_CURRENT

@@ -353,19 +353,25 @@ test('doctor explains installed backend quality tiers with actionable rebuild co
   assert.deepEqual(launcher.backendQualityProfile({ mediapipe: true, rvm: true }), {
     level: 'note',
     label: 'backend quality tier: matting',
-    hint: 'RVM true-alpha matting is installed; confirm the active provider in runtime status',
+    hint: [
+      'RVM true-alpha matting is installed',
+      'installed capability is not an evidence-qualified default',
+      'confirm the active provider and matte rollout decision in runtime status',
+    ].join('; '),
   });
 
   const defaultProfile = launcher.backendQualityProfile({ mediapipe: true, rvm: false });
   assert.equal(defaultProfile.level, 'note');
   assert.equal(defaultProfile.label, 'backend quality tier: segmentation');
   assert.match(defaultProfile.hint, /MediaPipe confidence-mask segmentation is installed/);
+  assert.match(defaultProfile.hint, /not an evidence-qualified default/);
   assert.match(defaultProfile.hint, /custback rebuild --extras rvm \(CPU\)/);
   assert.match(defaultProfile.hint, /custback rebuild --extras gpu \(NVIDIA\/CUDA\)/);
 
   const coreProfile = launcher.backendQualityProfile({ mediapipe: false, rvm: false });
   assert.equal(coreProfile.level, 'warn');
   assert.equal(coreProfile.label, 'backend quality tier: heuristic');
+  assert.match(coreProfile.hint, /not a named quality preset/);
   assert.match(coreProfile.hint, /custback rebuild --extras mediapipe/);
   assert.match(coreProfile.hint, /custback rebuild --extras rvm \(CPU\)/);
   assert.match(coreProfile.hint, /custback rebuild --extras gpu \(NVIDIA\/CUDA\)/);

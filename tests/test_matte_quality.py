@@ -102,26 +102,84 @@ def test_temporally_stable_underopaque_core_fails_spatial_gate_only(tmp_path):
     assert _gate(report, "opaque-core-p05")["status"] == "fail"
 
 
-def test_hole_halo_and_fine_edge_fixtures_exercise_spatial_metrics(tmp_path):
+def test_hole_and_exterior_halo_fixture_has_exact_detectable_defects(tmp_path):
     defects = evidence.generate_fixture(tmp_path, "holes_and_halos")
     defect_report = evaluate_bundle(
         defects.bundle,
         annotations_root=defects.annotations,
     )
     defect_metrics = defect_report["aggregate"]["metrics"]
-    assert defect_metrics["foreground_hole_components"]["p95"] >= 1
-    assert defect_metrics["exterior_halo_area_ratio"]["p95"] > 0
-    assert defect_metrics["exterior_halo_width_p95_px"]["p95"] > 0
+    assert defect_metrics["foreground_hole_components"]["p95"] == pytest.approx(1.0)
+    # The generated +8 px shifted copy puts 127 of the 3,705 annotated exterior
+    # pixels above alpha 0.05 and reaches exactly 8 px from the true contour.
+    assert defect_metrics["exterior_halo_area_ratio"]["p95"] == pytest.approx(
+        127 / 3_705,
+        abs=1e-6,
+    )
+    assert defect_metrics["exterior_halo_width_p95_px"]["p95"] == pytest.approx(8.0)
+    assert defect_metrics["ground_truth_alpha_mae"]["p95"] == pytest.approx(
+        0.01847545,
+        abs=1e-6,
+    )
 
+    clean = evidence.generate_fixture(
+        tmp_path,
+        "holes_and_halos",
+        mask_profile="ground_truth_control",
+        use_ground_truth_matte=True,
+    )
+    clean_metrics = evaluate_bundle(
+        clean.bundle,
+        annotations_root=clean.annotations,
+    )["aggregate"]["metrics"]
+    assert clean_metrics["foreground_hole_components"]["max"] == 0.0
+    assert clean_metrics["exterior_halo_area_ratio"]["max"] == 0.0
+    assert clean_metrics.get("exterior_halo_width_p95_px") is None
+    assert clean_metrics["ground_truth_alpha_mae"]["max"] == 0.0
+
+
+def test_fine_semitransparent_edge_fixture_has_exact_detectable_defects(tmp_path):
     fine = evidence.generate_fixture(tmp_path, "fine_semitransparent_edges")
     fine_report = evaluate_bundle(
         fine.bundle,
         annotations_root=fine.annotations,
     )
     fine_metrics = fine_report["aggregate"]["metrics"]
-    assert fine_metrics["uncertain_pixel_fraction"]["p95"] > 0.09
-    assert fine_metrics["ground_truth_gradient_mae"]["p95"] > 0
-    assert fine_metrics["clean_foreground_rgb_error"]["p95"] > 0.07
+    # The fixture retains 668 genuinely soft pixels while attenuating their
+    # alpha by four percent. The foreground proxy is exactly 20 levels brighter.
+    assert fine_metrics["uncertain_pixel_fraction"]["p95"] == pytest.approx(
+        668 / (evidence.HEIGHT * evidence.WIDTH),
+        abs=1e-6,
+    )
+    assert fine_metrics["ground_truth_gradient_mae"]["p95"] == pytest.approx(
+        0.01135965,
+        abs=1e-6,
+    )
+    assert fine_metrics["ground_truth_alpha_mae"]["p95"] == pytest.approx(
+        0.00181518,
+        abs=1e-6,
+    )
+    assert fine_metrics["clean_foreground_rgb_error"]["p95"] == pytest.approx(
+        20 / 255,
+        abs=1e-6,
+    )
+
+    clean = evidence.generate_fixture(
+        tmp_path,
+        "fine_semitransparent_edges",
+        mask_profile="ground_truth_control",
+        use_ground_truth_matte=True,
+    )
+    clean_metrics = evaluate_bundle(
+        clean.bundle,
+        annotations_root=clean.annotations,
+    )["aggregate"]["metrics"]
+    assert clean_metrics["uncertain_pixel_fraction"]["p95"] == pytest.approx(
+        fine_metrics["uncertain_pixel_fraction"]["p95"],
+        abs=1e-6,
+    )
+    assert clean_metrics["ground_truth_gradient_mae"]["max"] == 0.0
+    assert clean_metrics["ground_truth_alpha_mae"]["max"] == 0.0
 
 
 @pytest.mark.parametrize(

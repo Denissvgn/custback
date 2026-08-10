@@ -33,6 +33,7 @@ test('release metadata versions and required compatibility bounds agree', () => 
   assert.doesNotThrow(() => release.verifyCoreConfigTemplate(root));
   assert.doesNotThrow(() => release.verifyDocs(root));
   assert.doesNotThrow(() => release.verifyVisualPolicyRollout(root));
+  assert.doesNotThrow(() => release.verifyMattePolicyRollout(root));
   assert.doesNotThrow(() => release.verifyCiWorkflow(root));
   assert.doesNotThrow(() => release.verifyPlatformScope(root));
 });
@@ -73,6 +74,113 @@ test('CI vision compatibility profiles retain integrated qualification coverage'
   const optional = jobBlock('optional-backends');
   assert.match(optional, /timeout 180s python -m pytest -q/);
   assert.doesNotMatch(optional, /--ignore|--deselect/);
+});
+
+test('matte defaults remain held until every exact release authority changes', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-matte-rollout-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  for (const relative of [
+    'config/default.yaml',
+    'scripts/release/matte-policy-rollout.json',
+    'src/custback/api/webui.py',
+    'src/custback/default.yaml',
+  ]) {
+    const target = path.join(fixture, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(root, relative), target);
+  }
+  const source = JSON.parse(fs.readFileSync(
+    path.join(root, 'scripts', 'release', 'matte-policy-rollout.json'),
+    'utf8',
+  ));
+  const manifestPath = path.join(
+    fixture, 'scripts', 'release', 'matte-policy-rollout.json',
+  );
+  const runtimeContract = {
+    patch: structuredClone(source.compatibility_policy.patch),
+    status: {
+      schema: 'custback.matte-rollout-status',
+      version: 1,
+      stage: 'compatibility_hold',
+      decision: 'held_pending_physical_qualification',
+      configured_schema_version: 1,
+      config_version: 0,
+      qualified_default_active: false,
+      preset_catalog_version: 1,
+      preset_evidence_status: 'not_qualified',
+      legacy_policy_available: true,
+      legacy_policy_active: true,
+      rollback_patch_id: 'matte-legacy-v1',
+      patch_attempts: 0,
+      patch_in_flight: 0,
+      patch_successes: 0,
+      patch_failures: 0,
+      legacy_rollbacks: 0,
+      last_outcome: 'none',
+    },
+  };
+  const verify = (manifest, contract = runtimeContract) => {
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    return release.verifyMattePolicyRollout(fixture, {
+      runtimeContract: contract,
+    });
+  };
+
+  assert.doesNotThrow(() => verify(source));
+
+  const promoted = structuredClone(source);
+  promoted.active_stage = 'qualified_default';
+  assert.throws(() => verify(promoted), /manifest header is invalid/);
+
+  const privateField = structuredClone(source);
+  privateField.private_report_path = '/private/qualification/report.json';
+  assert.throws(() => verify(privateField), /manifest header is invalid/);
+
+  const preset = structuredClone(source);
+  preset.preset_catalog.evidence_status = 'qualified';
+  preset.preset_catalog.preset_ids = ['quality'];
+  assert.throws(() => verify(preset), /preset catalog must remain empty/);
+
+  const fabricated = structuredClone(source);
+  fabricated.promotion.status = 'qualified';
+  fabricated.promotion.authority = 'operator-asserted';
+  assert.throws(() => verify(fabricated), /pending physical evidence/);
+
+  const driftedPatch = structuredClone(source);
+  driftedPatch.compatibility_policy.patch.segmentation.threshold = 0.6;
+  assert.throws(() => verify(driftedPatch), /compatibility patch or digest/);
+
+  const omittedEvidence = structuredClone(source);
+  omittedEvidence.promotion.evidence.pop();
+  assert.throws(() => verify(omittedEvidence), /pending physical evidence/);
+
+  const destructive = structuredClone(source);
+  destructive.rollback.delete_model_cache = true;
+  assert.throws(() => verify(destructive), /rollback or reaction separation/);
+
+  const reactions = structuredClone(source);
+  reactions.reactions.included = true;
+  assert.throws(() => verify(reactions), /rollback or reaction separation/);
+
+  const helperDrift = structuredClone(runtimeContract);
+  helperDrift.patch.segmentation.threshold = 0.6;
+  assert.throws(
+    () => verify(source, helperDrift),
+    /Python rollback\/status contract disagrees/,
+  );
+
+  const statusDrift = structuredClone(runtimeContract);
+  statusDrift.status.qualified_default_active = true;
+  assert.throws(
+    () => verify(source, statusDrift),
+    /Python rollback\/status contract disagrees/,
+  );
+  const privateStatus = structuredClone(runtimeContract);
+  privateStatus.status.raw_error = '/private/provider/error';
+  assert.throws(
+    () => verify(source, privateStatus),
+    /Python rollback\/status contract disagrees/,
+  );
 });
 
 test('visual defaults cannot advance without a distinct commit and approval record', (t) => {

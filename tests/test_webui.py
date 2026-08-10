@@ -464,6 +464,8 @@ def test_matte_presets_are_versioned_evidence_gated_and_atomic():
     assert "checked-in evidence has not qualified portable model-backed profiles" in (
         script
     )
+    assert "matte-legacy-v1 policy as one atomic patch" in script
+    assert "not require deleting configuration or the model cache" in script
     for name in ("performance", "balanced", "quality"):
         button = re.search(
             rf'<button[^>]+data-quality-preset="{name}"[^>]*>', WEBUI_HTML
@@ -582,6 +584,7 @@ def test_matte_controls_expose_runtime_truth_and_lifecycle():
     for key in (
         "segmentation_selection",
         "matte_policy",
+        "matte_rollout",
         "qualityTier",
         "activeDevice",
         "activeProvider",
@@ -606,6 +609,78 @@ def test_matte_controls_expose_runtime_truth_and_lifecycle():
     assert 'selection.selectedBackend.toLowerCase() === "mediapipe"' in quality
     assert "renderMatteQualityRuntime();" in quality
     assert "renderMatteControlPolicy();" in quality
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_matte_rollout_status_is_exact_version_aligned_and_visible():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    helpers = (
+        "function currentMatteRollout"
+        + script.split("function currentMatteRollout", 1)[1].split(
+            "function renderMatteQualityRuntime", 1
+        )[0]
+    )
+    harness = r"""
+const rollout = {
+  schema: "custback.matte-rollout-status",
+  version: 1,
+  stage: "compatibility_hold",
+  decision: "held_pending_physical_qualification",
+  configured_schema_version: 1,
+  config_version: 4,
+  qualified_default_active: false,
+  preset_catalog_version: 1,
+  preset_evidence_status: "not_qualified",
+  legacy_policy_available: true,
+  legacy_policy_active: true,
+  rollback_patch_id: "matte-legacy-v1",
+  patch_attempts: 3,
+  patch_in_flight: 0,
+  patch_successes: 2,
+  patch_failures: 1,
+  legacy_rollbacks: 1,
+  last_outcome: "rollback",
+};
+const status = {config_version: 4, matte_rollout: rollout};
+process.stdout.write(JSON.stringify({
+  current: currentMatteRollout(status, 4),
+  rows: matteRolloutRows(status, 4),
+  stale: currentMatteRollout(status, 3),
+  nestedStale: currentMatteRollout(
+    {...status, matte_rollout: {...rollout, config_version: 3}}, 4),
+  unknown: currentMatteRollout(
+    {...status, matte_rollout: {...rollout, raw_error: "/private/path"}}, 4),
+  inconsistent: currentMatteRollout(
+    {...status, matte_rollout: {...rollout, patch_attempts: 4}}, 4),
+}));
+"""
+    result = subprocess.run(
+        ["node"],
+        input=helpers + harness,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = json.loads(result.stdout)
+    assert values["current"]["rollback_patch_id"] == "matte-legacy-v1"
+    assert values["rows"] == [
+        [
+            "Matte rollout",
+            "Compatibility hold · physical qualification pending · "
+            "presets unavailable · legacy policy active",
+            "warn",
+        ],
+        [
+            "Matte rollout changes",
+            "3 attempted · 2 succeeded · 1 failed · 0 in flight · 1 rolled back",
+            "warn",
+        ],
+    ]
+    assert values["stale"] is None
+    assert values["nestedStale"] is None
+    assert values["unknown"] is None
+    assert values["inconsistent"] is None
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
@@ -1201,6 +1276,7 @@ def test_system_diagnostics_report_backend_selection_and_effective_policy():
         "active_device",
         "active_provider",
         "matte_policy",
+        "matte_rollout",
         "rvm_downsample_ratio",
         "raw_alpha_mode",
     ):
@@ -1208,6 +1284,7 @@ def test_system_diagnostics_report_backend_selection_and_effective_policy():
     assert '["Subject detection", ...segmentationSummary(status)]' in script
     assert "coreRows.push(...segmentationFallbackRows(status))" in script
     assert "if (mattePolicy) coreRows.push(mattePolicy)" in script
+    assert "coreRows.push(...matteRolloutRows(status, state.coreVersion))" in script
 
     title_case = (
         "function titleCase"

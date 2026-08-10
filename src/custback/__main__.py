@@ -931,6 +931,25 @@ def main(argv: list[str] | None = None) -> int:
             effective_argv[1:],
             prog="custback matte-rvm-qualify",
         )
+    if effective_argv[:1] == ["matte-visual-qualify"]:
+        # Visual qualification is a private offline join. It opens no live
+        # capture, model, preview, API, network service, or output sink.
+        from .matte_visual_qualification import main as matte_visual_main
+
+        return matte_visual_main(
+            effective_argv[1:],
+            prog="custback matte-visual-qualify",
+        )
+    if effective_argv[:1] == ["matte-platform-qualify"]:
+        # Platform qualification validates already-recorded private capture,
+        # fixed-replay, sink, resource, and lifecycle evidence. It opens no
+        # camera, model, preview, API, network service, or output sink.
+        from .matte_platform_qualification import main as matte_platform_main
+
+        return matte_platform_main(
+            effective_argv[1:],
+            prog="custback matte-platform-qualify",
+        )
     if effective_argv[:1] == ["matte-performance"]:
         # Matrix-only profiling is offline. Explicit --collect-full-path also
         # opens the built-in model and requested local sink, but never live

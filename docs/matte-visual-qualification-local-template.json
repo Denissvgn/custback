@@ -1,0 +1,894 @@
+{
+  "schema": "custback.matte-visual-qualification-plan",
+  "version": 1,
+  "provenance": {
+    "qualification_id": "local_matte_visual_qualification",
+    "kind": "consented-local",
+    "license_or_consent_reference": "REPLACE_WITH_PRIVATE_CONSENT_OR_LICENSE_RECORD_ID",
+    "contains_private_footage_in_repository": false
+  },
+  "policy": {
+    "quality_policy_id": "matte-0.2-ratified-v1",
+    "maximum_full_frame_mae": 4.0,
+    "maximum_edge_band_mae": 8.0
+  },
+  "candidates": [
+    {
+      "id": "selected_optional_candidate",
+      "segmentation": {
+        "backend": "mediapipe",
+        "model_path": "",
+        "delegate": "cpu",
+        "rvm_downsample": 0.0,
+        "threshold": 0.5,
+        "mask_blur": 0,
+        "edge_refine": true,
+        "mask_shift": 0,
+        "temporal_smoothing": 0.0,
+        "boundary_stabilization": {
+          "mode": "motion_aware",
+          "time_constant_s": 0.1,
+          "max_motion_px_per_s": 720.0
+        },
+        "spatial_edge_refinement": {
+          "mode": "stable_guided",
+          "reference_short_edge_px": 720,
+          "radius_at_reference_px": 8,
+          "min_radius_px": 2,
+          "max_radius_px": 12
+        }
+      },
+      "compositing": {
+        "light_wrap": 0.25,
+        "use_model_foreground": false,
+        "blend_space": "linear_srgb",
+        "light_wrap_stabilization": {
+          "mode": "temporal_bounded",
+          "time_constant_s": 0.12
+        },
+        "color_correction": {
+          "mode": "off",
+          "strength": 0.5,
+          "exposure_limit_ev": 0.85,
+          "white_balance_strength": 0.5,
+          "adaptation_time_s": 0.8
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "static_image_360p15",
+      "candidate_id": "selected_optional_candidate",
+      "baseline_expected": {
+        "segmentation": {
+          "backend": "mediapipe",
+          "model_path": "",
+          "delegate": "cpu",
+          "rvm_downsample": 0.0,
+          "threshold": 0.5,
+          "mask_blur": 0,
+          "edge_refine": true,
+          "mask_shift": 0,
+          "temporal_smoothing": 0.0,
+          "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0
+          },
+          "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12
+          }
+        },
+        "compositing": {
+          "light_wrap": 0.25,
+          "use_model_foreground": false,
+          "blend_space": "linear_srgb",
+          "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12
+          },
+          "color_correction": {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8
+          }
+        },
+        "effective": {
+          "segmentation_backend": "MediaPipeSegmenter",
+          "segmentation_device": "cpu",
+          "rvm_downsample_ratio": null,
+          "matte_policy": {
+            "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_SELECTED_BACKEND_KIND",
+            "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_BACKEND_KIND",
+            "passthrough": false,
+            "experimental_rvm_generic": false,
+            "configured": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONFIGURED_POLICY": true
+            },
+            "effective": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_EFFECTIVE_POLICY": true
+            },
+            "controls": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONTROL_POLICY": true
+            }
+          }
+        }
+      },
+      "baseline": {
+        "bundle": "REPLACE_static_image_360p15_baseline_bundle",
+        "annotations": "REPLACE_static_image_360p15_baseline_annotations"
+      },
+      "candidate": {
+        "bundle": "REPLACE_static_image_360p15_candidate_bundle",
+        "annotations": "REPLACE_static_image_360p15_candidate_annotations"
+      },
+      "expected_effective": {
+        "segmentation_backend": "MediaPipeSegmenter",
+        "segmentation_device": "cpu",
+        "rvm_downsample_ratio": null,
+        "matte_policy": {
+          "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_SELECTED_BACKEND_KIND",
+          "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BACKEND_KIND",
+          "passthrough": false,
+          "experimental_rvm_generic": false,
+          "configured": {
+            "REPLACE_WITH_CODE_RESOLVED_CONFIGURED_POLICY": true
+          },
+          "effective": {
+            "REPLACE_WITH_CODE_RESOLVED_EFFECTIVE_POLICY": true
+          },
+          "controls": {
+            "REPLACE_WITH_CODE_RESOLVED_CONTROL_POLICY": true
+          }
+        }
+      },
+      "coverage": {
+        "appearances": [
+          "bald_or_short_hair",
+          "glasses",
+          "facial_hair",
+          "dark_opaque_clothing"
+        ],
+        "motions": [
+          "stationary",
+          "speech_micro_motion"
+        ],
+        "source_conditions": [
+          "bright",
+          "low_contrast"
+        ],
+        "backgrounds": [
+          "static_image"
+        ],
+        "cadences": [
+          "fps_15"
+        ],
+        "canvases": [
+          "640x360"
+        ]
+      },
+      "boundary_evidence": "REPLACE_static_image_360p15_boundary_evidence.json",
+      "review": "REPLACE_static_image_360p15_human_review.json"
+    },
+    {
+      "id": "static_image_720p15_stationary",
+      "candidate_id": "selected_optional_candidate",
+      "baseline_expected": {
+        "segmentation": {
+          "backend": "mediapipe",
+          "model_path": "",
+          "delegate": "cpu",
+          "rvm_downsample": 0.0,
+          "threshold": 0.5,
+          "mask_blur": 0,
+          "edge_refine": true,
+          "mask_shift": 0,
+          "temporal_smoothing": 0.0,
+          "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0
+          },
+          "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12
+          }
+        },
+        "compositing": {
+          "light_wrap": 0.25,
+          "use_model_foreground": false,
+          "blend_space": "linear_srgb",
+          "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12
+          },
+          "color_correction": {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8
+          }
+        },
+        "effective": {
+          "segmentation_backend": "MediaPipeSegmenter",
+          "segmentation_device": "cpu",
+          "rvm_downsample_ratio": null,
+          "matte_policy": {
+            "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_SELECTED_BACKEND_KIND",
+            "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_BACKEND_KIND",
+            "passthrough": false,
+            "experimental_rvm_generic": false,
+            "configured": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONFIGURED_POLICY": true
+            },
+            "effective": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_EFFECTIVE_POLICY": true
+            },
+            "controls": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONTROL_POLICY": true
+            }
+          }
+        }
+      },
+      "baseline": {
+        "bundle": "REPLACE_static_image_720p15_stationary_baseline_bundle",
+        "annotations": "REPLACE_static_image_720p15_stationary_baseline_annotations"
+      },
+      "candidate": {
+        "bundle": "REPLACE_static_image_720p15_stationary_candidate_bundle",
+        "annotations": "REPLACE_static_image_720p15_stationary_candidate_annotations"
+      },
+      "expected_effective": {
+        "segmentation_backend": "MediaPipeSegmenter",
+        "segmentation_device": "cpu",
+        "rvm_downsample_ratio": null,
+        "matte_policy": {
+          "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_SELECTED_BACKEND_KIND",
+          "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BACKEND_KIND",
+          "passthrough": false,
+          "experimental_rvm_generic": false,
+          "configured": {
+            "REPLACE_WITH_CODE_RESOLVED_CONFIGURED_POLICY": true
+          },
+          "effective": {
+            "REPLACE_WITH_CODE_RESOLVED_EFFECTIVE_POLICY": true
+          },
+          "controls": {
+            "REPLACE_WITH_CODE_RESOLVED_CONTROL_POLICY": true
+          }
+        }
+      },
+      "coverage": {
+        "appearances": [
+          "bald_or_short_hair",
+          "glasses",
+          "facial_hair",
+          "dark_opaque_clothing"
+        ],
+        "motions": [
+          "stationary",
+          "speech_micro_motion"
+        ],
+        "source_conditions": [
+          "bright",
+          "low_contrast"
+        ],
+        "backgrounds": [
+          "static_image"
+        ],
+        "cadences": [
+          "fps_15"
+        ],
+        "canvases": [
+          "1280x720"
+        ]
+      },
+      "boundary_evidence": "REPLACE_static_image_720p15_stationary_boundary_evidence.json",
+      "review": "REPLACE_static_image_720p15_stationary_human_review.json"
+    },
+    {
+      "id": "dynamic_video_720p30",
+      "candidate_id": "selected_optional_candidate",
+      "baseline_expected": {
+        "segmentation": {
+          "backend": "mediapipe",
+          "model_path": "",
+          "delegate": "cpu",
+          "rvm_downsample": 0.0,
+          "threshold": 0.5,
+          "mask_blur": 0,
+          "edge_refine": true,
+          "mask_shift": 0,
+          "temporal_smoothing": 0.0,
+          "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0
+          },
+          "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12
+          }
+        },
+        "compositing": {
+          "light_wrap": 0.25,
+          "use_model_foreground": false,
+          "blend_space": "linear_srgb",
+          "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12
+          },
+          "color_correction": {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8
+          }
+        },
+        "effective": {
+          "segmentation_backend": "MediaPipeSegmenter",
+          "segmentation_device": "cpu",
+          "rvm_downsample_ratio": null,
+          "matte_policy": {
+            "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_SELECTED_BACKEND_KIND",
+            "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_BACKEND_KIND",
+            "passthrough": false,
+            "experimental_rvm_generic": false,
+            "configured": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONFIGURED_POLICY": true
+            },
+            "effective": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_EFFECTIVE_POLICY": true
+            },
+            "controls": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONTROL_POLICY": true
+            }
+          }
+        }
+      },
+      "baseline": {
+        "bundle": "REPLACE_dynamic_video_720p30_baseline_bundle",
+        "annotations": "REPLACE_dynamic_video_720p30_baseline_annotations"
+      },
+      "candidate": {
+        "bundle": "REPLACE_dynamic_video_720p30_candidate_bundle",
+        "annotations": "REPLACE_dynamic_video_720p30_candidate_annotations"
+      },
+      "expected_effective": {
+        "segmentation_backend": "MediaPipeSegmenter",
+        "segmentation_device": "cpu",
+        "rvm_downsample_ratio": null,
+        "matte_policy": {
+          "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_SELECTED_BACKEND_KIND",
+          "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BACKEND_KIND",
+          "passthrough": false,
+          "experimental_rvm_generic": false,
+          "configured": {
+            "REPLACE_WITH_CODE_RESOLVED_CONFIGURED_POLICY": true
+          },
+          "effective": {
+            "REPLACE_WITH_CODE_RESOLVED_EFFECTIVE_POLICY": true
+          },
+          "controls": {
+            "REPLACE_WITH_CODE_RESOLVED_CONTROL_POLICY": true
+          }
+        }
+      },
+      "coverage": {
+        "appearances": [
+          "long_or_fine_hair",
+          "headphones_or_solid_accessories",
+          "light_opaque_clothing"
+        ],
+        "motions": [
+          "stationary",
+          "slow_turn",
+          "fast_turn"
+        ],
+        "source_conditions": [
+          "compression_noise",
+          "clutter"
+        ],
+        "backgrounds": [
+          "dynamic_video"
+        ],
+        "cadences": [
+          "fps_30"
+        ],
+        "canvases": [
+          "1280x720"
+        ]
+      },
+      "boundary_evidence": "REPLACE_dynamic_video_720p30_boundary_evidence.json",
+      "review": "REPLACE_dynamic_video_720p30_human_review.json"
+    },
+    {
+      "id": "blur_720p_irregular",
+      "candidate_id": "selected_optional_candidate",
+      "baseline_expected": {
+        "segmentation": {
+          "backend": "mediapipe",
+          "model_path": "",
+          "delegate": "cpu",
+          "rvm_downsample": 0.0,
+          "threshold": 0.5,
+          "mask_blur": 0,
+          "edge_refine": true,
+          "mask_shift": 0,
+          "temporal_smoothing": 0.0,
+          "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0
+          },
+          "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12
+          }
+        },
+        "compositing": {
+          "light_wrap": 0.25,
+          "use_model_foreground": false,
+          "blend_space": "linear_srgb",
+          "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12
+          },
+          "color_correction": {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8
+          }
+        },
+        "effective": {
+          "segmentation_backend": "MediaPipeSegmenter",
+          "segmentation_device": "cpu",
+          "rvm_downsample_ratio": null,
+          "matte_policy": {
+            "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_SELECTED_BACKEND_KIND",
+            "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_BACKEND_KIND",
+            "passthrough": false,
+            "experimental_rvm_generic": false,
+            "configured": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONFIGURED_POLICY": true
+            },
+            "effective": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_EFFECTIVE_POLICY": true
+            },
+            "controls": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONTROL_POLICY": true
+            }
+          }
+        }
+      },
+      "baseline": {
+        "bundle": "REPLACE_blur_720p_irregular_baseline_bundle",
+        "annotations": "REPLACE_blur_720p_irregular_baseline_annotations"
+      },
+      "candidate": {
+        "bundle": "REPLACE_blur_720p_irregular_candidate_bundle",
+        "annotations": "REPLACE_blur_720p_irregular_candidate_annotations"
+      },
+      "expected_effective": {
+        "segmentation_backend": "MediaPipeSegmenter",
+        "segmentation_device": "cpu",
+        "rvm_downsample_ratio": null,
+        "matte_policy": {
+          "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_SELECTED_BACKEND_KIND",
+          "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BACKEND_KIND",
+          "passthrough": false,
+          "experimental_rvm_generic": false,
+          "configured": {
+            "REPLACE_WITH_CODE_RESOLVED_CONFIGURED_POLICY": true
+          },
+          "effective": {
+            "REPLACE_WITH_CODE_RESOLVED_EFFECTIVE_POLICY": true
+          },
+          "controls": {
+            "REPLACE_WITH_CODE_RESOLVED_CONTROL_POLICY": true
+          }
+        }
+      },
+      "coverage": {
+        "appearances": [
+          "skin_tone_diversity"
+        ],
+        "motions": [
+          "hand_or_prop_crossing_face"
+        ],
+        "source_conditions": [
+          "dim"
+        ],
+        "backgrounds": [
+          "blur"
+        ],
+        "cadences": [
+          "fps_30",
+          "irregular",
+          "drops"
+        ],
+        "canvases": [
+          "1280x720"
+        ]
+      },
+      "boundary_evidence": "REPLACE_blur_720p_irregular_boundary_evidence.json",
+      "review": "REPLACE_blur_720p_irregular_human_review.json"
+    },
+    {
+      "id": "solid_color_1080p60",
+      "candidate_id": "selected_optional_candidate",
+      "baseline_expected": {
+        "segmentation": {
+          "backend": "mediapipe",
+          "model_path": "",
+          "delegate": "cpu",
+          "rvm_downsample": 0.0,
+          "threshold": 0.5,
+          "mask_blur": 0,
+          "edge_refine": true,
+          "mask_shift": 0,
+          "temporal_smoothing": 0.0,
+          "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0
+          },
+          "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12
+          }
+        },
+        "compositing": {
+          "light_wrap": 0.25,
+          "use_model_foreground": false,
+          "blend_space": "linear_srgb",
+          "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12
+          },
+          "color_correction": {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8
+          }
+        },
+        "effective": {
+          "segmentation_backend": "MediaPipeSegmenter",
+          "segmentation_device": "cpu",
+          "rvm_downsample_ratio": null,
+          "matte_policy": {
+            "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_SELECTED_BACKEND_KIND",
+            "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_BACKEND_KIND",
+            "passthrough": false,
+            "experimental_rvm_generic": false,
+            "configured": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONFIGURED_POLICY": true
+            },
+            "effective": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_EFFECTIVE_POLICY": true
+            },
+            "controls": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONTROL_POLICY": true
+            }
+          }
+        }
+      },
+      "baseline": {
+        "bundle": "REPLACE_solid_color_1080p60_baseline_bundle",
+        "annotations": "REPLACE_solid_color_1080p60_baseline_annotations"
+      },
+      "candidate": {
+        "bundle": "REPLACE_solid_color_1080p60_candidate_bundle",
+        "annotations": "REPLACE_solid_color_1080p60_candidate_annotations"
+      },
+      "expected_effective": {
+        "segmentation_backend": "MediaPipeSegmenter",
+        "segmentation_device": "cpu",
+        "rvm_downsample_ratio": null,
+        "matte_policy": {
+          "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_SELECTED_BACKEND_KIND",
+          "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BACKEND_KIND",
+          "passthrough": false,
+          "experimental_rvm_generic": false,
+          "configured": {
+            "REPLACE_WITH_CODE_RESOLVED_CONFIGURED_POLICY": true
+          },
+          "effective": {
+            "REPLACE_WITH_CODE_RESOLVED_EFFECTIVE_POLICY": true
+          },
+          "controls": {
+            "REPLACE_WITH_CODE_RESOLVED_CONTROL_POLICY": true
+          }
+        }
+      },
+      "coverage": {
+        "appearances": [
+          "lighting_diversity",
+          "long_or_fine_hair"
+        ],
+        "motions": [
+          "stationary",
+          "entering_frame",
+          "leaving_frame"
+        ],
+        "source_conditions": [
+          "bright"
+        ],
+        "backgrounds": [
+          "solid_color"
+        ],
+        "cadences": [
+          "fps_60"
+        ],
+        "canvases": [
+          "1920x1080"
+        ]
+      },
+      "boundary_evidence": "REPLACE_solid_color_1080p60_boundary_evidence.json",
+      "review": "REPLACE_solid_color_1080p60_human_review.json"
+    },
+    {
+      "id": "solid_color_720p60_stationary",
+      "candidate_id": "selected_optional_candidate",
+      "baseline_expected": {
+        "segmentation": {
+          "backend": "mediapipe",
+          "model_path": "",
+          "delegate": "cpu",
+          "rvm_downsample": 0.0,
+          "threshold": 0.5,
+          "mask_blur": 0,
+          "edge_refine": true,
+          "mask_shift": 0,
+          "temporal_smoothing": 0.0,
+          "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0
+          },
+          "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12
+          }
+        },
+        "compositing": {
+          "light_wrap": 0.25,
+          "use_model_foreground": false,
+          "blend_space": "linear_srgb",
+          "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12
+          },
+          "color_correction": {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8
+          }
+        },
+        "effective": {
+          "segmentation_backend": "MediaPipeSegmenter",
+          "segmentation_device": "cpu",
+          "rvm_downsample_ratio": null,
+          "matte_policy": {
+            "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_SELECTED_BACKEND_KIND",
+            "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_BACKEND_KIND",
+            "passthrough": false,
+            "experimental_rvm_generic": false,
+            "configured": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONFIGURED_POLICY": true
+            },
+            "effective": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_EFFECTIVE_POLICY": true
+            },
+            "controls": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONTROL_POLICY": true
+            }
+          }
+        }
+      },
+      "baseline": {
+        "bundle": "REPLACE_solid_color_720p60_stationary_baseline_bundle",
+        "annotations": "REPLACE_solid_color_720p60_stationary_baseline_annotations"
+      },
+      "candidate": {
+        "bundle": "REPLACE_solid_color_720p60_stationary_candidate_bundle",
+        "annotations": "REPLACE_solid_color_720p60_stationary_candidate_annotations"
+      },
+      "expected_effective": {
+        "segmentation_backend": "MediaPipeSegmenter",
+        "segmentation_device": "cpu",
+        "rvm_downsample_ratio": null,
+        "matte_policy": {
+          "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_SELECTED_BACKEND_KIND",
+          "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BACKEND_KIND",
+          "passthrough": false,
+          "experimental_rvm_generic": false,
+          "configured": {
+            "REPLACE_WITH_CODE_RESOLVED_CONFIGURED_POLICY": true
+          },
+          "effective": {
+            "REPLACE_WITH_CODE_RESOLVED_EFFECTIVE_POLICY": true
+          },
+          "controls": {
+            "REPLACE_WITH_CODE_RESOLVED_CONTROL_POLICY": true
+          }
+        }
+      },
+      "coverage": {
+        "appearances": [
+          "lighting_diversity",
+          "long_or_fine_hair"
+        ],
+        "motions": [
+          "stationary",
+          "entering_frame",
+          "leaving_frame"
+        ],
+        "source_conditions": [
+          "bright"
+        ],
+        "backgrounds": [
+          "solid_color"
+        ],
+        "cadences": [
+          "fps_60"
+        ],
+        "canvases": [
+          "1280x720"
+        ]
+      },
+      "boundary_evidence": "REPLACE_solid_color_720p60_stationary_boundary_evidence.json",
+      "review": "REPLACE_solid_color_720p60_stationary_human_review.json"
+    },
+    {
+      "id": "live_camera_1080p_restart",
+      "candidate_id": "selected_optional_candidate",
+      "baseline_expected": {
+        "segmentation": {
+          "backend": "mediapipe",
+          "model_path": "",
+          "delegate": "cpu",
+          "rvm_downsample": 0.0,
+          "threshold": 0.5,
+          "mask_blur": 0,
+          "edge_refine": true,
+          "mask_shift": 0,
+          "temporal_smoothing": 0.0,
+          "boundary_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.1,
+            "max_motion_px_per_s": 720.0
+          },
+          "spatial_edge_refinement": {
+            "mode": "legacy_watershed",
+            "reference_short_edge_px": 720,
+            "radius_at_reference_px": 8,
+            "min_radius_px": 2,
+            "max_radius_px": 12
+          }
+        },
+        "compositing": {
+          "light_wrap": 0.25,
+          "use_model_foreground": false,
+          "blend_space": "linear_srgb",
+          "light_wrap_stabilization": {
+            "mode": "off",
+            "time_constant_s": 0.12
+          },
+          "color_correction": {
+            "mode": "off",
+            "strength": 0.5,
+            "exposure_limit_ev": 0.85,
+            "white_balance_strength": 0.5,
+            "adaptation_time_s": 0.8
+          }
+        },
+        "effective": {
+          "segmentation_backend": "MediaPipeSegmenter",
+          "segmentation_device": "cpu",
+          "rvm_downsample_ratio": null,
+          "matte_policy": {
+            "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_SELECTED_BACKEND_KIND",
+            "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BASELINE_BACKEND_KIND",
+            "passthrough": false,
+            "experimental_rvm_generic": false,
+            "configured": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONFIGURED_POLICY": true
+            },
+            "effective": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_EFFECTIVE_POLICY": true
+            },
+            "controls": {
+              "REPLACE_WITH_CODE_RESOLVED_BASELINE_CONTROL_POLICY": true
+            }
+          }
+        }
+      },
+      "baseline": {
+        "bundle": "REPLACE_live_camera_1080p_restart_baseline_bundle",
+        "annotations": "REPLACE_live_camera_1080p_restart_baseline_annotations"
+      },
+      "candidate": {
+        "bundle": "REPLACE_live_camera_1080p_restart_candidate_bundle",
+        "annotations": "REPLACE_live_camera_1080p_restart_candidate_annotations"
+      },
+      "expected_effective": {
+        "segmentation_backend": "MediaPipeSegmenter",
+        "segmentation_device": "cpu",
+        "rvm_downsample_ratio": null,
+        "matte_policy": {
+          "selected_backend_kind": "REPLACE_WITH_CODE_RESOLVED_SELECTED_BACKEND_KIND",
+          "backend_kind": "REPLACE_WITH_CODE_RESOLVED_BACKEND_KIND",
+          "passthrough": false,
+          "experimental_rvm_generic": false,
+          "configured": {
+            "REPLACE_WITH_CODE_RESOLVED_CONFIGURED_POLICY": true
+          },
+          "effective": {
+            "REPLACE_WITH_CODE_RESOLVED_EFFECTIVE_POLICY": true
+          },
+          "controls": {
+            "REPLACE_WITH_CODE_RESOLVED_CONTROL_POLICY": true
+          }
+        }
+      },
+      "coverage": {
+        "appearances": [
+          "skin_tone_diversity",
+          "lighting_diversity",
+          "headphones_or_solid_accessories"
+        ],
+        "motions": [
+          "stationary",
+          "slow_turn"
+        ],
+        "source_conditions": [
+          "dim",
+          "clutter"
+        ],
+        "backgrounds": [
+          "live_camera"
+        ],
+        "cadences": [
+          "fps_30",
+          "restart"
+        ],
+        "canvases": [
+          "1920x1080"
+        ]
+      },
+      "boundary_evidence": "REPLACE_live_camera_1080p_restart_boundary_evidence.json",
+      "review": "REPLACE_live_camera_1080p_restart_human_review.json"
+    }
+  ]
+}

@@ -314,7 +314,10 @@ repository defaults describe an installation with persisted overrides.
 `experimental_rvm_generic` needs no live rollback because it has no config/API
 surface and exists only inside the bounded ablation runner.
 
-Any future policy/default change requires the MATTE-5.4 schema, migration,
-documentation, qualification, and one-patch rollback review. Versionless and
-schema-version-1 persisted configurations continue to retain their existing
-values and behavior.
+The implemented [MATTE-5.4 rollout authority](matte-quality-rollout.md) keeps
+the release on `compatibility_hold` while physical qualification is pending.
+It binds schema/migration behavior, the empty evidence-gated preset catalog,
+sanitized canary status, and the complete code-owned `matte-legacy-v1`
+one-patch rollback. A future policy/default change must advance that separate
+machine-reviewed decision. Versionless and schema-version-1 persisted
+configurations continue to retain their existing values and behavior.

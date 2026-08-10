@@ -637,6 +637,30 @@ def test_status_overlay_shows_structured_backend_downgrade_and_policy():
     ]
 
 
+def test_status_overlay_shows_only_frame_aligned_rollout_counters():
+    rollout = {
+        "config_version": 7,
+        "stage": "compatibility_hold",
+        "decision": "held_pending_physical_qualification",
+        "patch_attempts": 4,
+        "patch_successes": 2,
+        "patch_failures": 1,
+        "legacy_rollbacks": 1,
+    }
+    status, _warnings = preview_mod._status_overlay_lines(
+        {"config_version": 7, "matte_rollout": rollout}
+    )
+    assert (
+        "MATTE ROLLOUT compatibility_hold  "
+        "held_pending_physical_qualification  PATCHES 4/2/1  ROLLBACKS 1"
+    ) in status
+
+    stale, _warnings = preview_mod._status_overlay_lines(
+        {"config_version": 8, "matte_rollout": rollout}
+    )
+    assert all("MATTE ROLLOUT" not in line for line in stale)
+
+
 def test_status_overlay_does_not_warn_for_explicit_mediapipe():
     _status, warnings = preview_mod._status_overlay_lines(
         {

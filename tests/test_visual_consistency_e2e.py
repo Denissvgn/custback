@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ cv2 = pytest.importorskip("cv2")
 
 import custback.capture as capture_mod
 import custback.pipeline as pipeline_mod
+import custback.preview as preview_mod
 from custback.api.server import _encode_jpeg
 from custback.backgrounds import ImageBackdrop
 from custback.capture import CapturedFrame, CaptureHealth, OpenCVCapture
@@ -36,6 +38,7 @@ from custback.geometry import (
     transform_frame,
 )
 from custback.hub import FrameHub
+from custback.matte_diagnostics import MatteDiagnosticRecorder, MatteReplayBundle
 from custback.pipeline import Pipeline, _Resources
 from custback.vcam import PyVirtualCamOutput
 from custback.vcam_native import (
@@ -221,6 +224,9 @@ class _MaskSegmenter:
 class _IdentityRefiner:
     def refine(self, mask: np.ndarray, _frame: np.ndarray) -> np.ndarray:
         return np.ascontiguousarray(mask, dtype=np.float32)
+
+    def close(self) -> None:
+        pass
 
 
 class _GeometryBackdrop:
@@ -1061,6 +1067,32 @@ class _FakeVirtualCamera:
         self.closed = True
 
 
+class _QualificationHighGUI:
+    """Record the physical-window handoff without requiring a display."""
+
+    WINDOW_NORMAL = 0
+    WND_PROP_VISIBLE = 4
+    error = type("error", (Exception,), {})
+
+    def __init__(self) -> None:
+        self.shown: list[np.ndarray] = []
+
+    def namedWindow(self, *_args: object) -> None:
+        pass
+
+    def imshow(self, _title: str, frame: np.ndarray) -> None:
+        self.shown.append(frame.copy())
+
+    def waitKey(self, _delay_ms: int) -> int:
+        return ord("q")
+
+    def getWindowProperty(self, *_args: object) -> float:
+        return 1.0
+
+    def destroyWindow(self, _title: str) -> None:
+        pass
+
+
 class _SinkFanout:
     paces = True
     fallback_active = False
@@ -1430,6 +1462,139 @@ def test_four_three_camera_is_proportional_and_equal_at_every_local_sink(
             pytest.approx(1.0, rel=0.015)
         )
     finally:
+        resources.close()
+
+
+def test_one_matte_generation_is_identical_at_replay_preview_and_sink_seams(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind MATTE-5.2 comparisons to one production composite generation."""
+
+    width, height = 96, 54
+    canvas = (width, height)
+    y_grid, x_grid = np.indices((height, width), dtype=np.float32)
+    x_ramp = x_grid / float(width - 1)
+    y_ramp = y_grid / float(height - 1)
+    source = np.stack(
+        (
+            35.0 + 90.0 * x_ramp,
+            55.0 + 100.0 * y_ramp,
+            80.0 + 70.0 * (0.6 * x_ramp + 0.4 * y_ramp),
+        ),
+        axis=-1,
+    ).astype(np.uint8)
+    backdrop = np.stack(
+        (
+            155.0 + 45.0 * y_ramp,
+            105.0 + 55.0 * x_ramp,
+            45.0 + 65.0 * (1.0 - y_ramp),
+        ),
+        axis=-1,
+    ).astype(np.uint8)
+    y, x = np.ogrid[:height, :width]
+    distance = np.sqrt(
+        ((x - width / 2.0) / 25.0) ** 2 + ((y - height / 2.0) / 19.0) ** 2
+    )
+    alpha = np.clip(1.25 - distance, 0.0, 1.0).astype(np.float32)
+    cfg = _pipeline_config(
+        canvas,
+        background={
+            "mode": "image",
+            "image_path": "/generated/matte-5.2-background.png",
+        },
+    )
+    hub = FrameHub()
+    hub.configure_canvas(canvas)
+    bundle_root = tmp_path / "same-generation-bundle"
+    recorder = MatteDiagnosticRecorder(bundle_root, max_bytes=8_000_000)
+    pipeline = Pipeline(RuntimeConfig(cfg), hub, matte_recorder=recorder)
+
+    _FakeVirtualCamera.instances.clear()
+    monkeypatch.setitem(
+        sys.modules,
+        "pyvirtualcam",
+        SimpleNamespace(
+            Camera=_FakeVirtualCamera,
+            PixelFormat=SimpleNamespace(BGR=object()),
+        ),
+    )
+    pyvirtualcam = PyVirtualCamOutput(cfg.output, width, height)
+    ring = bytearray(ring_size(width, height))
+    native = NativeVirtualCameraOutput(
+        width,
+        height,
+        fps=cfg.output.fps,
+        buffer=ring,
+    )
+    output = _SinkFanout(pipeline, pyvirtualcam, native, stop_after=1)
+    resources = _Resources(
+        cfg,
+        0,
+        _SequenceCapture([source], generation=17),
+        _MaskSegmenter(alpha),
+        _IdentityRefiner(),
+        _CanvasBackdrop(backdrop),
+        output,
+    )
+    try:
+        pipeline._loop(resources)
+        recorder.close()
+
+        bundle = MatteReplayBundle(bundle_root)
+        assert len(bundle.frames) == 1
+        recorded = bundle.frames[0]
+        assert recorded["capture_sequence"] == 1
+        assert recorded["capture_generation"] == 17
+        assert recorded["geometry_generation"] == 17
+        base = bundle.load_array(recorded, "base_composite")
+        final = bundle.load_array(recorded, "final_composite")
+        np.testing.assert_array_equal(final, base)
+        assert all(
+            event["post_base_final_output_provenance"] is None
+            for event in bundle.output_events
+        )
+
+        published = hub.output.latest()[0]
+        assert published is not None
+        np.testing.assert_array_equal(published, final)
+        np.testing.assert_array_equal(output.frames[0], final)
+        np.testing.assert_array_equal(
+            _FakeVirtualCamera.instances[-1].frames[0],
+            final,
+        )
+        native_bgrx = read_latest_frame(ring)
+        assert native_bgrx is not None
+        np.testing.assert_array_equal(native_bgrx[..., :3], final)
+
+        pre_overlay: list[np.ndarray] = []
+
+        def capture_pre_overlay(frame, *_args, **_kwargs):
+            pre_overlay.append(frame.copy())
+            shown = frame.copy()
+            shown[0, 0] = (255, 0, 255)
+            return shown
+
+        fake_highgui = _QualificationHighGUI()
+        monkeypatch.setattr(preview_mod, "cv2", fake_highgui)
+        monkeypatch.setattr(preview_mod, "_draw_overlay", capture_pre_overlay)
+        assert preview_mod.run_preview(
+            RuntimeConfig(cfg),
+            hub,
+            threading.Event(),
+        )
+        np.testing.assert_array_equal(pre_overlay[0], final)
+        assert not np.array_equal(fake_highgui.shown[0], final)
+
+        jpeg = _encode_jpeg(published)
+        decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert decoded is not None and decoded.shape == final.shape
+        assert (
+            float(np.mean(np.abs(decoded.astype(np.int16) - final.astype(np.int16))))
+            < 4.0
+        )
+    finally:
+        recorder.close()
         resources.close()
 
 

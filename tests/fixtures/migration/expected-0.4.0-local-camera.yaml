@@ -91,3 +91,7 @@ api:
     video_max_height: 2160
     storage_max_bytes: 2147483648
     max_files: 100
+acceleration:
+  mode: auto
+  provider: auto
+  device_id: 0

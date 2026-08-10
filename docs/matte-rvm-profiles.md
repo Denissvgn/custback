@@ -3,8 +3,10 @@
 MATTE-2.5 is an evidence and decision contract. It does not add
 `performance`, `balanced`, or `quality` to persisted configuration, and it
 does not change the schema-1 `rvm_downsample: 0.0` automatic default.
-MATTE-4.2 owns any future user-facing preset and MATTE-5.4 owns a future
-default or migration.
+MATTE-4.2 supplies the evidence-gated preset surface. The implemented
+[MATTE-5.4 authority](matte-quality-rollout.md) keeps its catalog empty and the
+default/migration decision on compatibility hold until physical qualification
+can authorize an exact profile.
 
 The formal offline command is:
 

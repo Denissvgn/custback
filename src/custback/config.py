@@ -74,6 +74,63 @@ _URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\\\/]")
 
 
+def legacy_matte_policy_patch() -> dict[str, Any]:
+    """Return a detached one-patch rollback to schema-v1 matte behavior.
+
+    The patch deliberately excludes ``schema_version``, ``model_path``, and
+    non-matte configuration.  Operators can therefore apply it atomically to
+    a running or persisted configuration without downgrading the document,
+    deleting a model/cache, or replacing unrelated camera and API choices.
+    Every returned mapping is independently owned by the caller.
+    """
+
+    return {
+        "segmentation": {
+            "backend": "auto",
+            "delegate": "cpu",
+            "rvm_downsample": 0.0,
+            "threshold": 0.5,
+            "mask_blur": 7,
+            "edge_refine": True,
+            "mask_shift": 0,
+            "temporal_smoothing": 0.35,
+            "boundary_stabilization": {
+                "mode": "off",
+                "time_constant_s": 0.1,
+                "max_motion_px_per_s": 720.0,
+            },
+            "spatial_edge_refinement": {
+                "mode": "legacy_watershed",
+                "reference_short_edge_px": 720,
+                "radius_at_reference_px": 8,
+                "min_radius_px": 2,
+                "max_radius_px": 12,
+            },
+        },
+        "acceleration": {
+            "mode": "auto",
+            "provider": "auto",
+            "device_id": 0,
+        },
+        "compositing": {
+            "light_wrap": 0.25,
+            "use_model_foreground": True,
+            "blend_space": "srgb_legacy",
+            "light_wrap_stabilization": {
+                "mode": "off",
+                "time_constant_s": 0.12,
+            },
+            "color_correction": {
+                "mode": "off",
+                "strength": 0.5,
+                "exposure_limit_ev": 0.85,
+                "white_balance_strength": 0.5,
+                "adaptation_time_s": 0.8,
+            },
+        },
+    }
+
+
 def materialize_config_schema_defaults(data: dict[str, Any]) -> dict[str, Any]:
     """Copy a persisted mapping and bind absent fields to its schema semantics.
 
@@ -102,6 +159,23 @@ def materialize_config_schema_defaults(data: dict[str, Any]) -> dict[str, Any]:
                 bound.setdefault(field_name, value)
             materialized[section_name] = bound
 
+    def bind_nested(
+        section_name: str,
+        field_name: str,
+        defaults: dict[str, Any],
+    ) -> None:
+        section = materialized.get(section_name)
+        if not isinstance(section, dict):
+            return
+        nested = section.get(field_name)
+        if nested is None and field_name not in section:
+            section[field_name] = dict(defaults)
+        elif isinstance(nested, dict):
+            bound = dict(nested)
+            for nested_name, value in defaults.items():
+                bound.setdefault(nested_name, value)
+            section[field_name] = bound
+
     bind_section(
         "camera",
         {
@@ -124,72 +198,35 @@ def materialize_config_schema_defaults(data: dict[str, Any]) -> dict[str, Any]:
         },
     )
     bind_section("output", {"width": None, "height": None})
-    bind_section(
-        "compositing",
-        {
-            "blend_space": "srgb_legacy",
-            "light_wrap_stabilization": {
-                "mode": "off",
-                "time_constant_s": 0.12,
-            },
-        },
-    )
-    bind_section(
+    # Schema-v1 predates explicit quality rollout. Bind the complete policy,
+    # not just the newly nested modes, so a future new-install default cannot
+    # silently reinterpret any omitted legacy field.
+    matte_defaults = legacy_matte_policy_patch()
+    segmentation_defaults = matte_defaults["segmentation"]
+    segmentation_defaults["model_path"] = ""
+    bind_section("segmentation", segmentation_defaults)
+    bind_section("acceleration", matte_defaults["acceleration"])
+    bind_section("compositing", matte_defaults["compositing"])
+    bind_nested(
         "segmentation",
-        {
-            # Schema-v1 persisted configurations predate motion-aware
-            # stabilization. Bind them to the exact legacy EMA policy rather
-            # than letting a future new-install default reinterpret the file.
-            "boundary_stabilization": {
-                "mode": "off",
-                "time_constant_s": 0.1,
-                "max_motion_px_per_s": 720.0,
-            },
-            # Schema-v1 edge refinement is the fixed-radius watershed path.
-            # Persisted configurations must never inherit a later install
-            # default that would reinterpret ``edge_refine: true``.
-            "spatial_edge_refinement": {
-                "mode": "legacy_watershed",
-                "reference_short_edge_px": 720,
-                "radius_at_reference_px": 8,
-                "min_radius_px": 2,
-                "max_radius_px": 12,
-            },
-        },
+        "boundary_stabilization",
+        segmentation_defaults["boundary_stabilization"],
     )
-    segmentation = materialized.get("segmentation")
-    if isinstance(segmentation, dict):
-        spatial_defaults = {
-            "mode": "legacy_watershed",
-            "reference_short_edge_px": 720,
-            "radius_at_reference_px": 8,
-            "min_radius_px": 2,
-            "max_radius_px": 12,
-        }
-        spatial = segmentation.get("spatial_edge_refinement")
-        if isinstance(spatial, dict):
-            bound_spatial = dict(spatial)
-            for field_name, value in spatial_defaults.items():
-                bound_spatial.setdefault(field_name, value)
-            segmentation["spatial_edge_refinement"] = bound_spatial
-
-    compositing = materialized.get("compositing")
-    if isinstance(compositing, dict):
-        correction_defaults = {
-            "mode": "off",
-            "strength": 0.5,
-            "exposure_limit_ev": 0.85,
-            "white_balance_strength": 0.5,
-            "adaptation_time_s": 0.8,
-        }
-        correction = compositing.get("color_correction")
-        if correction is None and "color_correction" not in compositing:
-            compositing["color_correction"] = correction_defaults
-        elif isinstance(correction, dict):
-            bound_correction = dict(correction)
-            for field_name, value in correction_defaults.items():
-                bound_correction.setdefault(field_name, value)
-            compositing["color_correction"] = bound_correction
+    bind_nested(
+        "segmentation",
+        "spatial_edge_refinement",
+        segmentation_defaults["spatial_edge_refinement"],
+    )
+    bind_nested(
+        "compositing",
+        "light_wrap_stabilization",
+        matte_defaults["compositing"]["light_wrap_stabilization"],
+    )
+    bind_nested(
+        "compositing",
+        "color_correction",
+        matte_defaults["compositing"]["color_correction"],
+    )
     return materialized
 
 
@@ -1010,6 +1047,18 @@ class AppConfig(_StrictModel):
         if not isinstance(patch, dict):
             raise TypeError("config patch must be a mapping")
         return type(self).from_dict(merge_patch(self.to_dict(), patch))
+
+
+def uses_legacy_matte_policy(config: AppConfig) -> bool:
+    """Return whether all fields owned by the rollback patch are already exact.
+
+    Model paths and unrelated operator settings are intentionally outside this
+    classification, matching :func:`legacy_matte_policy_patch` semantics.
+    """
+
+    if not isinstance(config, AppConfig):
+        raise TypeError("config must be an AppConfig")
+    return config.patched(legacy_matte_policy_patch()) == config
 
 
 def resolved_output_size(config: AppConfig) -> tuple[int, int]:

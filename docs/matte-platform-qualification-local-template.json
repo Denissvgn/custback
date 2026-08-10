@@ -1,0 +1,270 @@
+{
+  "schema": "custback.matte-platform-qualification-plan",
+  "version": 1,
+  "qualification": {
+    "id": "replace_qualification"
+  },
+  "provenance": {
+    "kind": "generated",
+    "license_or_consent_sha256": null,
+    "physical_capture_origin_attested": false,
+    "physical_consumer_origin_attested": false,
+    "same_host_attested": false,
+    "physical_origin_cryptographically_proven": false
+  },
+  "reactions": {
+    "enabled": false,
+    "post_base_event_count": 0
+  },
+  "candidate": {
+    "revision": "replace_candidate_revision",
+    "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "defaults_changed": false
+  },
+  "prerequisites": {
+    "visual": {
+      "path": "private/visual-qualification.json",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "performance": {
+      "path": "private/performance-qualification.json",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "rvm": {
+      "path": "private/rvm-qualification.json",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "evidence_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  },
+  "routes": [
+    {
+      "id": "linux-v4l2-pyvirtualcam",
+      "platform": "linux",
+      "capture_backend": "V4L2",
+      "sink_backend": "pyvirtualcam",
+      "consumer": "v4l2loopback"
+    },
+    {
+      "id": "macos-obsvcam-pyvirtualcam",
+      "platform": "darwin",
+      "capture_backend": "AVFOUNDATION",
+      "sink_backend": "pyvirtualcam",
+      "consumer": "obs-virtual-camera"
+    },
+    {
+      "id": "windows-msmf-pyvirtualcam",
+      "platform": "windows",
+      "capture_backend": "MSMF",
+      "sink_backend": "pyvirtualcam",
+      "consumer": "obs-virtual-camera"
+    },
+    {
+      "id": "windows-dshow-pyvirtualcam",
+      "platform": "windows",
+      "capture_backend": "DSHOW",
+      "sink_backend": "pyvirtualcam",
+      "consumer": "obs-virtual-camera"
+    },
+    {
+      "id": "windows-native",
+      "platform": "windows",
+      "capture_backend": "MSMF",
+      "sink_backend": "native",
+      "consumer": "media-foundation-virtual-camera"
+    }
+  ],
+  "profiles": [
+    {
+      "id": "rvm_matting",
+      "backend": "rvm",
+      "segmenter": "RVMSegmenter",
+      "backend_kind": "matting",
+      "quality_claim": true,
+      "visual_candidate_id": "replace_rvm_candidate",
+      "visual_algorithm_contract_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "configured_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "effective_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "limits": [
+        "linux-rvm-cuda-standard-720p",
+        "macos-rvm-cpu-standard-720p",
+        "windows-rvm-directml-standard-720p",
+        "linux-rvm-cpu-without-gpu-720p"
+      ]
+    },
+    {
+      "id": "mediapipe_segmentation",
+      "backend": "mediapipe",
+      "segmenter": "MediaPipeSegmenter",
+      "backend_kind": "segmentation",
+      "quality_claim": true,
+      "visual_candidate_id": "replace_mediapipe_candidate",
+      "visual_algorithm_contract_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "configured_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "effective_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "limits": [
+        "windows-dshow-mediapipe-cpu-standard-720p"
+      ]
+    },
+    {
+      "id": "heuristic_segmentation",
+      "backend": "heuristic",
+      "segmenter": "HeuristicSegmenter",
+      "backend_kind": "heuristic",
+      "quality_claim": false,
+      "visual_candidate_id": null,
+      "visual_algorithm_contract_sha256": null,
+      "configured_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "effective_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "limits": [
+        "windows-native-heuristic-cpu-standard-720p",
+        "linux-heuristic-cpu-without-mediapipe-720p"
+      ]
+    },
+    {
+      "id": "none_passthrough",
+      "backend": "none",
+      "segmenter": "NullSegmenter",
+      "backend_kind": "none",
+      "quality_claim": false,
+      "visual_candidate_id": null,
+      "visual_algorithm_contract_sha256": null,
+      "configured_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "effective_policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "limits": [
+        "linux-none-cpu-standard-720p"
+      ]
+    }
+  ],
+  "cells": [
+    {
+      "id": "linux-rvm-cuda-standard-720p",
+      "route_id": "linux-v4l2-pyvirtualcam",
+      "profile_id": "rvm_matting",
+      "provider": "cuda",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "standard",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    },
+    {
+      "id": "macos-rvm-cpu-standard-720p",
+      "route_id": "macos-obsvcam-pyvirtualcam",
+      "profile_id": "rvm_matting",
+      "provider": "cpu",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "standard",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    },
+    {
+      "id": "windows-rvm-directml-standard-720p",
+      "route_id": "windows-msmf-pyvirtualcam",
+      "profile_id": "rvm_matting",
+      "provider": "directml",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "standard",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    },
+    {
+      "id": "windows-dshow-mediapipe-cpu-standard-720p",
+      "route_id": "windows-dshow-pyvirtualcam",
+      "profile_id": "mediapipe_segmentation",
+      "provider": "cpu",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "standard",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    },
+    {
+      "id": "windows-native-heuristic-cpu-standard-720p",
+      "route_id": "windows-native",
+      "profile_id": "heuristic_segmentation",
+      "provider": "cpu",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "standard",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    },
+    {
+      "id": "linux-heuristic-cpu-without-mediapipe-720p",
+      "route_id": "linux-v4l2-pyvirtualcam",
+      "profile_id": "heuristic_segmentation",
+      "provider": "cpu",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "without_mediapipe",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    },
+    {
+      "id": "linux-rvm-cpu-without-gpu-720p",
+      "route_id": "linux-v4l2-pyvirtualcam",
+      "profile_id": "rvm_matting",
+      "provider": "cpu",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "without_gpu_provider",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    },
+    {
+      "id": "linux-none-cpu-standard-720p",
+      "route_id": "linux-v4l2-pyvirtualcam",
+      "profile_id": "none_passthrough",
+      "provider": "cpu",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "target_fps": 30,
+      "dependency_profile": "standard",
+      "state": "unavailable",
+      "reason": "replace-with-owner-observed-evidence",
+      "run": null,
+      "capture_report": null
+    }
+  ]
+}

@@ -80,11 +80,14 @@ Each installer subprocess is bounded to 15 minutes by default
 (`CUSTBACK_INSTALL_TIMEOUT_MS` accepts a positive millisecond override); doctor
 probes use a 60-second bound (`CUSTBACK_DOCTOR_TIMEOUT_MS`).
 
-The default npm profile is the **segmentation** quality tier: it attempts to
-install MediaPipe confidence-mask segmentation, but it does not install the
-RVM/ONNX Runtime **matting** tier. `segmentation.backend: auto` can only prefer
-RVM when that optional runtime is present. Choose one RVM profile explicitly
-for true-alpha edges:
+The default npm compatibility profile attempts to install MediaPipe
+confidence-mask segmentation, but it does not install the RVM/ONNX Runtime
+**matting** tier. When present, MediaPipe is labelled the **segmentation**
+capability tier; that installed-capability label is not an evidence-qualified
+named preset or sustainability claim, and the
+[MATTE-5.4 authority](docs/matte-quality-rollout.md) remains on compatibility
+hold. `segmentation.backend: auto` can only prefer RVM when that optional
+runtime is present. Choose one RVM profile explicitly for true-alpha edges:
 
 ```bash
 custback rebuild --extras rvm  # CPU RVM
@@ -95,6 +98,8 @@ custback doctor
 The two RVM profiles are alternatives, not a combined extras list. An explicit
 `--extras` list replaces the stored intent; use `custback extras --json` first
 and retain any other compatible extras the installation still needs.
+Installation never upgrades an unqualified platform to RVM or a higher-detail
+policy automatically.
 
 An ordinary npm replacement removes the package-local venv used by custback
 0.3 before the new package's lifecycle script can inspect it. Run the candidate
@@ -269,6 +274,17 @@ format, and command contract, and
 qualification matrix. The separate native-preview-only workflow is described
 in [docs/matte-live-diagnostics.md](docs/matte-live-diagnostics.md); enabling
 it does not persist a bundle.
+End-to-end visual and sink qualification then joins those private reports with
+same-generation HighGUI/API/virtual-camera captures and human review:
+`custback matte-visual-qualify PRIVATE_PLAN --output NEW_DIR`. Start from
+the content-free
+[local template](docs/matte-visual-qualification-local-template.json) and
+follow the [MATTE-5.2 runbook](docs/matte-visual-qualification.md). Generated
+or fake route evidence always remains pending; qualification still needs
+consented/licensed representative clips, owner-attested physical preview and
+loopback captures, live-camera/60 FPS/1080p coverage, and a completed human
+review. Matching pixels and declared capture methods do not cryptographically
+prove physical-device origin; retain the private capture record.
 The 720p compositor/service budget is measured separately with
 `custback matte-performance PRIVATE_BUNDLE --output NEW_DIR`. It runs the
 eight-cell compositor matrix without capture or output pacing and remains
@@ -284,6 +300,28 @@ on the full hardware path; signed service headroom, the explicit
 30/27/24/20/15 FPS arrival sweep, and lower-rate classification rules are in
 [docs/matte-performance.md](docs/matte-performance.md) and
 [ADR 0003](docs/adr/0003-720p-compositor-budget.md).
+Cross-platform performance, sink, fallback, and lifecycle evidence is joined
+without changing a preset or default by
+`custback matte-platform-qualify PRIVATE_PLAN --output NEW_DIR`. Start from
+the content-free
+[local MATTE-5.3 template](docs/matte-platform-qualification-local-template.json)
+and follow the
+[platform qualification runbook](docs/matte-platform-qualification.md).
+The checked-in JSON is a shape skeleton rather than the full code-owned matrix,
+and v1 validates sidecars from an owner-controlled collector rather than
+opening hardware itself. Generated evidence remains pending: qualification
+requires owner-attested physical route observations, independent capture-only
+and fixed-replay runs, sustained and restart/hot-patch/shutdown observations,
+and the exact reviewed platform routes with reactions disabled.
+MATTE-5.4 therefore keeps the schema-1 matte policy and named preset catalog on
+an explicit compatibility hold. The
+[matte rollout, migration, and rollback guide](docs/matte-quality-rollout.md)
+links the baseline, ablation, visual, performance, platform, privacy, and
+migration gates; defines sanitized canary counters; and provides the exact
+single transactional rollback patch. That rollback preserves the user config,
+recognized schema, optional packages, and model cache. A future promotion is a
+separate evidence-bound release decision, not an inference from installed RVM
+or generated qualification fixtures. Reactions remain a separate `REACT` lane.
 For reversible, backend-aware troubleshooting while qualification is pending,
 use the
 [immediate matte operator guide](docs/matte-operator-mitigations.md).
@@ -367,6 +405,43 @@ listed below; do not assume every available quality policy is enabled:
   white-balance changes for image, video, and live-camera backdrops. It is
   excluded for passthrough, blur, solid color, and remote output; low
   confidence safely holds/decays or uses identity. Schema 1 keeps it `off`.
+
+### Matte-quality rollout status
+
+The active matte release stage is `compatibility_hold`: schema version 1,
+`backend: auto`, legacy watershed/EMA behavior for applicable non-RVM paths,
+native recurrent RVM alpha with generic postprocessing bypassed, stateless
+light wrap, and no evidence-qualified named preset. The checked-in MATTE-5.2
+and MATTE-5.3 fixtures are generated and pending; they do not authorize RVM, a
+higher-detail profile, or any candidate algorithm as a new-install default.
+The executable authority is
+`scripts/release/matte-policy-rollout.json`: it pins the code-owned legacy
+patch and digest, an empty unqualified preset catalog, seven pending promotion
+evidence slots, non-destructive rollback, and reaction exclusion. Release
+checks reject ledger/default/helper/status/catalog drift by recomputing the
+recursively key-sorted JSON/ECMAScript digest and running a dependency-free
+Python AST check of the helper/status contracts. Integral floats canonicalize
+as integers; the current patch digest is
+`27638e419a0dcf5955d52e2eb4ead2dafbdca7f2bbe0535108aa7c56c1f2f60d`.
+
+`GET /status.matte_rollout` reports the bounded rollout stage and decision,
+whether a qualified default is active, the preset catalog's evidence status,
+the code-owned legacy rollback-patch ID, and aggregate
+apply/success/failure/rollback counters. Read it together with
+`segmentation_selection`, `matte_policy`, and the matching `config_version`:
+installed capabilities and configured `auto` are not proof of the
+backend/provider actually producing the frame. The WebUI presents the same
+distinction and keeps Performance, Balanced, and Quality disabled while
+qualification is pending.
+
+Old, versionless, partial, and schema-1 files retain compatibility semantics;
+ordinary loading does not rewrite them. The one-patch rollback does not delete
+configuration or model caches and leaves unrelated output/background/API/
+avatar settings untouched. See the
+[MATTE-5.4 guide](docs/matte-quality-rollout.md) and
+[ADR 0004](docs/adr/0004-matte-quality-rollout.md) for the evidence chain,
+canary stop/go rules, sanitized telemetry allowlist, migration behavior, and
+exact rollback patch. Reactions are explicitly excluded.
 
 ### Visual-policy rollout status
 
@@ -466,7 +541,7 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /status` | run ID; capture/segmentation/base/reuse/exact-final-repeat/send cadence; gaps, deadlines, pacing and jitter; stage timings; versioned backend quality/selection attempts and configured/effective matte policy |
+| `GET /status` | run ID; capture/segmentation/base/reuse/exact-final-repeat/send cadence; gaps, deadlines, pacing and jitter; stage timings; versioned backend selection/effective matte policy and matte rollout/default/rollback decision |
 | `GET /config` / `PATCH /config` | read / partially update config live |
 | `POST /background/image` | upload static backdrop and switch to it |
 | `POST /background/video` | upload live (video) backdrop and switch to it |
@@ -498,7 +573,9 @@ auth_header | curl --config - -X POST http://127.0.0.1:8710/background/video \
 ```
 
 `GET /config` describes configured intent and carries `X-Config-Version`;
-`GET /status` reports active backend/device and backend-resolved matte controls.
+`GET /status` reports active backend/device, backend-resolved matte controls,
+and the fail-closed `matte_rollout` decision. The rollout object is bounded,
+path-free telemetry; it does not claim pixel quality or physical evidence.
 PATCHes are serialized and transactional. Background,
 segmentation, compositing, remote timeout, and remote fallback fields can
 activate live; camera, output, API bind/security, and upload-limit changes
@@ -526,6 +603,14 @@ movements / follow my voice only / idle presence), and sliders for framing,
 size, position, and smoothing. Everything hot-patchable applies live to the
 preview; controls that would need a restart surface the `409` reason instead
 of failing silently.
+
+The Quality panel labels configured intent separately from the effective
+backend, provider, fallback, and matte policy for the current config version.
+Its rollout row says when defaults are held pending physical qualification;
+named presets remain disabled until their concrete patches are evidence
+qualified. Advanced controls remain useful for private diagnosis, but their
+availability is not a recommendation. Use the MATTE-5.4 one-patch rollback
+instead of deleting a config or model cache.
 
 The page talks to this origin only. Avatar controls go through the
 `/avatar/{path}` reverse proxy. Configure the operator-owned `avatar:` URL,
@@ -709,6 +794,14 @@ distort, and how to pin or preview the policy. Later default schemas and their
 rollbacks are defined in the
 [visual-consistency rollout guide](docs/visual-consistency-rollout.md#deterministic-upgrade-behavior).
 
+The same migration materializes the schema-1 matte compatibility policy:
+`backend: auto`, legacy watershed and frame-count EMA where applicable,
+motion-aware stabilization off, temporal light-wrap stabilization off, and
+the existing backend-specific RVM bypass semantics. It never converts
+`temporal_smoothing` into a time constant or promotes a named preset. The
+complete field set and non-destructive rollback are in the
+[matte rollout guide](docs/matte-quality-rollout.md#one-patch-rollback).
+
 Storage audit is no-follow and non-mutating. Repair first rejects symlinks,
 special files, foreign ownership, overlapping roots, and inode changes, then
 sets safe managed directories to `0700` and regular assets to `0600`. Durable
@@ -760,6 +853,9 @@ This release intentionally breaks the old unauthenticated control plane:
 | `matte_diagnostics.py` | opt-in private bounded matte recorder and offline frozen/model replay |
 | `matte_live_diagnostics.py` | on-demand, native-preview-only matte views and frame-paired temporal telemetry |
 | `matte_quality.py` / `matte_attribution.py` / `matte_ablation.py` | digest-bound metrics, four-boundary RVM attribution, and bounded same-source screening |
+| `matte_visual_qualification.py` | fail-closed MATTE-5.2 taxonomy, route-parity, artifact, and human-review qualification |
+| `matte_platform_qualification.py` | fail-closed MATTE-5.3 platform, performance, sink, fallback, and lifecycle evidence join |
+| `matte_rollout.py` | fail-closed MATTE-5.4 default disposition plus path-free canary and rollback telemetry |
 | `gpu_probe.py` | real CUDA inference/profile capability probe for installer and doctor |
 | `vcam.py` | virtual camera output (pyvirtualcam → v4l2loopback / OBS extension) |
 | `hub.py` | thread-safe frame exchange between pipeline and API |
@@ -777,6 +873,21 @@ pytest
 npm test
 npm run release:check -- --quick
 ```
+
+The focused temporal/matte subset, its generated-fixture contract, and the
+boundary between fast CI regression coverage and private visual/hardware
+qualification are documented in the
+[deterministic matte regression gate](docs/matte-deterministic-regression-gate.md).
+The separate owner-only end-to-end workflow and its intentionally pending
+checked-in template are documented in the
+[matte visual qualification runbook](docs/matte-visual-qualification.md).
+The independent capture, fixed-replay, platform-route, and lifecycle evidence
+required for MATTE-5.3 is documented in the
+[matte platform qualification runbook](docs/matte-platform-qualification.md).
+The held default decision, old-config semantics, canary telemetry, complete
+release-evidence chain, and non-destructive rollback drill required for
+MATTE-5.4 are documented in the
+[matte rollout guide](docs/matte-quality-rollout.md).
 
 Geometry and color contracts run in every supported Python version, minimum
 and newest dependency profiles, the OpenCV/NumPy compatibility matrix, and
