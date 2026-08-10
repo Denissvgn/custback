@@ -928,7 +928,7 @@ def _repeat_operation_counts() -> dict[str, Any]:
     )
     counts = {"analysis": 0, "linear_decode": 0, "composite": 0}
     real_analysis = pipeline_mod.estimate_color_transform_linear
-    real_decode = pipeline_mod.bgr_u8_to_linear_rgb
+    real_decode = pipeline_mod.bgr_u8_to_linear_bgr
     real_composite = pipeline_mod.composite_linear_predecoded
 
     def counted_analysis(*args: Any, **kwargs: Any) -> Any:
@@ -944,13 +944,13 @@ def _repeat_operation_counts() -> dict[str, Any]:
         return real_composite(*args, **kwargs)
 
     pipeline_mod.estimate_color_transform_linear = counted_analysis
-    pipeline_mod.bgr_u8_to_linear_rgb = counted_decode
+    pipeline_mod.bgr_u8_to_linear_bgr = counted_decode
     pipeline_mod.composite_linear_predecoded = counted_composite
     try:
         pipeline._loop(resources)
     finally:
         pipeline_mod.estimate_color_transform_linear = real_analysis
-        pipeline_mod.bgr_u8_to_linear_rgb = real_decode
+        pipeline_mod.bgr_u8_to_linear_bgr = real_decode
         pipeline_mod.composite_linear_predecoded = real_composite
     stats = pipeline.hub.stats_dict()
     result = {

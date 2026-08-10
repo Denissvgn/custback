@@ -43,6 +43,8 @@ include tests/matte_rvm_qualification_evidence.py
 include tests/matte_platform_qualification_evidence.py
 include tests/matte_visual_qualification_evidence.py
 include tests/test_backend_selection.py
+include tests/test_background_asset_fallback.py
+include tests/test_background_video_lifetime.py
 include tests/test_cadence.py
 include tests/test_capture_diagnostics.py
 include tests/test_light_wrap.py
@@ -58,6 +60,10 @@ include tests/test_matte_operator_mitigations.py
 include tests/test_matte_performance.py
 include tests/test_matte_platform_qualification.py
 include tests/test_matte_stabilizer.py
+include tests/test_output_scheduler.py
+include tests/test_remote_protocol.py
+include tests/test_runtime_performance.py
+include tests/test_runtime_performance_status.py
 include tests/test_spatial_edge_refinement.py
 include tests/test_vcam_timing.py
 include tests/visual_consistency_evidence.py

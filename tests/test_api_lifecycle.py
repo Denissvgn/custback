@@ -1,5 +1,6 @@
-from types import SimpleNamespace
+import logging
 import signal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -91,6 +92,41 @@ def test_pipeline_start_exception_does_not_bind_api(monkeypatch):
     monkeypatch.setattr(main_mod, "_ApiRunner", Runner)
     assert main_mod.run(_cfg()) == main_mod.EXIT_RUNTIME
     assert stopped == []
+
+
+def test_recorded_pipeline_start_failure_has_one_authoritative_traceback(
+    monkeypatch, caplog
+):
+    _patch_common(monkeypatch)
+
+    class WorkerFailedPipeline(FakePipeline):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.error: BaseException | None = None
+
+        def start(self):
+            try:
+                raise RuntimeError("worker failed")
+            except RuntimeError as exc:
+                self.error = exc
+                logging.getLogger("custback.pipeline").exception("pipeline crashed")
+                raise RuntimeError("startup propagation") from exc
+
+        def stop(self):
+            self.stopped = True
+            assert self.error is not None
+            raise self.error
+
+    monkeypatch.setattr(main_mod, "Pipeline", WorkerFailedPipeline)
+
+    with caplog.at_level("ERROR"):
+        assert main_mod.run(_cfg()) == main_mod.EXIT_RUNTIME
+
+    traceback_records = [record for record in caplog.records if record.exc_info]
+    assert [record.getMessage() for record in traceback_records] == ["pipeline crashed"]
+    assert caplog.text.count("pipeline startup failed") == 1
+    assert "worker traceback logged" in caplog.text
+    assert "pipeline shutdown failed" not in caplog.text
 
 
 def test_signal_during_pipeline_start_unwinds_as_clean_exit(monkeypatch, caplog):

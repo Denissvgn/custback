@@ -6,6 +6,7 @@ import io
 import logging
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -222,6 +223,95 @@ def test_log_formatter_redacts_urls_inside_messages_and_tracebacks(tmp_path):
     assert "password" not in text
     assert "token=secret" not in text
     assert "rtsp://example.test/<redacted>" in text
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "model load failed at /home/alice/Private Models/rvm model.onnx; using cpu",
+            "model load failed at <redacted-path>; using cpu",
+        ),
+        (
+            r"model load failed at C:\Program Files (x86)\Private Models\rvm "
+            r"model.onnx; "
+            "using cpu",
+            "model load failed at <redacted-path>; using cpu",
+        ),
+        (
+            r"model load failed at \\studio-server\private share\Models\rvm.onnx; "
+            "using cpu",
+            "model load failed at <redacted-path>; using cpu",
+        ),
+        (
+            "device=/dev/v4l/by-id/private-camera "
+            "model=/mnt/private/models/rvm.onnx "
+            "token_file=/home/alice/.config/custback/api-token",
+            "device=<redacted-path> model=<redacted-path> token_file=<redacted-path>",
+        ),
+    ],
+)
+def test_local_source_paths_are_redacted_without_losing_public_context(
+    message,
+    expected,
+):
+    assert redact_sensitive_text(message) == expected
+
+
+def test_log_formatter_redacts_exception_messages_and_traceback_sources(tmp_path):
+    logger = logging.Logger("custback-local-path-redaction-test")
+    session = configure_logging(
+        log_file=tmp_path / "custback.log",
+        logger=logger,
+        run_id="local-path-redaction",
+    )
+    source_path = "/home/alice/Private Source/startup module.py"
+    model_path = r"C:\Users\Alice\Private Models\rvm model.onnx"
+    try:
+        try:
+            code = compile(
+                f"raise RuntimeError({model_path!r})",
+                source_path,
+                "exec",
+            )
+            exec(code, {})
+        except RuntimeError:
+            logger.exception("model startup failed for %s", "/dev/video99")
+        logger.info(
+            "created API token file %s; permissions=private",
+            Path("/home/alice/Private Config/api token"),
+        )
+    finally:
+        session.close()
+
+    text = (tmp_path / "custback.log").read_text(encoding="utf-8")
+    assert "Traceback (most recent call last)" in text
+    assert "RuntimeError" in text
+    assert text.count("<redacted-path>") >= 4
+    assert "/home/alice" not in text
+    assert "/mnt/data/projects" not in text
+    assert r"C:\Users\Alice" not in text
+    assert "/dev/video99" not in text
+    assert "Private Config" not in text
+
+
+def test_benign_one_line_diagnostics_and_safe_basenames_are_preserved():
+    message = (
+        "ready backend=rvm/cpu provider=CUDAExecutionProvider "
+        "model=rvm_mobilenetv3_fp32.onnx device=cuda route=/status fps=30/30"
+    )
+    assert redact_sensitive_text(message) == message
+    assert redact_sensitive_text("api_token=private-value ready") == (
+        "api_token=<redacted> ready"
+    )
+    assert (
+        redact_sensitive_text("/home/alice/Private Config/api token")
+        == "<redacted-path>"
+    )
+    assert (
+        redact_sensitive_text('  File "relative/private_source.py", line 7, in start')
+        == '  File "<redacted-path>", line 7, in start'
+    )
 
 
 def test_config_summary_whitelists_safe_values_and_redacts_sources():

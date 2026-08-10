@@ -316,6 +316,27 @@ def test_scalar_output_timeline_keeps_repeats_out_of_unique_input_track(tmp_path
     assert bundle.output_events[1]["exact_final_repeat"] is True
 
 
+def test_unattributed_safe_slate_marks_output_timeline_incomplete(tmp_path):
+    bundle_dir = tmp_path / "bundle"
+    recorder = MatteDiagnosticRecorder(bundle_dir, max_bytes=2_000_000)
+    evidence, rendered = _evidence(0, 1_000_000_000)
+    assert recorder.submit(evidence, rendered)
+    recorder._queue.join()
+    assert recorder.submit_output_event(
+        sent_monotonic_ns=1_001_000_000,
+        source_bundle_sequence=0,
+        base_updated=True,
+        exact_final_repeat=False,
+    )
+    recorder.mark_output_timeline_incomplete("unattributed-safe-slate")
+    recorder.close()
+
+    bundle = MatteReplayBundle(bundle_dir)
+    timeline = bundle.manifest["output_timeline"]
+    assert timeline["complete"] is False
+    assert len(bundle.output_events) == 1
+
+
 def test_frozen_attribution_swaps_compositor_without_mutating_upstream(tmp_path):
     bundle_dir = tmp_path / "bundle"
     evidence, rendered = _evidence(0, 10)
@@ -736,3 +757,64 @@ def test_pipeline_records_only_unique_full_composites_after_output_send(tmp_path
         {event["source_bundle_sequence"] for event in bundle.output_events}
     ) == list(range(len(bundle.frames)))
     assert not any("matte_diagnostic" in key for key in hub.stats_dict())
+
+
+def test_remote_privacy_slate_never_reuses_prior_matte_bundle_provenance(tmp_path):
+    from custback.config import AppConfig, RuntimeConfig
+    from custback.hub import FrameHub
+    from custback.pipeline import Pipeline
+
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {
+                "synthetic": True,
+                "width": 64,
+                "height": 48,
+                "fps": 30,
+            },
+            "background": {"mode": "color", "color": [1, 2, 3]},
+            "segmentation": {
+                "backend": "heuristic",
+                "mask_blur": 0,
+                "edge_refine": False,
+                "temporal_smoothing": 0.0,
+            },
+            "output": {"backend": "null", "fps": 30},
+            "api": {"enabled": False},
+        }
+    )
+    bundle_dir = tmp_path / "privacy-slate-bundle"
+    recorder = MatteDiagnosticRecorder(bundle_dir, max_bytes=10_000_000)
+    hub = FrameHub()
+    pipeline = Pipeline(RuntimeConfig(cfg), hub, matte_recorder=recorder)
+    pipeline.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while hub.stats_dict()["frames_in"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        before = hub.stats_dict()["frames_out"]
+        committed = pipeline.apply_config_patch({"background": {"mode": "remote"}})
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            stats = hub.stats_dict()
+            if (
+                stats["config_version"] == committed.version
+                and stats["frames_out"] > before
+                and stats["remote_fallback_active"] is True
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("privacy slate was not published after remote fence")
+    finally:
+        pipeline.stop()
+
+    bundle = MatteReplayBundle(bundle_dir)
+    timeline = bundle.manifest["output_timeline"]
+    assert timeline["complete"] is False
+    # Every retained event still names a real accepted bundle; the visually
+    # different input-independent slate is deliberately absent/unattributed.
+    assert all(
+        int(event["source_bundle_sequence"]) < len(bundle.frames)
+        for event in bundle.output_events
+    )

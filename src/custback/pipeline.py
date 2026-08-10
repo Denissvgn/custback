@@ -14,8 +14,8 @@ from concurrent.futures import (
     TimeoutError as FutureTimeout,
 )
 from contextlib import ExitStack
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, cast
 
 import numpy as np
 import cv2
@@ -23,6 +23,7 @@ import cv2
 from .backgrounds import (
     BackdropFrameTiming,
     BlurBackdrop,
+    ColorBackdrop,
     ImageBackdrop,
     create_backdrop,
 )
@@ -37,21 +38,24 @@ from .color import (
     HarmonizerPhase,
     HarmonizerSnapshot,
     IDENTITY_TRANSFORM,
-    _bgr_u8_to_linear_bgr_prevalidated as bgr_u8_to_linear_rgb,
+    _bgr_u8_to_linear_bgr_prevalidated as bgr_u8_to_linear_bgr,
     _estimate_color_transform_linear_bgr_prevalidated as estimate_color_transform_linear,
     _linear_bgr_analysis_raster_prevalidated,
 )
 from .compositor import (
+    COMPOSITOR_SUBSTAGE_NAMES,
     LegacyCompositorWorkspace,
     PreparedLightWrap,
     _composite_linear_bgr_prevalidated as composite_linear_predecoded,
     composite,
-    composite_legacy_predecoded,
+    _composite_legacy_bgr_prevalidated as composite_legacy_predecoded,
     prepare_light_wrap,
+    prepare_static_light_wrap,
 )
 from .config import (
     AVATAR_PROXY_RESTART_ONLY_FIELDS,
     AppConfig,
+    BlendSpace,
     ConfigState,
     ConfigVersionConflictError,
     RuntimeConfig,
@@ -73,6 +77,20 @@ from .matte_rollout import (
     MatteRolloutAttempt,
     MatteRolloutTelemetry,
     classify_matte_patch,
+)
+from .output_scheduler import (
+    OutputPublisher,
+    OutputPublisherError,
+    OutputSendReceipt,
+    PublicationPolicy,
+    RemoteOutputProof,
+    SafeBaseFrame,
+    thaw_status,
+)
+from .runtime_performance import (
+    PerformanceEpochKey,
+    PublisherTelemetry,
+    RuntimePerformanceTracker,
 )
 from .light_wrap import (
     LightWrapFrameContext,
@@ -117,6 +135,85 @@ _VIDEO_STATS_DEFAULTS: dict[str, object] = {
     "background_video_color_overridden_fields": [],
 }
 
+_VIDEO_LIFETIME_FIELD_PAIRS = (
+    (
+        "background_video_frames_displayed",
+        "background_video_lifetime_frames_displayed",
+    ),
+    (
+        "background_video_frames_skipped",
+        "background_video_lifetime_frames_skipped",
+    ),
+    (
+        "background_video_frames_reused",
+        "background_video_lifetime_frames_reused",
+    ),
+    (
+        "background_video_seek_count",
+        "background_video_lifetime_seek_count",
+    ),
+    (
+        "background_video_decode_failures",
+        "background_video_lifetime_decode_failures",
+    ),
+)
+_MAX_VIDEO_LIFETIME_COUNT = 2**63 - 1
+
+
+def _video_counter(stats: Mapping[str, object], name: str) -> int:
+    value = stats.get(name, 0)
+    if type(value) is not int or value < 0:
+        return 0
+    return min(value, _MAX_VIDEO_LIFETIME_COUNT)
+
+
+@dataclass
+class _BackgroundVideoLifetimeCounters:
+    """Retain scalar playback totals after a provider generation is retired."""
+
+    retired: dict[str, int] = field(
+        default_factory=lambda: {
+            lifetime_name: 0
+            for _current_name, lifetime_name in _VIDEO_LIFETIME_FIELD_PAIRS
+        }
+    )
+
+    @staticmethod
+    def _provider_stats(provider: object) -> Mapping[str, object]:
+        getter = getattr(provider, "stats_dict", None)
+        if not callable(getter):
+            return {}
+        try:
+            values = getter()
+        except Exception:
+            # Teardown telemetry is best effort and must never revoke an
+            # already committed configuration change.
+            return {}
+        return values if isinstance(values, Mapping) else {}
+
+    def retire(self, provider: object) -> None:
+        """Fold one quiescent provider's final counters into run totals."""
+
+        stats = self._provider_stats(provider)
+        for current_name, lifetime_name in _VIDEO_LIFETIME_FIELD_PAIRS:
+            self.retired[lifetime_name] = min(
+                _MAX_VIDEO_LIFETIME_COUNT,
+                self.retired[lifetime_name] + _video_counter(stats, current_name),
+            )
+
+    def project(self, current_stats: Mapping[str, object]) -> dict[str, int]:
+        """Return retired plus active-provider counters without mutating either."""
+
+        return {
+            lifetime_name: min(
+                _MAX_VIDEO_LIFETIME_COUNT,
+                self.retired[lifetime_name]
+                + _video_counter(current_stats, current_name),
+            )
+            for current_name, lifetime_name in _VIDEO_LIFETIME_FIELD_PAIRS
+        }
+
+
 _ACCELERATION_STATS_DEFAULTS: dict[str, object] = {
     "acceleration_mode": "",
     "acceleration_requested_provider": "",
@@ -130,6 +227,7 @@ _ACCELERATION_STATS_DEFAULTS: dict[str, object] = {
 }
 
 _COLOR_ELIGIBLE_MODES = frozenset({"image", "video", "camera"})
+_COLOR_REASON_DEBOUNCE_S = 0.5
 
 
 def _acceleration_stats(segmenter: Any) -> dict[str, object]:
@@ -436,7 +534,7 @@ def _backdrop_visual_key(cfg: AppConfig) -> tuple[object, ...]:
 
 
 def _visual_state_key(cfg: AppConfig) -> tuple[object, ...]:
-    """Inputs that invalidate future geometry and color temporal state."""
+    """Geometry/working-space inputs that invalidate temporal color state."""
 
     camera = cfg.camera
     correction = cfg.compositing.color_correction
@@ -452,6 +550,14 @@ def _visual_state_key(cfg: AppConfig) -> tuple[object, ...]:
         _backdrop_visual_key(cfg),
         cfg.compositing.blend_space,
         correction.mode,
+    )
+
+
+def _color_scalar_policy_key(cfg: AppConfig) -> tuple[object, ...]:
+    """Hot scalar policy that can retain an already-applied transform."""
+
+    correction = cfg.compositing.color_correction
+    return (
         correction.strength,
         correction.exposure_limit_ev,
         correction.white_balance_strength,
@@ -460,7 +566,7 @@ def _visual_state_key(cfg: AppConfig) -> tuple[object, ...]:
 
 
 def _color_state_key(cfg: AppConfig) -> tuple[object, ...]:
-    """Every policy/model input whose change invalidates temporal color state."""
+    """Hard reset inputs: mode/source/geometry/model/working-space changes."""
 
     return (_visual_state_key(cfg), _segmenter_key(cfg))
 
@@ -666,6 +772,8 @@ def _color_stats(
     *,
     applied_transform: ColorTransform | None = None,
     application_failed: bool = False,
+    exposure_clamped: bool = False,
+    white_balance_clamped: bool = False,
 ) -> dict[str, object]:
     """Map configured, temporal, and actually applied correction state."""
 
@@ -714,6 +822,7 @@ def _color_stats(
     confidence = snapshot.confidence if snapshot is not None and eligible else 0.0
     gains = transform.wb_gains
     active = eligible and not application_failed and not transform.is_identity
+    clamp_eligible = eligible and not application_failed
     return {
         "color_correction_mode": configured_mode,
         "color_correction_active": active,
@@ -726,6 +835,12 @@ def _color_stats(
         "color_correction_wb_gain_g": gains[1],
         "color_correction_wb_gain_b": gains[2],
         "color_correction_wb_active": any(abs(gain - 1.0) > 1e-9 for gain in gains),
+        "color_correction_exposure_clamped": (
+            bool(exposure_clamped) if clamp_eligible else False
+        ),
+        "color_correction_wb_clamped": (
+            bool(white_balance_clamped) if clamp_eligible else False
+        ),
         "color_correction_warming": state in {"warming", "scene-cut"},
         "color_correction_stale": state == "stale-decay",
         "color_input_assumption": "display-referred-srgb-bt709-full-range",
@@ -741,6 +856,28 @@ def _build_backdrop(cfg: AppConfig) -> Any:
     if _backdrop_provider_key(cfg)[0] == "camera":
         kwargs["camera_target"] = cfg.resolved_backdrop_target()
     return create_backdrop(cfg.background, **kwargs)
+
+
+def _startup_backdrop(cfg: AppConfig) -> tuple[Any, str]:
+    """Open the persisted backdrop without making its asset an API dependency.
+
+    A missing or unreadable operator-owned image/video is recoverable at
+    startup: the configured intent remains active and a later transactional
+    PATCH can replace it.  Other provider failures (for example a camera
+    device or invalid non-asset mode) retain the ordinary fail-fast contract.
+    """
+
+    effective_mode = (
+        cfg.background.remote_fallback_mode
+        if cfg.background.mode == "remote"
+        else cfg.background.mode
+    )
+    try:
+        return _build_backdrop(cfg), ""
+    except (OSError, RuntimeError, ValueError):
+        if effective_mode not in {"image", "video"}:
+            raise
+        return None, "asset-unavailable"
 
 
 def _ewma(previous: float | None, sample: float, alpha: float = 0.1) -> float:
@@ -1125,6 +1262,10 @@ class _Resources:
     refiner: Any
     backdrop: Any
     output: Any
+    output_factory: Callable[[], Any] | None = None
+    output_owned_by_publisher: bool = False
+    background_fallback_reason: str = ""
+    background_startup_asset_guard: bool = False
     visual_generation: int = 0
     segmentation_generation: int = 0
     light_wrap_generation: int = 0
@@ -1137,6 +1278,22 @@ class _Resources:
     color_correction_bypassed_frames: int = 0
     color_correction_scene_cuts: int = 0
     color_correction_transitions: int = 0
+    color_correction_reason_transitions: int = 0
+    color_correction_exposure_clamped: bool = False
+    color_correction_exposure_clamp_count: int = 0
+    color_correction_exposure_clamp_time_s: float = 0.0
+    color_correction_wb_clamped: bool = False
+    color_correction_wb_clamp_count: int = 0
+    color_correction_wb_clamp_time_s: float = 0.0
+    _color_correction_last_unique_at_s: float | None = field(
+        default=None,
+        repr=False,
+    )
+    background_video_lifetime: _BackgroundVideoLifetimeCounters = field(
+        default_factory=_BackgroundVideoLifetimeCounters,
+        repr=False,
+    )
+    last_compositor_substages_ms: dict[str, float] = field(default_factory=dict)
     canvas_size: Size = field(init=False)
     capture_sequence_timeline: _CaptureSequenceTimeline = field(
         init=False,
@@ -1151,6 +1308,16 @@ class _Resources:
         repr=False,
     )
     color_backdrop_analysis_linear_bgr: np.ndarray | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    static_light_wrap_token: tuple[object, ...] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    static_light_wrap: PreparedLightWrap | None = field(
         default=None,
         init=False,
         repr=False,
@@ -1223,6 +1390,60 @@ class _Resources:
         self.color_backdrop_analysis_token = None
         self.color_backdrop_analysis_linear_bgr = None
 
+    def static_light_wrap_sample(
+        self,
+        backdrop_frame: np.ndarray,
+        *,
+        blend_space: BlendSpace,
+        backdrop_linear_bgr: np.ndarray | None,
+        diagnostics: dict[str, float],
+    ) -> PreparedLightWrap | None:
+        """Return a generation-owned sample only for immutable providers."""
+
+        provider = self.backdrop
+        if not isinstance(provider, (ColorBackdrop, ImageBackdrop)):
+            return None
+        if getattr(provider, "_cache", None) is not backdrop_frame:
+            return None
+        token = (
+            self.visual_generation,
+            id(provider),
+            provider.geometry,
+            getattr(provider, "_cache_key", None),
+            getattr(provider, "color", None),
+            id(backdrop_frame),
+            backdrop_frame.shape,
+            blend_space,
+        )
+        if self.static_light_wrap_token != token or self.static_light_wrap is None:
+            self.static_light_wrap = prepare_static_light_wrap(
+                backdrop_frame,
+                blend_space=blend_space,
+                backdrop_linear_bgr=(
+                    backdrop_linear_bgr if blend_space == "linear_srgb" else None
+                ),
+                diagnostics=diagnostics,
+            )
+            self.static_light_wrap_token = token
+        return self.static_light_wrap
+
+    def invalidate_static_light_wrap(self) -> None:
+        self.static_light_wrap_token = None
+        self.static_light_wrap = None
+
+    def retire_background_video_provider(self, provider: object) -> None:
+        """Preserve final video counters before a provider is closed."""
+
+        self.background_video_lifetime.retire(provider)
+
+    def background_video_lifetime_stats(
+        self,
+        current_stats: Mapping[str, object],
+    ) -> dict[str, int]:
+        """Project cumulative counters including the active provider."""
+
+        return self.background_video_lifetime.project(current_stats)
+
     def legacy_compositor_workspace(self) -> LegacyCompositorWorkspace:
         """Return the lazily allocated generation-owned legacy work buffers."""
 
@@ -1246,13 +1467,15 @@ class _Resources:
         # teardown or the final operator-health snapshot.
         self.close_capture()
         self.invalidate_color_backdrop_analysis()
+        self.invalidate_static_light_wrap()
         _safe_close(self._legacy_compositor_workspace, "legacy compositor workspace")
         self._legacy_compositor_workspace = None
         try:
             self.color_analysis_executor.shutdown(wait=True, cancel_futures=True)
         except Exception:
             log.exception("cannot close color analysis workers")
-        _safe_close(self.output, "video output")
+        if not self.output_owned_by_publisher:
+            _safe_close(self.output, "video output")
         _safe_close(self.backdrop, "backdrop")
         _safe_close(self.light_wrap_stabilizer, "light-wrap stabilizer")
         _safe_close(self.refiner, "mask refiner")
@@ -1275,6 +1498,7 @@ class _Activation:
     backdrop: Any = None
     visual_state_changed: bool = False
     replace_harmonizer: bool = False
+    reconfigure_harmonizer: bool = False
     harmonizer: ColorHarmonizer | None = None
     replace_light_wrap_stabilizer: bool = False
     light_wrap_stabilizer: LightWrapStabilizer | None = None
@@ -1319,6 +1543,7 @@ class _Activation:
         self.replace_backdrop = False
         self.backdrop = None
         self.replace_harmonizer = False
+        self.reconfigure_harmonizer = False
         self.harmonizer = None
         self.replace_light_wrap_stabilizer = False
         self.light_wrap_stabilizer = None
@@ -1347,13 +1572,15 @@ class _PreparedColorFrame:
     backdrop_linear_bgr: np.ndarray | None = None
     edge_foreground_linear_bgr: np.ndarray | None = None
     snapshot: HarmonizerSnapshot | None = None
+    exposure_clamped: bool = False
+    white_balance_clamped: bool = False
 
 
 @dataclass(frozen=True)
 class _PreflightResult:
     """Already-sent startup output and the capture it consumed."""
 
-    output: np.ndarray
+    output: np.ndarray | None
     captured: CapturedFrame
     send_timing: OutputSendTiming
     base_ready_at_ns: int
@@ -1373,6 +1600,142 @@ class _PreflightResult:
     @property
     def capture_sequence(self) -> int:
         return self.captured.sequence
+
+
+@dataclass
+class _PublisherBridge:
+    """Bounded scalar/evidence bridge between compute and publication lanes."""
+
+    cadence: CadenceTracker
+    performance: RuntimePerformanceTracker
+    publisher_mode: str
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    last_status: dict[str, object] = field(default_factory=dict, repr=False)
+    # Current run/config identity authored only by the processing lane. A
+    # paced publisher may still repeat pixels from an older immutable
+    # envelope after a hot commit; this overlay keeps public policy and
+    # selection fields current while ``output_base_config_version`` preserves
+    # the pixels' producer version.
+    committed_status: dict[str, object] = field(default_factory=dict, repr=False)
+    pending_evidence: dict[int, MatteFrameEvidence] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    retained_base_epochs: dict[int, PerformanceEpochKey] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    last_matte_source_sequence: int | None = None
+    processing_completed_count: int = 0
+    output_base_config_version: int = 0
+    resolved_remote_raw_epoch: int = 0
+    performance_state: str = "warming"
+    output_ewma: dict[str, float | None] = field(
+        default_factory=lambda: {
+            "output_send_ms": None,
+            "output_submission_ms": None,
+            "output_sink_pacing_wait_ms": None,
+            "application_pacing_wait_ms": None,
+            "output_schedule_lateness_ms": None,
+            "new_frame_service_ms": None,
+        },
+        repr=False,
+    )
+
+    def retain_base(
+        self,
+        base_id: int,
+        epoch_key: PerformanceEpochKey,
+        evidence: MatteFrameEvidence | None,
+    ) -> None:
+        with self.lock:
+            if base_id in self.retained_base_epochs:
+                raise RuntimeError("publisher base id was retained twice")
+            if not self.performance.retain_epoch(epoch_key):
+                raise RuntimeError("publisher base references a finalized epoch")
+            self.retained_base_epochs[base_id] = epoch_key
+            if evidence is not None:
+                self.pending_evidence[base_id] = evidence
+
+    def discard_evidence(self, base_id: int) -> None:
+        with self.lock:
+            self.pending_evidence.pop(base_id, None)
+
+    def release_base(self, base_id: int) -> None:
+        """Release one envelope after it leaves publisher-owned retention."""
+
+        with self.lock:
+            self.pending_evidence.pop(base_id, None)
+            epoch_key = self.retained_base_epochs.pop(base_id, None)
+        if epoch_key is None:
+            raise RuntimeError("publisher released an unknown base id")
+        self.performance.release_epoch(epoch_key)
+        _log_finalized_performance_epochs(self.performance)
+
+
+_COMMITTED_OUTPUT_STATUS_NAMES = (
+    "config_version",
+    "mode",
+    "matte_rollout",
+    "matte_policy",
+    "color_correction_mode",
+    "effective_rvm_downsample_ratio",
+    "effective_mask_blur",
+    "effective_edge_refine",
+    "effective_edge_refinement_mode",
+    "effective_edge_refinement_radius_px",
+    "effective_mask_shift",
+    "effective_temporal_smoothing",
+    "effective_boundary_stabilization_mode",
+    "effective_boundary_stabilization_time_constant_s",
+    "effective_boundary_stabilization_max_motion_px_per_s",
+    "effective_use_model_foreground",
+    "effective_light_wrap",
+    "output_target_fps",
+    "capture_target_fps",
+    "remote_fallback_mode",
+)
+
+
+def _committed_output_status(identity: Mapping[str, object]) -> dict[str, object]:
+    """Select config/policy truth without relabelling old pixels.
+
+    Capture/provider/color-estimator counters and generations remain frozen in
+    each ``SafeBaseFrame``. Only fields whose meaning changes at the atomic
+    config commit are overlaid while that older base is repeated.
+    """
+
+    missing = [name for name in _COMMITTED_OUTPUT_STATUS_NAMES if name not in identity]
+    if missing:  # pragma: no cover - internal status-schema invariant
+        raise RuntimeError("committed output status is incomplete")
+    return {name: identity[name] for name in _COMMITTED_OUTPUT_STATUS_NAMES}
+
+
+def _log_finalized_performance_epochs(
+    performance: RuntimePerformanceTracker,
+) -> None:
+    """Emit one bounded, path-free record after an epoch can no longer mutate."""
+
+    for closed in performance.take_finalized_epoch_summaries():
+        raw_key = closed.get("key")
+        key = raw_key if isinstance(raw_key, Mapping) else {}
+        log.info(
+            "runtime performance epoch finalized config_version=%s "
+            "capture_generation=%s segmentation_generation=%s "
+            "backdrop_generation=%s state=%s reason=%s "
+            "output_attainment=%.6f unique_attainment=%.6f "
+            "deadline_miss_ratio=%.6f late_send_ratio=%.6f",
+            key.get("config_version", 0),
+            key.get("capture_generation", 0),
+            key.get("segmentation_generation", 0),
+            key.get("backdrop_generation", 0),
+            closed.get("state", "warming"),
+            closed.get("reason", "none"),
+            cast(float, closed.get("output_attainment", 0.0)),
+            cast(float, closed.get("unique_attainment", 0.0)),
+            cast(float, closed.get("processing_deadline_miss_ratio", 0.0)),
+            cast(float, closed.get("output_schedule_late_ratio", 0.0)),
+        )
 
 
 @dataclass
@@ -1491,6 +1854,12 @@ class Pipeline:
         self._stop = threading.Event()
         self._startup_done = threading.Event()
         self._thread: threading.Thread | None = None
+        self._output_publisher: OutputPublisher | None = None
+        self._runtime_performance: RuntimePerformanceTracker | None = None
+        self._publisher_policy = PublicationPolicy(0, "local")
+        self._publisher_policy_epoch = 0
+        self._publisher_raw_epoch = 0
+        self._publisher_policy_lock = threading.RLock()
         self._error: BaseException | None = None
         self._requests: queue.Queue[_PatchRequest | _MutationRequest] = queue.Queue()
         self._request_enqueue_lock = threading.Lock()
@@ -1530,12 +1899,21 @@ class Pipeline:
             )
         self._fallback_log_states: dict[str, tuple[bool, str]] = {}
         self._geometry_log_states: dict[str, tuple[object, ...]] = {}
-        self._color_log_state: tuple[object, ...] | None = None
+        self._color_phase_log_state: tuple[object, ...] | None = None
+        self._color_reason_log_state: str | None = None
+        self._color_reason_log_candidate: tuple[str, float] | None = None
         self._raw_fingerprint_capacity = raw_fingerprint_capacity
         self._recent_raw_fingerprints = _RawReplayHistory(raw_fingerprint_capacity)
         self._privacy_history_exhausted = False
         self._privacy_invalidated_session: int | None = None
         self._latest_raw_frame: np.ndarray | None = None
+        lifecycle_listener = getattr(
+            self.hub,
+            "set_remote_lifecycle_listener",
+            None,
+        )
+        if callable(lifecycle_listener):
+            lifecycle_listener(self._remote_lifecycle_changed)
 
     def start(self, timeout: float | None = None) -> None:
         """Start and synchronously acknowledge resource activation."""
@@ -1550,10 +1928,17 @@ class Pipeline:
             self._stop.clear()
             self._startup_done.clear()
             self._error = None
+            self._output_publisher = None
+            self._runtime_performance = None
+            self._publisher_policy = PublicationPolicy(0, "local")
+            self._publisher_policy_epoch = 0
+            self._publisher_raw_epoch = 0
             self._active_state = None
             self._fallback_log_states.clear()
             self._geometry_log_states.clear()
-            self._color_log_state = None
+            self._color_phase_log_state = None
+            self._color_reason_log_state = None
+            self._color_reason_log_candidate = None
             self._matte_bundle_sequence = 0
             self._matte_last_source_sequence = None
             with self._preparation_lock:
@@ -1597,6 +1982,9 @@ class Pipeline:
     def stop(self, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
         self._stop.set()
+        publisher = self._output_publisher
+        if publisher is not None:
+            publisher.request_stop()
         with self._request_enqueue_lock:
             self._fail_pending(ReconfigurationUnavailable("pipeline is stopping"))
         thread = self._thread
@@ -1634,9 +2022,20 @@ class Pipeline:
             raise self._error
 
     @property
+    def error(self) -> BaseException | None:
+        """Return the authoritative worker failure recorded by the pipeline."""
+
+        return self._error
+
+    @property
     def running(self) -> bool:
-        return (
-            self._error is None and self._thread is not None and self._thread.is_alive()
+        publisher = self._output_publisher
+        return bool(
+            self._error is None
+            and self._thread is not None
+            and self._thread.is_alive()
+            and publisher is not None
+            and publisher.snapshot().state in {"starting", "running"}
         )
 
     def apply_config_patch(
@@ -2013,7 +2412,12 @@ class Pipeline:
         return request.result
 
     # -- lifecycle -----------------------------------------------------
-    def _open_resources(self, state: ConfigState) -> _Resources:
+    def _open_resources(
+        self,
+        state: ConfigState,
+        *,
+        defer_output: bool = False,
+    ) -> _Resources:
         cfg = state.config
         canvas_size = resolved_output_size(cfg)
         # ExitStack protects every successfully opened backend if a later
@@ -2033,13 +2437,33 @@ class Pipeline:
                 )
             startup.callback(_safe_close, segmenter, "segmenter")
             refiner = refiner_for(cfg.segmentation, segmenter)
-            backdrop = _build_backdrop(cfg)
+            backdrop, background_fallback_reason = _startup_backdrop(cfg)
             if backdrop is not None:
                 startup.callback(_safe_close, backdrop, "backdrop")
-            output = open_output(cfg.output, canvas_size[0], canvas_size[1])
-            startup.callback(_safe_close, output, "video output")
+            output_factory: Callable[[], Any] | None = None
+            if defer_output:
+                output_cfg = cfg.output.model_copy(deep=True)
+
+                def deferred_output_factory() -> Any:
+                    return open_output(output_cfg, canvas_size[0], canvas_size[1])
+
+                output_factory = deferred_output_factory
+                output = None
+            else:
+                output = open_output(cfg.output, canvas_size[0], canvas_size[1])
+                startup.callback(_safe_close, output, "video output")
             resources = _Resources(
-                cfg, state.version, capture, segmenter, refiner, backdrop, output
+                cfg,
+                state.version,
+                capture,
+                segmenter,
+                refiner,
+                backdrop,
+                output,
+                output_factory=output_factory,
+                output_owned_by_publisher=defer_output,
+                background_fallback_reason=background_fallback_reason,
+                background_startup_asset_guard=True,
             )
             # Backend callbacks above already own their individual teardown.
             # Register only the executor created by _Resources so a later
@@ -2059,51 +2483,578 @@ class Pipeline:
             startup.pop_all()
             return resources
 
+    @staticmethod
+    def _performance_epoch_key(
+        resources: _Resources,
+        capture_health: Any,
+    ) -> PerformanceEpochKey:
+        return PerformanceEpochKey(
+            config_version=resources.version,
+            capture_generation=int(getattr(capture_health, "generation", 0) or 0),
+            segmentation_generation=resources.segmentation_generation,
+            backdrop_generation=resources.visual_generation,
+        )
+
+    @staticmethod
+    def _performance_epoch_tuple(
+        key: PerformanceEpochKey,
+    ) -> tuple[int, int, int, int]:
+        return (
+            key.config_version,
+            key.capture_generation,
+            key.segmentation_generation,
+            key.backdrop_generation,
+        )
+
+    @staticmethod
+    def _runtime_stage_samples(
+        timings: Mapping[str, float],
+        frame_processing_ms: float,
+        compositor_substages: Mapping[str, float] | None = None,
+    ) -> dict[str, float | None]:
+        """Project frame-local timers onto the additive performance schema."""
+
+        substages = compositor_substages or {}
+        light_wrap_ms = sum(
+            float(substages.get(name, 0.0) or 0.0)
+            for name in (
+                "backdrop_blur_resize",
+                "light_wrap_temporal_filter",
+                "light_wrap_interpolation",
+            )
+        )
+        return {
+            "capture.read": timings.get("capture_read_ms"),
+            "segmentation.total": timings.get("segmentation_ms"),
+            "background.total": timings.get("background_ms"),
+            "color_correction.estimate": timings.get("color_correction_ms"),
+            "color_correction.apply": substages.get("color_transform_application"),
+            **{
+                f"compositor.{name}": substages.get(name)
+                for name in COMPOSITOR_SUBSTAGE_NAMES
+            },
+            "compositor.light_wrap": light_wrap_ms,
+            "compositor.prepare": timings.get("composite_prepare_ms"),
+            "compositor.blend": timings.get("composite_blend_ms"),
+            "compositor.total": timings.get("composite_ms"),
+            "pipeline.processing_only": frame_processing_ms,
+            "output.submission": None,
+        }
+
+    def _publisher_policy_transition(
+        self,
+        mode: str,
+        *,
+        reason: str,
+        raw_epoch: int | None = None,
+    ) -> PublicationPolicy:
+        """Fence publication before changing any privacy-relevant epoch."""
+
+        with self._publisher_policy_lock:
+            publisher = self._output_publisher
+            self._publisher_policy_epoch += 1
+            if mode == "remote":
+                if raw_epoch is not None:
+                    self._publisher_raw_epoch = raw_epoch
+                session = self.hub.active_remote_session() or 0
+                policy = PublicationPolicy(
+                    self._publisher_policy_epoch,
+                    "remote",
+                    raw_epoch=self._publisher_raw_epoch,
+                    renderer_session=session,
+                )
+            else:
+                policy = PublicationPolicy(self._publisher_policy_epoch, "local")
+            if publisher is not None:
+                publisher.fence_to_slate(policy, reason=reason, timeout=0.25)
+            self._publisher_policy = policy
+            return policy
+
+    def _remote_lifecycle_changed(self, event: str, _session_id: int) -> None:
+        """Fence retained renderer pixels at the renderer lease boundary."""
+
+        reason = {
+            "connected": "renderer-session-changed",
+            "disconnected": "privacy-renderer-disconnected",
+            "invalidated": "privacy-renderer-invalidated",
+        }.get(event)
+        if reason is None:
+            raise ValueError("unknown remote lifecycle event")
+        try:
+            with self._publisher_policy_lock:
+                if (
+                    self._output_publisher is None
+                    or self._publisher_policy.mode != "remote"
+                ):
+                    return
+                if self._privacy_history_exhausted:
+                    reason = "privacy-history-exhausted"
+                self._publisher_policy_transition("remote", reason=reason)
+        except BaseException as exc:
+            self._publisher_failure(exc)
+            raise
+
+    def _publisher_failure(self, exc: BaseException) -> None:
+        tracker = self._runtime_performance
+        if tracker is not None:
+            try:
+                tracker.mark_failed("publisher-failed")
+                self._publish_publisher_state("failed")
+            except Exception:
+                pass
+        self._error = OutputPublisherError("output publication failed")
+        self._error.__cause__ = exc
+        self._stop.set()
+
+    def _publish_publisher_state(self, state: str) -> None:
+        """Latch a terminal publisher state even when no later send occurs."""
+
+        publisher = self._output_publisher
+        tracker = self._runtime_performance
+        if publisher is None or tracker is None:
+            return
+        snapshot = publisher.snapshot()
+        performance = tracker.snapshot()
+        raw_publisher = performance.get("publisher")
+        previous = raw_publisher if isinstance(raw_publisher, Mapping) else {}
+        tracker.update_publisher(
+            PublisherTelemetry(
+                mode=str(previous.get("mode", "deadline-paced")),  # type: ignore[arg-type]
+                state=("failed" if state == "failed" else "stopped"),
+                handoff_overwrite_count=snapshot.handoff_overwrite_count,
+                missed_slot_count=snapshot.schedule_skipped_slots,
+                slate_send_count=snapshot.privacy_slate_send_count,
+                pending_depth=int(snapshot.pending),
+                output_base_config_version=int(
+                    previous.get("output_base_config_version", 0) or 0
+                ),
+            )
+        )
+        self.hub.update_stats(
+            output_publisher_state=state,
+            runtime_performance=tracker.snapshot(),
+        )
+
+    def _publisher_pacing_complete(
+        self,
+        timing: OutputSendTiming,
+        *,
+        bridge: _PublisherBridge,
+    ) -> None:
+        """Install measured sink pacing after accepted pixels are visible."""
+
+        with bridge.lock:
+            output_send_ms = timing.submission_ms + timing.pacing_wait_ms
+            bridge.output_ewma["output_send_ms"] = _ewma(
+                bridge.output_ewma["output_send_ms"],
+                output_send_ms,
+            )
+            bridge.output_ewma["output_sink_pacing_wait_ms"] = _ewma(
+                bridge.output_ewma["output_sink_pacing_wait_ms"],
+                timing.pacing_wait_ms,
+            )
+            raw_timing = bridge.last_status.get("timing_ms")
+            timing_map = dict(raw_timing) if isinstance(raw_timing, Mapping) else {}
+            timing_map["output.send_total"] = bridge.output_ewma["output_send_ms"]
+            timing_map["output.sink_pacing_wait"] = bridge.output_ewma[
+                "output_sink_pacing_wait_ms"
+            ]
+            update = {
+                "output_send_ms": bridge.output_ewma["output_send_ms"],
+                "output_sink_pacing_wait_ms": bridge.output_ewma[
+                    "output_sink_pacing_wait_ms"
+                ],
+                "timing_ms": timing_map,
+            }
+            bridge.last_status.update(update)
+        self.hub.update_stats(**update)
+
+    def _publish_output_receipt(
+        self,
+        receipt: OutputSendReceipt,
+        *,
+        resources: _Resources,
+        bridge: _PublisherBridge,
+    ) -> None:
+        """Install one sink-accepted frame and its exact matching public state."""
+
+        base = receipt.base
+        with bridge.lock:
+            if base is not None:
+                raw_status = thaw_status(base.status)
+                if not isinstance(raw_status, dict):  # pragma: no cover - invariant
+                    raise RuntimeError("publisher base status is not a mapping")
+                status = raw_status
+                bridge.output_base_config_version = base.config_version
+                if receipt.base_updated:
+                    bridge.resolved_remote_raw_epoch = max(
+                        bridge.resolved_remote_raw_epoch,
+                        base.resolved_remote_raw_epoch,
+                    )
+            else:
+                status = dict(bridge.last_status)
+
+            # This processing-lane snapshot carries the currently committed
+            # policy/selection identity. An old safe base may continue to be
+            # repeated after a hot commit, but only
+            # ``output_base_config_version`` below is allowed to retain the
+            # old pixel provenance.
+            status.update(bridge.committed_status)
+
+            # A PATCH acknowledgement represents the committed runtime
+            # configuration even while the paced lane is still repeating the
+            # last safe pixels.  Preserve the pixel-producing version in
+            # ``output_base_config_version`` below, but never let an immutable
+            # old envelope roll the authoritative public config version or
+            # rollout decision backwards.
+            committed_state = self.runtime.read()
+            status["config_version"] = committed_state.version
+            status["mode"] = committed_state.config.background.mode
+            status["matte_rollout"] = self._matte_rollout.snapshot(
+                committed_state.config,
+                committed_state.version,
+            )
+
+            processing_missed = bool(
+                receipt.base_updated
+                and base is not None
+                and base.processing_deadline_missed
+            )
+            schedule_late = receipt.schedule_lateness_ms > 1.0
+            cadence_has_prior = (
+                bridge.cadence.snapshot(
+                    now_ns=receipt.timing.submitted_at_ns
+                ).output_send_count
+                > 0
+            )
+            cadence_base_updated = bool(
+                receipt.base_updated or (not cadence_has_prior and base is not None)
+            )
+            bridge.cadence.record_send(
+                sent_at_ns=receipt.timing.submitted_at_ns,
+                capture_sequence=(
+                    base.capture_sequence
+                    if cadence_base_updated and base is not None
+                    else None
+                ),
+                captured_at_ns=(
+                    base.captured_at_ns
+                    if cadence_base_updated and base is not None
+                    else None
+                ),
+                base_ready_at_ns=(
+                    base.base_ready_at_ns
+                    if cadence_base_updated and base is not None
+                    else None
+                ),
+                base_updated=cadence_base_updated,
+                segmentation_updated=bool(
+                    receipt.base_updated
+                    and base is not None
+                    and base.segmentation_updated
+                ),
+                exact_final_repeat=(
+                    receipt.exact_final_repeat if cadence_has_prior else False
+                ),
+                processing_deadline_missed=processing_missed,
+                serialized_new_frame_deadline_missed=False,
+                output_sink_pacing_events=receipt.timing.pacing_events,
+                output_sink_recovery_events=receipt.timing.recovery_events,
+                application_pacing_events=receipt.application_pacing_events,
+                output_schedule_late=schedule_late,
+            )
+
+            output_send_ms = (
+                receipt.timing.submission_ms
+                + receipt.timing.pacing_wait_ms
+                + receipt.application_pacing_wait_ms
+            )
+            output_samples = {
+                "output_send_ms": output_send_ms,
+                "output_submission_ms": receipt.timing.submission_ms,
+                "output_sink_pacing_wait_ms": receipt.timing.pacing_wait_ms,
+                "application_pacing_wait_ms": receipt.application_pacing_wait_ms,
+                "output_schedule_lateness_ms": receipt.schedule_lateness_ms,
+            }
+            for name, sample in output_samples.items():
+                if (
+                    bool(getattr(resources.output, "paces", False))
+                    and receipt.timing.pacing_events > 0
+                    and receipt.timing.pacing_wait_ms == 0.0
+                    and name in {"output_send_ms", "output_sink_pacing_wait_ms"}
+                ):
+                    # Acceptance-aware sinks expose the submitted pixels before
+                    # their deliberate wait. Completion installs these two
+                    # measurements without delaying the matching hub frame.
+                    continue
+                bridge.output_ewma[name] = _ewma(bridge.output_ewma[name], sample)
+
+            new_frame_service_ms: float | None = None
+            if receipt.base_updated and base is not None:
+                service_ns = receipt.timing.submitted_at_ns - base.captured_at_ns
+                if service_ns < 0 or service_ns > 3_600_000_000_000:
+                    # Focused/test captures and a few third-party capture
+                    # adapters may not share the process monotonic epoch.  Do
+                    # not publish an impossible duration; retain the bounded
+                    # handoff-to-first-submission component instead.
+                    service_ns = receipt.timing.submitted_at_ns - base.base_ready_at_ns
+                new_frame_service_ms = max(0.0, service_ns / 1_000_000.0)
+                bridge.output_ewma["new_frame_service_ms"] = _ewma(
+                    bridge.output_ewma["new_frame_service_ms"],
+                    new_frame_service_ms,
+                )
+
+            # Processing can rotate epochs before its new envelope is adopted.
+            # The tracker compares this producer key atomically with recording,
+            # so an old-generation repeat cannot leak into the new bucket.
+            # Built-in slates have no producer key and count in the active
+            # publication epoch.
+            expected_epoch = (
+                None if base is None else PerformanceEpochKey(*base.performance_epoch)
+            )
+            bridge.performance.record_output(
+                unique_base=receipt.base_updated,
+                schedule_late=schedule_late,
+                submission_ms=receipt.timing.submission_ms,
+                expected_epoch=expected_epoch,
+            )
+            publisher_state = receipt.snapshot.state
+            tracker_state = (
+                "failed"
+                if publisher_state == "failed"
+                else "stopped"
+                if publisher_state in {"stopping", "stopped"}
+                else "running"
+            )
+            bridge.performance.update_publisher(
+                PublisherTelemetry(
+                    mode=bridge.publisher_mode,  # type: ignore[arg-type]
+                    state=tracker_state,  # type: ignore[arg-type]
+                    handoff_overwrite_count=(receipt.snapshot.handoff_overwrite_count),
+                    missed_slot_count=receipt.snapshot.schedule_skipped_slots,
+                    slate_send_count=receipt.snapshot.privacy_slate_send_count,
+                    pending_depth=int(receipt.snapshot.pending),
+                    output_base_config_version=bridge.output_base_config_version,
+                )
+            )
+            performance = bridge.performance.snapshot()
+
+            previous_state = bridge.performance_state
+            current_state = str(performance["state"])
+            if current_state != previous_state:
+                if current_state == "degraded":
+                    log.warning(
+                        "runtime performance degraded reason=%s output_fps=%.3f "
+                        "unique_fps=%.3f dominant_stage=%s",
+                        performance["reason"],
+                        performance["output_send_fps"],
+                        performance["sent_unique_base_fps"],
+                        performance["dominant_stage"] or "none",
+                    )
+                elif previous_state == "degraded" and current_state == "healthy":
+                    log.warning("runtime performance recovered")
+                bridge.performance_state = current_state
+
+            status.update(
+                _cadence_status(
+                    bridge.cadence,
+                    now_ns=receipt.timing.completed_at_ns,
+                    target_output_fps=resources.cfg.output.fps,
+                )
+            )
+            timing = status.get("timing_ms")
+            timing_map = dict(timing) if isinstance(timing, Mapping) else {}
+            timing_map.update(
+                {
+                    "output.send_total": bridge.output_ewma["output_send_ms"],
+                    "output.submission": bridge.output_ewma["output_submission_ms"],
+                    "output.sink_pacing_wait": bridge.output_ewma[
+                        "output_sink_pacing_wait_ms"
+                    ],
+                    "output.application_pacing_wait": bridge.output_ewma[
+                        "application_pacing_wait_ms"
+                    ],
+                    "output.schedule_lateness": bridge.output_ewma[
+                        "output_schedule_lateness_ms"
+                    ],
+                    "pipeline.new_frame_service": bridge.output_ewma[
+                        "new_frame_service_ms"
+                    ],
+                    # The compute and publication lanes are no longer one
+                    # serialized service scope. Keep the v1 key nullable.
+                    "pipeline.new_frame_serialized_loop": None,
+                }
+            )
+            remote_privacy_slate = (
+                resources.cfg.background.mode == "remote" and receipt.privacy_slate
+            )
+            status.update(
+                {
+                    "output_send_ms": bridge.output_ewma["output_send_ms"],
+                    "output_submission_ms": bridge.output_ewma["output_submission_ms"],
+                    "output_sink_pacing_wait_ms": bridge.output_ewma[
+                        "output_sink_pacing_wait_ms"
+                    ],
+                    "application_pacing_wait_ms": bridge.output_ewma[
+                        "application_pacing_wait_ms"
+                    ],
+                    "output_schedule_lateness_ms": bridge.output_ewma[
+                        "output_schedule_lateness_ms"
+                    ],
+                    "new_frame_service_ms": bridge.output_ewma["new_frame_service_ms"],
+                    "new_frame_serialized_loop_ms": None,
+                    "timing_schema_version": TIMING_SCHEMA_VERSION,
+                    "timing_ms": timing_map,
+                    "processing_completed_count": bridge.processing_completed_count,
+                    "processing_completed_fps": performance["processing_completed_fps"],
+                    "output_base_config_version": bridge.output_base_config_version,
+                    "output_handoff_overwrite_count": (
+                        receipt.snapshot.handoff_overwrite_count
+                    ),
+                    "output_schedule_skipped_slots": (
+                        receipt.snapshot.schedule_skipped_slots
+                    ),
+                    "output_privacy_slate_send_count": (
+                        receipt.snapshot.privacy_slate_send_count
+                    ),
+                    "output_publisher_state": receipt.snapshot.state,
+                    "runtime_performance": performance,
+                    "remote_fallback_active": remote_privacy_slate,
+                    "remote_fallback_reason": (
+                        receipt.privacy_reason if remote_privacy_slate else ""
+                    ),
+                }
+            )
+            bridge.last_status = dict(status)
+            evidence = (
+                bridge.pending_evidence.pop(base.base_id, None)
+                if receipt.base_updated and base is not None
+                else None
+            )
+
+        self.hub.publish_output(receipt.pixels, stats=status)
+        if evidence is not None:
+            evidence.timings_ms.update(
+                {
+                    "output_send_ms": output_send_ms,
+                    "output_submission_ms": receipt.timing.submission_ms,
+                    "output_sink_pacing_wait_ms": receipt.timing.pacing_wait_ms,
+                    "application_pacing_wait_ms": (receipt.application_pacing_wait_ms),
+                    "output_schedule_lateness_ms": receipt.schedule_lateness_ms,
+                }
+            )
+            if new_frame_service_ms is not None:
+                evidence.timings_ms["new_frame_service_ms"] = new_frame_service_ms
+            rss_bytes = process_rss_bytes()
+            if rss_bytes is not None:
+                evidence.resource_samples["rss_bytes"] = rss_bytes
+            if self._submit_matte_evidence(evidence, receipt.pixels):
+                bridge.last_matte_source_sequence = evidence.metadata.bundle_sequence
+                self._matte_last_source_sequence = bridge.last_matte_source_sequence
+            self._submit_live_matte_evidence(evidence, status=status)
+        recorder = self._matte_recorder
+        output_matte_source = None if base is None else base.matte_bundle_sequence
+        if recorder is not None and output_matte_source is not None:
+            recorder.submit_output_event(
+                sent_monotonic_ns=receipt.timing.submitted_at_ns,
+                source_bundle_sequence=output_matte_source,
+                base_updated=receipt.base_updated,
+                exact_final_repeat=receipt.exact_final_repeat,
+            )
+        elif recorder is not None:
+            recorder.mark_output_timeline_incomplete("unattributed-safe-slate")
+
     def _run(self) -> None:
         resources: _Resources | None = None
         cadence_tracker: CadenceTracker | None = None
+        publisher: OutputPublisher | None = None
+        bridge: _PublisherBridge | None = None
         try:
             # Reset replay evidence only after every stale renderer lease and
             # queued remote frame have been invalidated at one hub boundary.
             self.hub.reset_remote_session(self._reset_raw_replay_history)
             state = self.runtime.read()
-            resources = self._open_resources(state)
+            resources = self._open_resources(state, defer_output=True)
             self._active_state = state
-            preflight = self._preflight(resources)
-            frame_interval_ms = 1000.0 / resources.cfg.output.fps
-            cadence_tracker = CadenceTracker(resources.cfg.output.fps)
-            cadence_tracker.record_send(
-                sent_at_ns=preflight.send_timing.submitted_at_ns,
-                capture_sequence=preflight.captured.sequence,
-                captured_at_ns=preflight.captured.captured_at_ns,
-                base_ready_at_ns=preflight.base_ready_at_ns,
-                base_updated=True,
-                segmentation_updated=preflight.segmentation_updated,
-                exact_final_repeat=False,
-                processing_deadline_missed=(
-                    preflight.frame_processing_ms > frame_interval_ms
-                ),
-                serialized_new_frame_deadline_missed=(
-                    preflight.new_frame_serialized_loop_ms > frame_interval_ms + 1.0
-                ),
-                output_sink_pacing_events=preflight.send_timing.pacing_events,
-                output_sink_recovery_events=preflight.send_timing.recovery_events,
+            capture_health = (
+                resources.capture.health_snapshot()
+                if hasattr(resources.capture, "health_snapshot")
+                else None
             )
+            cadence_tracker = CadenceTracker(resources.cfg.output.fps)
+            performance = RuntimePerformanceTracker(
+                resources.cfg.output.fps,
+                self._performance_epoch_key(resources, capture_health),
+                color_correction_mode=resources.cfg.compositing.color_correction.mode,
+                light_wrap=resources.cfg.compositing.light_wrap,
+            )
+            self._runtime_performance = performance
+            bridge = _PublisherBridge(
+                cadence=cadence_tracker,
+                performance=performance,
+                publisher_mode="deadline-paced",
+            )
+
+            initial_mode = resources.cfg.background.mode
+            initial_session = self.hub.active_remote_session() or 0
+            self._publisher_policy = PublicationPolicy(
+                0,
+                "remote" if initial_mode == "remote" else "local",
+                raw_epoch=0,
+                renderer_session=(initial_session if initial_mode == "remote" else 0),
+            )
+            if resources.output_factory is None:  # pragma: no cover - invariant
+                raise RuntimeError("deferred output factory is missing")
+            publisher = OutputPublisher(
+                resources.output_factory,
+                width=resources.canvas_size[0],
+                height=resources.canvas_size[1],
+                target_fps=resources.cfg.output.fps,
+                slate_pixels=self._privacy_slate(resources.canvas_shape),
+                initial_policy=self._publisher_policy,
+                on_send=lambda receipt: self._publish_output_receipt(
+                    receipt,
+                    resources=resources,
+                    bridge=bridge,
+                ),
+                on_pacing_complete=lambda timing: self._publisher_pacing_complete(
+                    timing,
+                    bridge=bridge,
+                ),
+                on_failure=self._publisher_failure,
+                on_overwrite=bridge.discard_evidence,
+                on_release=bridge.release_base,
+            )
+            self._output_publisher = publisher
+            publisher.start()
+            resources.output = publisher.wait_opened(5.0)
+            bridge.publisher_mode = (
+                "sink-paced"
+                if bool(getattr(resources.output, "paces", False))
+                else "deadline-paced"
+            )
+
+            preflight = self._preflight(resources, send_output=False)
+            frame_interval_ms = 1000.0 / resources.cfg.output.fps
+            performance.record_processing(
+                deadline_missed=preflight.frame_processing_ms > frame_interval_ms,
+                stages_ms=self._runtime_stage_samples(
+                    preflight.timings,
+                    preflight.frame_processing_ms,
+                    resources.last_compositor_substages_ms,
+                ),
+            )
+            bridge.processing_completed_count = 1
             stage_ewma: dict[str, float | None] = {
                 **preflight.timings,
-                "output_send_ms": (
-                    preflight.send_timing.submission_ms
-                    + preflight.send_timing.pacing_wait_ms
-                ),
-                "output_submission_ms": preflight.send_timing.submission_ms,
-                "output_sink_pacing_wait_ms": (preflight.send_timing.pacing_wait_ms),
-                "application_pacing_wait_ms": 0.0,
-                "output_schedule_lateness_ms": 0.0,
+                "output_send_ms": None,
+                "output_submission_ms": None,
+                "output_sink_pacing_wait_ms": None,
+                "application_pacing_wait_ms": None,
+                "output_schedule_lateness_ms": None,
                 "frame_processing_ms": preflight.frame_processing_ms,
-                "new_frame_service_ms": preflight.new_frame_service_ms,
-                "new_frame_serialized_loop_ms": (
-                    preflight.new_frame_serialized_loop_ms
-                ),
+                "new_frame_service_ms": None,
+                "new_frame_serialized_loop_ms": None,
             }
             capture_health = (
                 resources.capture.health_snapshot()
@@ -2119,7 +3070,7 @@ class Pipeline:
                 {
                     **_cadence_status(
                         cadence_tracker,
-                        now_ns=preflight.send_timing.completed_at_ns,
+                        now_ns=preflight.base_ready_at_ns,
                         target_output_fps=resources.cfg.output.fps,
                     ),
                     **_capture_health_stats(
@@ -2158,24 +3109,130 @@ class Pipeline:
                         capture_health=capture_health,
                         segmenter=resources.segmenter,
                     ),
+                    "processing_completed_count": 1,
+                    "processing_completed_fps": 0.0,
+                    "output_base_config_version": resources.version,
+                    "output_handoff_overwrite_count": 0,
+                    "output_schedule_skipped_slots": 0,
+                    "output_privacy_slate_send_count": 0,
+                    "output_publisher_state": "running",
+                    "runtime_performance": performance.snapshot(),
                 }
             )
-            if resources.cfg.background.mode != "remote":
+            if resources.cfg.background.mode == "remote":
+                self._publisher_raw_epoch += 1
+                self._publisher_policy_transition(
+                    "remote",
+                    reason="awaiting-renderer",
+                    raw_epoch=self._publisher_raw_epoch,
+                )
+                self._publish_remote_raw_frame(
+                    preflight.captured.pixels,
+                    self._publisher_raw_epoch,
+                )
+            else:
                 self.hub.publish_raw(preflight.captured.pixels)
-            self.hub.publish_output(preflight.output, stats=initial_stats)
-            self._submit_live_matte_evidence(
-                preflight.matte_evidence,
-                status=initial_stats,
+            bridge.last_status = dict(initial_stats)
+            bridge.committed_status = _committed_output_status(
+                self._identity_stats(
+                    resources,
+                    capture_health=capture_health,
+                    color_status=preflight.color_status,
+                )
             )
+            bridge.output_base_config_version = resources.version
+            initial_asset_slate = bool(resources.background_fallback_reason)
+            initial_privacy_slate = (
+                initial_asset_slate or resources.cfg.background.mode == "remote"
+            )
+            if preflight.output is None:  # pragma: no cover - startup invariant
+                raise RuntimeError("startup preflight produced no output")
+            base = SafeBaseFrame.create(
+                preflight.output,
+                base_id=0,
+                config_version=resources.version,
+                capture_sequence=preflight.captured.sequence,
+                captured_at_ns=preflight.captured.captured_at_ns,
+                base_ready_at_ns=preflight.base_ready_at_ns,
+                policy_epoch=self._publisher_policy.epoch,
+                segmentation_updated=preflight.segmentation_updated,
+                processing_deadline_missed=(
+                    preflight.frame_processing_ms > frame_interval_ms
+                ),
+                status=initial_stats,
+                performance_epoch=self._performance_epoch_tuple(
+                    performance.current_epoch_key
+                ),
+                privacy_slate=initial_privacy_slate,
+                privacy_reason=(
+                    resources.background_fallback_reason
+                    if initial_asset_slate
+                    else preflight.remote_fallback_reason or "no-client"
+                    if resources.cfg.background.mode == "remote"
+                    else ""
+                ),
+                matte_bundle_sequence=(
+                    None
+                    if initial_asset_slate or preflight.matte_evidence is None
+                    else preflight.matte_evidence.metadata.bundle_sequence
+                ),
+            )
+            # SafeBaseFrame owns its immutable pixels. Drop the preflight copy
+            # before the paced lane starts retaining current/pending bases.
+            retained_preflight_evidence = (
+                None if initial_asset_slate else preflight.matte_evidence
+            )
+            preflight = replace(preflight, output=None, matte_evidence=None)
+            with bridge.lock:
+                bridge.retain_base(
+                    0,
+                    PerformanceEpochKey(*base.performance_epoch),
+                    retained_preflight_evidence,
+                )
+                try:
+                    accepted = publisher.submit(base)
+                except BaseException:
+                    bridge.release_base(0)
+                    raise
+                if not accepted:
+                    bridge.release_base(0)
+                    raise OutputPublisherError("initial output base was rejected")
+            retained_preflight_evidence = None
+            publisher.wait_ready(5.0)
+            del base
+            performance.mark_ready()
+            # Pre-ready capture churn belongs to the startup epoch.  Begin the
+            # public steady-state sequence-gap accounting at the next accepted
+            # frame while retaining the preflight sequence only for duplicate
+            # rejection inside the processing loop.  The compatibility cadence
+            # tracker is deliberately *not* reset: ``frames_in`` remains the
+            # count of every unique base that reached the sink, including the
+            # startup base.  RuntimePerformanceTracker owns the separate
+            # pre-ready/steady-state split.
+            resources.capture_sequence_timeline = _CaptureSequenceTimeline()
+            self.hub.update_stats(runtime_performance=performance.snapshot())
+            self._startup_done.set()
             self._loop(
                 resources,
                 preflight=preflight,
                 cadence_tracker=cadence_tracker,
                 stage_ewma=stage_ewma,
+                publisher=publisher,
+                publisher_bridge=bridge,
             )
+            if publisher.error is not None:
+                raise OutputPublisherError(
+                    "output publisher failed"
+                ) from publisher.error
         except BaseException as exc:
             log.exception("pipeline crashed")
-            self._error = exc
+            if self._error is None:
+                self._error = exc
+            if self._runtime_performance is not None:
+                try:
+                    self._runtime_performance.mark_failed("pipeline-failed")
+                except Exception:
+                    pass
         finally:
             self._stop.set()
             with self._request_enqueue_lock:
@@ -2184,8 +3241,39 @@ class Pipeline:
                 )
             if resources is not None:
                 resources.close_capture()
+                if publisher is not None:
+                    publisher.request_stop()
+                    try:
+                        self._publish_publisher_state("stopping")
+                    except Exception:
+                        log.exception("cannot publish stopping output state")
+                    try:
+                        publisher.close(timeout=5.0)
+                    except OutputPublisherError as exc:
+                        if self._error is None:
+                            self._error = exc
+                        # A blocked/ambiguous sink call still owns the output
+                        # backend and may still invoke its acceptance callback.
+                        # Keep this pipeline worker, bridge, and resources alive
+                        # until that owner thread actually exits.  stop() stays
+                        # bounded by reporting this frame worker as a survivor,
+                        # and start() rejects a new run meanwhile.
+                        if publisher.is_alive:
+                            self._startup_done.set()
+                            while not publisher.wait_terminated(0.1):
+                                pass
+                    terminal_state = (
+                        "failed"
+                        if publisher.snapshot().state == "failed"
+                        else "stopped"
+                    )
+                    try:
+                        self._publish_publisher_state(terminal_state)
+                    except Exception:
+                        log.exception("cannot publish terminal output state")
                 self._publish_terminal_cadence(resources, cadence_tracker)
                 resources.close()
+            self._output_publisher = None
             if self._matte_recorder is not None:
                 self._matte_recorder.close()
             if self._matte_monitor is not None:
@@ -2300,6 +3388,11 @@ class Pipeline:
             ) != _color_state_key(current)
             if activation.replace_harmonizer:
                 activation.harmonizer = _new_color_harmonizer(candidate)
+            activation.reconfigure_harmonizer = (
+                not activation.replace_harmonizer
+                and _color_scalar_policy_key(candidate)
+                != _color_scalar_policy_key(current)
+            )
             activation.replace_light_wrap_stabilizer = _light_wrap_state_key(
                 candidate
             ) != _light_wrap_state_key(current)
@@ -2335,6 +3428,9 @@ class Pipeline:
             old_cfg
         )
         color_state_changed = _color_state_key(candidate) != _color_state_key(old_cfg)
+        color_scalar_policy_changed = _color_scalar_policy_key(
+            candidate
+        ) != _color_scalar_policy_key(old_cfg)
         light_wrap_state_changed = _light_wrap_state_key(
             candidate
         ) != _light_wrap_state_key(old_cfg)
@@ -2346,6 +3442,10 @@ class Pipeline:
             raise ActivationError("prepared visual-state candidate is stale")
         if color_state_changed != activation.replace_harmonizer:
             raise ActivationError("prepared color-state candidate is stale")
+        if (
+            color_scalar_policy_changed and not color_state_changed
+        ) != activation.reconfigure_harmonizer:
+            raise ActivationError("prepared color scalar-policy candidate is stale")
         if light_wrap_state_changed != activation.replace_light_wrap_stabilizer:
             raise ActivationError("prepared light-wrap-state candidate is stale")
         live_owner = resources.temporal_state_owner
@@ -2379,7 +3479,17 @@ class Pipeline:
             )
         if not background_changed:
             activation.backdrop = resources.backdrop
-        if not color_state_changed:
+        if activation.reconfigure_harmonizer:
+            if resources.harmonizer is None:
+                raise ActivationError("live color harmonizer is missing")
+            correction = candidate.compositing.color_correction
+            activation.harmonizer = resources.harmonizer.clone(
+                adaptation_time_s=correction.adaptation_time_s,
+            )
+            old_limit = old_cfg.compositing.color_correction.exposure_limit_ev
+            if correction.exposure_limit_ev < old_limit:
+                activation.harmonizer.clamp_exposure(correction.exposure_limit_ev)
+        elif not color_state_changed:
             activation.harmonizer = resources.harmonizer
         elif activation.harmonizer is None:
             raise ActivationError("prepared color harmonizer is missing")
@@ -2638,6 +3748,11 @@ class Pipeline:
             None,
         )
         old_backdrop = resources.backdrop
+        old_background_fallback_reason = getattr(
+            resources,
+            "background_fallback_reason",
+            "",
+        )
         old_harmonizer = getattr(resources, "harmonizer", None)
         old_light_wrap_stabilizer = getattr(
             resources,
@@ -2726,10 +3841,15 @@ class Pipeline:
                 )
             if activation.replace_backdrop:
                 resources.backdrop = activation.backdrop
-            if activation.replace_harmonizer:
+                # Candidate asset providers are constructed and exercised
+                # before this commit.  Replacing the unavailable persisted
+                # provider therefore clears the startup-only slate latch.
+                resources.background_fallback_reason = ""
+            if activation.replace_harmonizer or activation.reconfigure_harmonizer:
                 if activation.harmonizer is None:
                     raise ActivationError("staged color harmonizer is missing")
                 resources.harmonizer = activation.harmonizer
+            if activation.replace_harmonizer:
                 resources.color_reset_token = None
             if activation.replace_light_wrap_stabilizer:
                 resources.light_wrap_stabilizer = activation.light_wrap_stabilizer
@@ -2763,6 +3883,7 @@ class Pipeline:
             if old_temporal_state_owner is not None:
                 resources.temporal_state_owner = old_temporal_state_owner
             resources.backdrop = old_backdrop
+            resources.background_fallback_reason = old_background_fallback_reason
             resources.harmonizer = old_harmonizer
             resources.light_wrap_stabilizer = old_light_wrap_stabilizer
             resources.color_reset_token = old_color_reset_token
@@ -2830,6 +3951,8 @@ class Pipeline:
         resources: _Resources,
         request: _PatchRequest,
         trial_frame: CapturedFrame,
+        *,
+        publisher_bridge: _PublisherBridge | None = None,
     ) -> None:
         with request.lock:
             if request.cancelled:
@@ -2882,6 +4005,8 @@ class Pipeline:
 
         old_backdrop = old_segmenter = old_light_wrap_stabilizer = None
         old_cfg: AppConfig | None = None
+        old_publication_policy = self._publisher_policy
+        publication_fenced = False
         with request.lock:
             if request.cancelled:
                 self._schedule_discard_activation(activation)
@@ -2894,8 +4019,21 @@ class Pipeline:
                     nonlocal old_segmenter
                     nonlocal old_light_wrap_stabilizer
                     nonlocal old_cfg
+                    nonlocal publication_fenced
                     promotion_attempted = request.before_activate is not None
                     try:
+                        current_mode = resources.cfg.background.mode
+                        candidate_mode = request.candidate.background.mode
+                        if self._output_publisher is not None and (
+                            current_mode == "remote"
+                            or candidate_mode == "remote"
+                            or current_mode != candidate_mode
+                        ):
+                            self._publisher_policy_transition(
+                                candidate_mode,
+                                reason="config-transition",
+                            )
+                            publication_fenced = True
                         if request.before_activate is not None:
                             request.before_activate()
                         replaced_light_wrap_stabilizer = (
@@ -2908,6 +4046,14 @@ class Pipeline:
                         )
                         old_light_wrap_stabilizer = replaced_light_wrap_stabilizer
                     except BaseException:
+                        if publication_fenced and self._output_publisher is not None:
+                            self._output_publisher.fence_to_slate(
+                                old_publication_policy,
+                                reason="config-rollback",
+                                timeout=0.25,
+                            )
+                            self._publisher_policy = old_publication_policy
+                            publication_fenced = False
                         if (
                             promotion_attempted
                             and request.rollback_activate is not None
@@ -2922,6 +4068,13 @@ class Pipeline:
                     request.candidate, request.expected_version, activate
                 )
             except ConfigVersionConflictError as exc:
+                if publication_fenced and self._output_publisher is not None:
+                    self._output_publisher.fence_to_slate(
+                        old_publication_policy,
+                        reason="config-rollback",
+                        timeout=0.25,
+                    )
+                    self._publisher_policy = old_publication_policy
                 self._schedule_discard_activation(activation)
                 request.error = ConfigConflictError(
                     exc.expected_version, exc.current_version
@@ -2929,6 +4082,13 @@ class Pipeline:
                 if request.rollout_attempt is not None:
                     request.rollout_attempt.fail()
             except BaseException as exc:
+                if publication_fenced and self._output_publisher is not None:
+                    self._output_publisher.fence_to_slate(
+                        old_publication_policy,
+                        reason="config-rollback",
+                        timeout=0.25,
+                    )
+                    self._publisher_policy = old_publication_policy
                 self._schedule_discard_activation(activation)
                 request.error = exc
                 if request.rollout_attempt is not None:
@@ -2938,9 +4098,36 @@ class Pipeline:
                 # resources. Detach it before any best-effort side effect can
                 # fail and accidentally route it through candidate cleanup.
                 activation.mark_promoted()
+                if old_backdrop is not None:
+                    # The old provider is now quiescent but has not yet been
+                    # closed. Fold its final counters exactly once so the new
+                    # current-provider generation cannot erase run history.
+                    resources.retire_background_video_provider(old_backdrop)
                 request.result = committed
                 if request.rollout_attempt is not None:
                     request.rollout_attempt.succeed()
+                if publisher_bridge is not None:
+                    capture_health = (
+                        resources.capture.health_snapshot()
+                        if hasattr(resources.capture, "health_snapshot")
+                        else None
+                    )
+                    publisher_bridge.performance.bind_epoch(
+                        self._performance_epoch_key(resources, capture_health),
+                        color_correction_mode=(
+                            resources.cfg.compositing.color_correction.mode
+                        ),
+                        light_wrap=resources.cfg.compositing.light_wrap,
+                    )
+                    _log_finalized_performance_epochs(publisher_bridge.performance)
+                    committed_status = self._identity_stats(
+                        resources,
+                        capture_health=capture_health,
+                    )
+                    with publisher_bridge.lock:
+                        publisher_bridge.committed_status = _committed_output_status(
+                            committed_status
+                        )
                 if old_cfg is not None:
                     try:
                         self._post_install_activation(resources, old_cfg)
@@ -3074,12 +4261,17 @@ class Pipeline:
         )
         segmentation_fallback = bool(segmentation_selection["fallback_active"])
         segmentation_fallback_reason = str(segmentation_selection["fallback_reason"])
+        background_fallback_reason = resources.background_fallback_reason
+        background_fallback_active = bool(background_fallback_reason)
         video_stats = (
             resources.backdrop.stats_dict()
             if resources.backdrop is not None
             and hasattr(resources.backdrop, "stats_dict")
             else dict(_VIDEO_STATS_DEFAULTS)
         )
+        if not isinstance(video_stats, Mapping):
+            video_stats = dict(_VIDEO_STATS_DEFAULTS)
+        video_lifetime_stats = resources.background_video_lifetime_stats(video_stats)
         camera_geometry = _camera_plan_stats(
             cfg,
             resources.canvas_size,
@@ -3098,7 +4290,12 @@ class Pipeline:
                 if resources.harmonizer is not None
                 else None
             )
-            color_status = _color_stats(cfg, snapshot)
+            color_status = _color_stats(
+                cfg,
+                snapshot,
+                exposure_clamped=resources.color_correction_exposure_clamped,
+                white_balance_clamped=resources.color_correction_wb_clamped,
+            )
         self._log_color_transition(resources, color_status)
         self._log_fallback_transition(
             "output",
@@ -3109,6 +4306,11 @@ class Pipeline:
             "segmentation",
             segmentation_fallback,
             segmentation_fallback_reason,
+        )
+        self._log_fallback_transition(
+            "background",
+            background_fallback_active,
+            background_fallback_reason,
         )
         policy_snapshot = self._matte_policy_snapshot(resources)
         effective_controls = self._effective_matte_controls(
@@ -3245,6 +4447,8 @@ class Pipeline:
             "remote_fallback_mode": (
                 "privacy-slate" if cfg.background.mode == "remote" else ""
             ),
+            "background_fallback_active": background_fallback_active,
+            "background_fallback_reason": background_fallback_reason,
             "background_geometry_transitions": (
                 resources.background_geometry_transitions
             ),
@@ -3256,9 +4460,25 @@ class Pipeline:
             ),
             "color_correction_scene_cuts": resources.color_correction_scene_cuts,
             "color_correction_transitions": resources.color_correction_transitions,
+            "color_correction_reason_transitions": (
+                resources.color_correction_reason_transitions
+            ),
+            "color_correction_exposure_clamp_count": (
+                resources.color_correction_exposure_clamp_count
+            ),
+            "color_correction_exposure_clamp_time_s": (
+                resources.color_correction_exposure_clamp_time_s
+            ),
+            "color_correction_wb_clamp_count": (
+                resources.color_correction_wb_clamp_count
+            ),
+            "color_correction_wb_clamp_time_s": (
+                resources.color_correction_wb_clamp_time_s
+            ),
             "config_version": resources.version,
             **_acceleration_stats(resources.segmenter),
             **video_stats,
+            **video_lifetime_stats,
             **camera_geometry,
             **background_geometry,
             **color_status,
@@ -3328,6 +4548,39 @@ class Pipeline:
                 camera["camera_pad_right"],
                 camera["camera_pad_bottom"],
             )
+            delivered_width = int(getattr(capture_health, "delivered_width", 0) or 0)
+            delivered_height = int(getattr(capture_health, "delivered_height", 0) or 0)
+            oriented_width = int(getattr(capture_health, "oriented_width", 0) or 0)
+            oriented_height = int(getattr(capture_health, "oriented_height", 0) or 0)
+            negotiation_mismatch = bool(
+                delivered_width > 0
+                and delivered_height > 0
+                and (
+                    delivered_width != resources.cfg.camera.width
+                    or delivered_height != resources.cfg.camera.height
+                )
+            )
+            aspect_distortion = 0.0
+            if (
+                resources.cfg.camera.fit_mode == "stretch"
+                and oriented_width > 0
+                and oriented_height > 0
+            ):
+                source_aspect = oriented_width / oriented_height
+                target_aspect = resources.canvas_size[0] / resources.canvas_size[1]
+                aspect_distortion = abs(source_aspect / target_aspect - 1.0)
+            if negotiation_mismatch or aspect_distortion > 0.01:
+                log.warning(
+                    "camera geometry mismatch negotiation=%s "
+                    "delivered=%dx%d requested=%dx%d "
+                    "stretch_aspect_distortion_pct=%.3f",
+                    negotiation_mismatch,
+                    delivered_width,
+                    delivered_height,
+                    resources.cfg.camera.width,
+                    resources.cfg.camera.height,
+                    aspect_distortion * 100.0,
+                )
 
         effective_mode = (
             resources.cfg.background.remote_fallback_mode
@@ -3374,34 +4627,59 @@ class Pipeline:
         self,
         resources: _Resources,
         status: dict[str, object],
+        *,
+        now_s: float | None = None,
     ) -> None:
-        """Log only first correction state and meaningful later transitions."""
+        """Log phase immediately and debounce estimator-reason chatter."""
 
-        state = (
+        phase_state = (
             status["color_correction_mode"],
             status["color_correction_active"],
             status["color_correction_effective_mode"],
             status["color_correction_state"],
-            status["color_correction_reason"],
         )
-        if self._color_log_state == state:
-            return
-        self._color_log_state = state
-        resources.color_correction_transitions += 1
-        log.info(
-            "color correction state=%s configured=%s effective=%s active=%s "
-            "reason=%s confidence=%.3f exposure_ev=%+.3f wb=%.4f,%.4f,%.4f",
-            status["color_correction_state"],
-            status["color_correction_mode"],
-            status["color_correction_effective_mode"],
-            status["color_correction_active"],
-            status["color_correction_reason"],
-            status["color_correction_confidence"],
-            status["color_correction_exposure_ev"],
-            status["color_correction_wb_gain_r"],
-            status["color_correction_wb_gain_g"],
-            status["color_correction_wb_gain_b"],
-        )
+        if self._color_phase_log_state != phase_state:
+            self._color_phase_log_state = phase_state
+            resources.color_correction_transitions += 1
+            log.info(
+                "color correction phase state=%s configured=%s effective=%s "
+                "active=%s exposure_ev=%+.3f wb=%.4f,%.4f,%.4f",
+                status["color_correction_state"],
+                status["color_correction_mode"],
+                status["color_correction_effective_mode"],
+                status["color_correction_active"],
+                status["color_correction_exposure_ev"],
+                status["color_correction_wb_gain_r"],
+                status["color_correction_wb_gain_g"],
+                status["color_correction_wb_gain_b"],
+            )
+
+        observed = time.monotonic() if now_s is None else float(now_s)
+        if not math.isfinite(observed):
+            raise ValueError("color log observation time must be finite")
+        reason = str(status["color_correction_reason"])
+        if self._color_reason_log_state is None:
+            emit_reason = True
+        elif reason == self._color_reason_log_state:
+            self._color_reason_log_candidate = None
+            emit_reason = False
+        else:
+            candidate = self._color_reason_log_candidate
+            if candidate is None or candidate[0] != reason:
+                self._color_reason_log_candidate = (reason, observed)
+                emit_reason = False
+            else:
+                emit_reason = observed - candidate[1] >= _COLOR_REASON_DEBOUNCE_S
+
+        if emit_reason:
+            self._color_reason_log_state = reason
+            self._color_reason_log_candidate = None
+            resources.color_correction_reason_transitions += 1
+            log.info(
+                "color correction estimator reason=%s confidence=%.3f",
+                reason,
+                status["color_correction_confidence"],
+            )
 
     @staticmethod
     def _record_color_output(
@@ -3409,6 +4687,7 @@ class Pipeline:
         status: dict[str, object],
         *,
         processed: bool,
+        observed_at_s: float | None = None,
     ) -> None:
         if status["color_correction_active"]:
             resources.color_correction_applied_frames += 1
@@ -3416,6 +4695,32 @@ class Pipeline:
             resources.color_correction_bypassed_frames += 1
         if processed and status["color_correction_state"] == "scene-cut":
             resources.color_correction_scene_cuts += 1
+        if not processed:
+            return
+
+        observed = time.monotonic() if observed_at_s is None else float(observed_at_s)
+        if not math.isfinite(observed):
+            raise ValueError("color observation time must be finite")
+        previous_observed = resources._color_correction_last_unique_at_s
+        if previous_observed is not None:
+            # Accumulate a hold-last interval only at unique-frame boundaries;
+            # exact repeated output must never inflate clamp duration.
+            observed = max(observed, previous_observed)
+            elapsed = observed - previous_observed
+            if resources.color_correction_exposure_clamped:
+                resources.color_correction_exposure_clamp_time_s += elapsed
+            if resources.color_correction_wb_clamped:
+                resources.color_correction_wb_clamp_time_s += elapsed
+
+        exposure_clamped = status.get("color_correction_exposure_clamped") is True
+        white_balance_clamped = status.get("color_correction_wb_clamped") is True
+        resources.color_correction_exposure_clamped = exposure_clamped
+        resources.color_correction_wb_clamped = white_balance_clamped
+        if exposure_clamped:
+            resources.color_correction_exposure_clamp_count += 1
+        if white_balance_clamped:
+            resources.color_correction_wb_clamp_count += 1
+        resources._color_correction_last_unique_at_s = observed
 
     def _log_fallback_transition(self, kind: str, active: bool, reason: str) -> None:
         """Emit one record only when a fallback state or reason changes."""
@@ -3710,6 +5015,30 @@ class Pipeline:
         if backend_recovered:
             resources.segmentation_timeline.record_reset(
                 TemporalResetReason.BACKEND_RECOVERY
+            )
+        applied_reset = (
+            TemporalResetReason.BACKEND_RECOVERY
+            if backend_recovered
+            else boundary.reset_reason
+        )
+        if applied_reset is not None:
+            elapsed_gap_ms = (
+                "none"
+                if boundary.elapsed_ns is None
+                else f"{max(0.0, boundary.elapsed_ns / 1_000_000.0):.3f}"
+            )
+            log.info(
+                "matte temporal reset reason=%s sequence_gap=%d "
+                "elapsed_gap_ms=%s capture_generation=%d "
+                "geometry_generation=%d segmentation_generation=%d "
+                "config_version=%d",
+                applied_reset.value,
+                boundary.sequence_gap,
+                elapsed_gap_ms,
+                context.generation,
+                context.geometry_generation,
+                resources.segmentation_generation,
+                resources.version,
             )
         return result
 
@@ -4013,6 +5342,28 @@ class Pipeline:
         self.hub.invalidate_remote_session(session)
         self._privacy_invalidated_session = session
 
+    def _publish_remote_raw_frame(self, frame: np.ndarray, raw_epoch: int) -> bool:
+        """Atomically admit and expose raw pixels to the exclusive renderer."""
+
+        admitted_session = 0
+
+        def admit(session: int) -> bool:
+            nonlocal admitted_session
+            admitted_session = session
+            if self._remember_raw_frame(frame):
+                return True
+            self._privacy_invalidated_session = session
+            return False
+
+        published = self.hub.publish_remote_raw(
+            frame,
+            raw_epoch,
+            admit=admit,
+        )
+        if not published and admitted_session > 0:
+            self.hub.invalidate_remote_session(admitted_session)
+        return published
+
     @staticmethod
     def _lowres_raw_similarity(
         candidate: np.ndarray,
@@ -4146,11 +5497,11 @@ class Pipeline:
         edge_pair_ready = edge_foreground is None or edge_linear is not None
         if compositing.blend_space == "linear_srgb":
             if foreground_linear is None:
-                foreground_linear = bgr_u8_to_linear_rgb(frame)
+                foreground_linear = bgr_u8_to_linear_bgr(frame)
             if backdrop_linear is None:
-                backdrop_linear = bgr_u8_to_linear_rgb(backdrop_frame)
+                backdrop_linear = bgr_u8_to_linear_bgr(backdrop_frame)
             if edge_foreground is not None and edge_linear is None:
-                edge_linear = bgr_u8_to_linear_rgb(edge_foreground)
+                edge_linear = bgr_u8_to_linear_bgr(edge_foreground)
             return composite_linear_predecoded(
                 frame,
                 backdrop_frame,
@@ -4173,16 +5524,10 @@ class Pipeline:
                 frame,
                 backdrop_frame,
                 mask,
-                foreground_linear_rgb=np.ascontiguousarray(
-                    foreground_linear[..., ::-1]
-                ),
+                foreground_linear_bgr=foreground_linear,
                 light_wrap=light_wrap,
                 edge_foreground_bgr=edge_foreground,
-                edge_foreground_linear_rgb=(
-                    None
-                    if edge_linear is None
-                    else np.ascontiguousarray(edge_linear[..., ::-1])
-                ),
+                edge_foreground_linear_bgr=edge_linear,
                 color_transform=prepared.transform,
                 prepared_light_wrap=prepared_light_wrap,
                 workspace=legacy_workspace,
@@ -4242,6 +5587,8 @@ class Pipeline:
         source_generation: int | None = None
         pending_reset_token: tuple[object, ...] | None = None
         reset_required = False
+        exposure_clamped = False
+        white_balance_clamped = False
         try:
             foreground_content_rect: tuple[int, int, int, int] | None = None
             backdrop_content_rect: Any = None
@@ -4278,15 +5625,15 @@ class Pipeline:
                 )
                 reset_required = pending_reset_token != resources.color_reset_token
 
-            foreground_linear_bgr = bgr_u8_to_linear_rgb(frame)
-            backdrop_linear_bgr = bgr_u8_to_linear_rgb(backdrop_frame)
+            foreground_linear_bgr = bgr_u8_to_linear_bgr(frame)
+            backdrop_linear_bgr = bgr_u8_to_linear_bgr(backdrop_frame)
             if cfg is None and harmonizer is None and track_live_state:
                 backdrop_analysis_linear_bgr = resources.image_backdrop_analysis(
                     backdrop_frame,
                     backdrop_linear_bgr,
                 )
             if edge_foreground is not None:
-                edge_linear_bgr = bgr_u8_to_linear_rgb(edge_foreground)
+                edge_linear_bgr = bgr_u8_to_linear_bgr(edge_foreground)
             estimate = estimate_color_transform_linear(
                 foreground_linear_bgr,
                 backdrop_linear_bgr,
@@ -4313,6 +5660,10 @@ class Pipeline:
                     now_s,
                     source_generation=source_generation,
                 )
+            exposure_clamped = getattr(estimate, "exposure_clamped", False) is True
+            white_balance_clamped = (
+                getattr(estimate, "white_balance_clamped", False) is True
+            )
             if track_live_state:
                 self._log_fallback_transition(
                     "color-correction",
@@ -4346,9 +5697,16 @@ class Pipeline:
             backdrop_linear_bgr=backdrop_linear_bgr,
             edge_foreground_linear_bgr=edge_linear_bgr,
             snapshot=active_harmonizer.snapshot(),
+            exposure_clamped=exposure_clamped,
+            white_balance_clamped=white_balance_clamped,
         )
 
-    def _preflight(self, resources: _Resources) -> _PreflightResult:
+    def _preflight(
+        self,
+        resources: _Resources,
+        *,
+        send_output: bool = True,
+    ) -> _PreflightResult:
         """Read and process a real frame before reporting startup readiness."""
         accepted_started_ns = time.monotonic_ns()
         camera_wait = (
@@ -4387,6 +5745,11 @@ class Pipeline:
         privacy_reason = ""
         color_outcome: dict[str, object] = {}
         timings: dict[str, float] = {
+            **(
+                {"capture_read_ms": captured.read_ms}
+                if captured.read_ms is not None
+                else {}
+            ),
             "segmentation_ms": 0.0,
             "background_ms": 0.0,
             "color_correction_ms": 0.0,
@@ -4410,7 +5773,6 @@ class Pipeline:
                     privacy_safe=False,
                 )
             if remote_mode:
-                self._record_remote_raw_frame(frame)
                 # Exercise the configured fallback without publishing it. A
                 # remote startup probes the real output backend only with the
                 # fixed slate, never with a camera-derived composite.
@@ -4461,13 +5823,25 @@ class Pipeline:
             time.monotonic_ns() - guard_started_ns
         ) / 1_000_000.0
         base_ready_at_ns = time.monotonic_ns()
-        send_started = time.monotonic_ns()
-        send_timing = _send_output_with_timing(
-            resources.output,
-            out,
-            copy_frame=remote_mode,
-        )
-        output_send_ms = (send_timing.completed_at_ns - send_started) / 1_000_000.0
+        if send_output:
+            send_started = time.monotonic_ns()
+            send_timing = _send_output_with_timing(
+                resources.output,
+                out,
+                copy_frame=remote_mode,
+            )
+            output_send_ms = (send_timing.completed_at_ns - send_started) / 1_000_000.0
+        else:
+            # Production publication is owned by OutputPublisher.  Preserve the
+            # preflight result shape for focused synchronous callers without
+            # pretending the compute lane submitted a frame.
+            send_timing = OutputSendTiming(
+                submitted_at_ns=base_ready_at_ns,
+                completed_at_ns=base_ready_at_ns,
+                submission_ms=0.0,
+                pacing_wait_ms=0.0,
+            )
+            output_send_ms = 0.0
         new_frame_service_ms = (
             send_timing.submitted_at_ns - accepted_started_ns
         ) / 1_000_000.0
@@ -4499,7 +5873,7 @@ class Pipeline:
             rss_bytes = process_rss_bytes()
             if rss_bytes is not None:
                 matte_evidence.resource_samples["rss_bytes"] = rss_bytes
-        if self._submit_matte_evidence(matte_evidence, out):
+        if send_output and self._submit_matte_evidence(matte_evidence, out):
             assert matte_evidence is not None
             self._matte_last_source_sequence = matte_evidence.metadata.bundle_sequence
             recorder = self._matte_recorder
@@ -4517,9 +5891,22 @@ class Pipeline:
                 else None
             )
             color_outcome.update(_color_stats(resources.cfg, snapshot))
-        self._record_color_output(resources, color_outcome, processed=True)
+        self._record_color_output(
+            resources,
+            color_outcome,
+            processed=True,
+            observed_at_s=captured.captured_at_ns / 1_000_000_000.0,
+        )
         if privacy_reason:
             log.warning("remote privacy fallback active reason=%s", privacy_reason)
+        resources.background_startup_asset_guard = False
+        background_fallback_reason = getattr(
+            resources,
+            "background_fallback_reason",
+            "",
+        )
+        if background_fallback_reason:
+            matte_evidence = None
         return _PreflightResult(
             output=out,
             captured=captured,
@@ -4549,6 +5936,19 @@ class Pipeline:
     ) -> tuple[np.ndarray, str]:
         cfg = resources.cfg
         backdrop = resources.backdrop
+        background_fallback_reason = getattr(
+            resources,
+            "background_fallback_reason",
+            "",
+        )
+        if background_fallback_reason:
+            # Persisted image/video activation failed before any camera pixels
+            # were eligible for composition.  Keep this path input-independent
+            # until a valid transactional background replacement commits.
+            return (
+                self._privacy_slate(resources.canvas_shape),
+                background_fallback_reason,
+            )
         if privacy_safe and isinstance(resources.segmenter, NullSegmenter):
             return self._emergency_blur(frame), "segmentation-none"
 
@@ -4606,10 +6006,38 @@ class Pipeline:
                 if privacy_safe:
                     return self._emergency_blur(frame), "local-failure"
                 return frame, ""
-            bg = backdrop.frame(
-                resources.canvas_size[0],
-                resources.canvas_size[1],
-            )
+            try:
+                bg = backdrop.frame(
+                    resources.canvas_size[0],
+                    resources.canvas_size[1],
+                )
+            except (OSError, RuntimeError, ValueError):
+                effective_mode = (
+                    cfg.background.remote_fallback_mode
+                    if cfg.background.mode == "remote"
+                    else cfg.background.mode
+                )
+                if not (
+                    resources.background_startup_asset_guard
+                    and effective_mode in {"image", "video"}
+                ):
+                    raise
+                # Some video containers open successfully but cannot decode a
+                # first frame.  Treat only this startup provider boundary as
+                # asset unavailability; unrelated segmentation/compositor
+                # exceptions retain their existing fail-fast behavior.
+                resources.retire_background_video_provider(backdrop)
+                resources.backdrop = None
+                resources.background_fallback_reason = "asset-unavailable"
+                _safe_close(backdrop, "unavailable startup backdrop")
+                if timings is not None:
+                    timings["background_ms"] = (
+                        time.monotonic_ns() - started
+                    ) / 1_000_000.0
+                return (
+                    self._privacy_slate(resources.canvas_shape),
+                    resources.background_fallback_reason,
+                )
             self._validate_canvas_frame(
                 bg,
                 resources.canvas_size,
@@ -4664,7 +6092,7 @@ class Pipeline:
             compositor_diagnostics = (
                 matte_evidence.compositor_substages_ms
                 if matte_evidence is not None
-                else None
+                else {name: 0.0 for name in COMPOSITOR_SUBSTAGE_NAMES}
             )
             blend_started_ns: int | None = None
             next_light_wrap_stabilizer: LightWrapStabilizer | None = None
@@ -4698,7 +6126,7 @@ class Pipeline:
                             cfg.compositing.blend_space == "linear_srgb"
                             and backdrop_linear is None
                         ):
-                            backdrop_linear = bgr_u8_to_linear_rgb(bg)
+                            backdrop_linear = bgr_u8_to_linear_bgr(bg)
                             prepared_color = _PreparedColorFrame(
                                 transform=prepared_color.transform,
                                 foreground_linear_bgr=(
@@ -4709,6 +6137,10 @@ class Pipeline:
                                     prepared_color.edge_foreground_linear_bgr
                                 ),
                                 snapshot=prepared_color.snapshot,
+                                exposure_clamped=prepared_color.exposure_clamped,
+                                white_balance_clamped=(
+                                    prepared_color.white_balance_clamped
+                                ),
                             )
                         prepared_light_wrap = prepare_light_wrap(
                             bg,
@@ -4722,6 +6154,36 @@ class Pipeline:
                             ),
                             diagnostics=compositor_diagnostics,
                         )
+                elif matte_policy.effective.light_wrap > 0.0 and isinstance(
+                    resources, _Resources
+                ):
+                    backdrop_linear = prepared_color.backdrop_linear_bgr
+                    if (
+                        cfg.compositing.blend_space == "linear_srgb"
+                        and backdrop_linear is None
+                    ):
+                        backdrop_linear = bgr_u8_to_linear_bgr(bg)
+                        prepared_color = _PreparedColorFrame(
+                            transform=prepared_color.transform,
+                            foreground_linear_bgr=(
+                                prepared_color.foreground_linear_bgr
+                            ),
+                            backdrop_linear_bgr=backdrop_linear,
+                            edge_foreground_linear_bgr=(
+                                prepared_color.edge_foreground_linear_bgr
+                            ),
+                            snapshot=prepared_color.snapshot,
+                            exposure_clamped=prepared_color.exposure_clamped,
+                            white_balance_clamped=(
+                                prepared_color.white_balance_clamped
+                            ),
+                        )
+                    prepared_light_wrap = resources.static_light_wrap_sample(
+                        bg,
+                        blend_space=cfg.compositing.blend_space,
+                        backdrop_linear_bgr=backdrop_linear,
+                        diagnostics=compositor_diagnostics,
+                    )
                 if timings is not None:
                     timings["composite_prepare_ms"] = (
                         time.monotonic_ns() - prepare_started_ns
@@ -4760,6 +6222,12 @@ class Pipeline:
                             time.monotonic_ns() - prepare_started_ns
                         ) / 1_000_000.0
                     blend_started_ns = time.monotonic_ns()
+                fallback_prepared_light_wrap = (
+                    prepared_light_wrap
+                    if prepared_light_wrap is not None
+                    and not prepared_light_wrap.stabilized
+                    else None
+                )
                 rendered = composite(
                     frame,
                     bg,
@@ -4768,10 +6236,11 @@ class Pipeline:
                     edge_foreground=edge_fg,
                     blend_space=cfg.compositing.blend_space,
                     color_transform=IDENTITY_TRANSFORM,
-                    prepared_light_wrap=None,
+                    prepared_light_wrap=fallback_prepared_light_wrap,
                     workspace=legacy_workspace,
                     diagnostics=compositor_diagnostics,
                 )
+                diagnostic_prepared_light_wrap = fallback_prepared_light_wrap
                 if color_outcome is not None:
                     color_outcome.update(
                         _color_stats(
@@ -4779,6 +6248,10 @@ class Pipeline:
                             prepared_color.snapshot,
                             applied_transform=IDENTITY_TRANSFORM,
                             application_failed=True,
+                            exposure_clamped=prepared_color.exposure_clamped,
+                            white_balance_clamped=(
+                                prepared_color.white_balance_clamped
+                            ),
                         )
                     )
             else:
@@ -4788,6 +6261,10 @@ class Pipeline:
                             cfg,
                             prepared_color.snapshot,
                             applied_transform=prepared_color.transform,
+                            exposure_clamped=prepared_color.exposure_clamped,
+                            white_balance_clamped=(
+                                prepared_color.white_balance_clamped
+                            ),
                         )
                     )
             if timings is not None:
@@ -4809,6 +6286,10 @@ class Pipeline:
                 timings["composite_ms"] = (
                     time.monotonic_ns() - composite_started_ns
                 ) / 1_000_000.0
+            resources.last_compositor_substages_ms = {
+                name: float(compositor_diagnostics.get(name, 0.0))
+                for name in COMPOSITOR_SUBSTAGE_NAMES
+            }
             if matte_evidence is not None and not privacy_safe:
                 matte_evidence.raw_mask = raw_mask
                 matte_evidence.refined_mask = mask
@@ -4879,6 +6360,8 @@ class Pipeline:
         preflight: _PreflightResult | None = None,
         cadence_tracker: CadenceTracker | None = None,
         stage_ewma: dict[str, float | None] | None = None,
+        publisher: OutputPublisher | None = None,
+        publisher_bridge: _PublisherBridge | None = None,
     ) -> None:
         frame_interval_ns = round(1_000_000_000 / resources.cfg.output.fps)
         frame_interval_ms = frame_interval_ns / 1_000_000.0
@@ -4912,7 +6395,9 @@ class Pipeline:
         )
         remote_used = 0
         fallback_count = 1 if initial_remote_slate else 0
-        last_output = None if preflight is None else preflight.output
+        last_output = (
+            preflight.output if preflight is not None and publisher is None else None
+        )
         fallback_active = initial_remote_slate
         fallback_reason = "startup-slate" if initial_remote_slate else ""
         last_capture_sequence = (
@@ -4943,12 +6428,33 @@ class Pipeline:
             if preflight is None
             else next_cycle_start_ns
         )
+        next_base_id = 1
+        remote_pending_capture = (
+            preflight.captured
+            if preflight is not None and resources.cfg.background.mode == "remote"
+            else None
+        )
+        remote_pending_raw_epoch = (
+            self._publisher_raw_epoch if remote_pending_capture is not None else 0
+        )
+        remote_pending_config_version = (
+            resources.version if remote_pending_capture is not None else -1
+        )
+        remote_pending_renderer_session = (
+            self._publisher_policy.renderer_session
+            if remote_pending_capture is not None
+            else -1
+        )
+        remote_pending_started_ns = (
+            time.monotonic_ns() if remote_pending_capture is not None else 0
+        )
+        remote_submitted_response_ns = 0
 
         while not self._stop.is_set():
             serialized_started_ns = time.monotonic_ns()
             application_pacing_wait_ms = 0.0
             application_pacing_events = 0
-            if not resources.output.paces:
+            if publisher is not None or not resources.output.paces:
                 pacing_started_ns = time.monotonic_ns()
                 remaining_ns = next_cycle_start_ns - pacing_started_ns
                 if remaining_ns > 0:
@@ -4977,7 +6483,16 @@ class Pipeline:
             frame = captured.pixels if captured is not None else None
             matte_evidence: MatteFrameEvidence | None = None
             used_remote_candidate = False
+            remote_proof: RemoteOutputProof | None = None
+            remote_probe: tuple[np.ndarray | None, str, int, int, int] | None = None
+            resolved_remote_raw_epoch = 0
+            remote_candidate_published_ns = 0
             timings = {
+                **(
+                    {"capture_read_ms": captured.read_ms}
+                    if captured is not None and captured.read_ms is not None
+                    else {}
+                ),
                 "segmentation_ms": 0.0,
                 "background_ms": 0.0,
                 "color_correction_ms": 0.0,
@@ -4997,6 +6512,12 @@ class Pipeline:
             if processed:
                 assert frame is not None
                 assert captured is not None
+                # Substage telemetry is frame-local. Modes that bypass the
+                # compositor report measured-inapplicable zeros instead of
+                # inheriting an image/video sample from the prior epoch.
+                resources.last_compositor_substages_ms = {
+                    name: 0.0 for name in COMPOSITOR_SUBSTAGE_NAMES
+                }
                 frame = self._validate_canvas_frame(
                     frame,
                     resources.canvas_size,
@@ -5004,7 +6525,8 @@ class Pipeline:
                 )
                 resources.capture_sequence_timeline.observe(captured.sequence)
                 last_capture_sequence = captured.sequence
-                self.hub.publish_raw(frame)
+                if publisher is None:
+                    self.hub.publish_raw(frame)
                 segmentation_sequence_before = (
                     resources.segmentation_timeline.snapshot().last_sequence
                 )
@@ -5017,13 +6539,118 @@ class Pipeline:
                     request = None
                 if request is not None:
                     if isinstance(request, _PatchRequest):
-                        self._handle_patch_request(resources, request, captured)
+                        self._handle_patch_request(
+                            resources,
+                            request,
+                            captured,
+                            publisher_bridge=publisher_bridge,
+                        )
                     else:
                         self._handle_mutation_request(resources, request)
 
-                matte_evidence = self._new_matte_evidence(
-                    resources,
-                    captured,
+                mode = resources.cfg.background.mode
+                if publisher is not None and mode == "remote":
+                    if publisher_bridge is None:  # pragma: no cover - invariant
+                        raise RuntimeError("publisher bridge is missing")
+                    with publisher_bridge.lock:
+                        publisher_resolved_epoch = (
+                            publisher_bridge.resolved_remote_raw_epoch
+                        )
+                    now_ns = time.monotonic_ns()
+                    remote_timeout_ns = resources.cfg.api.remote_timeout_ms * 1_000_000
+                    raw_timed_out = bool(
+                        remote_pending_capture is not None
+                        and now_ns - remote_pending_started_ns > remote_timeout_ns
+                    )
+                    needs_new_raw = bool(
+                        remote_pending_capture is None
+                        or remote_pending_config_version != resources.version
+                        or remote_pending_renderer_session
+                        != self._publisher_policy.renderer_session
+                        or publisher_resolved_epoch >= remote_pending_raw_epoch
+                        or raw_timed_out
+                    )
+                    if needs_new_raw:
+                        self._publisher_raw_epoch += 1
+                        self._publisher_policy_transition(
+                            "remote",
+                            reason="awaiting-renderer",
+                            raw_epoch=self._publisher_raw_epoch,
+                        )
+                        raw_published = self._publish_remote_raw_frame(
+                            frame,
+                            self._publisher_raw_epoch,
+                        )
+                        remote_pending_capture = captured if raw_published else None
+                        remote_pending_raw_epoch = (
+                            self._publisher_raw_epoch if raw_published else 0
+                        )
+                        remote_pending_config_version = (
+                            resources.version if raw_published else -1
+                        )
+                        remote_pending_renderer_session = (
+                            self._publisher_policy.renderer_session
+                            if raw_published
+                            else -1
+                        )
+                        remote_pending_started_ns = now_ns if raw_published else 0
+                        remote_submitted_response_ns = 0
+                        # The publisher already emits its fixed slate after the
+                        # fence. Do not manufacture a processed "unique" base
+                        # before a response for this exact raw epoch exists.
+                        next_cycle_start_ns = service_started_ns + frame_interval_ns
+                        continue
+
+                    proof_reader = getattr(
+                        self.hub,
+                        "remote_frame_proof_status",
+                        None,
+                    )
+                    if callable(proof_reader):
+                        typed_probe_reader = cast(
+                            Callable[
+                                [float],
+                                tuple[np.ndarray | None, str, int, int, int],
+                            ],
+                            proof_reader,
+                        )
+                        remote_probe = typed_probe_reader(
+                            resources.cfg.api.remote_timeout_ms / 1000.0
+                        )
+                    else:
+                        probe_frame, probe_reason = self.hub.remote_frame_status(
+                            max_age_s=resources.cfg.api.remote_timeout_ms / 1000.0
+                        )
+                        remote_probe = (probe_frame, probe_reason, 0, 0, 0)
+                    if remote_probe[0] is None and remote_probe[4] == 0:
+                        next_cycle_start_ns = service_started_ns + frame_interval_ns
+                        continue
+                    if (
+                        remote_probe[4] > 0
+                        and remote_probe[4] == remote_submitted_response_ns
+                    ):
+                        # This exact response already has one immutable base in
+                        # the handoff/publication lane. Do not manufacture a
+                        # second unique base with the same capture provenance
+                        # while waiting for its first-send receipt.
+                        next_cycle_start_ns = service_started_ns + frame_interval_ns
+                        continue
+                    assert remote_pending_capture is not None
+                    captured = remote_pending_capture
+                    frame = captured.pixels
+                elif publisher is not None:
+                    self.hub.publish_raw(frame)
+                    remote_pending_capture = None
+                    remote_pending_raw_epoch = 0
+                    remote_pending_config_version = -1
+                    remote_pending_renderer_session = -1
+                    remote_pending_started_ns = 0
+                    remote_submitted_response_ns = 0
+
+                matte_evidence = (
+                    None
+                    if mode == "remote"
+                    else self._new_matte_evidence(resources, captured)
                 )
                 process_started = time.monotonic_ns()
                 cfg = resources.cfg
@@ -5031,15 +6658,16 @@ class Pipeline:
                 color_outcome: dict[str, object] = {}
                 fallback_active = False
                 fallback_reason = ""
-                if mode == "remote":
-                    self._record_remote_raw_frame(frame)
-                else:
+                if mode != "remote":
                     self._latest_raw_frame = frame.copy()
 
                 if mode == "remote":
-                    remote, fallback_reason = self.hub.remote_frame_status(
-                        max_age_s=cfg.api.remote_timeout_ms / 1000.0
-                    )
+                    if remote_probe is not None:
+                        remote, fallback_reason = remote_probe[:2]
+                    else:
+                        remote, fallback_reason = self.hub.remote_frame_status(
+                            max_age_s=cfg.api.remote_timeout_ms / 1000.0
+                        )
                     if remote is not None:
                         if (
                             remote.dtype != np.uint8
@@ -5062,6 +6690,9 @@ class Pipeline:
                         # fails closed to the input-independent slate.
                         out_frame = self._privacy_slate(frame.shape)
                         fallback_active = True
+                elif resources.background_fallback_reason:
+                    out_frame = self._privacy_slate(resources.canvas_shape)
+                    matte_evidence = None
                 elif mode == "passthrough" or resources.backdrop is None:
                     out_frame = frame
                 else:
@@ -5101,8 +6732,14 @@ class Pipeline:
                     ("frame_processing_ms", frame_processing_ms),
                 )
                 for name, sample in samples:
-                    stage_ewma[name] = _ewma(stage_ewma[name], sample)
+                    stage_ewma[name] = _ewma(stage_ewma.get(name), sample)
             else:
+                if publisher is not None:
+                    # The publication lane owns exact target-paced reuse.  A
+                    # missing capture must never re-enter segmentation,
+                    # backdrop, colour, matte, or harmonizer state.
+                    self._stop.wait(min(0.002, frame_interval_ms / 1000.0))
+                    continue
                 if last_output is None:
                     self._stop.wait(min(0.01, frame_interval_ms / 1000.0))
                     continue
@@ -5128,8 +6765,10 @@ class Pipeline:
             # input cannot resurrect an unsafe pre-gate candidate.
             self._validate_output_frame(out_frame, resources.canvas_size)
             base_ready_at_ns = time.monotonic_ns() if processed else None
-            exact_final_repeat = last_output is not None and np.array_equal(
-                out_frame, last_output
+            exact_final_repeat = bool(
+                publisher is None
+                and last_output is not None
+                and np.array_equal(out_frame, last_output)
             )
 
             if mode == "remote" and processed:
@@ -5138,9 +6777,65 @@ class Pipeline:
                 # pacing waits. Re-read the latest-only slot at the final send
                 # boundary so a stale decision cannot obscure a newer
                 # invalid/valid candidate for one extra output interval.
-                latest_remote, latest_reason = self.hub.remote_frame_status(
-                    max_age_s=resources.cfg.api.remote_timeout_ms / 1000.0
-                )
+                proof_reader = getattr(self.hub, "remote_frame_proof_status", None)
+                if publisher is not None and callable(proof_reader):
+                    typed_proof_reader = cast(
+                        Callable[[float], tuple[np.ndarray | None, str, int, int, int]],
+                        proof_reader,
+                    )
+                    (
+                        latest_remote,
+                        latest_reason,
+                        proof_raw_epoch,
+                        proof_session,
+                        proof_published_ns,
+                    ) = typed_proof_reader(resources.cfg.api.remote_timeout_ms / 1000.0)
+                    policy = self._publisher_policy
+                    matching_response = bool(
+                        proof_published_ns > 0
+                        and policy.mode == "remote"
+                        and proof_raw_epoch == policy.raw_epoch
+                        and proof_session == policy.renderer_session
+                    )
+                    if matching_response:
+                        resolved_remote_raw_epoch = proof_raw_epoch
+                        remote_candidate_published_ns = proof_published_ns
+                    structurally_valid_remote = bool(
+                        isinstance(latest_remote, np.ndarray)
+                        and latest_remote.dtype == np.uint8
+                        and latest_remote.ndim == 3
+                        and latest_remote.shape == resources.canvas_shape
+                    )
+                    if structurally_valid_remote and (
+                        policy.mode != "remote"
+                        or proof_raw_epoch != policy.raw_epoch
+                        or proof_session != policy.renderer_session
+                    ):
+                        # Never accept a frame carrying stale scalar proof, but
+                        # still classify a raw/delayed-raw echo before dropping
+                        # it.  The producer can outrun the paced sink and rotate
+                        # the required raw epoch before this rejection reaches
+                        # output; retaining the security reason keeps that
+                        # transition observable while pixels remain the slate.
+                        assert isinstance(latest_remote, np.ndarray)
+                        _guarded, proof_privacy_reason = self._guard_remote_output(
+                            latest_remote,
+                            frame,
+                            privacy_safe=True,
+                        )
+                        latest_remote = None
+                        latest_reason = proof_privacy_reason or "wrong-epoch"
+                    elif latest_remote is not None:
+                        remote_proof = RemoteOutputProof(
+                            proof_raw_epoch,
+                            proof_session,
+                            proof_published_ns
+                            + resources.cfg.api.remote_timeout_ms * 1_000_000,
+                        )
+                else:
+                    latest_remote, latest_reason = self.hub.remote_frame_status(
+                        max_age_s=resources.cfg.api.remote_timeout_ms / 1000.0
+                    )
                 if latest_remote is not None:
                     if (
                         latest_remote.dtype != np.uint8
@@ -5173,10 +6868,203 @@ class Pipeline:
                     used_remote_candidate = False
                 self._validate_output_frame(out_frame, resources.canvas_size)
                 base_ready_at_ns = time.monotonic_ns()
-                exact_final_repeat = np.array_equal(out_frame, last_output)
+                exact_final_repeat = bool(
+                    publisher is None
+                    and last_output is not None
+                    and np.array_equal(out_frame, last_output)
+                )
             guard_output_validation_ms = (
                 time.monotonic_ns() - guard_started_ns
             ) / 1_000_000.0
+            if publisher is not None:
+                if publisher_bridge is None:  # pragma: no cover - invariant
+                    raise RuntimeError("publisher bridge is missing")
+                assert captured is not None
+                assert base_ready_at_ns is not None
+                capture_health = (
+                    resources.capture.health_snapshot()
+                    if hasattr(resources.capture, "health_snapshot")
+                    else None
+                )
+                publisher_bridge.performance.bind_epoch(
+                    self._performance_epoch_key(resources, capture_health),
+                    color_correction_mode=(
+                        resources.cfg.compositing.color_correction.mode
+                    ),
+                    light_wrap=resources.cfg.compositing.light_wrap,
+                )
+                _log_finalized_performance_epochs(publisher_bridge.performance)
+                publisher_bridge.performance.record_processing(
+                    deadline_missed=processing_deadline_missed,
+                    stages_ms=self._runtime_stage_samples(
+                        timings,
+                        frame_processing_ms or 0.0,
+                        resources.last_compositor_substages_ms,
+                    ),
+                )
+                publisher_bridge.processing_completed_count += 1
+                self._record_color_output(
+                    resources,
+                    last_color_status,
+                    processed=True,
+                    observed_at_s=captured.captured_at_ns / 1_000_000_000.0,
+                )
+                if mode == "remote":
+                    if used_remote_candidate:
+                        remote_used += 1
+                    elif fallback_active:
+                        fallback_count += 1
+
+                producer_status = self._identity_stats(
+                    resources,
+                    capture_health=capture_health,
+                    color_status=last_color_status,
+                )
+                producer_status.update(
+                    {
+                        **_capture_health_stats(
+                            capture_health,
+                            fallback_frames_read=(
+                                resources.capture_sequence_timeline.snapshot().last_sequence
+                                or 0
+                            ),
+                        ),
+                        "remote_frames_used": remote_used,
+                        "remote_fallback_active": fallback_active,
+                        "remote_fallback_count": fallback_count,
+                        "remote_fallback_reason": fallback_reason,
+                        "segmentation_ms": stage_ewma["segmentation_ms"],
+                        "background_ms": stage_ewma["background_ms"],
+                        "color_correction_ms": stage_ewma["color_correction_ms"],
+                        "composite_ms": stage_ewma["composite_ms"],
+                        "output_send_ms": publisher_bridge.output_ewma[
+                            "output_send_ms"
+                        ],
+                        "output_submission_ms": publisher_bridge.output_ewma[
+                            "output_submission_ms"
+                        ],
+                        "output_sink_pacing_wait_ms": publisher_bridge.output_ewma[
+                            "output_sink_pacing_wait_ms"
+                        ],
+                        "application_pacing_wait_ms": publisher_bridge.output_ewma[
+                            "application_pacing_wait_ms"
+                        ],
+                        "output_schedule_lateness_ms": publisher_bridge.output_ewma[
+                            "output_schedule_lateness_ms"
+                        ],
+                        "frame_processing_ms": stage_ewma["frame_processing_ms"],
+                        "new_frame_service_ms": publisher_bridge.output_ewma[
+                            "new_frame_service_ms"
+                        ],
+                        "new_frame_serialized_loop_ms": None,
+                        "timing_schema_version": TIMING_SCHEMA_VERSION,
+                        "timing_ms": _timing_fields(
+                            stage_ewma,
+                            capture_health=capture_health,
+                            segmenter=resources.segmenter,
+                        ),
+                        "processing_completed_count": (
+                            publisher_bridge.processing_completed_count
+                        ),
+                        "processing_completed_fps": (
+                            publisher_bridge.performance.snapshot()[
+                                "processing_completed_fps"
+                            ]
+                        ),
+                        "output_base_config_version": resources.version,
+                        "output_handoff_overwrite_count": (
+                            publisher.snapshot().handoff_overwrite_count
+                        ),
+                        "output_schedule_skipped_slots": (
+                            publisher.snapshot().schedule_skipped_slots
+                        ),
+                        "output_privacy_slate_send_count": (
+                            publisher.snapshot().privacy_slate_send_count
+                        ),
+                        "output_publisher_state": publisher.snapshot().state,
+                        "runtime_performance": (
+                            publisher_bridge.performance.snapshot()
+                        ),
+                    }
+                )
+                if matte_evidence is not None:
+                    matte_evidence.timings_ms["guard_output_validation_ms"] = (
+                        guard_output_validation_ms
+                    )
+                asset_slate = bool(resources.background_fallback_reason)
+                privacy_slate = asset_slate or (
+                    mode == "remote" and not used_remote_candidate
+                )
+                reason_code = str(
+                    resources.background_fallback_reason
+                    if asset_slate
+                    else fallback_reason or "renderer-unavailable"
+                ).replace("_", "-")
+                if not reason_code or any(
+                    char not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+                    for char in reason_code
+                ):
+                    reason_code = "renderer-unavailable"
+                if mode == "remote" and used_remote_candidate and remote_proof is None:
+                    out_frame = self._privacy_slate(resources.canvas_shape)
+                    privacy_slate = True
+                    used_remote_candidate = False
+                    reason_code = "proof-unavailable"
+                base = SafeBaseFrame.create(
+                    out_frame,
+                    base_id=next_base_id,
+                    config_version=resources.version,
+                    capture_sequence=captured.sequence,
+                    captured_at_ns=captured.captured_at_ns,
+                    base_ready_at_ns=base_ready_at_ns,
+                    policy_epoch=self._publisher_policy.epoch,
+                    segmentation_updated=segmentation_updated,
+                    processing_deadline_missed=processing_deadline_missed,
+                    status=producer_status,
+                    performance_epoch=self._performance_epoch_tuple(
+                        publisher_bridge.performance.current_epoch_key
+                    ),
+                    remote_proof=(None if privacy_slate else remote_proof),
+                    resolved_remote_raw_epoch=resolved_remote_raw_epoch,
+                    privacy_slate=privacy_slate,
+                    privacy_reason=(reason_code if privacy_slate else ""),
+                    matte_bundle_sequence=(
+                        None
+                        if matte_evidence is None
+                        else matte_evidence.metadata.bundle_sequence
+                    ),
+                )
+                with publisher_bridge.lock:
+                    publisher_bridge.retain_base(
+                        next_base_id,
+                        PerformanceEpochKey(*base.performance_epoch),
+                        matte_evidence,
+                    )
+                    try:
+                        accepted = publisher.submit(base)
+                    except BaseException:
+                        publisher_bridge.release_base(next_base_id)
+                        raise
+                    if not accepted:
+                        publisher_bridge.release_base(next_base_id)
+                if (
+                    accepted
+                    and resolved_remote_raw_epoch > 0
+                    and resolved_remote_raw_epoch == remote_pending_raw_epoch
+                    and remote_candidate_published_ns > 0
+                ):
+                    remote_submitted_response_ns = remote_candidate_published_ns
+                next_base_id += 1
+                # Publisher custody now owns the immutable copy. The producer
+                # must not retain an older output raster/envelope between cycles.
+                del base
+                del out_frame
+                next_cycle_start_ns = service_started_ns + frame_interval_ns
+                if publisher.error is not None:
+                    raise OutputPublisherError(
+                        "output publisher failed"
+                    ) from publisher.error
+                continue
             send_started_ns = time.monotonic_ns()
             send_timing = _send_output_with_timing(
                 resources.output,
@@ -5331,6 +7219,11 @@ class Pipeline:
                 resources,
                 last_color_status,
                 processed=processed,
+                observed_at_s=(
+                    captured.captured_at_ns / 1_000_000_000.0
+                    if captured is not None
+                    else None
+                ),
             )
             frame_stats = self._identity_stats(
                 resources,

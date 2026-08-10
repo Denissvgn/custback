@@ -50,6 +50,7 @@ from custback.capture import CapturedFrame
 from custback.config import AppConfig, RuntimeConfig, SegmentationConfig
 from custback.hub import FrameHub
 from custback.pipeline import ActivationError, Pipeline, _Activation, _Resources
+from custback.remote_protocol import encode_remote_frame
 
 
 async def _with_event_loop_heartbeat(awaitable):
@@ -298,7 +299,7 @@ def test_LIFE_01_session_waits_for_inflight_render_before_returning(monkeypatch)
         async def recv(self):
             if self._first:
                 self._first = False
-                return b"jpeg-like-payload"
+                return encode_remote_frame("raw-input", 1, b"jpeg-like-payload")
             await self._never.wait()
 
         async def send(self, _payload):
@@ -977,7 +978,7 @@ def test_LIFE_01_cancelled_render_never_publishes_stale_preview(monkeypatch):
         async def recv(self):
             if self.first:
                 self.first = False
-                return jpeg.tobytes()
+                return encode_remote_frame("raw-input", 1, jpeg.tobytes())
             await self.wait.wait()
 
         async def send(self, payload):

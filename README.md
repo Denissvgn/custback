@@ -257,6 +257,21 @@ from slower visual updates. Counts, rolling rates, timestamp/send jitter
 summaries, deadline and pacing event classes, timing boundaries, and the typed
 post-base extension are defined by the
 [visual cadence observability contract](docs/cadence-observability.md).
+The depth-one publisher sends at the target cadence by adopting the newest
+guarded safe base or byte-identically repeating the last eligible final frame;
+a scheduler reuse never reruns or advances segmentation, refinement,
+compositor, or other temporal image state. A newly processed pixel-identical
+base can also increment the exact-repeat clock, so reuse and byte equality stay
+separate. `GET /status.runtime_performance` schema v1
+therefore reports output attainment and sent-unique-base attainment
+independently, with bounded generation epochs, stage p50/p95 timings,
+deadline/schedule health, and publisher counters. Its config-version-bound
+`recommended_mitigation` is advisory only: review it against a fresh
+config/status pair, save the active config, apply any chosen patch manually,
+and restore the exact saved fields to roll it back. It never changes defaults,
+qualifies a preset, or advances the `compatibility_hold` matte rollout. The
+[operator guide](docs/matte-operator-mitigations.md#runtime-performance-recommendation)
+defines the review, disable, confirmation, and rollback procedure.
 
 Identifiable matte evidence is separate and off by default. An explicit
 `--matte-diagnostics-dir NEW_DIR` records a duration/size-bounded private
@@ -541,7 +556,7 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /status` | run ID; capture/segmentation/base/reuse/exact-final-repeat/send cadence; gaps, deadlines, pacing and jitter; stage timings; versioned backend selection/effective matte policy and matte rollout/default/rollback decision |
+| `GET /status` | run ID; capture/segmentation/base/reuse/exact-final-repeat/send cadence; strict runtime-performance v1 health and advisory mitigation; gaps, deadlines, pacing and jitter; stage timings; versioned backend selection/effective matte policy and matte rollout/default/rollback decision |
 | `GET /config` / `PATCH /config` | read / partially update config live |
 | `POST /background/image` | upload static backdrop and switch to it |
 | `POST /background/video` | upload live (video) backdrop and switch to it |
@@ -552,7 +567,7 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 | `GET /video/snapshot.jpg` | single processed frame |
 | `GET /` | the web control UI (see below) |
 | `/avatar/{path}` | authenticated reverse proxy to the avatar control API (see below) |
-| `WS /ws/frames?stream=raw\|output` | binary JPEG frame forwarding (see below) |
+| `WS /ws/frames?stream=raw\|output` | read-only management JPEG previews; the renderer token upgrades only `raw` to the exclusive protocol-v1 renderer lease described below |
 
 Examples:
 
@@ -574,8 +589,10 @@ auth_header | curl --config - -X POST http://127.0.0.1:8710/background/video \
 
 `GET /config` describes configured intent and carries `X-Config-Version`;
 `GET /status` reports active backend/device, backend-resolved matte controls,
-and the fail-closed `matte_rollout` decision. The rollout object is bounded,
-path-free telemetry; it does not claim pixel quality or physical evidence.
+strict path-free `runtime_performance` v1 health, and the fail-closed
+`matte_rollout` decision. Runtime performance advice is never applied
+automatically, and neither status object claims pixel quality or physical
+evidence.
 PATCHes are serialized and transactional. Background,
 segmentation, compositing, remote timeout, and remote fallback fields can
 activate live; camera, output, API bind/security, and upload-limit changes
@@ -583,6 +600,14 @@ return `409 restart_required`. Avatar proxy URL, token file, CA bundle, and
 mTLS identity are likewise startup-only. A mixed hot/restart PATCH applies nothing.
 Invalid content returns `422`, activation unavailability returns `503`, and a
 no-op preserves the version.
+
+If a persisted image or video cannot be opened during startup, the service and
+control API remain available without changing that configured intent. Output
+stays on the fixed camera-independent slate and status reports
+`background_fallback_active=true` with
+`background_fallback_reason=asset-unavailable`; a successfully preflighted
+live background patch clears the fallback. Custback never substitutes
+passthrough or blur for the missing asset.
 
 Public config responses and their OpenAPI models omit management/renderer
 token paths, proxy credential/trust paths, and private-key paths.
@@ -633,9 +658,15 @@ slate; the remembered local mode is used only when Avatar is disabled.
 Avatar replacement plugs in through the WebSocket frame API — no pipeline
 changes needed:
 
-1. An avatar service connects to `WS /ws/frames?stream=raw` and receives
-   every raw camera frame as binary JPEG.
-2. It renders the avatar and sends frames back on the same socket.
+1. An avatar service connects to `WS /ws/frames?stream=raw` and receives each
+   JPEG in the strict binary remote-frame protocol-v1 envelope, including its
+   exact raw epoch. A renderer-token connection is the single exclusive writer
+   lease: a replacement renderer revokes the prior session and fences output
+   to the privacy slate. A management-token connection to the same route is a
+   read-only ordinary-JPEG preview and never acquires renderer authority.
+2. It renders the avatar and returns a `rendered-output` envelope carrying the
+   same raw epoch on the same socket. Bare JPEG responses are rejected, and a
+   delayed response is discarded rather than relabeled as current.
 3. With `background.mode = "remote"`, returned frames become the virtual
    camera output. If the service stalls longer than `api.remote_timeout_ms`,
    custback emits one fixed, opaque, camera-independent privacy slate. Missing,
@@ -747,8 +778,10 @@ GPU guidance:
   Check NVIDIA's NIM support matrix for the GB10/Blackwell container before
   planning on it; the `vision` driver is the portable alternative.
 
-The wire protocol is unchanged, so a custom stage-2 renderer still works: a
-minimal reference client lives in
+The remote-frame wire contract changed in 0.4.0: custom stage-2 renderers must
+upgrade to the mandatory protocol-v1 envelope and echo each positive raw epoch
+exactly. Upgrade meeting-host and renderer binaries together; legacy bare-JPEG
+responses fail closed. A minimal reference client lives in
 [`examples/avatar_client.py`](examples/avatar_client.py):
 
 ```bash
@@ -849,6 +882,9 @@ This release intentionally breaks the old unauthenticated control plane:
 | `light_wrap.py` | generation-owned elapsed-time stabilization for dynamic-backdrop wrap samples |
 | `diagnostics.py` | secure rotating logs, run correlation, and safe config audit records |
 | `cadence.py` | bounded unique-base/reuse/exact-repeat/send cadence and interval health |
+| `output_scheduler.py` | depth-one target-paced publication of guarded final frames with exact-repeat and privacy provenance |
+| `remote_protocol.py` | strict bounded remote-renderer protocol-v1 envelope with exact raw-epoch provenance |
+| `runtime_performance.py` | bounded path-free output/unique-attainment health, stage summaries, epochs, and advisory mitigations |
 | `capture_diagnostics.py` | bounded, pixel-free capture-only cadence measurement and native/runtime evidence comparison |
 | `matte_diagnostics.py` | opt-in private bounded matte recorder and offline frozen/model replay |
 | `matte_live_diagnostics.py` | on-demand, native-preview-only matte views and frame-paired temporal telemetry |
@@ -878,6 +914,15 @@ The focused temporal/matte subset, its generated-fixture contract, and the
 boundary between fast CI regression coverage and private visual/hardware
 qualification are documented in the
 [deterministic matte regression gate](docs/matte-deterministic-regression-gate.md).
+`tests/test_output_scheduler.py`, `tests/test_runtime_performance.py`,
+`tests/test_runtime_performance_status.py`, and
+`tests/test_remote_protocol.py`, `tests/test_background_video_lifetime.py`, plus
+`tests/test_background_asset_fallback.py` deterministically cover absolute
+target pacing and exact repeats, independent output/unique health and
+hysteresis, strict bounded status/OpenAPI projection, truthful WebUI rows, and
+fail-closed recovery from unavailable persisted image/video assets.
+They do not qualify a physical sink, camera, backend, or sustainable host
+profile.
 The separate owner-only end-to-end workflow and its intentionally pending
 checked-in template are documented in the
 [matte visual qualification runbook](docs/matte-visual-qualification.md).

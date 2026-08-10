@@ -12,6 +12,7 @@ cv2 = pytest.importorskip("cv2")
 
 import custback.compositor as compositor_mod
 import custback.pipeline as pipeline_mod
+import custback.runtime_performance as runtime_performance_mod
 from custback.capture import CapturedFrame, CaptureHealth
 from custback.color import (
     ANALYSIS_LONG_EDGE,
@@ -52,7 +53,7 @@ from custback.segmentation import (
     Segmenter,
     segmenter_selection_status,
 )
-from custback.vcam import NullOutput, OutputSendTiming
+from custback.vcam import NullOutput, OutputSendTiming, VideoOutput
 
 
 def _captured(
@@ -107,6 +108,37 @@ def wait_for_stats(hub: FrameHub, predicate, timeout=5.0):
             return stats
         time.sleep(0.01)
     raise AssertionError("status did not reach the expected state")
+
+
+def push_remote_for_latest_raw(
+    hub: FrameHub,
+    frame: np.ndarray,
+    session_id: int,
+    *,
+    timeout: float = 5.0,
+) -> bool:
+    """Echo the exact epoch attached to the newest eligible raw slot."""
+
+    deadline = time.monotonic() + timeout
+    sequence = -1
+    while time.monotonic() < deadline:
+        _raw, next_sequence = hub.raw.get(
+            sequence,
+            min(0.1, max(0.0, deadline - time.monotonic())),
+        )
+        if next_sequence == sequence:
+            continue
+        sequence = next_sequence
+        raw_epoch = hub.remote_raw_epoch_for_sequence(sequence)
+        if raw_epoch is None or raw_epoch <= 0:
+            continue
+        if hub.push_remote_frame(
+            frame,
+            raw_epoch=raw_epoch,
+            session_id=session_id,
+        ):
+            return True
+    return False
 
 
 def run_pipeline(runtime):
@@ -252,6 +284,80 @@ def test_hot_mode_switch():
         pipeline.stop()
 
 
+def test_hot_patch_repeat_keeps_committed_and_pixel_config_versions_distinct(
+    monkeypatch,
+):
+    runtime = make_runtime(mode="color")
+    hub = FrameHub()
+    pipeline = Pipeline(runtime, hub)
+    original_local_composite = Pipeline._local_composite
+    post_commit_processing = threading.Event()
+    release_processing = threading.Event()
+
+    def block_first_post_commit_composite(self, *args, **kwargs):
+        if runtime.version == 1:
+            post_commit_processing.set()
+            assert release_processing.wait(2.0)
+        return original_local_composite(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Pipeline,
+        "_local_composite",
+        block_first_post_commit_composite,
+    )
+    pipeline.start()
+    try:
+        before = wait_for_stats(
+            hub,
+            lambda value: (
+                value["frames_out"] >= 3 and value["output_base_config_version"] == 0
+            ),
+        )
+        committed = pipeline.apply_config_patch(
+            {
+                "background": {"color": [0, 0, 255]},
+                "segmentation": {"mask_blur": 3},
+                "compositing": {
+                    "color_correction": {"mode": "auto"},
+                    "light_wrap": 0.0,
+                },
+            },
+            origin="test",
+        )
+        assert committed.version == 1
+        assert post_commit_processing.wait(1.0)
+
+        repeated = wait_for_stats(
+            hub,
+            lambda value: (
+                value["frames_out"] > before["frames_out"]
+                and value["config_version"] == committed.version
+                and value["output_base_config_version"] == 0
+            ),
+        )
+        assert repeated["matte_rollout"]["config_version"] == committed.version
+        assert repeated["color_correction_mode"] == "auto"
+        assert repeated["effective_light_wrap"] == 0.0
+        assert repeated["effective_mask_blur"] == 3
+        # The committed policy is current, while the actual pixel-producing
+        # segmenter generation remains tied to the repeated base.
+        assert repeated["segmentation_generation"] == 0
+        assert repeated["matte_policy"]["controls"]["mask_blur"]["configured"] == 3
+
+        release_processing.set()
+        adopted = wait_for_stats(
+            hub,
+            lambda value: (
+                value["config_version"] == committed.version
+                and value["output_base_config_version"] == committed.version
+            ),
+        )
+        assert adopted["frames_in"] > repeated["frames_in"]
+    finally:
+        release_processing.set()
+        pipeline.stop()
+
+
 def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
     baseline = (
         make_runtime(mode="color")
@@ -301,7 +407,10 @@ def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
         state = pipeline.apply_config_patch(value)
         return wait_for_stats(
             hub,
-            lambda stats: stats["config_version"] == state.version,
+            lambda stats: (
+                stats["config_version"] == state.version
+                and stats["output_base_config_version"] == state.version
+            ),
         )
 
     try:
@@ -1188,7 +1297,7 @@ def test_remote_mode_uses_pushed_frames_and_falls_back():
         deadline = time.monotonic() + 5.0
         used = False
         while time.monotonic() < deadline:
-            assert hub.push_remote_frame(avatar, remote_session)
+            assert push_remote_for_latest_raw(hub, avatar, remote_session)
             frame, seq = wait_for_frame(hub, seq)
             if tuple(frame[0, 0]) == (7, 8, 9):
                 used = True
@@ -1201,7 +1310,7 @@ def test_remote_mode_uses_pushed_frames_and_falls_back():
         frame, _ = wait_for_frame(hub, seq)
         assert np.array_equal(frame, slate)
         stats = hub.stats_dict()
-        assert stats["remote_fallback_reason"] == "stale"
+        assert stats["remote_fallback_reason"] == "awaiting-renderer"
         assert stats["remote_fallback_count"] >= 1
     finally:
         if remote_session is not None:
@@ -1395,7 +1504,7 @@ def test_runtime_privacy_gate_protects_vcam_and_preview(monkeypatch):
     try:
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            assert hub.push_remote_frame(raw.copy(), session)
+            assert push_remote_for_latest_raw(hub, raw.copy(), session)
             if hub.stats_dict()["remote_fallback_reason"] in {
                 "privacy-raw-echo",
                 "privacy-delayed-raw-echo",
@@ -1617,11 +1726,21 @@ def test_privacy_capacity_exhaustion_revokes_renderer_and_slates_all_sinks(
             time.sleep(0.005)
         assert not hub.remote_session_valid(first_session)
         assert pipeline._privacy_history_exhausted
-        assert not hub.push_remote_frame(raw.copy(), first_session)
+        assert not hub.push_remote_frame(
+            raw.copy(),
+            raw_epoch=1,
+            session_id=first_session,
+        )
 
         # Reauthentication cannot turn exhausted evidence into an allow.
         second_session = hub.remote_client_connected()
-        assert hub.push_remote_frame(raw.copy(), second_session)
+        pushed = push_remote_for_latest_raw(
+            hub,
+            raw.copy(),
+            second_session,
+            timeout=0.5,
+        )
+        assert pushed or not hub.remote_session_valid(second_session)
         deadline = time.monotonic() + 2.0
         while hub.remote_session_valid(second_session) and time.monotonic() < deadline:
             time.sleep(0.005)
@@ -1667,7 +1786,8 @@ def test_remote_sessions_clear_frames_and_reject_prior_session_replay():
     hub = FrameHub()
     first_session = hub.remote_client_connected()
     frame = np.full((4, 6, 3), 9, np.uint8)
-    assert hub.push_remote_frame(frame, first_session)
+    hub.publish_remote_raw(frame, 1)
+    assert hub.push_remote_frame(frame, raw_epoch=1, session_id=first_session)
     assert hub.remote_frame_status(1.0)[0] is not None
     hub.remote_client_disconnected(first_session)
     assert hub.remote_frame_status(1.0) == (None, "no-client")
@@ -1675,7 +1795,12 @@ def test_remote_sessions_clear_frames_and_reject_prior_session_replay():
 
     next_session = hub.remote_client_connected()
     assert next_session != first_session
-    assert not hub.push_remote_frame(frame, first_session)
+    hub.publish_remote_raw(frame, 2)
+    assert not hub.push_remote_frame(
+        frame,
+        raw_epoch=2,
+        session_id=first_session,
+    )
     assert hub.remote_frame_status(1.0) == (None, "stale")
     hub.remote_client_disconnected(next_session)
 
@@ -1684,18 +1809,52 @@ def test_remote_session_invalidation_is_linearized_with_frame_ownership():
     hub = FrameHub()
     session = hub.remote_client_connected()
     frame = np.full((4, 6, 3), 17, np.uint8)
-    assert hub.push_remote_frame(frame, session)
+    hub.publish_remote_raw(frame, 1)
+    assert hub.push_remote_frame(frame, raw_epoch=1, session_id=session)
 
     assert hub.invalidate_remote_session(session)
     assert not hub.remote_session_valid(session)
     assert hub.remote_frame_status(1.0) == (None, "no-client")
-    assert not hub.push_remote_frame(frame, session)
+    assert not hub.push_remote_frame(frame, raw_epoch=1, session_id=session)
 
     replacement = hub.remote_client_connected()
     assert replacement != session
     assert hub.remote_session_valid(replacement)
-    assert hub.push_remote_frame(frame, replacement)
+    hub.publish_remote_raw(frame, 2)
+    assert hub.push_remote_frame(frame, raw_epoch=2, session_id=replacement)
     hub.remote_client_disconnected(replacement)
+
+
+def test_remote_session_lifecycle_notifications_are_synchronous():
+    hub = FrameHub()
+    events: list[tuple[str, int]] = []
+    hub.set_remote_lifecycle_listener(
+        lambda event, session: events.append((event, session))
+    )
+
+    first = hub.remote_client_connected()
+    assert events == [("connected", first)]
+    hub.remote_client_disconnected(first)
+    assert events[-1] == ("disconnected", first)
+
+    replacement = hub.remote_client_connected()
+    assert events[-1] == ("connected", replacement)
+    assert hub.invalidate_remote_session(replacement)
+    assert events[-1] == ("invalidated", replacement + 1)
+
+
+def test_remote_session_connect_aborts_when_privacy_fence_fails():
+    hub = FrameHub()
+
+    def fail_fence(_event: str, _session: int) -> None:
+        raise RuntimeError("fence unavailable")
+
+    hub.set_remote_lifecycle_listener(fail_fence)
+    with pytest.raises(RuntimeError, match="fence unavailable"):
+        hub.remote_client_connected()
+
+    assert hub.active_remote_session() is None
+    assert not hub.stats_dict()["remote_connected"]
 
 
 def test_malformed_and_wrong_sized_remote_frames_use_privacy_slate():
@@ -1707,15 +1866,29 @@ def test_malformed_and_wrong_sized_remote_frames_use_privacy_slate():
     try:
         slate = Pipeline._privacy_slate((72, 128, 3))
         _, seq = wait_for_frame(hub)
-        assert hub.push_remote_frame(np.zeros((72, 128, 3), np.float32), session)
+        assert push_remote_for_latest_raw(
+            hub,
+            np.zeros((72, 128, 3), np.float32),
+            session,
+        )
+        wait_for_stats(
+            hub,
+            lambda status: status["remote_fallback_reason"] == "invalid",
+        )
         frame, seq = wait_for_frame(hub, seq)
         assert np.array_equal(frame, slate)
-        assert hub.stats_dict()["remote_fallback_reason"] == "invalid"
 
-        assert hub.push_remote_frame(np.zeros((10, 10, 3), np.uint8), session)
+        assert push_remote_for_latest_raw(
+            hub,
+            np.zeros((10, 10, 3), np.uint8),
+            session,
+        )
+        wait_for_stats(
+            hub,
+            lambda status: status["remote_fallback_reason"] == "wrong-size",
+        )
         frame, _ = wait_for_frame(hub, seq)
         assert np.array_equal(frame, slate)
-        assert hub.stats_dict()["remote_fallback_reason"] == "wrong-size"
     finally:
         hub.remote_client_disconnected(session)
         pipeline.stop()
@@ -2862,9 +3035,106 @@ def test_startup_timeout_reports_worker_that_survives_shutdown_request(monkeypat
     assert entered.is_set()
     release.set()
     deadline = time.monotonic() + 2.0
-    while pipeline.running and time.monotonic() < deadline:
+    while (
+        pipeline._thread is not None and pipeline._thread.is_alive()
+    ) and time.monotonic() < deadline:
         time.sleep(0.01)
+    assert pipeline._thread is not None and not pipeline._thread.is_alive()
     assert not pipeline.running
+
+
+def test_blocked_output_shutdown_rejects_restart_until_owner_exits(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class StableCapture:
+        def __init__(self) -> None:
+            self.sequence = 0
+
+        def read(self) -> CapturedFrame:
+            self.sequence += 1
+            return _captured(
+                np.zeros((72, 128, 3), np.uint8),
+                self.sequence,
+                captured_at_ns=time.monotonic_ns(),
+            )
+
+        def close(self) -> None:
+            pass
+
+    class BlockingOutput(VideoOutput):
+        paces = False
+
+        def __init__(self, *, block_third_send: bool) -> None:
+            self.block_third_send = block_third_send
+            self.send_count = 0
+            self.close_count = 0
+            self.close_thread: int | None = None
+
+        def send(self, _frame_bgr: np.ndarray) -> None:
+            self.send_count += 1
+            if self.block_third_send and self.send_count == 3:
+                entered.set()
+                assert release.wait(2.0)
+
+        def close(self) -> None:
+            self.close_count += 1
+            self.close_thread = threading.get_ident()
+
+    outputs: list[BlockingOutput] = []
+
+    def open_blocking_output(*_args, **_kwargs):
+        output = BlockingOutput(block_third_send=not outputs)
+        outputs.append(output)
+        return output
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_capture",
+        lambda *_args, **_kwargs: StableCapture(),
+    )
+    monkeypatch.setattr(pipeline_mod, "open_output", open_blocking_output)
+    pipeline = Pipeline(make_runtime(mode="color"), FrameHub())
+    pipeline.start()
+    first = outputs[0]
+    try:
+        assert entered.wait(1.0)
+        with pytest.raises(
+            ReconfigurationUnavailable,
+            match="pipeline worker did not stop",
+        ):
+            pipeline.stop(timeout=0.05)
+        assert first.close_count == 0
+
+        with pytest.raises(ReconfigurationUnavailable, match="already running"):
+            pipeline.start(timeout=0.05)
+        assert len(outputs) == 1
+
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while (
+            pipeline._thread is not None and pipeline._thread.is_alive()
+        ) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert pipeline._thread is not None and not pipeline._thread.is_alive()
+        assert first.close_count == 1
+        assert first.close_thread is not None
+
+        # Once the surviving sink owner has released all run resources, a
+        # fresh run is allowed and owns a different backend instance.
+        pipeline.start(timeout=1.0)
+        assert len(outputs) == 2
+        pipeline.stop(timeout=1.0)
+        assert first.close_count == 1
+        assert outputs[1].close_count == 1
+    finally:
+        release.set()
+        thread = pipeline._thread
+        if thread is not None and thread.is_alive():
+            try:
+                pipeline.stop(timeout=2.0)
+            except BaseException:
+                pass
 
 
 def test_passthrough_startup_preflights_segmenter_inference(monkeypatch):
@@ -2942,6 +3212,7 @@ def test_terminal_capture_health_is_sampled_after_capture_stops(monkeypatch):
             events.append("capture-close")
 
     capture = FinalHealthCapture()
+    output = NullOutput(32, 24, cfg.output.fps)
     resources = pipeline_mod._Resources(
         cfg,
         0,
@@ -2949,7 +3220,8 @@ def test_terminal_capture_health_is_sampled_after_capture_stops(monkeypatch):
         _FixedMaskSegmenter(np.ones((24, 32), np.float32)),
         _IdentityRefiner(),
         None,
-        NullOutput(32, 24, cfg.output.fps),
+        None,
+        output_factory=lambda: output,
     )
     now_ns = time.monotonic_ns()
     captured = _captured(
@@ -2980,8 +3252,16 @@ def test_terminal_capture_health_is_sampled_after_capture_stops(monkeypatch):
         remote_fallback_active=False,
         remote_fallback_reason="",
     )
-    monkeypatch.setattr(pipeline, "_open_resources", lambda _state: resources)
-    monkeypatch.setattr(pipeline, "_preflight", lambda _resources: preflight)
+    monkeypatch.setattr(
+        pipeline,
+        "_open_resources",
+        lambda _state, *, defer_output=False: resources,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_preflight",
+        lambda _resources, *, send_output=True: preflight,
+    )
     monkeypatch.setattr(pipeline, "_loop", lambda *_args, **_kwargs: None)
 
     pipeline._run()
@@ -3387,6 +3667,217 @@ def test_slow_processing_counts_deadline_misses_without_send_pacing(monkeypatch)
         pipeline.stop()
 
 
+def test_target_paced_publisher_stays_at_thirty_during_120ms_processing(
+    monkeypatch,
+    caplog,
+):
+    # The tracker thresholds themselves have exact fake-clock unit coverage.
+    # Shorten only their wall-clock hysteresis here so this integration test
+    # proves the production lane wiring without adding six seconds to the suite.
+    monkeypatch.setattr(
+        runtime_performance_mod,
+        "RUNTIME_PERFORMANCE_WARMUP_NS",
+        200_000_000,
+    )
+    monkeypatch.setattr(
+        runtime_performance_mod,
+        "RUNTIME_PERFORMANCE_DEGRADE_NS",
+        200_000_000,
+    )
+    monkeypatch.setattr(
+        runtime_performance_mod,
+        "RUNTIME_PERFORMANCE_RECOVER_NS",
+        200_000_000,
+    )
+    monkeypatch.setattr(
+        runtime_performance_mod,
+        "RUNTIME_PERFORMANCE_WINDOW_NS",
+        1_000_000_000,
+    )
+    original_local_composite = Pipeline._local_composite
+    original_segment_and_refine = Pipeline._segment_and_refine_masks
+    original_refine = pipeline_mod.MaskRefiner.refine
+    original_backdrop_frame = pipeline_mod.ColorBackdrop.frame
+    original_harmonizer_update = pipeline_mod.ColorHarmonizer.update
+    original_timeline_observe = pipeline_mod.SegmentationTimeline.observe
+    stage_calls = {
+        "segmentation": 0,
+        "refinement": 0,
+        "backdrop": 0,
+        "harmonizer": 0,
+        "matte_timeline": 0,
+    }
+
+    def count_segment_and_refine(cls, *args, **kwargs):
+        stage_calls["segmentation"] += 1
+        return original_segment_and_refine(*args, **kwargs)
+
+    def count_refine(self, *args, **kwargs):
+        stage_calls["refinement"] += 1
+        return original_refine(self, *args, **kwargs)
+
+    def count_backdrop_frame(self, *args, **kwargs):
+        stage_calls["backdrop"] += 1
+        return original_backdrop_frame(self, *args, **kwargs)
+
+    def count_harmonizer_update(self, *args, **kwargs):
+        stage_calls["harmonizer"] += 1
+        return original_harmonizer_update(self, *args, **kwargs)
+
+    def count_timeline_observe(self, *args, **kwargs):
+        stage_calls["matte_timeline"] += 1
+        return original_timeline_observe(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Pipeline,
+        "_segment_and_refine_masks",
+        classmethod(count_segment_and_refine),
+    )
+    monkeypatch.setattr(pipeline_mod.MaskRefiner, "refine", count_refine)
+    monkeypatch.setattr(pipeline_mod.ColorBackdrop, "frame", count_backdrop_frame)
+    monkeypatch.setattr(
+        pipeline_mod.ColorHarmonizer,
+        "update",
+        count_harmonizer_update,
+    )
+    monkeypatch.setattr(
+        pipeline_mod.SegmentationTimeline,
+        "observe",
+        count_timeline_observe,
+    )
+
+    class RecordingOutput(VideoOutput):
+        paces = False
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.frames: list[np.ndarray] = []
+
+        def send(self, frame_bgr: np.ndarray) -> None:
+            with self._lock:
+                self.frames.append(frame_bgr.copy())
+
+        def snapshot(self) -> list[np.ndarray]:
+            with self._lock:
+                return [frame.copy() for frame in self.frames]
+
+    output = RecordingOutput()
+    monkeypatch.setattr(
+        pipeline_mod,
+        "open_output",
+        lambda *_args, **_kwargs: output,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "create_backdrop",
+        lambda *_args, **_kwargs: pipeline_mod.ColorBackdrop((17, 31, 47)),
+    )
+    slow_processing = threading.Event()
+    slow_processing.set()
+
+    def slow_local_composite(self, *args, **kwargs):
+        result = original_local_composite(self, *args, **kwargs)
+        if slow_processing.is_set():
+            time.sleep(0.12)
+        return result
+
+    monkeypatch.setattr(Pipeline, "_local_composite", slow_local_composite)
+    cfg = (
+        make_runtime(mode="camera", camera_device=1)
+        .snapshot()
+        .patched(
+            {
+                "camera": {"fps": 30},
+                "output": {"fps": 30},
+                "compositing": {"color_correction": {"mode": "auto", "strength": 0.5}},
+            }
+        )
+    )
+    pipeline, hub = run_pipeline(RuntimeConfig(cfg))
+    initial_stats = hub.stats_dict()
+    initial_stage_calls = dict(stage_calls)
+    initial_frames = output.snapshot()
+    try:
+        stats = wait_for_stats(
+            hub,
+            lambda value: (
+                value["frames_out"] >= 30
+                and value["runtime_performance"]["state"] == "degraded"
+            ),
+            timeout=4.0,
+        )
+        performance = stats["runtime_performance"]
+        assert performance["stage_p50_ms"]["capture.read"] is not None
+        assert performance["stage_p95_ms"]["capture.read"] is not None
+        assert performance["output_send_fps"] >= 27.0
+        assert 6.0 <= performance["sent_unique_base_fps"] <= 10.0
+        assert performance["output_healthy"] is True
+        assert performance["unique_healthy"] is False
+        assert performance["reason"] in {
+            "unique-attainment",
+            "multiple-performance-gates",
+        }
+        assert stats["output_repeated_frames"] > 0
+        assert stats["frames_out"] == (
+            stats["frames_in"] + stats["output_repeated_frames"]
+        )
+        assert (
+            stats["exact_final_output_repeat_count"]
+            >= stats["base_composite_reuse_count"]
+        )
+        assert performance["publisher"]["pending_depth"] in {0, 1}
+        # Repeated presentation never re-enters the processing graph.
+        assert stats["segmentation_update_count"] <= stats["processing_completed_count"]
+        assert stats["processing_completed_count"] < stats["frames_out"]
+
+        final_frames = output.snapshot()
+        observed_frames = final_frames[max(0, len(initial_frames) - 1) :]
+        exact_adjacent_pairs = sum(
+            np.array_equal(previous, current)
+            for previous, current in zip(observed_frames, observed_frames[1:])
+        )
+        repeat_delta = (
+            stats["output_repeated_frames"] - initial_stats["output_repeated_frames"]
+        )
+        exact_repeat_delta = (
+            stats["exact_final_output_repeat_count"]
+            - initial_stats["exact_final_output_repeat_count"]
+        )
+        # The one-frame baseline snapshot can race one publisher tick. Apart
+        # from that boundary, the frames physically accepted by the sink and
+        # the publisher's byte-digest classification agree exactly.
+        assert abs(exact_adjacent_pairs - exact_repeat_delta) <= 1
+        assert exact_adjacent_pairs >= repeat_delta - 1
+
+        processed_delta = (
+            stats["processing_completed_count"]
+            - initial_stats["processing_completed_count"]
+        )
+        send_delta = stats["frames_out"] - initial_stats["frames_out"]
+        for name, count in stage_calls.items():
+            call_delta = count - initial_stage_calls[name]
+            assert 0 < call_delta <= processed_delta + 1, (name, stage_calls)
+            assert call_delta < send_delta, (name, stage_calls)
+
+        slow_processing.clear()
+        wait_for_stats(
+            hub,
+            lambda value: value["runtime_performance"]["state"] == "healthy",
+            timeout=4.0,
+        )
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and record.getMessage().startswith("runtime performance")
+        ]
+        assert sum("degraded" in message for message in warnings) == 1
+        assert sum("recovered" in message for message in warnings) == 1
+    finally:
+        slow_processing.clear()
+        pipeline.stop()
+
+
 def test_video_counters_reset_when_leaving_the_provider(monkeypatch):
     class VideoStatsBackdrop:
         def frame(self, width, height):
@@ -3508,6 +3999,33 @@ def _color_integration_config(
             "api": {"enabled": False},
         }
     )
+
+
+def _seeded_color_harmonizer(exposure_ev: float = 0.7) -> ColorHarmonizer:
+    harmonizer = ColorHarmonizer(0.8, mode="image")
+    estimate = ColorEstimate(
+        transform=ColorTransform(exposure_ev, (1.10, 1.0, 0.90)),
+        behavior=ColorBehavior.EXPOSURE_WHITE_BALANCE,
+        reason=ColorReason.OK,
+        confidence=0.9,
+        exposure_confidence=0.95,
+        white_balance_confidence=0.9,
+        usable_source=512,
+        usable_target=512,
+        neutral_source=256,
+        neutral_target=256,
+        target_is_local=True,
+        reliable=True,
+        signature=ColorSceneSignature(
+            source_log_luminance=-2.0,
+            target_log_luminance=-1.5,
+            source_chroma_log2=(0.0, 0.0, 0.0),
+            target_chroma_log2=(0.0, 0.0, 0.0),
+        ),
+    )
+    for index in range(121):
+        harmonizer.update(estimate, index / 30.0, source_generation=1)
+    return harmonizer
 
 
 class _FixedMaskSegmenter:
@@ -3732,6 +4250,111 @@ def test_color_correction_eligibility_is_explicit_and_bypasses_to_identity(
         assert not harmonizer.error_calls
 
 
+def test_legacy_prepared_color_seam_preserves_bgr_channel_order_with_wb(
+    monkeypatch,
+):
+    cfg = _color_integration_config("image", blend_space="srgb_legacy")
+    y, x = np.indices((24, 32), dtype=np.uint8)
+    frame = np.stack(
+        (
+            20 + x,
+            70 + y,
+            130 + ((x.astype(np.uint16) + y.astype(np.uint16)) % 40).astype(np.uint8),
+        ),
+        axis=2,
+    ).astype(np.uint8)
+    backdrop = np.full_like(frame, (11, 37, 83))
+    mask = np.ones((24, 32), np.float32)
+    transform = ColorTransform(0.25, (1.12, 0.97, 0.88))
+    estimate = ColorEstimate(
+        transform=transform,
+        behavior=ColorBehavior.EXPOSURE_WHITE_BALANCE,
+        reason=ColorReason.OK,
+        confidence=0.9,
+        exposure_confidence=0.9,
+        white_balance_confidence=0.9,
+        usable_source=512,
+        usable_target=512,
+        neutral_source=256,
+        neutral_target=256,
+        target_is_local=True,
+        reliable=True,
+        signature=ColorSceneSignature(
+            source_log_luminance=-2.0,
+            target_log_luminance=-1.5,
+            source_chroma_log2=(0.0, 0.0, 0.0),
+            target_chroma_log2=(0.0, 0.0, 0.0),
+        ),
+    )
+    estimator_inputs = []
+
+    def estimate_predecoded(foreground_linear_bgr, backdrop_linear_bgr, *_args, **_kw):
+        estimator_inputs.append((foreground_linear_bgr, backdrop_linear_bgr))
+        return estimate
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "estimate_color_transform_linear",
+        estimate_predecoded,
+    )
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        _FixedBackdrop(backdrop),
+        None,
+        harmonizer=_SpyHarmonizer(transform),
+    )
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    try:
+        prepared = pipeline._prepare_color_frame(
+            resources,
+            frame,
+            backdrop,
+            mask,
+            None,
+            now_s=10.0,
+            captured=_captured(frame, captured_at_ns=10_000_000_000),
+        )
+        rendered = pipeline._composite_prepared_color(
+            cfg,
+            frame,
+            backdrop,
+            mask,
+            None,
+            prepared,
+            light_wrap=0.0,
+        )
+        expected = compositor_mod.composite(
+            frame,
+            backdrop,
+            mask,
+            light_wrap=0.0,
+            blend_space="srgb_legacy",
+            color_transform=transform,
+        )
+
+        assert len(estimator_inputs) == 1
+        observed_foreground_bgr, observed_backdrop_bgr = estimator_inputs[0]
+        np.testing.assert_array_equal(
+            observed_foreground_bgr[..., ::-1],
+            bgr_u8_to_linear_rgb(frame),
+        )
+        np.testing.assert_array_equal(
+            observed_backdrop_bgr[..., ::-1],
+            bgr_u8_to_linear_rgb(backdrop),
+        )
+        assert not np.array_equal(
+            observed_foreground_bgr,
+            bgr_u8_to_linear_rgb(frame),
+        )
+        np.testing.assert_array_equal(rendered, expected)
+    finally:
+        resources.close()
+
+
 def test_image_backdrop_analysis_cache_is_bounded_and_generation_scoped(
     monkeypatch,
     tmp_path,
@@ -3940,6 +4563,8 @@ def test_live_reset_consumes_first_reliable_estimate_with_production_harmonizer(
         target_is_local=True,
         reliable=True,
         signature=signature,
+        exposure_clamped=True,
+        white_balance_clamped=False,
     )
     monkeypatch.setattr(
         pipeline_mod,
@@ -3965,6 +4590,8 @@ def test_live_reset_consumes_first_reliable_estimate_with_production_harmonizer(
     )
     snapshot = harmonizer.snapshot()
     assert first.transform.is_identity
+    assert first.exposure_clamped is True
+    assert first.white_balance_clamped is False
     assert snapshot.reliable
     assert snapshot.signature == signature
     assert snapshot.phase is HarmonizerPhase.WARMING
@@ -4153,7 +4780,7 @@ def test_auto_legacy_reuses_estimator_decodes_for_foreground_and_rvm_edge(
         lambda *_args, **_kwargs: object(),
     )
     calls = {"decode": 0, "legacy_predecoded": 0}
-    real_decode = pipeline_mod.bgr_u8_to_linear_rgb
+    real_decode = pipeline_mod.bgr_u8_to_linear_bgr
     real_legacy_predecoded = pipeline_mod.composite_legacy_predecoded
 
     def counted_decode(value):
@@ -4164,7 +4791,7 @@ def test_auto_legacy_reuses_estimator_decodes_for_foreground_and_rvm_edge(
         calls["legacy_predecoded"] += 1
         return real_legacy_predecoded(*args, **kwargs)
 
-    monkeypatch.setattr(pipeline_mod, "bgr_u8_to_linear_rgb", counted_decode)
+    monkeypatch.setattr(pipeline_mod, "bgr_u8_to_linear_bgr", counted_decode)
     monkeypatch.setattr(
         pipeline_mod,
         "composite_legacy_predecoded",
@@ -4334,6 +4961,83 @@ def test_live_light_wrap_preparation_error_falls_back_without_advancing_state(
     np.testing.assert_array_equal(rendered, expected)
     assert resources.light_wrap_stabilizer is stabilizer
     assert stabilizer.snapshot() == before
+
+
+@pytest.mark.parametrize("blend_space", ["srgb_legacy", "linear_srgb"])
+def test_immutable_backdrop_light_wrap_is_cached_per_visual_generation(
+    monkeypatch,
+    blend_space,
+):
+    cfg = _color_integration_config(
+        "color",
+        correction_mode="off",
+        blend_space=blend_space,
+    ).patched(
+        {
+            "compositing": {
+                "light_wrap": 0.8,
+                "light_wrap_stabilization": {"mode": "off"},
+            }
+        }
+    )
+    foreground = np.full((24, 32, 3), 80, np.uint8)
+    backdrop = np.full((24, 32, 3), (10, 30, 90), np.uint8)
+    mask = np.full((24, 32), 0.5, np.float32)
+    provider = pipeline_mod.ColorBackdrop((10, 30, 90))
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        _SequenceCapture([]),
+        _FixedMaskSegmenter(mask),
+        _IdentityRefiner(),
+        provider,
+        None,
+    )
+    prepare_calls = 0
+    original_prepare = pipeline_mod.prepare_static_light_wrap
+
+    def counted_prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "prepare_static_light_wrap", counted_prepare)
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    first, first_reason = pipeline._local_composite(
+        resources,
+        foreground,
+        privacy_safe=False,
+    )
+    second, second_reason = pipeline._local_composite(
+        resources,
+        foreground,
+        privacy_safe=False,
+    )
+    expected = pipeline_mod.composite(
+        foreground,
+        backdrop,
+        mask,
+        light_wrap=0.8,
+        blend_space=blend_space,
+    )
+
+    assert first_reason == second_reason == ""
+    np.testing.assert_array_equal(first, expected)
+    np.testing.assert_array_equal(second, expected)
+    assert prepare_calls == 1
+    assert resources.static_light_wrap is not None
+    assert resources.static_light_wrap.pixels_bgr.flags.writeable is False
+
+    resources.visual_generation += 1
+    third, third_reason = pipeline._local_composite(
+        resources,
+        foreground,
+        privacy_safe=False,
+    )
+    assert third_reason == ""
+    np.testing.assert_array_equal(third, expected)
+    assert prepare_calls == 2
+    resources.close()
 
 
 def test_private_live_evidence_retains_exact_consumed_prepared_light_wrap(
@@ -4595,7 +5299,8 @@ def test_repeat_output_does_not_advance_harmonizer(
     assert stats["exact_final_output_repeat_ratio"] == 1.0
 
 
-def test_temporal_timeline_status_counts_gaps_and_boundary_resets():
+def test_temporal_timeline_status_counts_gaps_and_boundary_resets(caplog):
+    caplog.set_level("INFO", logger="custback.pipeline")
     cfg = _color_integration_config(
         "image",
         correction_mode="off",
@@ -4659,6 +5364,19 @@ def test_temporal_timeline_status_counts_gaps_and_boundary_resets():
     assert stats["matte_reset_count"] == 2
     assert stats["matte_last_reset_reason"] == "timestamp-gap"
     assert stats["output_repeated_frames"] == 1
+    reset_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("matte temporal reset ")
+    ]
+    assert len(reset_messages) == 2
+    assert "reason=initial sequence_gap=0 elapsed_gap_ms=none" in reset_messages[0]
+    assert (
+        "reason=timestamp-gap sequence_gap=2 elapsed_gap_ms=1200.000"
+        in reset_messages[1]
+    )
+    assert "capture_generation=1 geometry_generation=1" in reset_messages[1]
+    assert "segmentation_generation=0 config_version=0" in reset_messages[1]
 
 
 @pytest.mark.parametrize(
@@ -4685,16 +5403,26 @@ def test_capture_status_advances_when_output_mode_bypasses_segmentation(
     )
     pipeline, hub = run_pipeline(RuntimeConfig(cfg))
     try:
-        stats = wait_for_stats(hub, lambda value: value["frames_in"] >= 5)
+        stats = wait_for_stats(
+            hub,
+            lambda value: (
+                value["frames_out"] >= 5
+                if mode == "remote"
+                else value["frames_in"] >= 5
+            ),
+        )
         assert stats["capture_sequence"] == stats["frames_in"]
         assert stats["capture_frames_read"] == stats["frames_in"]
+        if mode == "remote":
+            assert stats["frames_in"] == 1
+            assert stats["output_repeated_frames"] >= 4
         assert stats["capture_sequence_gap_count"] == 0
         assert stats["capture_missing_input_count"] == 0
     finally:
         pipeline.stop()
 
 
-def test_remote_to_local_transition_does_not_invent_capture_gaps():
+def test_remote_to_local_transition_reports_capture_health_truthfully():
     cfg = (
         make_runtime(mode="remote", remote_fallback_mode="color")
         .snapshot()
@@ -4702,8 +5430,9 @@ def test_remote_to_local_transition_does_not_invent_capture_gaps():
     )
     pipeline, hub = run_pipeline(RuntimeConfig(cfg))
     try:
-        before = wait_for_stats(hub, lambda value: value["frames_in"] >= 5)
+        before = wait_for_stats(hub, lambda value: value["frames_out"] >= 5)
         assert before["capture_sequence"] == before["frames_in"]
+        assert before["frames_in"] == 1
         assert before["capture_sequence_gap_count"] == 0
         assert before["capture_missing_input_count"] == 0
 
@@ -4718,9 +5447,12 @@ def test_remote_to_local_transition_does_not_invent_capture_gaps():
                 and value["capture_sequence"] > before["capture_sequence"]
             ),
         )
-        assert after["capture_sequence"] == after["frames_in"]
-        assert after["capture_sequence_gap_count"] == 0
-        assert after["capture_missing_input_count"] == 0
+        assert after["capture_sequence"] == after["capture_frames_read"]
+        assert after["frames_in"] > before["frames_in"]
+        missing = after["capture_missing_input_count"]
+        gap_events = after["capture_sequence_gap_count"]
+        assert missing >= gap_events
+        assert (missing == 0) == (gap_events == 0)
     finally:
         pipeline.stop()
 
@@ -4757,7 +5489,12 @@ def test_auto_correction_leaves_remote_candidate_or_privacy_slate_untouched(
     )
     session = hub.remote_client_connected() if remote_candidate else None
     if session is not None:
-        assert hub.push_remote_frame(candidate, session)
+        hub.publish_remote_raw(raw, 1)
+        assert hub.push_remote_frame(
+            candidate,
+            raw_epoch=1,
+            session_id=session,
+        )
     try:
         pipeline._loop(resources)
     finally:
@@ -5409,13 +6146,237 @@ def test_unrelated_hot_commit_preserves_harmonizer_object_and_snapshot():
     assert resources.color_reset_token == ("stable",)
 
 
+@pytest.mark.parametrize(
+    ("patch", "expected_adaptation"),
+    [
+        ({"compositing": {"color_correction": {"strength": 0.25}}}, 0.8),
+        (
+            {"compositing": {"color_correction": {"exposure_limit_ev": 0.95}}},
+            0.8,
+        ),
+        (
+            {"compositing": {"color_correction": {"white_balance_strength": 0.25}}},
+            0.8,
+        ),
+        (
+            {"compositing": {"color_correction": {"adaptation_time_s": 1.7}}},
+            1.7,
+        ),
+    ],
+)
+def test_safe_color_scalar_commit_preserves_applied_temporal_state(
+    patch,
+    expected_adaptation,
+):
+    current = _color_integration_config("image")
+    candidate = current.patched(patch)
+    live = _seeded_color_harmonizer()
+    before = live.snapshot()
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.zeros((24, 32, 3), np.uint8)),
+        None,
+        harmonizer=live,
+        color_reset_token=("stable",),
+        visual_generation=4,
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    activation = pipeline._prepare_activation_off_lane(current, candidate)
+    assert activation.replace_harmonizer is False
+    assert activation.reconfigure_harmonizer is True
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        0,
+        prepared_activation=activation,
+    )
+
+    pipeline._handle_patch_request(
+        resources,
+        request,
+        _captured(
+            np.zeros((24, 32, 3), np.uint8),
+            captured_at_ns=10_000_000_000,
+        ),
+    )
+
+    assert request.error is None
+    assert request.result is not None
+    assert resources.harmonizer is not live
+    assert resources.harmonizer is not None
+    assert resources.harmonizer.snapshot() == before
+    assert resources.harmonizer.adaptation_time_s == expected_adaptation
+    assert resources.color_reset_token == ("stable",)
+    assert resources.visual_generation == 4
+    resources.close()
+
+
+@pytest.mark.parametrize(
+    ("initial_exposure", "new_limit", "expected_exposure"),
+    [(0.7, 0.3, 0.3), (0.2, 0.3, 0.2)],
+)
+def test_lowered_exposure_bound_clamps_only_when_current_state_requires_it(
+    initial_exposure,
+    new_limit,
+    expected_exposure,
+):
+    current = _color_integration_config("image")
+    candidate = current.patched(
+        {"compositing": {"color_correction": {"exposure_limit_ev": new_limit}}}
+    )
+    live = _seeded_color_harmonizer(initial_exposure)
+    before = live.snapshot()
+    resources = pipeline_mod._Resources(
+        current,
+        0,
+        None,
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.zeros((24, 32, 3), np.uint8)),
+        None,
+        harmonizer=live,
+        color_reset_token=("stable",),
+    )
+    pipeline = Pipeline(RuntimeConfig(current), FrameHub())
+    request = pipeline_mod._PatchRequest(
+        candidate,
+        0,
+        prepared_activation=pipeline._prepare_activation_off_lane(
+            current,
+            candidate,
+        ),
+    )
+
+    pipeline._handle_patch_request(
+        resources,
+        request,
+        _captured(
+            np.zeros((24, 32, 3), np.uint8),
+            captured_at_ns=10_000_000_000,
+        ),
+    )
+
+    assert request.error is None
+    assert resources.harmonizer is not None
+    after = resources.harmonizer.snapshot()
+    assert after.transform.exposure_ev == pytest.approx(expected_exposure, abs=0.01)
+    assert after.transform.wb_gains == before.transform.wb_gains
+    for name in (
+        "phase",
+        "reason",
+        "confidence",
+        "reliable",
+        "last_timestamp_s",
+        "last_reliable_s",
+        "low_confidence_since_s",
+        "fast_until_s",
+        "source_generation",
+        "signature",
+    ):
+        assert getattr(after, name) == getattr(before, name)
+    assert resources.color_reset_token == ("stable",)
+    resources.close()
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"compositing": {"color_correction": {"mode": "off"}}},
+        {"background": {"image_path": "/deterministic/other.png"}},
+        {"background": {"anchor_x": 0.25}},
+        {"segmentation": {"threshold": 0.61}},
+        {"compositing": {"blend_space": "srgb_legacy"}},
+    ],
+)
+def test_color_state_key_retains_every_hard_reset_boundary(patch):
+    current = _color_integration_config("image")
+    candidate = current.patched(patch)
+    assert pipeline_mod._color_state_key(candidate) != pipeline_mod._color_state_key(
+        current
+    )
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"compositing": {"color_correction": {"strength": 0.25}}},
+        {"compositing": {"color_correction": {"exposure_limit_ev": 0.5}}},
+        {"compositing": {"color_correction": {"white_balance_strength": 0.25}}},
+        {"compositing": {"color_correction": {"adaptation_time_s": 1.7}}},
+    ],
+)
+def test_color_scalar_policy_does_not_expand_the_hard_reset_key(patch):
+    current = _color_integration_config("image")
+    candidate = current.patched(patch)
+    assert pipeline_mod._color_state_key(candidate) == pipeline_mod._color_state_key(
+        current
+    )
+    assert pipeline_mod._color_scalar_policy_key(
+        candidate
+    ) != pipeline_mod._color_scalar_policy_key(current)
+
+
+def test_color_clamp_telemetry_advances_only_on_unique_processed_frames():
+    cfg = _color_integration_config("image")
+    resources = pipeline_mod._Resources(
+        cfg,
+        0,
+        None,
+        _FixedMaskSegmenter(np.full((24, 32), 0.5, np.float32)),
+        _IdentityRefiner(),
+        _FixedBackdrop(np.zeros((24, 32, 3), np.uint8)),
+        None,
+    )
+    status = {
+        "color_correction_active": True,
+        "color_correction_state": "active",
+        "color_correction_exposure_clamped": True,
+        "color_correction_wb_clamped": True,
+    }
+
+    Pipeline._record_color_output(resources, status, processed=True, observed_at_s=10.0)
+    Pipeline._record_color_output(
+        resources, status, processed=False, observed_at_s=10.4
+    )
+    Pipeline._record_color_output(
+        resources,
+        {**status, "color_correction_wb_clamped": False},
+        processed=True,
+        observed_at_s=10.5,
+    )
+    Pipeline._record_color_output(
+        resources,
+        {
+            **status,
+            "color_correction_exposure_clamped": False,
+            "color_correction_wb_clamped": False,
+        },
+        processed=True,
+        observed_at_s=11.0,
+    )
+
+    assert resources.color_correction_applied_frames == 4
+    assert resources.color_correction_exposure_clamped is False
+    assert resources.color_correction_exposure_clamp_count == 2
+    assert resources.color_correction_exposure_clamp_time_s == pytest.approx(1.0)
+    assert resources.color_correction_wb_clamped is False
+    assert resources.color_correction_wb_clamp_count == 1
+    assert resources.color_correction_wb_clamp_time_s == pytest.approx(0.5)
+    resources.close()
+
+
 @pytest.mark.parametrize("outcome", ["trial", "conflict", "cancel"])
 def test_rejected_activation_paths_do_not_mutate_live_harmonizer(
     monkeypatch,
     outcome,
 ):
     current = _color_integration_config("image")
-    candidate = current.patched({"background": {"anchor_x": 0.25}})
+    candidate = current.patched(
+        {"compositing": {"color_correction": {"adaptation_time_s": 1.7}}}
+    )
     live = ColorHarmonizer(0.8, mode="image")
     live.reset(5.0, reason=ColorReason.INVALID)
     snapshot = live.snapshot()

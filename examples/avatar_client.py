@@ -26,7 +26,10 @@ import cv2
 import numpy as np
 import websockets
 
+from custback.remote_protocol import decode_remote_frame, encode_remote_frame
+
 CUSTBACK_WS = "ws://127.0.0.1:8710/ws/frames?stream=raw"
+FRAME_MAX_BYTES = 16 * 1024 * 1024
 
 
 def renderer_token() -> str:
@@ -75,7 +78,7 @@ async def main() -> None:
         connect_kwargs["proxy"] = None
     async with websockets.connect(
         CUSTBACK_WS,
-        max_size=16 * 1024 * 1024,
+        max_size=FRAME_MAX_BYTES,
         **connect_kwargs,
     ) as ws:
         print(f"connected to {CUSTBACK_WS}")
@@ -83,13 +86,31 @@ async def main() -> None:
             data = await ws.recv()
             if not isinstance(data, bytes):
                 raise RuntimeError("frame WebSocket returned a non-binary message")
-            frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            envelope = decode_remote_frame(
+                data,
+                expected_kind="raw-input",
+                max_message_bytes=FRAME_MAX_BYTES,
+            )
+            # Renderer leases receive only positive, remotely admitted raw
+            # epochs. Local-mode/management preview frames are never exposed
+            # on this credentialed duplex lane.
+            frame = cv2.imdecode(
+                np.frombuffer(envelope.jpeg, np.uint8),
+                cv2.IMREAD_COLOR,
+            )
             if frame is None:
                 continue
             rendered = transform(frame)
             ok, jpeg = cv2.imencode(".jpg", rendered, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if ok:
-                await ws.send(jpeg.tobytes())
+                await ws.send(
+                    encode_remote_frame(
+                        "rendered-output",
+                        envelope.raw_epoch,
+                        jpeg.tobytes(),
+                        max_message_bytes=FRAME_MAX_BYTES,
+                    )
+                )
 
 
 if __name__ == "__main__":

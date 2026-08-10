@@ -118,6 +118,37 @@ def test_pixel_identical_successful_capture_is_unique_and_exact():
     assert snapshot.last_unique_frame_age_ms == 20.0
 
 
+def test_new_visual_base_may_reuse_exact_capture_provenance():
+    tracker = CadenceTracker(30)
+    _record_base(
+        tracker,
+        7,
+        10_000_000,
+        ready_at_ns=20_000_000,
+        sent_at_ns=30_000_000,
+    )
+    # A renderer response or committed scalar policy can produce a second
+    # immutable visual base from the same capture. It is a base update (and
+    # may be pixel-identical), but it must not invent a second camera sample.
+    _record_base(
+        tracker,
+        7,
+        10_000_000,
+        ready_at_ns=40_000_000,
+        sent_at_ns=50_000_000,
+        segmentation_updated=False,
+        exact_final_repeat=True,
+    )
+
+    snapshot = tracker.snapshot(now_ns=50_000_000)
+    assert snapshot.capture_sequence == 7
+    assert snapshot.unique_capture_count == 1
+    assert snapshot.base_composite_update_count == 2
+    assert snapshot.exact_final_output_repeat_count == 1
+    assert snapshot.capture_sequence_gap_count == 0
+    assert snapshot.capture_missing_input_count == 0
+
+
 def test_no_unread_send_is_safe_base_reuse_independent_of_final_equality():
     tracker = CadenceTracker(30)
     _record_base(tracker, 1, 0)

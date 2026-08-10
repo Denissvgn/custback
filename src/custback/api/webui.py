@@ -2672,7 +2672,8 @@ function formatDiagnostic(key, value) {
     "acceleration_active_provider", "acceleration_state",
     "color_correction_mode", "color_correction_effective_mode",
     "color_correction_state", "color_correction_reason",
-    "camera_fit", "background_fit", "color_input_assumption",
+    "camera_fit", "background_fit", "background_fallback_reason",
+    "color_input_assumption",
     "background_video_decoder_backend", "background_video_color_status",
   ]);
   return enumKeys.has(key) ? titleCase(value) : String(value);
@@ -2731,6 +2732,7 @@ function diagnosticLabel(key) {
     cadence_mismatch_active: "Visual cadence mismatch",
     timing_schema_version: "Timing schema version",
     timing_ms: "Pipeline timing boundaries",
+    runtime_performance: "Runtime performance",
     extensions: "Status extensions",
     segmentation_backend: "Segmentation backend", segmentation_device: "Segmentation device",
     segmentation_selection: "Backend selection", matte_policy: "Matte policy",
@@ -2747,6 +2749,8 @@ function diagnosticLabel(key) {
     camera_mirror: "Camera mirror", camera_scale_x: "Camera horizontal scale",
     camera_scale_y: "Camera vertical scale", background_fit: "Background fit",
     background_scale_x: "Background horizontal scale", background_scale_y: "Background vertical scale",
+    background_fallback_active: "Background fallback active",
+    background_fallback_reason: "Background fallback reason",
     camera_controls: "Camera-control qualification",
     background_video_decoder_backend: "Video decoder backend",
     background_video_color_status: "Video colour status",
@@ -2754,6 +2758,11 @@ function diagnosticLabel(key) {
     background_video_output_color: "Normalized video output colour",
     background_video_color_assumed_fields: "Assumed video colour fields",
     background_video_color_overridden_fields: "Overridden video colour fields",
+    background_video_lifetime_frames_displayed: "Run video frames displayed",
+    background_video_lifetime_frames_skipped: "Run video frames skipped",
+    background_video_lifetime_frames_reused: "Run video frames reused",
+    background_video_lifetime_seek_count: "Run video seeks",
+    background_video_lifetime_decode_failures: "Run video decode failures",
     color_correction_mode: "Configured colour correction",
     color_correction_active: "Colour transform applied",
     color_correction_effective_mode: "Effective colour correction",
@@ -2761,8 +2770,15 @@ function diagnosticLabel(key) {
     color_correction_reason: "Colour correction reason",
     color_correction_confidence: "Colour estimate confidence",
     color_correction_exposure_ev: "Exposure correction",
+    color_correction_exposure_clamped: "Exposure estimate clamped",
+    color_correction_exposure_clamp_count: "Clamped exposure frames",
+    color_correction_exposure_clamp_time_s: "Exposure clamp time",
     color_correction_wb_gain_r: "Red gain", color_correction_wb_gain_g: "Green gain",
     color_correction_wb_gain_b: "Blue gain", color_correction_warming: "Correction warming",
+    color_correction_wb_clamped: "White-balance estimate clamped",
+    color_correction_wb_clamp_count: "Clamped white-balance frames",
+    color_correction_wb_clamp_time_s: "White-balance clamp time",
+    color_correction_reason_transitions: "Colour estimator reason transitions",
     color_correction_stale: "Correction stale", color_input_assumption: "Input colour assumption",
     uptime_s: "Uptime", connected: "Camera feed connected", driver_backend: "Following driver",
     face_present: "Face detected", render_ms: "Avatar render time", render_failures: "Render failures",
@@ -2824,6 +2840,49 @@ function visualCadenceRows(status) {
         + count(status.exact_final_output_repeat_count) + " total · "
         + ratio(status.exact_final_output_repeat_ratio),
       tone],
+  ];
+}
+
+function runtimePerformanceRows(status) {
+  const performance = status && status.runtime_performance;
+  if (!performance || performance.schema_version !== 1) {
+    return [
+      ["Output cadence", "Runtime performance status unavailable", "warn"],
+      ["Unique visual cadence", "Runtime performance status unavailable", "warn"],
+      ["Dominant stage", "Not measured", ""],
+      ["Suggested patch", "None while status is unavailable", ""],
+    ];
+  }
+  const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const target = number(performance.target_fps);
+  const cadence = (value, attainment) => number(value).toFixed(1) + " / "
+    + target.toFixed(1) + " fps · " + (number(attainment) * 100).toFixed(1)
+    + "% target";
+  const failed = performance.state === "failed";
+  const outputTone = failed ? "bad" : (performance.output_healthy ? "good" : "warn");
+  const uniqueTone = failed ? "bad" : (performance.unique_healthy ? "good" : "warn");
+  const stage = performance.dominant_stage;
+  const stageP95 = stage && performance.stage_p95_ms
+    ? Number(performance.stage_p95_ms[stage]) : NaN;
+  const stageText = stage
+    ? titleCase(stage.replaceAll(".", " "))
+      + (Number.isFinite(stageP95) ? " · p95 " + stageP95.toFixed(1) + " ms" : "")
+    : "Not measured";
+  const mitigation = performance.recommended_mitigation;
+  const mitigationText = mitigation
+    ? titleCase(mitigation.kind) + " · config v" + mitigation.config_version
+      + " · " + JSON.stringify(mitigation.patch)
+    : (performance.state === "warming"
+      ? "Waiting for the performance window" : "No mitigation suggested");
+  return [
+    ["Output cadence",
+      cadence(performance.output_send_fps, performance.output_attainment),
+      outputTone],
+    ["Unique visual cadence",
+      cadence(performance.sent_unique_base_fps, performance.unique_attainment),
+      uniqueTone],
+    ["Dominant stage", stageText, performance.state === "degraded" ? "warn" : ""],
+    ["Suggested patch", mitigationText, mitigation ? "warn" : ""],
   ];
 }
 
@@ -2891,7 +2950,16 @@ function renderDiagnostics() {
     const mattePolicy = mattePolicySummary(status);
     if (mattePolicy) coreRows.push(mattePolicy);
     coreRows.push(...matteRolloutRows(status, state.coreVersion));
+    coreRows.push(...runtimePerformanceRows(status));
     coreRows.push(...visualCadenceRows(status));
+    if (status.background_fallback_active) {
+      coreRows.push([
+        "Background fallback",
+        titleCase(status.background_fallback_reason || "asset-unavailable")
+          + " · fixed privacy slate",
+        "warn",
+      ]);
+    }
     // Acceleration is only meaningful for the RVM/ONNX Runtime backend; other
     // segmenters report an empty active provider. Show the truthful post-
     // fallback provider, not the requested one.

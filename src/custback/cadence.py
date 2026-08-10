@@ -80,6 +80,7 @@ class _SuccessfulSend:
     captured_at_ns: int | None
     base_ready_at_ns: int | None
     base_updated: bool
+    capture_advanced: bool
     segmentation_updated: bool
     exact_final_repeat: bool
 
@@ -268,15 +269,6 @@ class CadenceTracker:
                     "capture, base-ready, and send timestamps must be ordered"
                 )
 
-        event = _SuccessfulSend(
-            sent_at_ns=sent_at_ns,
-            capture_sequence=capture_sequence,
-            captured_at_ns=captured_at_ns,
-            base_ready_at_ns=base_ready_at_ns,
-            base_updated=base_updated,
-            segmentation_updated=segmentation_updated,
-            exact_final_repeat=exact_final_repeat,
-        )
         with self._lock:
             if self._last_sent_at_ns is not None and sent_at_ns < self._last_sent_at_ns:
                 raise ValueError("successful send timestamps must not decrease")
@@ -293,10 +285,17 @@ class CadenceTracker:
                 )
                 if (
                     previous_sequence is not None
-                    and capture_sequence <= previous_sequence
+                    and capture_sequence < previous_sequence
                 ):
                     raise ValueError(
                         "capture sequence must increase for every base update"
+                    )
+                capture_advanced = bool(
+                    previous_sequence is None or capture_sequence > previous_sequence
+                )
+                if not capture_advanced and captured_at_ns != self._last_captured_at_ns:
+                    raise ValueError(
+                        "a repeated capture sequence must retain its timestamp"
                     )
                 if (
                     self._last_captured_at_ns is not None
@@ -310,20 +309,32 @@ class CadenceTracker:
                     and base_ready_at_ns < self._last_base_ready_at_ns
                 ):
                     raise ValueError("base-ready timestamps must not decrease")
-                if previous_sequence is not None:
+                if capture_advanced and previous_sequence is not None:
                     missing = capture_sequence - previous_sequence - 1
                     if missing:
                         self._capture_sequence_gap_count += 1
                         self._capture_missing_input_count += missing
-                self._capture_sequence = capture_sequence
-                self._last_captured_at_ns = captured_at_ns
+                if capture_advanced:
+                    self._capture_sequence = capture_sequence
+                    self._last_captured_at_ns = captured_at_ns
+                    self._unique_capture_count += 1
                 self._last_base_ready_at_ns = base_ready_at_ns
-                self._unique_capture_count += 1
                 self._base_composite_update_count += 1
                 if segmentation_updated:
                     self._segmentation_update_count += 1
             else:
+                capture_advanced = False
                 self._base_composite_reuse_count += 1
+            event = _SuccessfulSend(
+                sent_at_ns=sent_at_ns,
+                capture_sequence=capture_sequence,
+                captured_at_ns=captured_at_ns,
+                base_ready_at_ns=base_ready_at_ns,
+                base_updated=base_updated,
+                capture_advanced=capture_advanced,
+                segmentation_updated=segmentation_updated,
+                exact_final_repeat=exact_final_repeat,
+            )
             if exact_final_repeat:
                 self._exact_final_output_repeat_count += 1
             if processing_deadline_missed:
@@ -391,7 +402,7 @@ class CadenceTracker:
             capture_timestamps = [
                 event.captured_at_ns
                 for event in events
-                if event.captured_at_ns is not None
+                if event.captured_at_ns is not None and event.capture_advanced
             ]
             if (
                 len(capture_timestamps) >= 2

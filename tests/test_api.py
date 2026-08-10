@@ -47,6 +47,11 @@ from custback.config import (
 )
 from custback.hub import TIMING_FIELD_NAMES, FrameHub, PostBaseProvenance
 from custback.pipeline import Pipeline
+from custback.remote_protocol import (
+    REMOTE_FRAME_HEADER_BYTES,
+    decode_remote_frame,
+    encode_remote_frame,
+)
 
 
 TOKEN = "test-api-token-which-is-at-least-32-characters"
@@ -286,7 +291,7 @@ def stack(tmp_path):
             "background": {"mode": "color", "color": [200, 30, 30]},
             "segmentation": {"backend": "heuristic"},
             "output": {"backend": "null", "fps": 60},
-            "api": {"ws_max_bytes": 1024},
+            "api": {"ws_max_bytes": 16 * 1024},
         }
     )
     runtime = RuntimeConfig(cfg)
@@ -1088,6 +1093,10 @@ def test_active_auto_frame_is_consistent_across_raw_output_snapshot_and_mjpeg(
             headers={**AUTH, "Origin": ORIGIN},
         ).connect()
         try:
+            # A management raw preview is read-only and never acquires a
+            # renderer lease. Re-publish the frozen local frame for this
+            # transport comparison.
+            stack.hub.publish_raw(raw_exact.copy())
             return (
                 await raw_socket.receive_bytes(),
                 await output_socket.receive_bytes(),
@@ -1096,7 +1105,7 @@ def test_active_auto_frame_is_consistent_across_raw_output_snapshot_and_mjpeg(
             await raw_socket.close()
             await output_socket.close()
 
-    raw_jpeg, output_ws_jpeg = run_async(read_websockets())
+    raw_message, output_ws_jpeg = run_async(read_websockets())
     mjpeg = run_async(_first_mjpeg_frame(stack.app))
     snapshot = stack.get("/video/snapshot.jpg", headers=AUTH)
     assert snapshot.status_code == 200
@@ -1106,7 +1115,7 @@ def test_active_auto_frame_is_consistent_across_raw_output_snapshot_and_mjpeg(
         assert frame is not None
         return frame
 
-    decoded_raw = decode(raw_jpeg)
+    decoded_raw = decode(raw_message)
     decoded_outputs = [
         decode(value) for value in (output_ws_jpeg, mjpeg, snapshot.content)
     ]
@@ -1148,21 +1157,23 @@ def test_remote_near_raw_echo_reaches_mjpeg_only_as_privacy_slate(stack):
         websocket = await ASGIWebSocket(
             stack.app,
             "/ws/frames?stream=raw",
-            headers={**AUTH, "Origin": ORIGIN},
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
         ).connect()
         try:
-            # Drain the frame which may predate renderer-session activation.
-            await websocket.receive_bytes()
-            raw_jpeg = await websocket.receive_bytes()
+            raw_message = await websocket.receive_bytes()
+            raw_envelope = decode_remote_frame(
+                raw_message,
+                expected_kind="raw-input",
+            )
+            assert raw_envelope.raw_epoch > 0
             raw = cv2.imdecode(
-                np.frombuffer(raw_jpeg, dtype=np.uint8),
+                np.frombuffer(raw_envelope.jpeg, dtype=np.uint8),
                 cv2.IMREAD_COLOR,
             )
             assert raw is not None and raw.shape == (72, 128, 3)
 
-            # The fixture intentionally limits renderer frames to 1 KiB. Use
-            # the highest quality that fits, preserving a recognizable JPEG
-            # near-echo while still traversing the real WebSocket decoder.
+            # Use the highest quality that fits the total configured wire
+            # bound, preserving a recognizable JPEG near-echo.
             echo_jpeg = None
             for quality in (60, 50, 40, 30, 25, 20, 15, 10):
                 ok, encoded = cv2.imencode(
@@ -1171,7 +1182,10 @@ def test_remote_near_raw_echo_reaches_mjpeg_only_as_privacy_slate(stack):
                     [cv2.IMWRITE_JPEG_QUALITY, quality],
                 )
                 assert ok
-                if encoded.nbytes <= stack.runtime.snapshot().api.ws_max_bytes:
+                if (
+                    encoded.nbytes + REMOTE_FRAME_HEADER_BYTES
+                    <= stack.runtime.snapshot().api.ws_max_bytes
+                ):
                     echo_jpeg = encoded.tobytes()
                     break
             assert echo_jpeg is not None
@@ -1186,7 +1200,14 @@ def test_remote_near_raw_echo_reaches_mjpeg_only_as_privacy_slate(stack):
                 )
                 < 8.0
             )
-            await websocket.send_bytes(echo_jpeg)
+            await websocket.send_bytes(
+                encode_remote_frame(
+                    "rendered-output",
+                    raw_envelope.raw_epoch,
+                    echo_jpeg,
+                    max_message_bytes=stack.runtime.snapshot().api.ws_max_bytes,
+                )
+            )
 
             slate = Pipeline._privacy_slate(raw.shape)
             deadline = time.monotonic() + 5.0
@@ -1762,17 +1783,32 @@ def test_websocket_round_trip(stack):
         websocket = await ASGIWebSocket(
             stack.app,
             "/ws/frames?stream=raw",
-            headers={**AUTH, "Origin": ORIGIN},
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
         ).connect()
         try:
             data = await websocket.receive_bytes()
-            frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            raw_envelope = decode_remote_frame(
+                data,
+                expected_kind="raw-input",
+            )
+            assert raw_envelope.raw_epoch > 0
+            frame = cv2.imdecode(
+                np.frombuffer(raw_envelope.jpeg, np.uint8),
+                cv2.IMREAD_COLOR,
+            )
             assert frame is not None and frame.shape == (72, 128, 3)
 
             rendered = np.full_like(frame, (9, 9, 9))
             ok, jpeg = cv2.imencode(".jpg", rendered)
             assert ok
-            await websocket.send_bytes(jpeg.tobytes())
+            await websocket.send_bytes(
+                encode_remote_frame(
+                    "rendered-output",
+                    raw_envelope.raw_epoch,
+                    jpeg.tobytes(),
+                    max_message_bytes=stack.runtime.snapshot().api.ws_max_bytes,
+                )
+            )
 
             deadline = time.monotonic() + 5.0
             while (
@@ -1780,6 +1816,66 @@ def test_websocket_round_trip(stack):
             ):
                 await asyncio.sleep(0.02)
             assert stack.hub.remote_in.latest()[0] is not None
+        finally:
+            await websocket.close()
+
+    run_async(scenario())
+
+
+def test_websocket_rejects_delayed_tag_without_relabeling_current_epoch(stack):
+    stack.pipeline.stop()
+    raw = np.full((72, 128, 3), 37, dtype=np.uint8)
+    first_epoch = 2**62
+
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
+        ).connect()
+        try:
+            stack.hub.publish_remote_raw(raw, first_epoch)
+            first = decode_remote_frame(
+                await websocket.receive_bytes(),
+                expected_kind="raw-input",
+            )
+            assert first.raw_epoch == first_epoch
+
+            stack.hub.publish_remote_raw(raw, first_epoch + 1)
+            second = decode_remote_frame(
+                await websocket.receive_bytes(),
+                expected_kind="raw-input",
+            )
+            assert second.raw_epoch == first_epoch + 1
+
+            rendered = np.full_like(raw, 11)
+            ok, jpeg = cv2.imencode(".jpg", rendered)
+            assert ok
+            await websocket.send_bytes(
+                encode_remote_frame(
+                    "rendered-output",
+                    first.raw_epoch,
+                    jpeg.tobytes(),
+                    max_message_bytes=stack.runtime.snapshot().api.ws_max_bytes,
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert stack.hub.remote_in.latest()[0] is None
+
+            await websocket.send_bytes(
+                encode_remote_frame(
+                    "rendered-output",
+                    second.raw_epoch,
+                    jpeg.tobytes(),
+                    max_message_bytes=stack.runtime.snapshot().api.ws_max_bytes,
+                )
+            )
+            deadline = time.monotonic() + 2.0
+            while stack.hub.remote_in.latest()[0] is None:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            proof = stack.hub.remote_frame_proof_status(1.0)
+            assert proof[2] == second.raw_epoch
         finally:
             await websocket.close()
 
@@ -1794,7 +1890,6 @@ def test_invalidated_renderer_epoch_closes_websocket(stack):
             headers={**RENDERER_AUTH, "Origin": ORIGIN},
         ).connect()
         try:
-            await websocket.receive_bytes()
             session = stack.hub.active_remote_session()
             assert session is not None
             assert stack.hub.invalidate_remote_session(session)
@@ -1807,16 +1902,110 @@ def test_invalidated_renderer_epoch_closes_websocket(stack):
     run_async(scenario())
 
 
+def test_second_renderer_exclusively_replaces_and_fences_first(stack):
+    stack.pipeline.apply_config_patch({"background": {"mode": "remote"}})
+
+    async def scenario():
+        first = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
+        ).connect()
+        second = None
+        try:
+            first_raw = decode_remote_frame(
+                await first.receive_bytes(),
+                expected_kind="raw-input",
+            )
+            first_session = stack.hub.active_remote_session()
+            assert first_session is not None
+            sends_before_replacement = stack.hub.stats_dict()["frames_out"]
+
+            second = await ASGIWebSocket(
+                stack.app,
+                "/ws/frames?stream=raw",
+                headers={**RENDERER_AUTH, "Origin": ORIGIN},
+            ).connect()
+            second_session = stack.hub.active_remote_session()
+            assert second_session is not None and second_session != first_session
+            closed = await first.receive_close()
+            assert closed.code == 1012
+            assert closed.reason == "renderer session invalidated"
+            assert not stack.hub.push_remote_frame(
+                np.zeros((72, 128, 3), np.uint8),
+                raw_epoch=first_raw.raw_epoch,
+                session_id=first_session,
+            )
+
+            # Replacement synchronously fences output to the fixed slate until
+            # this exact new session returns its current raw epoch.
+            slate = Pipeline._privacy_slate((72, 128, 3))
+            deadline = time.monotonic() + 2.0
+            while True:
+                protected = stack.hub.output.latest()[0]
+                if (
+                    stack.hub.stats_dict()["frames_out"] > sends_before_replacement
+                    and protected is not None
+                    and np.array_equal(protected, slate)
+                ):
+                    break
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            second_raw = decode_remote_frame(
+                await second.receive_bytes(),
+                expected_kind="raw-input",
+            )
+            rendered = np.full((72, 128, 3), 19, np.uint8)
+            ok, jpeg = cv2.imencode(".jpg", rendered)
+            assert ok
+            await second.send_bytes(
+                encode_remote_frame(
+                    "rendered-output",
+                    second_raw.raw_epoch,
+                    jpeg.tobytes(),
+                    max_message_bytes=stack.runtime.snapshot().api.ws_max_bytes,
+                )
+            )
+            deadline = time.monotonic() + 2.0
+            while stack.hub.remote_in.latest()[0] is None:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+        finally:
+            await first.close()
+            if second is not None:
+                await second.close()
+
+    run_async(scenario())
+
+
 def test_websocket_rejects_text_and_wrong_dimensions(stack):
     async def scenario():
+        # Management authentication grants raw preview only; it never creates
+        # a renderer session or accepts returned pixels.
         websocket = await ASGIWebSocket(
             stack.app,
             "/ws/frames?stream=raw",
             headers={**AUTH, "Origin": ORIGIN},
         ).connect()
+        assert stack.hub.active_remote_session() is None
         await websocket.send_text("not jpeg")
         closed = await websocket.receive_close()
-        assert closed.code == 1003
+        assert closed.code == 1008
+        assert closed.reason == "stream is read-only"
+        await websocket.close()
+
+        legacy = np.zeros((72, 128, 3), np.uint8)
+        ok, legacy_jpeg = cv2.imencode(".jpg", legacy)
+        assert ok
+        websocket = await ASGIWebSocket(
+            stack.app,
+            "/ws/frames?stream=raw",
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
+        ).connect()
+        await websocket.send_bytes(legacy_jpeg.tobytes())
+        closed = await websocket.receive_close()
+        assert closed.code == 1007
+        assert closed.reason == "invalid renderer frame envelope"
         await websocket.close()
 
         wrong = np.zeros((10, 10, 3), np.uint8)
@@ -1825,9 +2014,16 @@ def test_websocket_rejects_text_and_wrong_dimensions(stack):
         websocket = await ASGIWebSocket(
             stack.app,
             "/ws/frames?stream=raw",
-            headers={**AUTH, "Origin": ORIGIN},
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
         ).connect()
-        await websocket.send_bytes(jpeg.tobytes())
+        await websocket.send_bytes(
+            encode_remote_frame(
+                "rendered-output",
+                1,
+                jpeg.tobytes(),
+                max_message_bytes=stack.runtime.snapshot().api.ws_max_bytes,
+            )
+        )
         closed = await websocket.receive_close()
         assert closed.code == 1007
         await websocket.close()
@@ -1840,12 +2036,66 @@ def test_websocket_rejects_frame_over_configured_limit(stack):
         websocket = await ASGIWebSocket(
             stack.app,
             "/ws/frames?stream=raw",
-            headers={**AUTH, "Origin": ORIGIN},
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
         ).connect()
-        await websocket.send_bytes(b"x" * 1025)
+        await websocket.send_bytes(
+            b"x" * (stack.runtime.snapshot().api.ws_max_bytes + 1)
+        )
         closed = await websocket.receive_close()
         assert closed.code == 1009
         await websocket.close()
+
+    run_async(scenario())
+
+
+def test_websocket_raw_sender_counts_epoch_header_in_wire_limit(tmp_path):
+    rng = np.random.default_rng(20260810)
+    raw = rng.integers(0, 256, size=(72, 128, 3), dtype=np.uint8)
+    encoded = server_mod._encode_jpeg(raw)
+    ws_limit = REMOTE_FRAME_HEADER_BYTES + len(encoded) - 1
+    assert ws_limit >= 1024
+
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {"synthetic": True, "width": 128, "height": 72, "fps": 60},
+            "background": {"mode": "remote"},
+            "segmentation": {"backend": "heuristic"},
+            "output": {"backend": "null", "fps": 60},
+            "api": {"ws_max_bytes": ws_limit},
+        }
+    )
+    runtime = RuntimeConfig(cfg)
+    hub = FrameHub()
+    pipeline = Pipeline(runtime, hub)
+    security = SecurityPolicy.for_bind(
+        TOKEN,
+        "testserver",
+        80,
+        allowed_origins=[ORIGIN],
+        extra_hosts=["testserver"],
+        renderer_token=RENDERER_TOKEN,
+    )
+    app = create_app(
+        runtime,
+        hub,
+        pipeline,
+        security=security,
+        upload_dir=tmp_path / "uploads",
+    )
+
+    async def scenario():
+        websocket = await ASGIWebSocket(
+            app,
+            "/ws/frames?stream=raw",
+            headers={**RENDERER_AUTH, "Origin": ORIGIN},
+        ).connect()
+        try:
+            hub.publish_remote_raw(raw, 1)
+            closed = await websocket.receive_close()
+            assert closed.code == 1009
+            assert closed.reason == "frame exceeds configured byte limit"
+        finally:
+            await websocket.close()
 
     run_async(scenario())
 

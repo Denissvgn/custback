@@ -13,6 +13,61 @@ The contract is scalar-only and constant-space. It contains no pixels, masks,
 frame-derived hashes, wall-clock recording timestamps, device paths, or raw
 monotonic timestamps.
 
+## Target-paced publication and runtime performance v1
+
+The output publisher owns a depth-one handoff and an absolute target-rate
+schedule. At each output opportunity it adopts the newest guarded safe base or
+submits a byte-identical copy of the last eligible final frame. It skips late
+schedule slots instead of bursting to catch up. The reuse path does not call
+capture, segmentation, refinement, background preparation, color correction,
+or compositing, and it cannot advance any of their temporal state. It advances
+publication/reuse/repeat observations, never unique-work observations. A newly
+processed base can coincidentally be byte-identical too, so the exact-repeat
+counter alone is not reuse provenance.
+
+This makes a smooth consumer-facing output clock possible without relabeling
+repeated pixels as new visual work. In particular, a healthy
+`output_send_fps` can coexist with degraded `sent_unique_base_fps`,
+`base_composite_update_fps`, or `segmentation_update_fps`. The version-1
+`GET /status.runtime_performance` object exposes that distinction as a strict,
+bounded, path-free contract:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Exact contract version; currently `1`. |
+| `state`, `reason` | `warming`, `healthy`, `degraded`, or `failed`, plus a bounded reason code. |
+| `target_fps` | Output target used for both attainment ratios. |
+| `output_send_fps`, `output_attainment`, `output_healthy` | Successfully accepted sink sends and their fraction of target. Exact repeats count here. |
+| `processing_completed_fps` | Completed processing results, including a result superseded before the depth-one publisher adopts it. |
+| `sent_unique_base_fps`, `unique_attainment`, `unique_healthy` | Sends that adopted a new guarded base and their fraction of target. Repeats do not count here. |
+| `processing_deadline_miss_ratio`, `output_schedule_late_ratio` | Independent processing-budget and publication-schedule observations. |
+| `stage_p50_ms`, `stage_p95_ms`, `dominant_stage` | Fixed-name scalar stage summaries and the largest actionable p95 stage. Missing observations stay null. |
+| `publisher` | Publisher mode/state, depth-zero-or-one pending state, output-base config version, and monotonic overwrite/missed-slot/privacy-slate counters. |
+| `current_epoch`, `last_closed_epoch`, `startup` | Current generation-bound measurements, one bounded prior scalar summary, and pre-ready counters kept outside steady-state rates. |
+| `recommended_mitigation` | A config-version-bound advisory patch while degraded, or null. Custback never applies it automatically. |
+
+The fixed stage maps contain `capture.read`, `segmentation.total`,
+`background.total`, `color_correction.estimate`, `color_correction.apply`,
+all nine `compositor.*` substage timers (`input_mask_validation`,
+`color_transform_application`, `edge_band`, `model_foreground_replacement`,
+`backdrop_blur_resize`, `light_wrap_temporal_filter`,
+`light_wrap_interpolation`, `final_blend_conversion`, and
+`internal_output_validation`), plus `compositor.light_wrap`,
+`compositor.prepare`, `compositor.blend`, `compositor.total`,
+`pipeline.processing_only`, and `output.submission`. They are a separate
+versioned health view; they do not replace the compatibility `timing_ms`
+object below.
+
+Health uses a bounded five-second window and requires both output and unique
+attainment to reach 90% of target, with at most a 5% processing-deadline-miss
+ratio. Measurement warms for three seconds. An unhealthy result must remain
+continuous for three further seconds before `degraded`; recovery from an
+already degraded epoch requires five continuous healthy seconds. Publisher or
+pipeline failure reports `failed` immediately. A change to config, capture,
+segmentation, or backdrop identity closes the current epoch, retains only its
+final scalar summary, and starts a fresh warm-up, so measurements from
+different effective paths are never averaged together.
+
 ## Counts and compatibility aliases
 
 Run counters include the successful startup/preflight send. They advance only
@@ -33,6 +88,14 @@ frames_in              == base_composite_update_count
 frames_out             == output_send_count
 output_repeated_frames == base_composite_reuse_count
 ```
+
+Background-video playback counters have two scopes. The unqualified
+`background_video_frames_displayed`, `background_video_frames_skipped`,
+`background_video_frames_reused`, `background_video_seek_count`, and
+`background_video_decode_failures` describe only the active provider and reset
+when it is replaced. Their `background_video_lifetime_*` counterparts
+accumulate the current and retired providers across the run, survive hot
+provider replacement, and are the authoritative run/shutdown evidence.
 
 `capture_frames_read` counts successful capture-worker publications before
 pipeline consumption. `capture_dropped_frames` counts latest-slot overwrites.
@@ -197,6 +260,7 @@ auth_header | curl --config - http://127.0.0.1:8710/status |
     mismatch: .cadence_mismatch_active,
     timing_schema_version,
     timing_ms,
+    runtime_performance,
     post_base: .extensions.post_base
   }'
 ```

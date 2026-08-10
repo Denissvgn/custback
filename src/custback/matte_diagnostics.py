@@ -619,6 +619,7 @@ class MatteDiagnosticRecorder:
         self._last_output_timestamp_ns: int | None = None
         self._output_event_bytes = 0
         self._output_events: list[dict[str, Any]] = []
+        self._output_timeline_complete = True
         self._stop_reason = ""
         self._error = ""
         self._artifact_bytes = 0
@@ -804,6 +805,30 @@ class MatteDiagnosticRecorder:
             self._last_output_timestamp_ns = sent_monotonic_ns
         return True
 
+    def mark_output_timeline_incomplete(self, reason: str) -> None:
+        """Record that a successful send had no matte-source provenance.
+
+        Privacy and asset slates are deliberately input independent and must
+        never be attributed to the previously accepted matte bundle merely
+        because that bundle remains the last ordinary base. Keep recording
+        subsequent evidence, but make the timeline's qualification authority
+        fail closed.
+        """
+
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or len(reason) > 64
+            or any(
+                char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in reason
+            )
+        ):
+            raise ValueError("output timeline reason must be a bounded reason code")
+        with self._lock:
+            if self._closed:
+                return
+            self._output_timeline_complete = False
+
     def _artifact_payloads(
         self,
         evidence: MatteFrameEvidence,
@@ -969,12 +994,13 @@ class MatteDiagnosticRecorder:
                 if int(event["source_bundle_sequence"]) < len(frames)
             ]
             all_output_events_written = len(output_events) == len(self._output_events)
+            output_timeline_complete = self._output_timeline_complete
         for sequence, event in enumerate(output_events):
             event["sequence"] = sequence
         timeline = {
             "version": 1,
             "timestamp_clock": "monotonic",
-            "complete": all_output_events_written,
+            "complete": output_timeline_complete and all_output_events_written,
             "events": output_events,
         }
         self._manifest["output_timeline"] = timeline

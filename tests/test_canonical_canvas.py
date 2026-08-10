@@ -34,6 +34,7 @@ from custback.config import AppConfig, ConfigState, RuntimeConfig
 from custback.hub import FrameHub
 from custback.matte_policy import MatteBackendKind
 from custback.pipeline import ActivationError, Pipeline, _Resources
+from custback.remote_protocol import decode_remote_frame, encode_remote_frame
 
 
 ACQUISITION_SIZE = (64, 48)
@@ -123,6 +124,35 @@ def _wait_for_output(hub: FrameHub, *, timeout: float = 3.0) -> np.ndarray:
         if frame is not None:
             return frame
     raise AssertionError("pipeline produced no output frame")
+
+
+def _push_remote_for_latest_raw(
+    hub: FrameHub,
+    frame: np.ndarray,
+    session_id: int,
+    *,
+    timeout: float = 3.0,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    sequence = -1
+    while time.monotonic() < deadline:
+        _raw, next_sequence = hub.raw.get(
+            sequence,
+            min(0.1, max(0.0, deadline - time.monotonic())),
+        )
+        if next_sequence == sequence:
+            continue
+        sequence = next_sequence
+        raw_epoch = hub.remote_raw_epoch_for_sequence(sequence)
+        if raw_epoch is None or raw_epoch <= 0:
+            continue
+        if hub.push_remote_frame(
+            frame,
+            raw_epoch=raw_epoch,
+            session_id=session_id,
+        ):
+            return True
+    return False
 
 
 class _ScriptedCapture:
@@ -406,7 +436,8 @@ def test_passthrough_keeps_hub_raw_output_and_sink_byte_identical(
         published = _wait_for_output(hub)
         raw = hub.raw.latest()[0]
         assert raw is source
-        assert published is source
+        assert published is not source
+        assert not published.flags.writeable
         np.testing.assert_array_equal(raw, published)
         assert all(frame.shape == CANVAS_SHAPE for frame in output.snapshots())
         assert all(np.array_equal(frame, source) for frame in output.snapshots())
@@ -436,7 +467,7 @@ def test_remote_startup_fallback_and_valid_success_keep_exact_canvas(
 
         session = hub.remote_client_connected()
         rendered = np.full(CANVAS_SHAPE, (231, 17, 93), dtype=np.uint8)
-        assert hub.push_remote_frame(rendered, session)
+        assert _push_remote_for_latest_raw(hub, rendered, session)
         _wait_until(
             lambda: (
                 hub.output.latest()[0] is not None
@@ -471,7 +502,7 @@ def test_wrong_size_remote_output_is_not_fitted_and_emits_privacy_slate(
             (1, 222, 19),
             dtype=np.uint8,
         )
-        assert hub.push_remote_frame(wrong, session)
+        assert _push_remote_for_latest_raw(hub, wrong, session)
         _wait_until(
             lambda: hub.stats_dict()["remote_fallback_reason"] == "wrong-size",
             message="wrong-size remote fallback",
@@ -502,7 +533,7 @@ def test_remote_raw_echo_is_replaced_by_canonical_privacy_slate(
     pipeline.start(timeout=2.0)
     session = hub.remote_client_connected()
     try:
-        assert hub.push_remote_frame(source.copy(), session)
+        assert _push_remote_for_latest_raw(hub, source.copy(), session)
         _wait_until(
             lambda: hub.stats_dict()["remote_fallback_reason"] == "privacy-raw-echo",
             message="raw-echo privacy fallback",
@@ -543,7 +574,9 @@ def test_repeats_reuse_last_guarded_frame_without_reprocessing(
         assert len(sent) >= 3
         assert len(segmenter.frames) == 1
         assert len(refiner.frames) == 1
-        assert hub.raw.latest()[0] is None
+        raw = hub.raw.latest()[0]
+        assert raw is not None
+        np.testing.assert_array_equal(raw, source)
         assert all(frame.shape == CANVAS_SHAPE for frame in sent)
         assert all(np.array_equal(frame, slate) for frame in sent)
         np.testing.assert_array_equal(hub.output.latest()[0], slate)
@@ -863,6 +896,11 @@ def test_mjpeg_part_metadata_and_pixels_use_resolved_canvas(
 def test_raw_websocket_advertises_canvas_and_renderer_accepts_only_that_size(
     canonical_api_stack,
 ) -> None:
+    canonical_api_stack.pipeline.apply_config_patch(
+        {"background": {"mode": "remote"}},
+        origin="test",
+    )
+
     async def scenario() -> None:
         websocket = await _ASGIWebSocket(
             canonical_api_stack.app,
@@ -874,11 +912,22 @@ def test_raw_websocket_advertises_canvas_and_renderer_accepts_only_that_size(
                 "x-custback-frame-width": str(CANVAS_SIZE[0]),
                 "x-custback-frame-height": str(CANVAS_SIZE[1]),
             }
-            assert _decode(await websocket.receive_bytes()).shape == CANVAS_SHAPE
+            raw_envelope = decode_remote_frame(
+                await websocket.receive_bytes(),
+                expected_kind="raw-input",
+            )
+            assert raw_envelope.raw_epoch > 0
+            assert _decode(raw_envelope.jpeg).shape == CANVAS_SHAPE
             rendered = np.full(CANVAS_SHAPE, (27, 109, 233), dtype=np.uint8)
             ok, jpeg = cv2.imencode(".jpg", rendered)
             assert ok
-            await websocket.send_bytes(jpeg.tobytes())
+            await websocket.send_bytes(
+                encode_remote_frame(
+                    "rendered-output",
+                    raw_envelope.raw_epoch,
+                    jpeg.tobytes(),
+                )
+            )
             deadline = time.monotonic() + 3.0
             while (
                 canonical_api_stack.hub.remote_in.latest()[0] is None
@@ -897,14 +946,23 @@ def test_raw_websocket_advertises_canvas_and_renderer_accepts_only_that_size(
             headers={**RENDERER_AUTH, "Origin": ORIGIN},
         ).connect()
         try:
-            await websocket.receive_bytes()
+            raw_envelope = decode_remote_frame(
+                await websocket.receive_bytes(),
+                expected_kind="raw-input",
+            )
             wrong = np.zeros(
                 (ACQUISITION_SIZE[1], ACQUISITION_SIZE[0], 3),
                 dtype=np.uint8,
             )
             ok, jpeg = cv2.imencode(".jpg", wrong)
             assert ok
-            await websocket.send_bytes(jpeg.tobytes())
+            await websocket.send_bytes(
+                encode_remote_frame(
+                    "rendered-output",
+                    raw_envelope.raw_epoch,
+                    jpeg.tobytes(),
+                )
+            )
             closed = await websocket.receive_close()
             assert closed.code == 1007
             assert closed.reason == "invalid JPEG or frame dimensions"

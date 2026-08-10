@@ -146,6 +146,7 @@ api_get status | jq '{
   output_repeated_frames,
   timing_schema_version,
   timing_ms,
+  runtime_performance,
   post_base: .extensions.post_base
 }'
 ```
@@ -418,6 +419,94 @@ and roll back in one patch to the exact saved mode (normally
 not change RVM or MediaPipe output and is not a mitigation for either backend.
 
 ## Cadence diagnosis
+
+### Runtime performance recommendation
+
+`GET /status.runtime_performance` version 1 separates target-paced output from
+unique visual updates. When no new eligible base is ready, the publisher reuses
+the last eligible final frame without rerunning segmentation, refinement,
+color correction, light wrap, or compositing. That reuse is an exact repeat;
+a newly processed pixel-identical base can also count as an exact repeat, so
+exact equality alone is not reuse provenance. Therefore a healthy
+`output_send_fps` does not clear a degraded `sent_unique_base_fps` or
+`unique_attainment`. Let the current epoch leave `warming`, then review the
+state, reason, attainment ratios, deadline-miss ratio, dominant stage, p95
+stages, and publisher counters together:
+
+```bash
+api_get status | jq '{
+  config_version,
+  runtime_performance: (.runtime_performance | {
+    schema_version,
+    state,
+    reason,
+    target_fps,
+    output_send_fps,
+    sent_unique_base_fps,
+    output_attainment,
+    unique_attainment,
+    processing_deadline_miss_ratio,
+    output_schedule_late_ratio,
+    dominant_stage,
+    stage_p95_ms,
+    current_epoch,
+    publisher,
+    recommended_mitigation
+  })
+}'
+```
+
+`recommended_mitigation` is advice, not an automatic controller or a quality
+claim. It is present only while degraded and is valid only when its
+`config_version` still equals both the top-level status version and
+`current_epoch.key.config_version`. Discard a stale recommendation and fetch a
+fresh status/config pair. Review and apply at most the explicit fields shown;
+never pipe the status-provided patch directly into the API. The possible v1
+recommendations are:
+
+| Kind | Advisory patch | Operator meaning |
+| --- | --- | --- |
+| `disable-color-and-light-wrap` | `{"compositing":{"color_correction":{"mode":"off"},"light_wrap":0}}` | Attribute the combined optional compositor cost. |
+| `disable-color-correction` | `{"compositing":{"color_correction":{"mode":"off"}}}` | Attribute foreground-correction cost. |
+| `disable-light-wrap` | `{"compositing":{"light_wrap":0}}` | Attribute light-wrap cost. |
+| `review-backend-or-diagnostic-target` | `{}` | Do not PATCH; inspect the selected backend/device and whether the requested target is sustainable. |
+
+If the saved rollback file, current config, and visual-quality impact have been
+reviewed, an operator may manually apply the matching non-empty patch with
+`api_patch`. This is a transactional hot config change, but the status check is
+not a conditional write: keep the change window exclusive and re-fetch both
+config and status immediately after it. The new config version opens a fresh
+performance epoch. Wait for warm-up and sustained measurement instead of
+judging one frame or the target-paced send rate alone.
+
+To roll back, restore only the fields that the recommendation changed, using
+the exact pre-change values in `MITIGATION_ROLLBACK`:
+
+```bash
+# Combined recommendation rollback
+jq '{compositing:{
+  color_correction:{mode:.compositing.color_correction.mode},
+  light_wrap:.compositing.light_wrap
+}}' "$MITIGATION_ROLLBACK" | api_patch
+
+# Single-control rollback: choose only the field that was changed
+jq '{compositing:{
+  color_correction:{mode:.compositing.color_correction.mode}
+}}' "$MITIGATION_ROLLBACK" | api_patch
+jq '{compositing:{
+  light_wrap:.compositing.light_wrap
+}}' "$MITIGATION_ROLLBACK" | api_patch
+```
+
+Confirm the restored effective controls, config version, fresh epoch, unique
+cadence, and visual result. These runtime suggestions do not change a default,
+create or qualify a preset, or advance the matte rollout from
+`compatibility_hold`. Runtime performance reporting and target-paced
+publication have no separate hot disable switch. If the publisher itself
+reports `failed`, stop the process and use the deployment system's reviewed
+package rollback/restart procedure; do not keep applying compositor patches.
+Preserve the user configuration, model cache, and privacy mode during that
+software rollback.
 
 ### Lighting and capture versus processing
 

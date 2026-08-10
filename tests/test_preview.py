@@ -148,6 +148,7 @@ def make_diagnostic_frame() -> LocalMatteDiagnosticFrame:
         },
         compositor_substages_ms={
             "input_mask_validation": 0.01,
+            "color_transform_application": 0.09,
             "edge_band": 0.02,
             "model_foreground_replacement": 0.03,
             "backdrop_blur_resize": 0.04,
@@ -812,9 +813,10 @@ def test_diagnostic_overlay_formats_frame_and_public_telemetry():
     assert "validate 0.05" in lines[8]
     assert "seg 8.40  compositor 1.10  new-frame 11.20" in lines[9]
     assert "input-mask-validation 0.01" in lines[10]
-    assert "backdrop-blur-resize 0.04" in lines[10]
+    assert "color-transform-application 0.09" in lines[10]
+    assert "backdrop-blur-resize 0.04" in lines[11]
     assert "light-wrap-temporal-filter 0.05" in lines[11]
-    assert "internal-output-validation 0.08" in lines[11]
+    assert "internal-output-validation 0.08" in lines[12]
 
 
 def test_diagnostic_overlay_waiting_line_uses_selected_view_label():

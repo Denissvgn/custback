@@ -409,7 +409,7 @@ def test_dynamic_delivered_size_warn_replans_and_keeps_canonical_slot(
         capture.close()
 
 
-def test_legacy_stretch_aspect_upgrade_note_is_emitted_once_per_capture(
+def test_capture_geometry_and_aspect_notes_are_debug_only_and_deduplicated(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -427,13 +427,14 @@ def test_legacy_stretch_aspect_upgrade_note_is_emitted_once_per_capture(
         canvas_size=(40, 20),
     )
     try:
-        cap.push(np.full((24, 32, 3), 11, dtype=np.uint8))
-        _wait_for_frame(capture)
-        cap.push(np.full((32, 16, 3), 99, dtype=np.uint8))
-        _wait_for_frame(
-            capture,
-            predicate=lambda frame: int(frame.pixels[0, 0, 0]) == 99,
-        )
+        with caplog.at_level("DEBUG", logger="custback.capture"):
+            cap.push(np.full((24, 32, 3), 11, dtype=np.uint8))
+            _wait_for_frame(capture)
+            cap.push(np.full((32, 16, 3), 99, dtype=np.uint8))
+            _wait_for_frame(
+                capture,
+                predicate=lambda frame: int(frame.pixels[0, 0, 0]) == 99,
+            )
 
         note = "visual-policy upgrade note"
         assert caplog.text.count(note) == 1
@@ -441,6 +442,12 @@ def test_legacy_stretch_aspect_upgrade_note_is_emitted_once_per_capture(
         assert "camera.fit_mode=stretch" in caplog.text
         assert "camera.fit_mode=cover" in caplog.text
         assert "/dev/" not in caplog.text
+        assert all(
+            record.levelname == "DEBUG"
+            for record in caplog.records
+            if note in record.getMessage()
+            or record.getMessage().startswith("camera geometry generation=")
+        )
     finally:
         capture.close()
 

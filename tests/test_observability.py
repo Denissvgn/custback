@@ -445,11 +445,142 @@ def test_geometry_and_color_logs_are_transition_only_and_path_free(caplog):
     messages = [record.getMessage() for record in caplog.records]
     assert sum(message.startswith("camera transform") for message in messages) == 2
     assert sum(message.startswith("background transform") for message in messages) == 2
-    assert sum(message.startswith("color correction") for message in messages) == 4
+    phase_messages = [
+        message for message in messages if message.startswith("color correction phase")
+    ]
+    reason_messages = [
+        message
+        for message in messages
+        if message.startswith("color correction estimator reason")
+    ]
+    assert len(phase_messages) == 4
+    assert len(reason_messages) == 1
+    assert all("reason=" not in message for message in phase_messages)
+    assert all("state=" not in message for message in reason_messages)
     assert any("state=low-confidence" in message for message in messages)
     assert any("state=warming" in message for message in messages)
     assert any("state=scene-cut" in message for message in messages)
+    assert resources.color_correction_transitions == 4
+    assert resources.color_correction_reason_transitions == 1
     assert "/private/operator" not in "\n".join(messages)
+    assert not any(
+        message.startswith("camera geometry mismatch") for message in messages
+    )
+    assert all(
+        record.levelname == "INFO"
+        for record in caplog.records
+        if record.getMessage().startswith("camera transform")
+    )
+
+
+def test_geometry_warns_only_for_mismatch_or_material_stretch_distortion(caplog):
+    cfg = _config().patched({"camera": {"fit_mode": "stretch"}})
+    health = CaptureHealth(
+        generation=1,
+        delivered_width=640,
+        delivered_height=480,
+        oriented_width=640,
+        oriented_height=480,
+    )
+    resources = _resources(cfg, health)
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+
+    with caplog.at_level("INFO", logger="custback.pipeline"):
+        pipeline._log_geometry_transitions(
+            resources,
+            health,
+            _camera_plan_stats(cfg, resources.canvas_size, health),
+            _background_plan_stats(resources),
+        )
+
+    transform = next(
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("camera transform")
+    )
+    mismatch = next(
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("camera geometry mismatch")
+    )
+    assert transform.levelname == "INFO"
+    assert mismatch.levelname == "WARNING"
+    assert "negotiation=False" in mismatch.getMessage()
+    assert "stretch_aspect_distortion_pct=25.000" in mismatch.getMessage()
+
+
+def test_color_estimator_reason_changes_are_independently_debounced(caplog):
+    cfg = _config()
+    resources = _resources(cfg, CaptureHealth(generation=1))
+    pipeline = Pipeline(RuntimeConfig(cfg), FrameHub())
+    ok = _color_stats(cfg, _snapshot(HarmonizerPhase.ACTIVE))
+    low_confidence = _color_stats(
+        cfg,
+        _snapshot(
+            HarmonizerPhase.ACTIVE,
+            reason=ColorReason.INSUFFICIENT_MASK,
+            confidence=0.1,
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="custback.pipeline"):
+        pipeline._log_color_transition(resources, ok, now_s=0.0)
+        pipeline._log_color_transition(resources, low_confidence, now_s=0.1)
+        pipeline._log_color_transition(resources, low_confidence, now_s=0.4)
+        pipeline._log_color_transition(resources, ok, now_s=0.45)
+        pipeline._log_color_transition(resources, low_confidence, now_s=1.0)
+        pipeline._log_color_transition(resources, low_confidence, now_s=1.49)
+        pipeline._log_color_transition(resources, low_confidence, now_s=1.5)
+
+    reason_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("color correction estimator reason")
+    ]
+    phase_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("color correction phase")
+    ]
+    assert reason_messages == [
+        "color correction estimator reason=ok confidence=0.820",
+        "color correction estimator reason=insufficient-mask confidence=0.100",
+    ]
+    assert len(phase_messages) == 1
+    assert resources.color_correction_transitions == 1
+    assert resources.color_correction_reason_transitions == 2
+
+
+def test_color_clamp_status_is_false_for_bypass_or_application_failure():
+    cfg = _config()
+    snapshot = _snapshot(HarmonizerPhase.ACTIVE)
+
+    active = _color_stats(
+        cfg,
+        snapshot,
+        exposure_clamped=True,
+        white_balance_clamped=True,
+    )
+    failed = _color_stats(
+        cfg,
+        snapshot,
+        application_failed=True,
+        exposure_clamped=True,
+        white_balance_clamped=True,
+    )
+    disabled = _color_stats(
+        _config(correction_mode="off"),
+        snapshot,
+        exposure_clamped=True,
+        white_balance_clamped=True,
+    )
+
+    assert active["color_correction_exposure_clamped"] is True
+    assert active["color_correction_wb_clamped"] is True
+    assert failed["color_correction_exposure_clamped"] is False
+    assert failed["color_correction_wb_clamped"] is False
+    assert disabled["color_correction_exposure_clamped"] is False
+    assert disabled["color_correction_wb_clamped"] is False
 
 
 def test_status_model_and_openapi_schema_have_exact_hub_key_parity():
@@ -505,6 +636,35 @@ def test_status_model_and_openapi_schema_have_exact_hub_key_parity():
     assert set(stage_schema["required"]) == stage_fields
     assert stage_schema["additionalProperties"] is False
     _StatusResponse.model_validate({**hub_status, "native_ring": "unsupported"})
+
+
+def test_color_clamp_telemetry_is_strictly_validated_and_projected():
+    hub = FrameHub()
+    hub.update_stats(
+        color_correction_exposure_clamped=True,
+        color_correction_exposure_clamp_count=7,
+        color_correction_exposure_clamp_time_s=1.23456,
+        color_correction_wb_clamped=False,
+        color_correction_wb_clamp_count=3,
+        color_correction_wb_clamp_time_s=0.75,
+        color_correction_reason_transitions=5,
+    )
+
+    status = hub.stats_dict()
+    assert status["color_correction_exposure_clamped"] is True
+    assert status["color_correction_exposure_clamp_count"] == 7
+    assert status["color_correction_exposure_clamp_time_s"] == 1.235
+    assert status["color_correction_wb_clamped"] is False
+    assert status["color_correction_wb_clamp_count"] == 3
+    assert status["color_correction_wb_clamp_time_s"] == 0.75
+    assert status["color_correction_reason_transitions"] == 5
+
+    with pytest.raises(TypeError, match="must be boolean"):
+        hub.update_stats(color_correction_exposure_clamped=1)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        hub.update_stats(color_correction_wb_clamp_count=-1)
+    with pytest.raises(ValueError, match="finite duration"):
+        hub.update_stats(color_correction_exposure_clamp_time_s=float("nan"))
 
 
 def test_timing_registry_validates_exact_keys_bounds_and_copies_values():

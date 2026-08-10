@@ -77,6 +77,11 @@ class CapturedFrame:
     generation: int
     geometry_generation: int
     content_rect: tuple[int, int, int, int]
+    # Exact successful source-read duration for this envelope when the source
+    # owns that boundary. It is scalar/path-free and lets downstream
+    # performance epochs attribute capture work to the matching frame instead
+    # of sampling a racing EWMA health snapshot.
+    read_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -699,10 +704,17 @@ class OpenCVCapture(CaptureSource):
             f"{f'{fps:g}' if fps is not None else 'unknown'} fps"
         )
         if should_log:
-            if mismatches or unverifiable:
+            if mismatches:
                 log.warning(
-                    "camera mode %s on %s: requested %s, negotiated %s",
-                    "mismatch" if mismatches else "could not be fully verified",
+                    "camera mode mismatch on %s: requested %s, negotiated %s",
+                    backend,
+                    requested,
+                    negotiated,
+                )
+            elif unverifiable:
+                log.info(
+                    "camera mode could not be fully verified on %s: requested %s, "
+                    "negotiated %s",
                     backend,
                     requested,
                     negotiated,
@@ -788,8 +800,7 @@ class OpenCVCapture(CaptureSource):
             if aspect_upgrade_note:
                 self._aspect_upgrade_note_emitted = True
         if changed:
-            self._log_capture_transition(
-                f"geometry:{signature!r}",
+            log.debug(
                 "camera geometry generation=%d delivered=%dx%d oriented=%dx%d "
                 "canvas=%dx%d fit=%s rotation=%d mirror=%s",
                 generation,
@@ -804,7 +815,7 @@ class OpenCVCapture(CaptureSource):
                 plan.mirror,
             )
         if aspect_upgrade_note:
-            log.warning(
+            log.debug(
                 "visual-policy upgrade note: camera aspect %dx%d differs from "
                 "canvas %dx%d; schema-v1 stretch preserves legacy distortion. "
                 "The staged cover default will crop proportionally. Pin "
@@ -843,6 +854,7 @@ class OpenCVCapture(CaptureSource):
                     return
                 captured_at_ns = time.monotonic_ns()
                 finished = captured_at_ns / 1_000_000_000.0
+                read_ms = max(0.0, (finished - started) * 1000.0)
                 if stop.is_set():
                     break
                 if not ok or frame is None:
@@ -914,6 +926,7 @@ class OpenCVCapture(CaptureSource):
                         generation=generation,
                         geometry_generation=self._geometry_transitions,
                         content_rect=self._slot_content_rect,
+                        read_ms=read_ms,
                     )
                     self._slot_identity = CaptureHealth(
                         sequence=self._slot_sequence,
@@ -947,7 +960,6 @@ class OpenCVCapture(CaptureSource):
                         and finished - self._capture_timestamps[0] > self._RATE_WINDOW_S
                     ):
                         self._capture_timestamps.popleft()
-                    read_ms = (finished - started) * 1000.0
                     self._read_ms = (
                         read_ms
                         if self._read_ms is None
@@ -1459,6 +1471,7 @@ class SyntheticCapture(CaptureSource):
                     content.right,
                     content.bottom,
                 ),
+                read_ms=read_ms,
             )
 
     def health_snapshot(self) -> CaptureHealth:

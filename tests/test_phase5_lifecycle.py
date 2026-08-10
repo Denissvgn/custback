@@ -15,6 +15,7 @@ from custback.avatar.audio2face import Audio2FaceDriver
 from custback.avatar.config import Audio2FaceConfig, AvatarConfig, AvatarRuntime
 from custback.avatar.drivers import DriverUnavailableError
 from custback.avatar.service import AvatarService, _RenderPublication
+from custback.remote_protocol import encode_remote_frame
 
 
 async def _wait_for_thread_event(event: threading.Event, message: str) -> None:
@@ -70,7 +71,7 @@ def test_LIFE_01_stop_after_completed_send_discards_queued_publication_same_vers
         async def recv(self):
             if self.first:
                 self.first = False
-                return jpeg.tobytes()
+                return encode_remote_frame("raw-input", 1, jpeg.tobytes())
             await self.never.wait()
 
         async def send(self, payload):

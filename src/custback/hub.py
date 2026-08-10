@@ -26,6 +26,10 @@ from .matte_rollout import (
     empty_matte_rollout_status,
     validate_matte_rollout_status,
 )
+from .runtime_performance import (
+    empty_runtime_performance_status,
+    validate_runtime_performance_status,
+)
 
 
 TIMING_SCHEMA_VERSION = 1
@@ -51,6 +55,36 @@ TIMING_FIELD_NAMES = (
 )
 _TIMING_FIELD_SET = frozenset(TIMING_FIELD_NAMES)
 _MAX_PUBLIC_DURATION_MS = 3_600_000.0
+_REMOTE_RAW_EPOCH_BINDING_LIMIT = 2_048
+_BACKGROUND_FALLBACK_REASONS = frozenset({"", "asset-unavailable"})
+_BACKGROUND_VIDEO_LIFETIME_FIELDS = frozenset(
+    {
+        "background_video_lifetime_frames_displayed",
+        "background_video_lifetime_frames_skipped",
+        "background_video_lifetime_frames_reused",
+        "background_video_lifetime_seek_count",
+        "background_video_lifetime_decode_failures",
+    }
+)
+_COLOR_CLAMP_BOOLEAN_FIELDS = frozenset(
+    {
+        "color_correction_exposure_clamped",
+        "color_correction_wb_clamped",
+    }
+)
+_COLOR_TELEMETRY_COUNT_FIELDS = frozenset(
+    {
+        "color_correction_reason_transitions",
+        "color_correction_exposure_clamp_count",
+        "color_correction_wb_clamp_count",
+    }
+)
+_COLOR_CLAMP_TIME_FIELDS = frozenset(
+    {
+        "color_correction_exposure_clamp_time_s",
+        "color_correction_wb_clamp_time_s",
+    }
+)
 _POST_BASE_NAMESPACE_RE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _MAX_POST_BASE_STAGES = 8
 _SELECTION_KEYS = frozenset(
@@ -511,6 +545,13 @@ class Stats:
     exact_final_output_repeat_ratio: float = 0.0
     output_send_count: int = 0
     output_send_fps: float = 0.0
+    processing_completed_count: int = 0
+    processing_completed_fps: float = 0.0
+    output_base_config_version: int = 0
+    output_handoff_overwrite_count: int = 0
+    output_schedule_skipped_slots: int = 0
+    output_privacy_slate_send_count: int = 0
+    output_publisher_state: str = "stopped"
     last_unique_frame_age_ms: float | None = None
     capture_timestamp_delta_p50_ms: float | None = None
     capture_timestamp_delta_p95_ms: float | None = None
@@ -545,6 +586,8 @@ class Stats:
     background_pad_right: int = 0
     background_pad_bottom: int = 0
     background_geometry_transitions: int = 0
+    background_fallback_active: bool = False
+    background_fallback_reason: str = ""
     color_correction_mode: str = "off"
     color_correction_active: bool = False
     color_correction_effective_mode: str = "off"
@@ -556,12 +599,19 @@ class Stats:
     color_correction_wb_gain_g: float = 1.0
     color_correction_wb_gain_b: float = 1.0
     color_correction_wb_active: bool = False
+    color_correction_exposure_clamped: bool = False
+    color_correction_exposure_clamp_count: int = 0
+    color_correction_exposure_clamp_time_s: float = 0.0
+    color_correction_wb_clamped: bool = False
+    color_correction_wb_clamp_count: int = 0
+    color_correction_wb_clamp_time_s: float = 0.0
     color_correction_warming: bool = False
     color_correction_stale: bool = False
     color_correction_applied_frames: int = 0
     color_correction_bypassed_frames: int = 0
     color_correction_scene_cuts: int = 0
     color_correction_transitions: int = 0
+    color_correction_reason_transitions: int = 0
     color_input_assumption: str = "display-referred-srgb-bt709-full-range"
     composite_ms: float | None = None
     output_send_ms: float | None = None
@@ -574,6 +624,9 @@ class Stats:
     new_frame_serialized_loop_ms: float | None = None
     timing_schema_version: int = TIMING_SCHEMA_VERSION
     timing_ms: dict[str, float | None] = field(default_factory=_empty_timing_fields)
+    runtime_performance: dict[str, object] = field(
+        default_factory=empty_runtime_performance_status
+    )
     output_fallback_active: bool = False
     output_fallback_reason: str = ""
     segmentation_fallback_active: bool = False
@@ -595,6 +648,11 @@ class Stats:
     background_video_skip_ratio: float = 0.0
     background_video_seek_count: int = 0
     background_video_decode_failures: int = 0
+    background_video_lifetime_frames_displayed: int = 0
+    background_video_lifetime_frames_skipped: int = 0
+    background_video_lifetime_frames_reused: int = 0
+    background_video_lifetime_seek_count: int = 0
+    background_video_lifetime_decode_failures: int = 0
     background_video_orientation_status: str | None = None
     background_video_metadata_rotation: int | None = None
     background_video_auto_rotation_disabled: bool | None = None
@@ -617,15 +675,17 @@ class _Slot:
         self._ts = 0.0
         self._subscribers: set[_AsyncSlotSubscription] = set()
 
-    def put(self, value: np.ndarray) -> None:
+    def put(self, value: np.ndarray) -> int:
         with self._cond:
             self._value = value
             self._seq += 1
+            sequence = self._seq
             self._ts = time.monotonic()
             self._cond.notify_all()
             subscribers = tuple(self._subscribers)
         for subscriber in subscribers:
             subscriber._notify()
+        return sequence
 
     def get(self, last_seq: int = -1, timeout: float | None = None):
         """Return (frame, seq) newer than last_seq, or (None, last_seq)."""
@@ -736,8 +796,36 @@ class FrameHub:
         self._stats_lock = threading.Lock()
         self._remote_clients = 0
         self._remote_session = 0
+        self._required_remote_raw_epoch = 0
+        self._remote_raw_epoch_by_slot_sequence: dict[int, int] = {}
+        self._remote_frame_raw_epoch = 0
+        self._remote_frame_session = 0
+        self._remote_frame_published_ns = 0
+        self._remote_lifecycle_listener: Callable[[str, int], None] | None = None
         self._canvas_size: Size | None = None
         self._post_base_provenance: dict[str, PostBaseProvenance] = {}
+
+    def set_remote_lifecycle_listener(
+        self,
+        listener: Callable[[str, int], None] | None,
+    ) -> None:
+        """Install the run-owned renderer lifecycle privacy fence callback.
+
+        Notifications are invoked after releasing the hub lock. The callback
+        therefore may synchronously acquire the output publisher send fence
+        without introducing a hub/publisher lock inversion.
+        """
+
+        if listener is not None and not callable(listener):
+            raise TypeError("remote lifecycle listener must be callable")
+        with self._stats_lock:
+            self._remote_lifecycle_listener = listener
+
+    def _notify_remote_lifecycle(self, event: str, session_id: int) -> None:
+        with self._stats_lock:
+            listener = self._remote_lifecycle_listener
+        if listener is not None:
+            listener(event, session_id)
 
     def configure_canvas(self, canvas_size: Size) -> None:
         """Freeze the optional pipeline publication contract for this run."""
@@ -751,6 +839,8 @@ class FrameHub:
         with self._stats_lock:
             changed = self._canvas_size is not None and self._canvas_size != canvas_size
             self._canvas_size = canvas_size
+            if changed:
+                self._remote_raw_epoch_by_slot_sequence.clear()
         if changed:
             # A process-level restart may reuse the hub object.  Never let
             # subscribers or a renderer observe pixels from the old canvas.
@@ -794,9 +884,59 @@ class FrameHub:
                 self._update_stats_locked(stats)
             self.output.put(frame)
 
+    def _bind_remote_raw_epoch_locked(self, slot_sequence: int, raw_epoch: int) -> None:
+        self._remote_raw_epoch_by_slot_sequence[slot_sequence] = raw_epoch
+        while (
+            len(self._remote_raw_epoch_by_slot_sequence)
+            > _REMOTE_RAW_EPOCH_BINDING_LIMIT
+        ):
+            oldest = next(iter(self._remote_raw_epoch_by_slot_sequence))
+            del self._remote_raw_epoch_by_slot_sequence[oldest]
+
     def publish_raw(self, frame: np.ndarray) -> None:
         self._validate_publication(frame, "raw")
-        self.raw.put(frame)
+        with self._stats_lock:
+            sequence = self.raw.put(frame)
+            # Epoch zero is an explicit, non-output-eligible tag for ordinary
+            # local-mode raw preview frames. It is never accepted as renderer
+            # proof, but keeps the WebSocket protocol uniformly enveloped.
+            self._bind_remote_raw_epoch_locked(sequence, 0)
+
+    def publish_remote_raw(
+        self,
+        frame: np.ndarray,
+        raw_epoch: int,
+        *,
+        admit: Callable[[int], bool] | None = None,
+    ) -> bool:
+        """Publish a remote raw frame atomically with replay admission.
+
+        ``admit`` runs under the renderer-session lock with the exact exclusive
+        lease id. Returning false advances the required epoch (invalidating
+        older output) but exposes no raw pixels.
+        """
+
+        if type(raw_epoch) is not int or raw_epoch <= 0:
+            raise ValueError("remote raw epoch must be a positive integer")
+        self._validate_publication(frame, "raw")
+        with self._stats_lock:
+            if raw_epoch <= self._required_remote_raw_epoch:
+                raise ValueError("remote raw epochs must increase")
+            self._required_remote_raw_epoch = raw_epoch
+            session = self._remote_session if self._remote_clients > 0 else 0
+            if session > 0 and admit is not None and not admit(session):
+                return False
+            sequence = self.raw.put(frame)
+            self._bind_remote_raw_epoch_locked(sequence, raw_epoch)
+            return True
+
+    def remote_raw_epoch_for_sequence(self, slot_sequence: int) -> int | None:
+        """Return the exact raw epoch bound to one published raw-slot sequence."""
+
+        if type(slot_sequence) is not int or slot_sequence <= 0:
+            raise ValueError("raw slot sequence must be a positive integer")
+        with self._stats_lock:
+            return self._remote_raw_epoch_by_slot_sequence.get(slot_sequence)
 
     def get_remote_frame(self, max_age_s: float) -> np.ndarray | None:
         """Latest remote-rendered frame if it is fresh enough, else None."""
@@ -804,53 +944,124 @@ class FrameHub:
 
     def remote_frame_status(self, max_age_s: float) -> tuple[np.ndarray | None, str]:
         """Return a fresh frame or a deterministic local-fallback reason."""
+        frame, reason, _raw_epoch, _session, _published_ns = (
+            self.remote_frame_proof_status(max_age_s)
+        )
+        return frame, reason
+
+    def remote_frame_proof_status(
+        self,
+        max_age_s: float,
+    ) -> tuple[np.ndarray | None, str, int, int, int]:
+        """Return fresh renderer pixels with scalar session/raw proof metadata."""
+
         with self._stats_lock:
             if self._remote_clients == 0:
-                return None, "no-client"
+                return None, "no-client", 0, 0, 0
+            session = self._remote_session
+            raw_epoch = self._remote_frame_raw_epoch
+            frame_session = self._remote_frame_session
+            published_ns = self._remote_frame_published_ns
         frame, ts = self.remote_in.latest()
         if frame is None or (time.monotonic() - ts) > max_age_s:
-            return None, "stale"
+            return None, "stale", 0, session, 0
         if (
             not isinstance(frame, np.ndarray)
             or frame.dtype != np.uint8
             or frame.ndim != 3
             or frame.shape[2] != 3
         ):
-            return None, "invalid"
-        return frame, ""
+            return None, "invalid", raw_epoch, frame_session, published_ns
+        if frame_session != session:
+            return None, "stale", 0, session, 0
+        return frame, "", raw_epoch, frame_session, published_ns
 
     # -- API side ------------------------------------------------------
     def push_remote_frame(
-        self, frame: np.ndarray, session_id: int | None = None
+        self,
+        frame: np.ndarray,
+        *,
+        raw_epoch: int,
+        session_id: int,
     ) -> bool:
-        """Publish a frame only for the currently connected remote session."""
+        """Publish only explicitly tagged current-session renderer pixels."""
+
+        if type(raw_epoch) is not int or raw_epoch <= 0:
+            raise ValueError("renderer raw epoch must be a positive integer")
+        if type(session_id) is not int or session_id <= 0:
+            raise ValueError("renderer session id must be a positive integer")
         with self._stats_lock:
             if self._remote_clients == 0:
                 return False
-            if session_id is not None and session_id != self._remote_session:
+            if session_id != self._remote_session:
+                return False
+            if raw_epoch != self._required_remote_raw_epoch:
+                return False
+            if raw_epoch not in self._remote_raw_epoch_by_slot_sequence.values():
+                return False
+            if (
+                self._remote_frame_raw_epoch == raw_epoch
+                and self._remote_frame_session == self._remote_session
+            ):
+                # One issued raw epoch has one renderer result. A duplicate
+                # cannot become a second unique base with identical capture
+                # provenance merely by arriving at a later wall-clock time.
                 return False
             # Keep the stats lock through put so a final disconnect always
             # clears any frame published by that session.
             self.remote_in.put(frame)
+            self._remote_frame_raw_epoch = raw_epoch
+            self._remote_frame_session = self._remote_session
+            self._remote_frame_published_ns = time.monotonic_ns()
             return True
 
     def remote_client_connected(self) -> int:
+        """Grant one exclusive renderer lease and revoke any prior lease."""
+
         with self._stats_lock:
-            if self._remote_clients == 0:
-                self._remote_session += 1
-                self.remote_in.clear()
-            self._remote_clients += 1
+            # Every renderer-token connection is a replacement, even when an
+            # older socket has not noticed revocation yet. This makes the
+            # lease scalar unambiguous and prevents two writers from sharing a
+            # current raw epoch.
+            self._remote_session += 1
+            self.remote_in.clear()
+            self._remote_raw_epoch_by_slot_sequence.clear()
+            self._remote_frame_raw_epoch = 0
+            self._remote_frame_session = 0
+            self._remote_frame_published_ns = 0
+            self._remote_clients = 1
             self.stats.remote_connected = True
-            return self._remote_session
+            session = self._remote_session
+        try:
+            self._notify_remote_lifecycle("connected", session)
+        except BaseException:
+            # A renderer lease is unusable unless the publisher has
+            # synchronously fenced away pixels from the prior session.
+            with self._stats_lock:
+                if self._remote_session == session:
+                    self._invalidate_remote_session_locked(session)
+            raise
+        return session
 
     def remote_client_disconnected(self, session_id: int | None = None) -> None:
+        notify = False
+        session = 0
         with self._stats_lock:
             if session_id is not None and session_id != self._remote_session:
                 return
-            self._remote_clients = max(0, self._remote_clients - 1)
+            had_clients = self._remote_clients > 0
+            self._remote_clients = 0
             self.stats.remote_connected = self._remote_clients > 0
-            if self._remote_clients == 0:
+            if had_clients and self._remote_clients == 0:
+                session = self._remote_session
                 self.remote_in.clear()
+                self._remote_raw_epoch_by_slot_sequence.clear()
+                self._remote_frame_raw_epoch = 0
+                self._remote_frame_session = 0
+                self._remote_frame_published_ns = 0
+                notify = True
+        if notify:
+            self._notify_remote_lifecycle("disconnected", session)
 
     def active_remote_session(self) -> int | None:
         """Return the authenticated renderer epoch, if one is currently live."""
@@ -875,21 +1086,32 @@ class FrameHub:
         self._remote_clients = 0
         self.stats.remote_connected = False
         self.remote_in.clear()
+        self._remote_raw_epoch_by_slot_sequence.clear()
+        self._remote_frame_raw_epoch = 0
+        self._remote_frame_session = 0
+        self._remote_frame_published_ns = 0
         return had_session
 
     def invalidate_remote_session(self, session_id: int | None = None) -> bool:
         """Atomically revoke the renderer epoch and discard every queued frame."""
 
         with self._stats_lock:
-            return self._invalidate_remote_session_locked(session_id)
+            had_session = self._invalidate_remote_session_locked(session_id)
+            session = self._remote_session
+        if had_session:
+            self._notify_remote_lifecycle("invalidated", session)
+        return had_session
 
     def reset_remote_session(self, reset: Callable[[], None]) -> bool:
         """Revoke stale output and reset privacy state at the same boundary."""
 
         with self._stats_lock:
             had_session = self._invalidate_remote_session_locked(None)
+            session = self._remote_session
             reset()
-            return had_session
+        if had_session:
+            self._notify_remote_lifecycle("invalidated", session)
+        return had_session
 
     def clear_remote_frames(self) -> None:
         """Discard queued output without changing the authenticated epoch."""
@@ -936,6 +1158,31 @@ class FrameHub:
                 )
             if key == "timing_ms":
                 value = self._validated_timing_fields(value)
+            if key == "runtime_performance":
+                value = validate_runtime_performance_status(value)
+            if key == "background_fallback_active" and type(value) is not bool:
+                raise TypeError("background_fallback_active must be boolean")
+            if key == "background_fallback_reason" and (
+                not isinstance(value, str) or value not in _BACKGROUND_FALLBACK_REASONS
+            ):
+                raise ValueError("background_fallback_reason is not sanitized")
+            if key in _BACKGROUND_VIDEO_LIFETIME_FIELDS and (
+                type(value) is not int or not 0 <= value <= 2**63 - 1
+            ):
+                raise ValueError(f"{key} must be a bounded nonnegative integer")
+            if key in _COLOR_CLAMP_BOOLEAN_FIELDS and type(value) is not bool:
+                raise TypeError(f"{key} must be boolean")
+            if key in _COLOR_TELEMETRY_COUNT_FIELDS and (
+                type(value) is not int or not 0 <= value <= 2**63 - 1
+            ):
+                raise ValueError(f"{key} must be a bounded nonnegative integer")
+            if key in _COLOR_CLAMP_TIME_FIELDS:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"{key} must be a nonnegative finite duration")
+                duration = float(value)
+                if not math.isfinite(duration) or duration < 0.0:
+                    raise ValueError(f"{key} must be a nonnegative finite duration")
+                value = duration
             if key == "segmentation_selection":
                 value = self._validated_segmentation_selection(value)
             if key == "matte_policy":
@@ -951,6 +1198,18 @@ class FrameHub:
             self.stats.segmentation_selection,
         )
         candidate_policy = staged.get("matte_policy", self.stats.matte_policy)
+        candidate_background_fallback_active = staged.get(
+            "background_fallback_active",
+            self.stats.background_fallback_active,
+        )
+        candidate_background_fallback_reason = staged.get(
+            "background_fallback_reason",
+            self.stats.background_fallback_reason,
+        )
+        if bool(candidate_background_fallback_reason) != (
+            candidate_background_fallback_active is True
+        ):
+            raise ValueError("background fallback active/reason are inconsistent")
         if "segmentation_selection" in staged or "matte_policy" in staged:
             self._validate_selection_policy_pair(
                 candidate_selection,
@@ -1439,6 +1698,21 @@ class FrameHub:
                 ),
                 "output_send_count": self.stats.output_send_count,
                 "output_send_fps": round(self.stats.output_send_fps, 3),
+                "processing_completed_count": self.stats.processing_completed_count,
+                "processing_completed_fps": round(
+                    self.stats.processing_completed_fps, 3
+                ),
+                "output_base_config_version": self.stats.output_base_config_version,
+                "output_handoff_overwrite_count": (
+                    self.stats.output_handoff_overwrite_count
+                ),
+                "output_schedule_skipped_slots": (
+                    self.stats.output_schedule_skipped_slots
+                ),
+                "output_privacy_slate_send_count": (
+                    self.stats.output_privacy_slate_send_count
+                ),
+                "output_publisher_state": self.stats.output_publisher_state,
                 "last_unique_frame_age_ms": self._rounded_optional(
                     self.stats.last_unique_frame_age_ms, 3
                 ),
@@ -1505,6 +1779,8 @@ class FrameHub:
                 "background_geometry_transitions": (
                     self.stats.background_geometry_transitions
                 ),
+                "background_fallback_active": self.stats.background_fallback_active,
+                "background_fallback_reason": self.stats.background_fallback_reason,
                 "color_correction_mode": self.stats.color_correction_mode,
                 "color_correction_active": self.stats.color_correction_active,
                 "color_correction_effective_mode": (
@@ -1528,6 +1804,24 @@ class FrameHub:
                     self.stats.color_correction_wb_gain_b, 4
                 ),
                 "color_correction_wb_active": self.stats.color_correction_wb_active,
+                "color_correction_exposure_clamped": (
+                    self.stats.color_correction_exposure_clamped
+                ),
+                "color_correction_exposure_clamp_count": (
+                    self.stats.color_correction_exposure_clamp_count
+                ),
+                "color_correction_exposure_clamp_time_s": round(
+                    self.stats.color_correction_exposure_clamp_time_s,
+                    3,
+                ),
+                "color_correction_wb_clamped": (self.stats.color_correction_wb_clamped),
+                "color_correction_wb_clamp_count": (
+                    self.stats.color_correction_wb_clamp_count
+                ),
+                "color_correction_wb_clamp_time_s": round(
+                    self.stats.color_correction_wb_clamp_time_s,
+                    3,
+                ),
                 "color_correction_warming": self.stats.color_correction_warming,
                 "color_correction_stale": self.stats.color_correction_stale,
                 "color_correction_applied_frames": (
@@ -1539,6 +1833,9 @@ class FrameHub:
                 "color_correction_scene_cuts": (self.stats.color_correction_scene_cuts),
                 "color_correction_transitions": (
                     self.stats.color_correction_transitions
+                ),
+                "color_correction_reason_transitions": (
+                    self.stats.color_correction_reason_transitions
                 ),
                 "color_input_assumption": self.stats.color_input_assumption,
                 "composite_ms": self._rounded_optional(self.stats.composite_ms, 1),
@@ -1569,6 +1866,7 @@ class FrameHub:
                     key: self._rounded_optional(self.stats.timing_ms[key], 3)
                     for key in TIMING_FIELD_NAMES
                 },
+                "runtime_performance": copy.deepcopy(self.stats.runtime_performance),
                 "output_fallback_active": self.stats.output_fallback_active,
                 "output_fallback_reason": self.stats.output_fallback_reason,
                 "segmentation_fallback_active": self.stats.segmentation_fallback_active,
@@ -1605,6 +1903,21 @@ class FrameHub:
                 "background_video_seek_count": self.stats.background_video_seek_count,
                 "background_video_decode_failures": (
                     self.stats.background_video_decode_failures
+                ),
+                "background_video_lifetime_frames_displayed": (
+                    self.stats.background_video_lifetime_frames_displayed
+                ),
+                "background_video_lifetime_frames_skipped": (
+                    self.stats.background_video_lifetime_frames_skipped
+                ),
+                "background_video_lifetime_frames_reused": (
+                    self.stats.background_video_lifetime_frames_reused
+                ),
+                "background_video_lifetime_seek_count": (
+                    self.stats.background_video_lifetime_seek_count
+                ),
+                "background_video_lifetime_decode_failures": (
+                    self.stats.background_video_lifetime_decode_failures
                 ),
                 "background_video_orientation_status": (
                     self.stats.background_video_orientation_status

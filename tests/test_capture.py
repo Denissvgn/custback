@@ -452,6 +452,34 @@ def test_warn_mode_reports_negotiated_mismatch_and_resizes(monkeypatch, caplog):
         capture.close()
 
 
+def test_unreported_camera_fps_is_informational_not_a_mismatch_warning(
+    monkeypatch,
+    caplog,
+):
+    cap = FakeCap(
+        fps=0.0,
+        locked={FakeCV2.CAP_PROP_FPS},
+    )
+    monkeypatch.setattr(capture_mod, "cv2", FakeCV2([cap]))
+    capture = OpenCVCapture(CameraConfig(width=128, height=72, fps=30))
+    try:
+        with caplog.at_level("INFO", logger="custback.capture"):
+            wait_for_frame(capture)
+        relevant = [
+            record
+            for record in caplog.records
+            if "camera mode could not be fully verified" in record.getMessage()
+        ]
+        assert len(relevant) == 1
+        assert relevant[0].levelname == "INFO"
+        assert not any(
+            record.levelname == "WARNING" and "camera mode" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        capture.close()
+
+
 def test_error_mode_fails_on_negotiated_mismatch(monkeypatch):
     locked = {
         FakeCV2.CAP_PROP_FRAME_WIDTH,

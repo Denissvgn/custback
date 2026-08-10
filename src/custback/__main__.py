@@ -486,7 +486,9 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         "rvm_ratio=%s alpha_policy=%s edge_policy=%s temporal_policy=%s "
         "light_wrap=%s blend_space=%s "
         "capture_fps=%.1f output_fps=%.1f read_failures=%d restarts=%d "
-        "repeats=%d video_skips=%d capture_read_ms=%s segmentation_ms=%s "
+        "repeats=%d video_skips_current=%d video_displayed_lifetime=%d "
+        "video_skips_lifetime=%d video_reuses_lifetime=%d video_seeks_lifetime=%d "
+        "video_failures_lifetime=%d capture_read_ms=%s segmentation_ms=%s "
         "background_ms=%s color_correction_ms=%s composite_ms=%s output_send_ms=%s "
         "frame_processing_ms=%s capture_generation=%d camera_geometry=%d "
         "background_geometry=%d corrections_applied=%d corrections_bypassed=%d "
@@ -522,6 +524,11 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         stats["capture_restarts"],
         stats["output_repeated_frames"],
         stats["background_video_frames_skipped"],
+        stats["background_video_lifetime_frames_displayed"],
+        stats["background_video_lifetime_frames_skipped"],
+        stats["background_video_lifetime_frames_reused"],
+        stats["background_video_lifetime_seek_count"],
+        stats["background_video_lifetime_decode_failures"],
         stats["capture_read_ms"],
         stats["segmentation_ms"],
         stats["background_ms"],
@@ -666,7 +673,17 @@ def run(
             except _ShutdownSignal:
                 raise
             except BaseException:
-                log.exception("pipeline startup failed")
+                worker_error = getattr(pipeline, "error", None)
+                if worker_error is None:
+                    # Startup coordination itself failed, so this is the only
+                    # component able to retain the diagnostic traceback.
+                    log.exception("pipeline startup failed")
+                else:
+                    # Pipeline._run already emitted the authoritative traceback.
+                    log.error(
+                        "pipeline startup failed (%s; worker traceback logged)",
+                        type(worker_error).__name__,
+                    )
                 exit_code = EXIT_RUNTIME
                 shutdown_reason = "pipeline-startup-failure"
 
@@ -841,8 +858,10 @@ def run(
         if pipeline is not None:
             try:
                 pipeline.stop()
-            except Exception:
-                log.exception("pipeline error")
+            except Exception as exc:
+                if exc is not getattr(pipeline, "error", None):
+                    # A distinct teardown error has no earlier owner.
+                    log.exception("pipeline shutdown failed")
                 if exit_code == 0:
                     exit_code = EXIT_RUNTIME
                     shutdown_reason = "pipeline-failure"

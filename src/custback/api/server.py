@@ -58,6 +58,16 @@ from ..config import (
     resolved_output_size,
 )
 from ..hub import FrameHub
+from ..remote_protocol import (
+    RemoteFrameProtocolError,
+    decode_remote_frame,
+    encode_remote_frame,
+)
+from ..runtime_performance import (
+    RUNTIME_PERFORMANCE_SAMPLE_LIMIT,
+    RUNTIME_STAGE_NAMES,
+    validate_runtime_performance_status,
+)
 from ..storage_tx import OwnedPath, OwnershipLedger, rename_noreplace
 from .security import SESSION_COOKIE, SecurityPolicy
 from .streaming import ConnectionLimiter, JpegBroadcaster, LeasedStreamingResponse
@@ -719,6 +729,280 @@ class _MatteRolloutResponse(BaseModel):
         return self
 
 
+_RuntimePerformanceState = Literal["warming", "healthy", "degraded", "failed"]
+_RuntimePerformanceReason = Literal[
+    "none",
+    "output-attainment",
+    "unique-attainment",
+    "output-and-unique-attainment",
+    "processing-deadline-miss",
+    "multiple-performance-gates",
+    "publisher-failed",
+    "pipeline-failed",
+]
+_RuntimeStageName = Literal[
+    "capture.read",
+    "segmentation.total",
+    "background.total",
+    "color_correction.estimate",
+    "color_correction.apply",
+    "compositor.input_mask_validation",
+    "compositor.color_transform_application",
+    "compositor.edge_band",
+    "compositor.model_foreground_replacement",
+    "compositor.backdrop_blur_resize",
+    "compositor.light_wrap_temporal_filter",
+    "compositor.light_wrap_interpolation",
+    "compositor.final_blend_conversion",
+    "compositor.internal_output_validation",
+    "compositor.light_wrap",
+    "compositor.prepare",
+    "compositor.blend",
+    "compositor.total",
+    "pipeline.processing_only",
+    "output.submission",
+]
+
+
+class _RuntimeStageMapResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    capture_read: float | None = Field(alias="capture.read", ge=0.0, le=3_600_000.0)
+    segmentation_total: float | None = Field(
+        alias="segmentation.total", ge=0.0, le=3_600_000.0
+    )
+    background_total: float | None = Field(
+        alias="background.total", ge=0.0, le=3_600_000.0
+    )
+    color_correction_estimate: float | None = Field(
+        alias="color_correction.estimate", ge=0.0, le=3_600_000.0
+    )
+    color_correction_apply: float | None = Field(
+        alias="color_correction.apply", ge=0.0, le=3_600_000.0
+    )
+    compositor_input_mask_validation: float | None = Field(
+        alias="compositor.input_mask_validation", ge=0.0, le=3_600_000.0
+    )
+    compositor_color_transform_application: float | None = Field(
+        alias="compositor.color_transform_application", ge=0.0, le=3_600_000.0
+    )
+    compositor_edge_band: float | None = Field(
+        alias="compositor.edge_band", ge=0.0, le=3_600_000.0
+    )
+    compositor_model_foreground_replacement: float | None = Field(
+        alias="compositor.model_foreground_replacement", ge=0.0, le=3_600_000.0
+    )
+    compositor_backdrop_blur_resize: float | None = Field(
+        alias="compositor.backdrop_blur_resize", ge=0.0, le=3_600_000.0
+    )
+    compositor_light_wrap_temporal_filter: float | None = Field(
+        alias="compositor.light_wrap_temporal_filter", ge=0.0, le=3_600_000.0
+    )
+    compositor_light_wrap_interpolation: float | None = Field(
+        alias="compositor.light_wrap_interpolation", ge=0.0, le=3_600_000.0
+    )
+    compositor_final_blend_conversion: float | None = Field(
+        alias="compositor.final_blend_conversion", ge=0.0, le=3_600_000.0
+    )
+    compositor_internal_output_validation: float | None = Field(
+        alias="compositor.internal_output_validation", ge=0.0, le=3_600_000.0
+    )
+    compositor_light_wrap: float | None = Field(
+        alias="compositor.light_wrap", ge=0.0, le=3_600_000.0
+    )
+    compositor_prepare: float | None = Field(
+        alias="compositor.prepare", ge=0.0, le=3_600_000.0
+    )
+    compositor_blend: float | None = Field(
+        alias="compositor.blend", ge=0.0, le=3_600_000.0
+    )
+    compositor_total: float | None = Field(
+        alias="compositor.total", ge=0.0, le=3_600_000.0
+    )
+    pipeline_processing_only: float | None = Field(
+        alias="pipeline.processing_only", ge=0.0, le=3_600_000.0
+    )
+    output_submission: float | None = Field(
+        alias="output.submission", ge=0.0, le=3_600_000.0
+    )
+
+
+class _RuntimeMetricsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_duration_s: float = Field(ge=0.0, le=5.0)
+    window_sample_count: int = Field(ge=0, le=RUNTIME_PERFORMANCE_SAMPLE_LIMIT)
+    output_send_fps: float = Field(ge=0.0, le=10_000.0)
+    processing_completed_fps: float = Field(ge=0.0, le=10_000.0)
+    sent_unique_base_fps: float = Field(ge=0.0, le=10_000.0)
+    output_attainment: float = Field(ge=0.0, le=10_000.0)
+    unique_attainment: float = Field(ge=0.0, le=10_000.0)
+    processing_deadline_miss_ratio: float = Field(ge=0.0, le=1.0)
+    output_schedule_late_ratio: float = Field(ge=0.0, le=1.0)
+    stage_p50_ms: _RuntimeStageMapResponse
+    stage_p95_ms: _RuntimeStageMapResponse
+    dominant_stage: _RuntimeStageName | None
+
+
+class _RuntimeEpochKeyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_version: int = Field(ge=0, le=2**63 - 1)
+    capture_generation: int = Field(ge=0, le=2**63 - 1)
+    segmentation_generation: int = Field(ge=0, le=2**63 - 1)
+    backdrop_generation: int = Field(ge=0, le=2**63 - 1)
+
+
+class _RuntimeCountersResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    processing_completed_count: int = Field(ge=0, le=2**63 - 1)
+    output_send_count: int = Field(ge=0, le=2**63 - 1)
+    sent_unique_base_count: int = Field(ge=0, le=2**63 - 1)
+    processing_deadline_miss_count: int = Field(ge=0, le=2**63 - 1)
+    output_schedule_late_count: int = Field(ge=0, le=2**63 - 1)
+
+
+class _RuntimeEpochResponse(_RuntimeMetricsResponse, _RuntimeCountersResponse):
+    model_config = ConfigDict(extra="forbid")
+
+    key: _RuntimeEpochKeyResponse
+    state: _RuntimePerformanceState
+    reason: _RuntimePerformanceReason
+    duration_s: float = Field(ge=0.0, le=1_000_000_000.0)
+
+
+class _RuntimePublisherResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["uninitialized", "sink-paced", "deadline-paced"]
+    state: Literal["starting", "running", "stopped", "failed"]
+    handoff_overwrite_count: int = Field(ge=0, le=2**63 - 1)
+    missed_slot_count: int = Field(ge=0, le=2**63 - 1)
+    slate_send_count: int = Field(ge=0, le=2**63 - 1)
+    pending_depth: int = Field(ge=0, le=1)
+    output_base_config_version: int = Field(ge=0, le=2**63 - 1)
+
+
+class _ColorOffPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["off"]
+
+
+class _DisableColorCompositingPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    color_correction: _ColorOffPatchResponse
+
+
+class _DisableWrapCompositingPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    light_wrap: float = Field(ge=0.0, le=0.0)
+
+
+class _DisableColorAndWrapCompositingPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    color_correction: _ColorOffPatchResponse
+    light_wrap: float = Field(ge=0.0, le=0.0)
+
+
+class _DisableColorPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    compositing: _DisableColorCompositingPatchResponse
+
+
+class _DisableWrapPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    compositing: _DisableWrapCompositingPatchResponse
+
+
+class _DisableColorAndWrapPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    compositing: _DisableColorAndWrapCompositingPatchResponse
+
+
+class _EmptyMitigationPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _DisableColorMitigationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_version: int = Field(ge=0, le=2**63 - 1)
+    kind: Literal["disable-color-correction"]
+    patch: _DisableColorPatchResponse
+
+
+class _DisableWrapMitigationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_version: int = Field(ge=0, le=2**63 - 1)
+    kind: Literal["disable-light-wrap"]
+    patch: _DisableWrapPatchResponse
+
+
+class _DisableColorAndWrapMitigationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_version: int = Field(ge=0, le=2**63 - 1)
+    kind: Literal["disable-color-and-light-wrap"]
+    patch: _DisableColorAndWrapPatchResponse
+
+
+class _ReviewBackendMitigationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_version: int = Field(ge=0, le=2**63 - 1)
+    kind: Literal["review-backend-or-diagnostic-target"]
+    patch: _EmptyMitigationPatchResponse
+
+
+_RuntimeMitigationResponse = (
+    _DisableColorMitigationResponse
+    | _DisableWrapMitigationResponse
+    | _DisableColorAndWrapMitigationResponse
+    | _ReviewBackendMitigationResponse
+)
+
+
+class _RuntimePerformanceResponse(_RuntimeMetricsResponse):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    state: _RuntimePerformanceState
+    reason: _RuntimePerformanceReason
+    target_fps: float = Field(ge=0.0, le=1000.0)
+    output_healthy: bool
+    unique_healthy: bool
+    current_epoch: _RuntimeEpochResponse
+    last_closed_epoch: _RuntimeEpochResponse | None
+    startup: _RuntimeCountersResponse
+    publisher: _RuntimePublisherResponse
+    recommended_mitigation: _RuntimeMitigationResponse | None
+
+    @model_validator(mode="after")
+    def _runtime_contract_is_consistent(self) -> "_RuntimePerformanceResponse":
+        public = self.model_dump(mode="python", by_alias=True)
+        validate_runtime_performance_status(public)
+        return self
+
+
+if (
+    tuple(
+        _RuntimeStageMapResponse.model_fields[field].alias
+        for field in _RuntimeStageMapResponse.model_fields
+    )
+    != RUNTIME_STAGE_NAMES
+):  # pragma: no cover - schema invariant
+    raise RuntimeError("runtime performance stage schema drifted")
+
+
 class _StatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -819,6 +1103,13 @@ class _StatusResponse(BaseModel):
     exact_final_output_repeat_ratio: float
     output_send_count: int
     output_send_fps: float
+    processing_completed_count: int
+    processing_completed_fps: float
+    output_base_config_version: int
+    output_handoff_overwrite_count: int
+    output_schedule_skipped_slots: int
+    output_privacy_slate_send_count: int
+    output_publisher_state: Literal["starting", "running", "stopped", "failed"]
     last_unique_frame_age_ms: float | None
     capture_timestamp_delta_p50_ms: float | None
     capture_timestamp_delta_p95_ms: float | None
@@ -853,6 +1144,8 @@ class _StatusResponse(BaseModel):
     background_pad_right: int
     background_pad_bottom: int
     background_geometry_transitions: int
+    background_fallback_active: bool
+    background_fallback_reason: Literal["", "asset-unavailable"]
     color_correction_mode: str
     color_correction_active: bool
     color_correction_effective_mode: str
@@ -864,12 +1157,19 @@ class _StatusResponse(BaseModel):
     color_correction_wb_gain_g: float
     color_correction_wb_gain_b: float
     color_correction_wb_active: bool
+    color_correction_exposure_clamped: bool
+    color_correction_exposure_clamp_count: int
+    color_correction_exposure_clamp_time_s: float
+    color_correction_wb_clamped: bool
+    color_correction_wb_clamp_count: int
+    color_correction_wb_clamp_time_s: float
     color_correction_warming: bool
     color_correction_stale: bool
     color_correction_applied_frames: int
     color_correction_bypassed_frames: int
     color_correction_scene_cuts: int
     color_correction_transitions: int
+    color_correction_reason_transitions: int
     color_input_assumption: str
     composite_ms: float | None
     output_send_ms: float | None
@@ -882,6 +1182,7 @@ class _StatusResponse(BaseModel):
     new_frame_serialized_loop_ms: float | None
     timing_schema_version: Literal[1]
     timing_ms: _TimingFieldsResponse
+    runtime_performance: _RuntimePerformanceResponse
     output_fallback_active: bool
     output_fallback_reason: str
     segmentation_fallback_active: bool
@@ -903,6 +1204,11 @@ class _StatusResponse(BaseModel):
     background_video_skip_ratio: float
     background_video_seek_count: int
     background_video_decode_failures: int
+    background_video_lifetime_frames_displayed: int = Field(ge=0, le=2**63 - 1)
+    background_video_lifetime_frames_skipped: int = Field(ge=0, le=2**63 - 1)
+    background_video_lifetime_frames_reused: int = Field(ge=0, le=2**63 - 1)
+    background_video_lifetime_seek_count: int = Field(ge=0, le=2**63 - 1)
+    background_video_lifetime_decode_failures: int = Field(ge=0, le=2**63 - 1)
     background_video_orientation_status: str | None
     background_video_metadata_rotation: int | None
     background_video_auto_rotation_disabled: bool | None
@@ -2727,6 +3033,7 @@ def create_app(
             return
 
         remote_session = None
+        renderer_connection = bool(stream == "raw" and renderer_authenticated)
         try:
             canvas_width, canvas_height = resolved_output_size(_state(runtime).config)
             await ws.accept(
@@ -2735,7 +3042,9 @@ def create_app(
                     (b"x-custback-frame-height", str(canvas_height).encode("ascii")),
                 ]
             )
-            remote_session = hub.remote_client_connected() if stream == "raw" else None
+            remote_session = (
+                hub.remote_client_connected() if renderer_connection else None
+            )
             jpegs = raw_jpegs if stream == "raw" else output_jpegs
             stop = asyncio.Event()
             ws_limit = int(
@@ -2760,17 +3069,38 @@ def create_app(
                             return
                         jpeg, seq = await subscription.get(seq, 0.5)
                         if jpeg is not None:
+                            if renderer_connection:
+                                raw_epoch = hub.remote_raw_epoch_for_sequence(seq)
+                                if raw_epoch is None or raw_epoch <= 0:
+                                    # The bounded binding may expire behind an
+                                    # unusually stalled encoder. Epoch zero is
+                                    # management-preview-only local input.
+                                    # Never relabel either as renderer input.
+                                    continue
+                                try:
+                                    jpeg = encode_remote_frame(
+                                        "raw-input",
+                                        raw_epoch,
+                                        jpeg,
+                                        max_message_bytes=ws_limit,
+                                    )
+                                except ValueError:
+                                    await ws.close(
+                                        code=1009,
+                                        reason=("frame exceeds configured byte limit"),
+                                    )
+                                    return
                             await ws.send_bytes(jpeg)
 
             async def receiver() -> None:
-                if stream == "output":
+                if not renderer_connection:
                     while True:
                         message = await ws.receive()
                         if message.get("type") == "websocket.disconnect":
                             return
                         await ws.close(
                             code=1008,
-                            reason="output stream is read-only",
+                            reason="stream is read-only",
                         )
                         return
                 expected_size = resolved_output_size(_state(runtime).config)
@@ -2792,9 +3122,21 @@ def create_app(
                             reason="frame exceeds configured byte limit",
                         )
                         return
+                    try:
+                        envelope = decode_remote_frame(
+                            data,
+                            expected_kind="rendered-output",
+                            max_message_bytes=ws_limit,
+                        )
+                    except (RemoteFrameProtocolError, TypeError, ValueError):
+                        await ws.close(
+                            code=1007,
+                            reason="invalid renderer frame envelope",
+                        )
+                        return
                     frame = await asyncio.to_thread(
                         _decode_jpeg,
-                        data,
+                        envelope.jpeg,
                         expected_size,
                     )
                     if frame is None:
@@ -2804,7 +3146,11 @@ def create_app(
                         )
                         return
                     assert remote_session is not None
-                    hub.push_remote_frame(frame, remote_session)
+                    hub.push_remote_frame(
+                        frame,
+                        raw_epoch=envelope.raw_epoch,
+                        session_id=remote_session,
+                    )
 
             send_task = asyncio.create_task(sender())
             receive_task = asyncio.create_task(receiver())

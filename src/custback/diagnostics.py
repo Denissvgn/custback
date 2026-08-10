@@ -8,6 +8,7 @@ configuration audit records.
 
 from __future__ import annotations
 
+import copy
 import errno
 import logging
 import logging.handlers
@@ -26,6 +27,60 @@ DEFAULT_LOG_BYTES = 5 * 1024 * 1024
 DEFAULT_LOG_BACKUPS = 3
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s [run=%(run_id)s]: %(message)s"
 _URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>'\"]+")
+_QUOTED_LOCAL_PATH_RE = re.compile(
+    r"(?P<quote>['\"])(?P<path>(?:[A-Za-z]:[\\/]|\\\\|/)[^'\"\r\n]+)"
+    r"(?P=quote)"
+)
+_SPACED_ABSOLUTE_FILE_RE = re.compile(
+    r"(?<![\w:/\\])"
+    r"(?:[A-Za-z]:[\\/]|\\\\|/)"
+    r"[^=\r\n,;<>\"']*?"
+    r"\.[A-Za-z0-9]{1,12}"
+    r"(?=$|[\s,;:)\]}>])"
+)
+_UNQUOTED_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w:/\\])(?:"
+    r"[A-Za-z]:[\\/][^\s,;:()\[\]{}<>\"']+"
+    r"|\\\\[^\s,;:()\[\]{}<>\"']+"
+    r"(?:[\\/][^\s,;:()\[\]{}<>\"']+)+"
+    r"|/(?:[^/\s,;:()\[\]{}<>\"']+/)+[^/\s,;:()\[\]{}<>\"']*"
+    r"|/(?:dev|etc|home|mnt|opt|private|proc|root|run|sys|tmp|usr|var)"
+    r"(?:/[^/\s,;:()\[\]{}<>\"']+)*"
+    r"|/[^/\s,;:()\[\]{}<>\"']+"
+    r")"
+)
+_TRACEBACK_SOURCE_RE = re.compile(
+    r"(?m)(\bFile\s+)(?P<quote>['\"])(?P<path>[^'\"\r\n]+)"
+    r"(?P=quote)(,\s+line\s+\d+)"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|api[_-]?token|credential|password|"
+    r"renderer[_-]?token|secret|token)\s*[=:]\s*)"
+    r"(?P<quote>['\"]?)[^\s,;\r\n]+(?P=quote)"
+)
+_SAFE_PUBLIC_ROUTES = {
+    "/config",
+    "/docs",
+    "/health",
+    "/openapi.json",
+    "/status",
+}
+
+
+def _is_absolute_local_path(value: str) -> bool:
+    stripped = value.strip()
+    if any(
+        stripped == route or stripped.startswith(f"{route} ")
+        for route in _SAFE_PUBLIC_ROUTES
+    ):
+        return False
+    return bool(
+        stripped.startswith("/")
+        or stripped.startswith("\\\\")
+        or re.match(r"^[A-Za-z]:[\\/]", stripped)
+    )
+
+
 _SAFE_CONFIG_STRINGS = {
     "acceleration.mode",
     "acceleration.provider",
@@ -81,7 +136,18 @@ def sanitized_source(value: object) -> str:
 
 
 def redact_sensitive_text(value: object) -> str:
-    """Strip URL credentials, paths, queries and fragments from log text."""
+    """Strip credentials and source paths from durable diagnostic text.
+
+    The formatter applies this function after exception and traceback
+    rendering, so one policy covers ordinary messages, interpolation values,
+    exception strings, and traceback ``File`` records.  Bare filenames,
+    provider/enumeration labels, ratios, and the small public-route allowlist
+    remain useful diagnostic text.
+    """
+
+    raw_text = str(value)
+    if _is_absolute_local_path(raw_text):
+        return "<redacted-path>"
 
     def redact(match: re.Match[str]) -> str:
         raw = match.group(0)
@@ -110,12 +176,61 @@ def redact_sensitive_text(value: object) -> str:
         )
         return (origin + ("/<redacted>" if sensitive else "")) + trailing
 
-    return _URL_RE.sub(redact, str(value))
+    def redact_traceback_source(match: re.Match[str]) -> str:
+        path = match.group("path")
+        if path.startswith("<") and path.endswith(">"):
+            return match.group(0)
+        return (
+            f"{match.group(1)}{match.group('quote')}<redacted-path>"
+            f"{match.group('quote')}{match.group(4)}"
+        )
+
+    def redact_quoted_path(match: re.Match[str]) -> str:
+        path = match.group("path")
+        if path in _SAFE_PUBLIC_ROUTES:
+            return match.group(0)
+        quote = match.group("quote")
+        return f"{quote}<redacted-path>{quote}"
+
+    def redact_unquoted_path(match: re.Match[str]) -> str:
+        path = match.group(0)
+        if path in _SAFE_PUBLIC_ROUTES:
+            return path
+        return "<redacted-path>"
+
+    def redact_secret_assignment(match: re.Match[str]) -> str:
+        return f"{match.group(1)}<redacted>"
+
+    text = _URL_RE.sub(redact, raw_text)
+    text = _TRACEBACK_SOURCE_RE.sub(redact_traceback_source, text)
+    text = _QUOTED_LOCAL_PATH_RE.sub(redact_quoted_path, text)
+    text = _SPACED_ABSOLUTE_FILE_RE.sub(redact_unquoted_path, text)
+    text = _UNQUOTED_LOCAL_PATH_RE.sub(redact_unquoted_path, text)
+    return _SECRET_ASSIGNMENT_RE.sub(redact_secret_assignment, text)
 
 
 class _RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        return redact_sensitive_text(super().format(record))
+        safe_record = copy.copy(record)
+        if isinstance(record.msg, (str, os.PathLike, BaseException)):
+            safe_record.msg = redact_sensitive_text(record.msg)
+        if isinstance(record.args, Mapping):
+            safe_record.args = {
+                key: (
+                    redact_sensitive_text(item)
+                    if isinstance(item, (str, os.PathLike, BaseException))
+                    else item
+                )
+                for key, item in record.args.items()
+            }
+        elif isinstance(record.args, tuple):
+            safe_record.args = tuple(
+                redact_sensitive_text(item)
+                if isinstance(item, (str, os.PathLike, BaseException))
+                else item
+                for item in record.args
+            )
+        return redact_sensitive_text(super().format(safe_record))
 
 
 def sanitized_config_summary(

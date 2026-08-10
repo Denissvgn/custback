@@ -18,6 +18,7 @@ websockets = pytest.importorskip("websockets")
 import custback.avatar.service as avatar_service_mod
 from custback.avatar.config import AvatarConfig, AvatarRuntime
 from custback.avatar.service import AvatarService
+from custback.remote_protocol import decode_remote_frame, encode_remote_frame
 
 TOKEN = "avatar-service-test-token-0123456789abcdef"
 WIDTH, HEIGHT = 160, 120
@@ -133,6 +134,14 @@ def _camera_jpeg(index: int) -> bytes:
     return jpeg.tobytes()
 
 
+def _rendered_envelope(data: bytes):
+    return decode_remote_frame(
+        data,
+        expected_kind="rendered-output",
+        max_message_bytes=16 * 1024 * 1024,
+    )
+
+
 def _request_headers(ws):
     request = getattr(ws, "request", None)
     if request is not None and hasattr(request, "headers"):
@@ -145,6 +154,7 @@ class FakeCustback:
 
     def __init__(self, *, close_after: int | None = None):
         self.received: list[bytes] = []
+        self.sent_epochs: list[int] = []
         self.rejected = 0
         self.sessions = 0
         self.close_after = close_after
@@ -161,7 +171,15 @@ class FakeCustback:
         async def send_frames():
             index = 0
             while True:
-                await ws.send(_camera_jpeg(index))
+                raw_epoch = index + 1
+                self.sent_epochs.append(raw_epoch)
+                await ws.send(
+                    encode_remote_frame(
+                        "raw-input",
+                        raw_epoch,
+                        _camera_jpeg(index),
+                    )
+                )
                 index += 1
                 if self.close_after is not None and index >= self.close_after:
                     await ws.close()
@@ -248,11 +266,19 @@ def test_service_renders_and_returns_camera_sized_frames(token_file):
 
     fake, stats, service = run_async(scenario())
     assert fake.rejected == 0
+    returned_epochs = []
     for data in fake.received[:3]:
-        assert data.startswith(b"\xff\xd8")  # custback requires JPEG
-        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        envelope = _rendered_envelope(data)
+        returned_epochs.append(envelope.raw_epoch)
+        assert envelope.jpeg.startswith(b"\xff\xd8")
+        frame = cv2.imdecode(
+            np.frombuffer(envelope.jpeg, np.uint8),
+            cv2.IMREAD_COLOR,
+        )
         # custback rejects any frame that does not match the camera size.
         assert frame.shape == (HEIGHT, WIDTH, 3)
+    assert returned_epochs == sorted(set(returned_epochs))
+    assert set(returned_epochs) <= set(fake.sent_epochs)
     assert stats["connected"] is True
     assert stats["frames_sent"] >= 3
     assert stats["frames_received"] >= 3
@@ -389,7 +415,8 @@ def test_service_switches_avatar_style_and_framing_live(token_file):
             stop.set()
             await asyncio.wait_for(runner, 5.0)
             frame = cv2.imdecode(
-                np.frombuffer(fake.received[-1], np.uint8), cv2.IMREAD_COLOR
+                np.frombuffer(_rendered_envelope(fake.received[-1]).jpeg, np.uint8),
+                cv2.IMREAD_COLOR,
             )
             return frame
 
@@ -418,7 +445,8 @@ def test_service_applies_hot_config_between_frames(token_file):
             stop.set()
             await asyncio.wait_for(runner, 5.0)
             frame = cv2.imdecode(
-                np.frombuffer(fake.received[-1], np.uint8), cv2.IMREAD_COLOR
+                np.frombuffer(_rendered_envelope(fake.received[-1]).jpeg, np.uint8),
+                cv2.IMREAD_COLOR,
             )
             return frame
 

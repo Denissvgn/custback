@@ -115,6 +115,31 @@ Run `custback avatar -c /etc/custback/avatar.yaml` (the installed
 `custback-avatar` alias is equivalent). A remote `ws://` or `http://` URL is
 rejected; plaintext is supported only on numeric loopback for same-host use.
 
+## Renderer wire-protocol migration
+
+Custback 0.4.0 uses the mandatory binary remote-frame protocol-v1 envelope on
+`WS /ws/frames?stream=raw`. Each `raw-input` message carries a bounded JPEG and
+the exact raw epoch that produced it. The renderer must preserve that scalar
+unchanged in its matching `rendered-output` envelope. Bare JPEG responses,
+unknown versions or message kinds, inconsistent lengths, and zero-epoch
+rendered output are rejected. Delayed responses are discarded; custback never
+assigns the current epoch when a response arrives.
+
+This duplex contract is granted only to the renderer-scoped bearer. It is an
+exclusive lease: connecting a replacement renderer revokes the old session,
+clears its proof, and synchronously fences output to the fixed privacy slate
+until the replacement returns a current-epoch result. The management bearer
+may open `stream=raw` only as a read-only ordinary-JPEG preview; it receives no
+epoch envelope, creates no renderer session, and any attempted write closes
+the socket.
+
+This is a breaking renderer-wire migration. Upgrade the meeting-host custback
+service and every renderer client, including custom clients, as one deployment
+unit. During a mixed-version rollout the output remains on the fixed privacy
+slate; do not restore service by weakening framing or epoch validation. The
+bundled `custback avatar` service and `examples/avatar_client.py` implement the
+protocol-v1 echo contract.
+
 ## Rotation
 
 Token-file paths and outbound trust settings are startup authority. Token

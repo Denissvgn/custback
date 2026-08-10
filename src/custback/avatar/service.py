@@ -2,10 +2,11 @@
 
 Connects to custback's ``WS /ws/frames?stream=raw`` (locally or across
 hosts), animates the rig from the configured driver, composites it over the
-selected background at exactly the incoming frame size, and returns JPEG
-frames on the same socket. With ``background.mode: remote`` on the custback
-side these frames become the virtual camera output; custback's privacy-safe
-custback's fixed privacy slate covers every stall or disconnect of this service.
+selected background at exactly the incoming frame size, and returns each JPEG
+in a protocol-v1 envelope carrying the unchanged input raw epoch. With
+``background.mode: remote`` on the custback side these frames become the
+virtual camera output; custback's fixed privacy slate covers every stall or
+disconnect of this service.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from ..api.security import (
 )
 from ..backgrounds import BackdropProvider
 from ..hub import _Slot
+from ..remote_protocol import decode_remote_frame, encode_remote_frame
 from .config import (
     AvatarConfig,
     AvatarConfigState,
@@ -1202,8 +1204,19 @@ class AvatarService:
                     newest, seq = await slot.get(seq - 1, 0.01)
                     if newest is not None:
                         data = newest
+                source_limit = self.runtime.read().config.source.frame_max_bytes
+                envelope = decode_remote_frame(
+                    data,
+                    expected_kind="raw-input",
+                    max_message_bytes=source_limit,
+                )
+                if envelope.raw_epoch == 0:
+                    # Local-mode preview frames are explicitly tagged as
+                    # ineligible. Do not spend renderer state or send a reply
+                    # that could never satisfy the publisher proof.
+                    continue
                 payload, publication = await self._await_lane_future(
-                    self._submit_lane(self._process_deferred, data)
+                    self._submit_lane(self._process_deferred, envelope.jpeg)
                 )
                 if stop.is_set():
                     return
@@ -1215,7 +1228,14 @@ class AvatarService:
                             session_epoch=lease.epoch,
                             frame_sequence=frame_sequence,
                         )
-                    await ws.send(payload)
+                    await ws.send(
+                        encode_remote_frame(
+                            "rendered-output",
+                            envelope.raw_epoch,
+                            payload,
+                            max_message_bytes=source_limit,
+                        )
+                    )
                     self._account_completed_send(lease, frame_sequence)
                     if publication is not None:
                         await self._await_lane_future(
