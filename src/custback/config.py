@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import re
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, cast
@@ -1080,6 +1082,57 @@ def resolved_output_size(config: AppConfig) -> tuple[int, int]:
     return width, height
 
 
+def changed_config_paths(old: Any, new: Any, prefix: str = "") -> list[str]:
+    """Return sorted changed leaf paths for two config-shaped values.
+
+    This is the shared lifecycle authority used by both the live pipeline and
+    the persisted profile service.  Keeping the classification beside the
+    schema prevents a browser manifest or a second API implementation from
+    declaring a restart-only camera/canvas change hot-applicable.
+    """
+
+    if hasattr(old, "model_dump"):
+        old = old.model_dump(mode="python")
+    if hasattr(new, "model_dump"):
+        new = new.model_dump(mode="python")
+    if isinstance(old, dict) and isinstance(new, dict):
+        changed: list[str] = []
+        for key in sorted(old.keys() | new.keys()):
+            path = f"{prefix}.{key}" if prefix else key
+            if key not in old or key not in new:
+                changed.append(path)
+            else:
+                changed.extend(changed_config_paths(old[key], new[key], path))
+        return changed
+    return [] if old == new else [prefix]
+
+
+def restart_only_config_paths(old: AppConfig, new: AppConfig) -> list[str]:
+    """Return changed leaves whose resources are bound only at startup."""
+
+    changed = changed_config_paths(old, new)
+    return [
+        path
+        for path in changed
+        if path == "schema_version"
+        or path.startswith("camera.")
+        or path.startswith("output.")
+        or (path.startswith("api.") and path != "api.remote_timeout_ms")
+        or path == "background.camera_device"
+        or path.startswith("backdrop_targets.")
+        or path in AVATAR_PROXY_RESTART_ONLY_FIELDS
+    ]
+
+
+def config_lifecycle(old: AppConfig, new: AppConfig) -> str:
+    """Classify a validated transition as ``none``, ``hot``, or ``restart``."""
+
+    changed = changed_config_paths(old, new)
+    if not changed:
+        return "none"
+    return "restart" if restart_only_config_paths(old, new) else "hot"
+
+
 @dataclass(frozen=True)
 class ConfigState:
     config: AppConfig
@@ -1137,6 +1190,22 @@ class RuntimeConfig:
         """Atomically return a matching configuration snapshot and version."""
         with self._lock:
             return ConfigState(self._config.model_copy(deep=True), self._version)
+
+    @contextlib.contextmanager
+    def guard_version(self, expected_version: int) -> Iterator[ConfigState]:
+        """Hold a read-only version lease across a bounded sidecar CAS write.
+
+        Profile preferences have an independent durable revision, but applying
+        them is also conditional on the live configuration revision supplied by
+        the browser. Holding this lease prevents a pipeline configuration commit
+        from landing between that comparison and the atomic preference-file
+        replacement. The context must therefore contain only bounded local I/O.
+        """
+
+        with self._lock:
+            if self._version != expected_version:
+                raise ConfigVersionConflictError(expected_version, self._version)
+            yield ConfigState(self._config.model_copy(deep=True), self._version)
 
     def snapshot(self) -> AppConfig:
         """Compatibility wrapper around :meth:`read`."""

@@ -86,10 +86,15 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/output_scheduler.py',
   'custback/pipeline.py',
   'custback/preview.py',
+  'custback/profile_preferences.py',
+  'custback/profile_service.py',
   'custback/remote_protocol.py',
   'custback/runtime_performance.py',
   'custback/segmentation.py',
   'custback/storage_tx.py',
+  'custback/system-profile-catalog.json',
+  'custback/system_profile_probe.py',
+  'custback/system_profiles.py',
   'custback/vcam.py',
   'custback/vcam_native.py',
   'custback/video_decoder.py',
@@ -161,6 +166,7 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/test_segmentation_timeline.py',
   'tests/test_spatial_edge_refinement.py',
   'tests/test_streaming.py',
+  'tests/test_system_profiles.py',
   'tests/test_visual_consistency_e2e.py',
   'tests/test_visual_consistency_evidence.py',
   'tests/test_visual_consistency_qualification.py',
@@ -215,6 +221,7 @@ const REVIEWED_PYTHON_SDIST_DATA = [
   'docs/matte-spatial-refinement.md',
   'docs/matte-visual-qualification.md',
   'docs/matte-visual-qualification-local-template.json',
+  'docs/system-profiles.md',
   'docs/visual-consistency-phase4-qualification-runbook.md',
   'docs/visual-consistency-phase4-qualification-template.json',
   'docs/visual-consistency-rollout.md',
@@ -266,6 +273,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'docs/matte-visual-qualification.md',
   'docs/matte-visual-qualification-local-template.json',
   'docs/remote-deployment.md',
+  'docs/system-profiles.md',
   'docs/visual-consistency-phase0-baseline.json',
   'docs/visual-consistency-phase0-contact-sheet.png',
   'docs/visual-consistency-phase0-evidence.md',
@@ -405,6 +413,7 @@ const REVIEWED_NPM_METADATA = {
     'REMEDIATION_PLAN.md',
     'packaging/npm/*.js',
     'packaging/npm/test/*.test.js',
+    'src/**/*.json',
     'src/**/*.py',
     'src/**/*.yaml',
     'tests/*.py',
@@ -1691,6 +1700,7 @@ function verifyMattePolicyRollout(root = ROOT, options = {}) {
       'src/custback/config.py',
       'src/custback/default.yaml',
       'src/custback/matte_rollout.py',
+      'src/custback/system-profile-catalog.json',
     ]) {
       verifyTrustedReleaseSourceFile(sourceContext, relativePath);
     }
@@ -1893,21 +1903,91 @@ print(json.dumps(contract, sort_keys=True, separators=(",", ":")))`,
   };
   visitPatch(expectedPatch);
 
-  if (!isDeepStrictEqual(manifest.preset_catalog, {
-    schema: 'custback.matte-quality-presets',
+  const catalogBytes = fs.readFileSync(
+    path.join(root, 'src', 'custback', 'system-profile-catalog.json'),
+  );
+  const catalog = JSON.parse(catalogBytes.toString('utf8'));
+  if (!catalog || catalog.schema !== 'custback.system-profile-catalog' ||
+      catalog.version !== 1 || catalog.quality_claim !== false ||
+      !catalog.axes || typeof catalog.axes !== 'object') {
+    fail('system profile catalog header is invalid');
+  }
+  const catalogProfiles = [];
+  const owned = new Set();
+  const forbiddenProfilePaths = new Set([
+    'acceleration.device_id',
+    'camera.device',
+    'output.backend',
+    'output.device',
+    'segmentation.model_path',
+  ]);
+  const catalogEvidenceStates = [];
+  for (const [axis, axisDefinition] of Object.entries(catalog.axes)) {
+    if (!axisDefinition || !Array.isArray(axisDefinition.owned_paths) ||
+        !axisDefinition.profiles || typeof axisDefinition.profiles !== 'object') {
+      fail(`system profile axis ${axis} is invalid`);
+    }
+    for (const field of axisDefinition.owned_paths) {
+      if (typeof field !== 'string' || owned.has(field) ||
+          forbiddenProfilePaths.has(field)) {
+        fail(`system profile axes overlap at ${String(field)}`);
+      }
+      owned.add(field);
+    }
+    for (const [id, profile] of Object.entries(axisDefinition.profiles)) {
+      if (!profile ||
+          !['experimental', 'locally_screened'].includes(profile.evidence_state) ||
+          profile.selectable !== true || profile.quality_claim !== false ||
+          !profile.patch || typeof profile.patch !== 'object') {
+        fail(`non-qualified system profile ${axis}.${id} is invalid`);
+      }
+      const requirements = profile.requirements;
+      const patch = profile.patch;
+      if (!requirements || typeof requirements !== 'object' ||
+          (requirements.builtin_rvm_model === true &&
+            patch.segmentation?.backend !== 'rvm') ||
+          (requirements.provider === 'cuda' &&
+            (patch.acceleration?.mode !== 'gpu_required' ||
+              patch.acceleration?.provider !== 'cuda')) ||
+          (Array.isArray(requirements.output_mode) &&
+            !isDeepStrictEqual(requirements.output_mode, [
+              patch.output?.width, patch.output?.height, patch.output?.fps,
+            ]))) {
+        fail(`system profile requirements ${axis}.${id} are not enforced`);
+      }
+      catalogEvidenceStates.push(profile.evidence_state);
+      catalogProfiles.push({
+        axis,
+        id,
+        patch_sha256: crypto.createHash('sha256')
+          .update(canonicalJson(profile.patch)).digest('hex'),
+        evidence_status: profile.evidence_state,
+        quality_claim: false,
+      });
+    }
+  }
+  const expectedCatalogLedger = {
+    schema: 'custback.system-profile-catalog',
     version: 1,
-    evidence_status: 'not_qualified',
-    preset_ids: [],
-  })) {
-    fail('matte-policy preset catalog must remain empty and not qualified');
+    catalog_sha256: crypto.createHash('sha256').update(catalogBytes).digest('hex'),
+    evidence_status: catalogEvidenceStates.every(
+      (state) => state === 'locally_screened'
+    ) ? 'locally_screened' : 'experimental',
+    quality_claim: false,
+    explicit_acknowledgement_required: true,
+    portable_qualification: 'blocked_pending_second_hardware_identity',
+    profiles: catalogProfiles,
+  };
+  if (!isDeepStrictEqual(manifest.preset_catalog, expectedCatalogLedger)) {
+    fail('non-qualified system profile catalog or patch digest disagrees with the ledger');
   }
   const webui = fs.readFileSync(
     path.join(root, 'src', 'custback', 'api', 'webui.py'), 'utf8',
   );
-  if (!/schema:\s*"custback\.matte-quality-presets"/.test(webui) ||
-      !/evidenceStatus:\s*"not_qualified"/.test(webui) ||
-      !/presets:\s*Object\.freeze\(\{\}\)/.test(webui)) {
-    fail('WebUI matte preset catalog disagrees with the held rollout decision');
+  if (!/\/profiles/.test(webui) ||
+      !/accept_experimental/.test(webui) ||
+      /custback\.matte-quality-presets/.test(webui)) {
+    fail('WebUI must consume the server-owned experimental profile catalog');
   }
 
   const promotion = manifest.promotion;

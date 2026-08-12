@@ -54,10 +54,64 @@
     }
   },
   "preset_catalog": {
-    "schema": "custback.matte-quality-presets",
+    "schema": "custback.system-profile-catalog",
     "version": 1,
-    "evidence_status": "not_qualified",
-    "preset_ids": []
+    "catalog_sha256": "0329c789f5b348cf409b97136f4f1f696f37245719b8c0d731dcb131e9027f61",
+    "evidence_status": "experimental",
+    "quality_claim": false,
+    "explicit_acknowledgement_required": true,
+    "portable_qualification": "blocked_pending_second_hardware_identity",
+    "profiles": [
+      {
+        "axis": "quality",
+        "id": "performance",
+        "patch_sha256": "3c0c9fad931db57eee7eddd5931a255e0478149de5f68abec3a850458fd66a55",
+        "evidence_status": "experimental",
+        "quality_claim": false
+      },
+      {
+        "axis": "quality",
+        "id": "balanced",
+        "patch_sha256": "dab00f9fe5bd91b6c9ed73c5970838a76d465b7e103e3e48bb130f860c5db5a0",
+        "evidence_status": "experimental",
+        "quality_claim": false
+      },
+      {
+        "axis": "quality",
+        "id": "quality",
+        "patch_sha256": "183b3f65ba84c37597b713c0db2f3e1974d554e79b89a478740963397d43fc8e",
+        "evidence_status": "experimental",
+        "quality_claim": false
+      },
+      {
+        "axis": "quality",
+        "id": "motion_stable",
+        "patch_sha256": "ab58747982ce7de20b32411dd3bb47a49ef4356a367da3f6167918a96fe77926",
+        "evidence_status": "experimental",
+        "quality_claim": false
+      },
+      {
+        "axis": "framing",
+        "id": "fill_center",
+        "patch_sha256": "29bc0f8f42b2f46f115615fe6d377a9c18b3da7c6b917f7b98b4a5ce8c44696a",
+        "evidence_status": "experimental",
+        "quality_claim": false
+      },
+      {
+        "axis": "framing",
+        "id": "headroom",
+        "patch_sha256": "e4d2333fce2f90c8b129e06aec14488e969c55d8ffb78f08ef5dfdb521462e01",
+        "evidence_status": "experimental",
+        "quality_claim": false
+      },
+      {
+        "axis": "framing",
+        "id": "show_all",
+        "patch_sha256": "3f3c13c97cdd64b5851c0fff38f191c604077d7c9b56003fc0ec1b811a7592f9",
+        "evidence_status": "experimental",
+        "quality_claim": false
+      }
+    ]
   },
   "promotion": {
     "status": "pending",

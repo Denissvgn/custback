@@ -14,6 +14,7 @@ when it is absent (e.g. running from an installed wheel/sdist that ships only
 
 from __future__ import annotations
 
+import json
 import os
 import py_compile
 import subprocess
@@ -91,13 +92,26 @@ def test_spec_carries_dynamic_custback_imports() -> None:
 
 def test_spec_carries_both_annotated_configuration_templates() -> None:
     text = _spec_text()
-    assert 'collect_data_files("custback", includes=["**/*.yaml"])' in text
+    assert '"**/*.yaml", "**/system-profile-catalog.json"' in text
     assert (PROJECT_ROOT / "src" / "custback" / "default.yaml").read_bytes() == (
         PROJECT_ROOT / "config" / "default.yaml"
     ).read_bytes()
     assert (
         PROJECT_ROOT / "src" / "custback" / "avatar" / "avatar.yaml"
     ).read_bytes() == (PROJECT_ROOT / "config" / "avatar.yaml").read_bytes()
+    catalog = PROJECT_ROOT / "src" / "custback" / "system-profile-catalog.json"
+    assert json.loads(catalog.read_text(encoding="utf-8"))["schema"] == (
+        "custback.system-profile-catalog"
+    )
+    hook = (
+        PROJECT_ROOT
+        / "packaging"
+        / "windows"
+        / "pyinstaller"
+        / "hooks"
+        / "hook-custback.py"
+    ).read_text(encoding="utf-8")
+    assert '"**/system-profile-catalog.json"' in hook
 
 
 def test_spec_carries_pyav_submodules_and_private_ffmpeg_bundle() -> None:

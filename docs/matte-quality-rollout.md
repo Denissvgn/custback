@@ -1,13 +1,16 @@
 # Matte quality rollout, migration, and rollback
 
-Status: **compatibility hold; no qualified matte preset or default promotion**
+Status: **compatibility default hold; Experimental profiles are not qualified**
 
 This is the MATTE-5.4 operator and release-owner guide. It defines how a
 separately qualified matte policy would become a reversible rollout; it does
 not create that qualification. At this revision the checked-in visual/platform
-evidence is generated and pending, so the only permitted release stage is the
-schema-1 compatibility policy. Performance, Balanced, and Quality remain
-unavailable as named presets.
+evidence is generated and pending, so schema-1 compatibility remains the only
+default policy. Performance, Balanced, Quality, and Motion stable are exposed
+only as explicitly acknowledged non-qualified concrete profiles with
+`quality_claim: false`. A local one-host screen may advance an exact row from
+`experimental` to `locally_screened`, but portable qualification remains
+blocked pending the complete second-hardware matrix.
 
 Reactions are outside this procedure. Keep them disabled while collecting,
 canarying, or deciding matte behavior. A reaction rollout uses the separate
@@ -19,8 +22,8 @@ defined by [the matte-policy contract](matte-backend-policies.md).
 The machine-readable release authority is
 [`scripts/release/matte-policy-rollout.json`](../scripts/release/matte-policy-rollout.json).
 Release validation rejects drift between its canonical patch/digest, the
-schema-1 defaults, the code-owned rollback helper, status disposition, and
-preset catalog.
+schema-1 defaults, the code-owned rollback helper, status disposition, and the
+packaged system-profile catalog plus every concrete profile-patch digest.
 
 The patch digest is SHA-256 over UTF-8 canonical JSON, not over the pretty
 printed ledger bytes. Canonicalization preserves array order, recursively
@@ -42,7 +45,7 @@ the release workflow therefore share the same fail-closed semantics.
 | --- | --- |
 | Config schema | Version 1; versionless persisted mappings keep schema-1 semantics |
 | New-install matte policy | Compatibility values from the two byte-identical default YAML files |
-| Named presets | Unavailable; the WebUI catalog remains evidence-gated and empty |
+| Named profiles | Selectable only as explicitly acknowledged `experimental` or `locally_screened` entries; no portable quality claim |
 | Default backend | `auto`; this is selection intent, not a promise of RVM or a quality tier |
 | RVM package profile | Optional explicit `rvm` or `gpu` extra; never added by a default rollout on an unqualified route |
 | Spatial candidate | `stable_guided` available only by explicit selection; default remains `legacy_watershed` |
@@ -56,10 +59,11 @@ inspect the effective `segmentation_selection`, provider, and `matte_policy`;
 the configured word `auto` alone is not a runtime result.
 
 The checked-in rollout ledger is intentionally not a partially completed
-approval. Its `promotion.status` is `pending`, the candidate/commit fields are
-null, and its seven baseline, ablation, visual, performance, platform,
-privacy, and migration evidence slots contain no report or digest. Generated
-fixtures may test those joins but cannot fill a physical promotion slot.
+approval. It binds the immutable Experimental catalog and patch hashes while
+its `promotion.status` remains `pending`, the candidate/commit fields are null,
+and its seven baseline, ablation, visual, performance, platform, privacy, and
+migration evidence slots contain no report or digest. Generated fixtures may
+test those joins but cannot fill a physical promotion slot.
 
 ## Persisted-config behavior
 

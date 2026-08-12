@@ -158,12 +158,111 @@ function lstatOrNull(file) {
   }
 }
 
+function requireRegularFile(file, label) {
+  const st = fs.lstatSync(file);
+  if (!st.isFile() || st.isSymbolicLink()) {
+    throw new Error(`${label} is not a regular owned file: ${file}`);
+  }
+  return st;
+}
+
+function sameIdentity(left, right) {
+  return Boolean(left && right) && left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameOptionalIdentity(left, right) {
+  return left === null ? right === null : right !== null && sameIdentity(left, right);
+}
+
+function identityForStat(st) {
+  return { dev: st.dev, ino: st.ino };
+}
+
+function optionalIdentityForStat(st) {
+  return st ? identityForStat(st) : null;
+}
+
+function requireStablePath(file, before, after, label) {
+  if (!sameOptionalIdentity(optionalIdentityForStat(before), optionalIdentityForStat(after))) {
+    throw new Error(`custback ${label} changed while being inspected: ${file}`);
+  }
+}
+
+function sameNames(left, right) {
+  return left.length === right.length && left.every((name, index) => name === right[index]);
+}
+
+/**
+ * Retire a path only if the object atomically moved away from its public name
+ * is the same inode that was validated by the purge plan.  Moving first keeps
+ * a late replacement at the original path rather than recursively deleting
+ * it.  A private sibling directory also ensures the quarantine destination
+ * cannot overwrite an existing user path.
+ */
+function retireVerifiedPath(file, expectedIdentity, label = 'custback managed artifact') {
+  if (!expectedIdentity) {
+    throw new Error(`missing validated identity for ${label}: ${file}`);
+  }
+  const resolved = path.resolve(file);
+  const quarantineRoot = fs.mkdtempSync(
+    path.join(path.dirname(resolved), `.${path.basename(resolved)}.custback-purge-`),
+  );
+  const quarantined = path.join(quarantineRoot, 'artifact');
+  let moved = false;
+  try {
+    try {
+      fs.renameSync(resolved, quarantined);
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        throw new Error(`${label} disappeared during purge: ${resolved}`);
+      }
+      throw err;
+    }
+    moved = true;
+    const stat = lstatOrNull(quarantined);
+    if (!stat || !sameIdentity(expectedIdentity, identityForStat(stat))) {
+      let restored = false;
+      if (!lstatOrNull(resolved)) {
+        try {
+          fs.renameSync(quarantined, resolved);
+          moved = false;
+          restored = true;
+        } catch (err) {
+          if (!['EEXIST', 'ENOTEMPTY'].includes(err.code)) {
+            throw new Error(
+              `${label} changed during purge and could not be restored: ${resolved}: ${err.message}`,
+            );
+          }
+        }
+      }
+      const retained = restored ? '' : `; retained at ${quarantined}`;
+      throw new Error(`${label} changed during purge and was not deleted: ${resolved}${retained}`);
+    }
+
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      fs.rmSync(quarantined, { recursive: true, force: false });
+    } else {
+      fs.unlinkSync(quarantined);
+    }
+    moved = false;
+    if (lstatOrNull(resolved)) {
+      throw new Error(`${label} was recreated during purge and was not deleted: ${resolved}`);
+    }
+  } finally {
+    if (!moved) {
+      try { fs.rmdirSync(quarantineRoot); } catch {}
+    }
+  }
+}
+
 function validateGenerationsRoot(root, target) {
   const st = fs.lstatSync(root);
   if (!st.isDirectory() || st.isSymbolicLink()) {
     throw new Error(`custback generations path is not an owned directory: ${root}`);
   }
-  const marker = readJson(path.join(root, GENERATIONS_MARKER));
+  const markerPath = path.join(root, GENERATIONS_MARKER);
+  requireRegularFile(markerPath, 'custback generations marker');
+  const marker = readJson(markerPath);
   if (marker.owner !== OWNER || marker.schema !== MARKER_SCHEMA ||
       !samePath(marker.logicalTarget, target)) {
     throw new Error(`custback generations marker does not match ${target}`);
@@ -245,7 +344,9 @@ function validateGeneration(directory, target, expectedRoot = generationsRootFor
   if (!st.isDirectory() || st.isSymbolicLink()) {
     throw new Error(`managed generation is not a real directory: ${resolved}`);
   }
-  const marker = readJson(path.join(resolved, VENV_MARKER));
+  const markerPath = path.join(resolved, VENV_MARKER);
+  requireRegularFile(markerPath, 'custback generation marker');
+  const marker = readJson(markerPath);
   if (marker.owner !== OWNER || marker.schema !== MARKER_SCHEMA ||
       !samePath(marker.logicalTarget, target) || marker.generationId !== path.basename(resolved)) {
     throw new Error(`generation marker does not match ${resolved}`);
@@ -282,6 +383,7 @@ function inspectTarget(target) {
   const markerPath = path.join(resolvedTarget, VENV_MARKER);
   const legacyPath = path.join(resolvedTarget, LEGACY_STAMP);
   if (fs.existsSync(markerPath)) {
+    requireRegularFile(markerPath, 'custback venv marker');
     const marker = readJson(markerPath);
     if (marker.owner !== OWNER || marker.schema !== MARKER_SCHEMA ||
         !samePath(marker.logicalTarget, resolvedTarget)) {
@@ -289,7 +391,8 @@ function inspectTarget(target) {
     }
     return { kind: 'direct', target: resolvedTarget, generationRoot, legacy: false };
   }
-  if (fs.existsSync(legacyPath) && fs.statSync(legacyPath).isFile()) {
+  if (fs.existsSync(legacyPath)) {
+    requireRegularFile(legacyPath, 'legacy custback ownership stamp');
     const legacyStamp = fs.readFileSync(legacyPath, 'utf8').trim();
     if (/^\d+\.\d+\.\d+\s+\S+\s+3\.\d+(?:\.\d+)?\s+\[[^\]]*\]$/.test(legacyStamp)) {
       return { kind: 'direct', target: resolvedTarget, generationRoot, legacy: true };
@@ -299,6 +402,107 @@ function inspectTarget(target) {
   throw new Error(
     `refusing to replace unowned venv ${resolvedTarget}; move it aside or choose another CUSTBACK_VENV`
   );
+}
+
+function validPrivateLockRecord(file, generationRoot) {
+  let record;
+  try {
+    requireRegularFile(file, 'custback private install lock');
+    record = readJson(file);
+  } catch {
+    return false;
+  }
+  return record.owner === OWNER && record.schema === MARKER_SCHEMA &&
+    typeof record.token === 'string' && record.token.length > 0 &&
+    Number.isInteger(record.pid) && Number.isFinite(record.createdAt) &&
+    path.resolve(record.recordPath || '') === path.resolve(file) &&
+    path.dirname(path.resolve(file)) === path.resolve(generationRoot);
+}
+
+function currentPurgeLockEntries(generationRoot) {
+  const lockPath = path.join(generationRoot, LOCK_DIR);
+  const lock = inspectInstallLock(lockPath, generationRoot, 0);
+  if (!lock || !lock.owned || lock.kind !== 'owner-file' ||
+      !validPrivateLockRecord(lock.recordPath, generationRoot) ||
+      !sameInode(lockPath, lock.recordPath)) {
+    return null;
+  }
+  return new Set([LOCK_DIR, path.basename(lock.recordPath)]);
+}
+
+/**
+ * Inspect every artifact eligible for an explicit runtime purge. This is
+ * intentionally stricter than regular rebuild cleanup: unknown, corrupt, or
+ * symlinked children make the entire purge fail before anything is deleted.
+ */
+function inspectPurgeState(target, options = {}) {
+  const resolvedTarget = path.resolve(target);
+  const targetBefore = lstatOrNull(resolvedTarget);
+  const inspection = inspectTarget(resolvedTarget);
+  const targetStat = lstatOrNull(resolvedTarget);
+  requireStablePath(resolvedTarget, targetBefore, targetStat, 'managed runtime target');
+  const generationRootPath = generationsRootFor(resolvedTarget);
+  const rootStat = lstatOrNull(generationRootPath);
+  const generations = [];
+
+  if (rootStat) {
+    validateGenerationsRoot(generationRootPath, resolvedTarget);
+    const validatedRoot = lstatOrNull(generationRootPath);
+    requireStablePath(generationRootPath, rootStat, validatedRoot, 'generations root');
+    const allowedLockEntries = options.allowInstallLock
+      ? currentPurgeLockEntries(generationRootPath) : null;
+    const names = fs.readdirSync(generationRootPath).sort();
+    for (const name of names) {
+      if (name === GENERATIONS_MARKER) continue;
+      if (allowedLockEntries && allowedLockEntries.has(name)) {
+        continue;
+      }
+      if (!name.startsWith('gen-') && !name.startsWith('legacy-')) {
+        throw new Error(
+          `custback generations path contains an unexpected entry: ` +
+          `${path.join(generationRootPath, name)}`,
+        );
+      }
+      const generation = path.join(generationRootPath, name);
+      const generationBefore = lstatOrNull(generation);
+      validateGeneration(generation, resolvedTarget, generationRootPath);
+      const generationStat = lstatOrNull(generation);
+      requireStablePath(generation, generationBefore, generationStat, 'managed runtime generation');
+      generations.push({ path: generation, identity: identityForStat(generationStat) });
+    }
+    const finalNames = fs.readdirSync(generationRootPath).sort();
+    if (!sameNames(names, finalNames)) {
+      throw new Error(`custback generations path changed while being inspected: ${generationRootPath}`);
+    }
+    requireStablePath(
+      generationRootPath,
+      rootStat,
+      lstatOrNull(generationRootPath),
+      'generations root',
+    );
+  }
+
+  return {
+    target: resolvedTarget,
+    inspection,
+    targetIdentity: targetStat ? identityForStat(targetStat) : null,
+    generationRoot: rootStat ? generationRootPath : null,
+    generationRootIdentity: rootStat ? identityForStat(rootStat) : null,
+    generations,
+  };
+}
+
+function samePurgeState(left, right) {
+  return Boolean(left && right) && left.target === right.target &&
+    left.inspection.kind === right.inspection.kind &&
+    Boolean(left.inspection.legacy) === Boolean(right.inspection.legacy) &&
+    sameOptionalIdentity(left.targetIdentity, right.targetIdentity) &&
+    left.generationRoot === right.generationRoot &&
+    sameOptionalIdentity(left.generationRootIdentity, right.generationRootIdentity) &&
+    left.generations.length === right.generations.length &&
+    left.generations.every((generation, index) =>
+      generation.path === right.generations[index].path &&
+      sameIdentity(generation.identity, right.generations[index].identity));
 }
 
 function markGeneration(generation, target) {
@@ -545,6 +749,33 @@ function generationIsReferenced(target, generation, generationRoot) {
 function removeOwnedGeneration(generation, target, generationRoot) {
   validateGeneration(generation, target, generationRoot);
   fs.rmSync(generation, { recursive: true, force: false });
+}
+
+/**
+ * Remove only a freshly validated managed runtime. The caller must hold the
+ * install lock for `state.generationRoot`; that lock itself and the root marker
+ * are deliberately retained so a concurrent/restarted installer cannot race a
+ * recursive root deletion.
+ */
+function purgeOwnedRuntime(state) {
+  const current = inspectPurgeState(state.target, { allowInstallLock: true });
+  if (!samePurgeState(state, current)) {
+    throw new Error(`managed runtime changed while waiting for purge lock: ${state.target}`);
+  }
+
+  if (current.inspection.kind === 'symlink') {
+    retireVerifiedPath(current.target, current.targetIdentity, 'managed runtime link');
+  } else if (current.inspection.kind === 'direct') {
+    retireVerifiedPath(current.target, current.targetIdentity, 'managed runtime');
+  }
+  for (const generation of current.generations) {
+    retireVerifiedPath(generation.path, generation.identity, 'managed runtime generation');
+  }
+  const remaining = inspectPurgeState(current.target, { allowInstallLock: true });
+  if (remaining.inspection.kind !== 'absent' || remaining.generations.length !== 0) {
+    throw new Error(`managed runtime changed during purge and was not fully removed: ${current.target}`);
+  }
+  return current;
 }
 
 function cleanupGenerations(generationRoot, target, keep, retainPrevious = 1) {
@@ -876,15 +1107,19 @@ module.exports = {
   ensureGenerationsRoot,
   generationIsReferenced,
   generationsRootFor,
+  inspectPurgeState,
   inspectTarget,
   isWithin,
   markGeneration,
   npmPrefixForPackage,
   prepareInstallTarget,
   promoteGeneration,
+  purgeOwnedRuntime,
   readJson,
   recoverInterruptedPromotion,
+  retireVerifiedPath,
   removeCreatedGeneration,
+  samePurgeState,
   validateGeneration,
   withInstallLock,
   writeJson,

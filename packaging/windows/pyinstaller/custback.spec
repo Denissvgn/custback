@@ -142,10 +142,11 @@ for _pkg in ("mediapipe", "cv2"):
     except Exception:
         pass
 
-# The avatar service config template is loaded via
-# importlib.resources.files("custback.avatar")/"avatar.yaml"; a frozen build must
-# carry it as a real data file next to the package.
-_datas += collect_data_files("custback", includes=["**/*.yaml"])
+# Config templates and the immutable system-profile catalog are loaded through
+# importlib.resources; a frozen build must carry them as real package data.
+_datas += collect_data_files(
+    "custback", includes=["**/*.yaml", "**/system-profile-catalog.json"]
+)
 
 # uvicorn/websockets select their loop/protocol implementations by string import
 # at runtime; FastAPI + pydantic pull optional submodules the same way.  The

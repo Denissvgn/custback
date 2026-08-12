@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 import custback.backgrounds as backgrounds_mod
 from custback.api.avatar_proxy import register_avatar_proxy
+from custback.api.streaming import ConnectionLimiter
 from custback.avatar.config import Audio2FaceConfig, AvatarConfig
 from custback.capture import CapturedFrame
 from custback.config import AppConfig, RuntimeConfig
@@ -56,7 +57,14 @@ def _proxy_app(
     def client_factory() -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    register_avatar_proxy(app, runtime, client_factory=client_factory)
+    stream_connections = ConnectionLimiter(cfg.api.max_stream_connections)
+    app.state.stream_connections = stream_connections
+    register_avatar_proxy(
+        app,
+        runtime,
+        stream_connections=stream_connections,
+        client_factory=client_factory,
+    )
     return app
 
 

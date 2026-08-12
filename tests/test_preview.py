@@ -576,6 +576,7 @@ def test_status_overlay_shows_actual_backends_cpu_and_fallbacks():
             "background_video_timing_mode": "clocked",
             "background_video_frames_displayed": 100,
             "background_video_skip_ratio": 0.58,
+            "base_composite_update_fps": 9.5,
         }
     )
     rendered = "\n".join(status)
@@ -586,7 +587,9 @@ def test_status_overlay_shows_actual_backends_cpu_and_fallbacks():
     assert "NullOutput" in rendered
     assert "CONFIG v4" in rendered
     assert "1280x720" in rendered and "YUYV" in rendered
-    assert "skip 58%" in rendered
+    assert "source 24.0 fps" in rendered
+    assert "visual updates 9.5 fps" in rendered
+    assert "skip 58% (preserves playback phase)" in rendered
     assert "CAPTURE BELOW TARGET" in warning_text
     assert "OUTPUT FALLBACK" in warning_text
     assert "REMOTE FALLBACK" in warning_text
@@ -751,6 +754,26 @@ def test_status_overlay_distinguishes_visual_updates_from_output_sends():
         "CADENCE VIS 15.0  SEG 14.9  SEND 29.7  BASE REUSE 51%  EXACT FINAL REPEAT 51%",
     ]
     assert warnings == ["VISUAL UPDATES 15 FPS; OUTPUT REPEATS TO 30 FPS"]
+
+
+def test_status_overlay_labels_configured_intentional_repeats_without_warning():
+    status, warnings = preview_mod._status_overlay_lines(
+        {
+            "base_composite_update_fps": 15.0,
+            "segmentation_update_fps": 15.0,
+            "output_send_fps": 30.0,
+            "cadence_mismatch_active": True,
+            "runtime_performance": {
+                "schema_version": 2,
+                "cadence_status": "intentional-repeat",
+                "unique_target_fps": 15.0,
+                "transport_target_fps": 30.0,
+            },
+        }
+    )
+
+    assert status[-1] == "CADENCE INTENTIONAL REPEAT 15 -> 30 FPS"
+    assert warnings == []
 
 
 def test_status_overlay_does_not_infer_mismatch_from_partial_cadence():

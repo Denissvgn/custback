@@ -23,6 +23,6 @@ hiddenimports = collect_submodules("custback")
 
 datas = collect_data_files(
     "custback",
-    includes=["**/*.yaml"],
+    includes=["**/*.yaml", "**/system-profile-catalog.json"],
     excludes=["**/*.onnx", "**/*.tflite"],
 )

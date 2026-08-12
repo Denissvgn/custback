@@ -10,7 +10,7 @@ installer (`../installer/`, WIN-5.6) wraps the whole `dist/custback/` tree.
 
 | File | Purpose |
 | --- | --- |
-| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects PyAV and its sibling `av.libs` FFmpeg bundle, OpenCV/ONNX Runtime/MediaPipe natives plus pyvirtualcam where supported, `custback` package data (`default.yaml` and `avatar.yaml`), and pywin32; excludes model weights and GUI toolkits. Windows ARM64 omits pyvirtualcam collection/hidden import to match its PEP 508 dependency marker. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face swaps stacks — protobuf conflict makes them one-per-payload). |
+| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects PyAV and its sibling `av.libs` FFmpeg bundle, OpenCV/ONNX Runtime/MediaPipe natives plus pyvirtualcam where supported, `custback` package data (`default.yaml`, `avatar.yaml`, and `system-profile-catalog.json`), and pywin32; excludes model weights and GUI toolkits. Windows ARM64 omits pyvirtualcam collection/hidden import to match its PEP 508 dependency marker. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face swaps stacks — protobuf conflict makes them one-per-payload). |
 | `entry_custback.py` | Frozen entry script → `custback.__main__:main` with `multiprocessing.freeze_support()`. |
 | `entry_custback_avatar.py` | Frozen entry script → `custback.avatar.__main__:main` (WIN-6.4). |
 | `hooks/hook-custback.py` | Analysis hook: hidden imports for `custback._platform.*` and segmentation delegates; packaged YAML data. |

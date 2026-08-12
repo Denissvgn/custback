@@ -415,6 +415,57 @@ test('install lock is exclusive and released after callback', (t) => {
   assert.equal(managed.withInstallLock(generationRoot, () => 42), 42);
 });
 
+test('purge inspection refuses a live install lock without touching managed state', (t) => {
+  const root = sandbox(t);
+  const target = path.join(root, 'custback-venv');
+  const generationRoot = managed.ensureGenerationsRoot(target);
+  const generation = fakeGeneration(generationRoot, target);
+  managed.promoteGeneration({
+    target,
+    generation,
+    inspection: managed.inspectTarget(target),
+    validateActive() {},
+  });
+
+  managed.withInstallLock(generationRoot, () => {
+    assert.throws(() => managed.inspectPurgeState(target), /unexpected entry/);
+    assert.doesNotThrow(() => managed.inspectPurgeState(target, { allowInstallLock: true }));
+    const extraLockRecord = path.join(generationRoot, '.install-lock-owner-extra.json');
+    const canonicalLock = managed.readJson(path.join(generationRoot, '.install-lock'));
+    managed.writeJson(extraLockRecord, {
+      ...canonicalLock,
+      token: 'extra-valid-looking-owner-record',
+      recordPath: extraLockRecord,
+    });
+    assert.throws(
+      () => managed.inspectPurgeState(target, { allowInstallLock: true }),
+      /unexpected entry/,
+    );
+    assert.equal(fs.realpathSync(target), fs.realpathSync(generation));
+    assert.equal(fs.existsSync(generation), true);
+  });
+  assert.equal(fs.existsSync(target), true);
+  assert.equal(fs.existsSync(generation), true);
+});
+
+test('verified purge retirement restores a late replacement without deleting it', (t) => {
+  const root = sandbox(t);
+  const artifact = path.join(root, 'artifact');
+  const original = path.join(root, 'original');
+  fs.writeFileSync(artifact, 'owned');
+  const expected = fs.lstatSync(artifact);
+  fs.renameSync(artifact, original);
+  fs.writeFileSync(artifact, 'foreign replacement');
+
+  assert.throws(
+    () => managed.retireVerifiedPath(artifact, { dev: expected.dev, ino: expected.ino }, 'test artifact'),
+    /changed during purge and was not deleted/,
+  );
+  assert.equal(fs.readFileSync(artifact, 'utf8'), 'foreign replacement');
+  assert.equal(fs.readFileSync(original, 'utf8'), 'owned');
+  assert.deepEqual(fs.readdirSync(root).sort(), ['artifact', 'original']);
+});
+
 test('stale owned install lock is recovered', (t) => {
   const root = sandbox(t);
   const target = path.join(root, 'custback-venv');

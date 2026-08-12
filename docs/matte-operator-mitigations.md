@@ -422,14 +422,17 @@ not change RVM or MediaPipe output and is not a mitigation for either backend.
 
 ### Runtime performance recommendation
 
-`GET /status.runtime_performance` version 1 separates target-paced output from
+`GET /status.runtime_performance` version 2 separates target-paced output from
 unique visual updates. When no new eligible base is ready, the publisher reuses
 the last eligible final frame without rerunning segmentation, refinement,
 color correction, light wrap, or compositing. That reuse is an exact repeat;
 a newly processed pixel-identical base can also count as an exact repeat, so
 exact equality alone is not reuse provenance. Therefore a healthy
 `output_send_fps` does not clear a degraded `sent_unique_base_fps` or
-`unique_attainment`. Let the current epoch leave `warming`, then review the
+`unique_attainment`. A configured 15 FPS camera carried by a 30 FPS output uses
+a 15 FPS unique target and reports `intentional-repeat`; falling below either
+the unique or transport target reports `unexpected-shortfall`. Let the current
+epoch leave `warming`, then review the
 state, reason, attainment ratios, deadline-miss ratio, dominant stage, p95
 stages, and publisher counters together:
 
@@ -440,7 +443,12 @@ api_get status | jq '{
     schema_version,
     state,
     reason,
+    cadence_status,
     target_fps,
+    transport_target_fps,
+    unique_target_fps,
+    transport_deadline_ms,
+    processing_deadline_ms,
     output_send_fps,
     sent_unique_base_fps,
     output_attainment,
@@ -461,7 +469,7 @@ claim. It is present only while degraded and is valid only when its
 `config_version` still equals both the top-level status version and
 `current_epoch.key.config_version`. Discard a stale recommendation and fetch a
 fresh status/config pair. Review and apply at most the explicit fields shown;
-never pipe the status-provided patch directly into the API. The possible v1
+never pipe the status-provided patch directly into the API. The possible v2
 recommendations are:
 
 | Kind | Advisory patch | Operator meaning |
@@ -478,6 +486,17 @@ not a conditional write: keep the change window exclusive and re-fetch both
 config and status immediately after it. The new config version opens a fresh
 performance epoch. Wait for warm-up and sustained measurement instead of
 judging one frame or the target-paced send rate alone.
+
+The WebUI exposes the same non-empty recommendation as an **Apply suggested
+stability mitigation** button. It independently matches the recommendation
+against the fixed patch allowlist, requires the status, current epoch, and
+fetched config versions to agree, asks for explicit confirmation, and then
+uses a conditional transactional config patch. The server compares the
+expected version again at the activation boundary, so a concurrent config
+change rejects stale advice with `409` instead of applying it. The UI hides the
+action for stale, malformed, empty, warming, healthy, or failed
+recommendations. This is a user-triggered shortcut for the reviewed fields
+above, not an automatic controller and not a preset.
 
 To roll back, restore only the fields that the recommendation changed, using
 the exact pre-change values in `MITIGATION_ROLLBACK`:
@@ -519,7 +538,8 @@ writes camera controls. Compare two warm status intervals under the same mode:
 - If capture stays near target but `frame_processing_ms`,
   `segmentation_ms`, or `composite_ms` grows beyond the frame budget while
   deadline misses and capture-slot drops rise, the full processing path is the
-  constraint.
+  constraint. Compare processing against `processing_deadline_ms` (the unique
+  target), not the usually shorter `transport_deadline_ms`.
 
 Try a stable, brighter, diffuse scene and observe whether cadence changes.
 Do not automatically force exposure/gain values: support varies by camera and

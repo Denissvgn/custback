@@ -21,6 +21,7 @@
     "REMEDIATION_PLAN.md",
     "packaging/npm/*.js",
     "packaging/npm/test/*.test.js",
+    "src/**/*.json",
     "src/**/*.py",
     "src/**/*.yaml",
     "tests/*.py",

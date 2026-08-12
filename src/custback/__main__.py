@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -26,6 +27,9 @@ EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
 EXIT_API = 3
 API_START_TIMEOUT_S = 5.0
+API_GRACEFUL_SHUTDOWN_TIMEOUT_S = 2
+API_STOP_TIMEOUT_S = 4.0
+API_FORCE_EXIT_RESERVE_S = 0.5
 SignalHandler = Callable[[int, FrameType | None], Any] | int | signal.Handlers | None
 _VISUAL_POLICY_DIAGNOSTIC_FIELDS = (
     "schema_version",
@@ -53,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Virtual camera with background replacement",
     )
     parser.add_argument("-c", "--config", help="path to YAML config file")
+    parser.add_argument(
+        "--no-profile-preferences",
+        action="store_true",
+        help="ignore and disable the managed profile-preferences overlay",
+    )
     parser.add_argument("--camera", help="camera device (index or path/URL)")
     parser.add_argument("--width", type=int, help="capture width")
     parser.add_argument("--height", type=int, help="capture height")
@@ -224,11 +233,11 @@ def list_cameras() -> int:
     return 0
 
 
-def config_from_args(args: argparse.Namespace) -> AppConfig:
+def _config_from_base_and_args(args: argparse.Namespace, base: AppConfig) -> AppConfig:
     # Apply every CLI override to plain data and validate the resulting
     # configuration once.  Valid combinations must not depend on assignment
     # order when two overrides jointly satisfy a cross-field invariant.
-    values = AppConfig.load(args.config).to_dict()
+    values = base.to_dict()
     cam = values["camera"]
     bg = values["background"]
     api = values["api"]
@@ -334,6 +343,55 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
     return AppConfig.from_dict(values)
 
 
+@dataclass(frozen=True)
+class ResolvedConfiguration:
+    config: AppConfig
+    profile_startup: Any
+
+
+def resolve_config_from_args(
+    args: argparse.Namespace,
+    *,
+    preferences_path: Path | None = None,
+) -> ResolvedConfiguration:
+    """Resolve YAML, managed concrete preferences, then authoritative CLI flags."""
+
+    from .profile_preferences import (
+        ProfilePreferences,
+        ProfilePreferencesStore,
+        apply_preferences,
+    )
+    from .profile_service import ProfileStartupContext
+    from .system_profiles import get_path
+
+    base = AppConfig.load(args.config)
+    if getattr(args, "no_profile_preferences", False):
+        store = None
+        preferences = ProfilePreferences(0, {})
+    else:
+        store = ProfilePreferencesStore(preferences_path)
+        preferences = store.read()
+    preferred = apply_preferences(base, preferences)
+    config = _config_from_base_and_args(args, preferred)
+    values = config.to_dict()
+    locked_paths: list[str] = []
+    if getattr(args, "width", None) is not None:
+        locked_paths.append("camera.width")
+    if getattr(args, "height", None) is not None:
+        locked_paths.append("camera.height")
+    if getattr(args, "fps", None) is not None:
+        locked_paths.extend(("camera.fps", "output.fps"))
+    cli_values = {path: get_path(values, path) for path in locked_paths}
+    return ResolvedConfiguration(
+        config,
+        ProfileStartupContext(base, preferences, store, cli_values),
+    )
+
+
+def config_from_args(args: argparse.Namespace) -> AppConfig:
+    return resolve_config_from_args(args).config
+
+
 class ApiStartupError(RuntimeError):
     """The configured API could not become or remain available."""
 
@@ -357,13 +415,18 @@ class _ApiRunner:
                 ssl_certfile=cfg.tls_certfile or None,
                 ssl_keyfile=cfg.tls_keyfile or None,
                 ws_max_size=cfg.ws_max_bytes,
+                timeout_graceful_shutdown=API_GRACEFUL_SHUTDOWN_TIMEOUT_S,
             )
         )
+        app_state = getattr(app, "state", None)
+        self._stream_lifecycle = getattr(app_state, "stream_lifecycle", None)
         self._thread: threading.Thread | None = None
         self._socket = None
         self._error: BaseException | None = None
         self._shutdown_requested = False
         self._unexpected_exit = False
+        self._stop_lock = threading.Lock()
+        self._stop_result: bool | None = None
 
     @property
     def failed(self) -> bool:
@@ -418,20 +481,115 @@ class _ApiRunner:
         self.stop()
         raise ApiStartupError(f"API did not start within {timeout:g} seconds")
 
-    def stop(self, timeout: float = 3.0) -> bool:
-        self._shutdown_requested = True
-        self.server.should_exit = True
-        if self._thread is not None:
-            self._thread.join(timeout)
-            if self._thread.is_alive():
+    def _close_socket(self) -> None:
+        socket = self._socket
+        self._socket = None
+        if socket is not None:
+            with contextlib.suppress(OSError):
+                socket.close()
+
+    def _log_stop_timeout(self, *, elapsed_s: float, reason: str) -> None:
+        snapshot: dict[str, object] = {}
+        lifecycle = getattr(self, "_stream_lifecycle", None)
+        if lifecycle is not None:
+            with contextlib.suppress(Exception):
+                snapshot = lifecycle.snapshot()
+        by_kind = snapshot.get("by_kind", {})
+        if not isinstance(by_kind, dict):
+            by_kind = {}
+        active = snapshot.get("active", 0)
+        if not isinstance(active, int):
+            active = 0
+        active_tasks = snapshot.get("active_tasks", active)
+        if not isinstance(active_tasks, int):
+            active_tasks = active
+        log.error(
+            "API shutdown fallback phase=force-exit reason=%s elapsed_ms=%.1f "
+            "thread_alive=%s streams_active=%d tasks_active=%d core_mjpeg=%d "
+            "management_websocket=%d renderer_websocket=%d avatar_proxy=%d "
+            "avatar_mjpeg=%d",
+            reason,
+            elapsed_s * 1000.0,
+            bool(self._thread is not None and self._thread.is_alive()),
+            active,
+            active_tasks,
+            int(by_kind.get("core_mjpeg", 0)),
+            int(by_kind.get("management_websocket", 0)),
+            int(by_kind.get("renderer_websocket", 0)),
+            int(by_kind.get("avatar_proxy", 0)),
+            int(by_kind.get("avatar_mjpeg", 0)),
+        )
+
+    def stop(self, timeout: float = API_STOP_TIMEOUT_S) -> bool:
+        """Stop streams and Uvicorn within one total, idempotent time budget."""
+
+        if timeout <= 0.0:
+            raise ValueError("API stop timeout must be positive")
+        started = time.monotonic()
+        if not self._stop_lock.acquire(timeout=timeout):
+            stopped = self._thread is None or not self._thread.is_alive()
+            if not stopped:
+                self._log_stop_timeout(
+                    elapsed_s=time.monotonic() - started,
+                    reason="coordinator-lock-timeout",
+                )
+            return stopped
+        try:
+            cached = getattr(self, "_stop_result", None)
+            if cached is not None:
+                return cached
+            deadline = started + timeout
+            self._shutdown_requested = True
+            lifecycle = getattr(self, "_stream_lifecycle", None)
+            if lifecycle is not None:
+                with contextlib.suppress(Exception):
+                    lifecycle.request_shutdown(
+                        min(1.0, max(0.01, timeout - API_FORCE_EXIT_RESERVE_S))
+                    )
+            self.server.should_exit = True
+
+            thread = self._thread
+            if thread is None or not thread.is_alive():
+                self._close_socket()
+                self._stop_result = True
+                return True
+            if thread is threading.current_thread():
+                # Joining the API loop from itself can never make progress.
                 self.server.force_exit = True
-                self._thread.join(1.0)
-        if self._socket is not None:
-            try:
-                self._socket.close()
-            except OSError:
-                pass
-        return self._thread is None or not self._thread.is_alive()
+                self._close_socket()
+                self._log_stop_timeout(
+                    elapsed_s=time.monotonic() - started,
+                    reason="api-thread-self-stop",
+                )
+                self._stop_result = False
+                return False
+
+            graceful_deadline = max(
+                started,
+                deadline - min(API_FORCE_EXIT_RESERVE_S, timeout / 2.0),
+            )
+            thread.join(max(0.0, graceful_deadline - time.monotonic()))
+            forced = False
+            if thread.is_alive():
+                forced = True
+                self.server.force_exit = True
+                self._close_socket()
+                thread.join(max(0.0, deadline - time.monotonic()))
+            else:
+                self._close_socket()
+
+            stopped = not thread.is_alive()
+            if forced:
+                self._log_stop_timeout(
+                    elapsed_s=time.monotonic() - started,
+                    reason=("graceful-timeout" if stopped else "forced-timeout"),
+                )
+                self._stop_result = False
+                return False
+            self._stop_result = stopped
+            return stopped
+        finally:
+            self._stop_lock.release()
 
 
 def _watch_pipeline(
@@ -479,6 +637,7 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
     selection = stats["segmentation_selection"]
     matte_policy = stats["matte_policy"]
     effective_policy = matte_policy["effective"]
+    runtime_performance = stats["runtime_performance"]
     log.info(
         "shutdown reason=%s exit=%d uptime=%.1fs frames_in=%d frames_out=%d "
         "backend=%s->%s tier=%s device=%s provider=%s backend_fallback=%s "
@@ -488,17 +647,24 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         "capture_fps=%.1f output_fps=%.1f read_failures=%d restarts=%d "
         "repeats=%d video_skips_current=%d video_displayed_lifetime=%d "
         "video_skips_lifetime=%d video_reuses_lifetime=%d video_seeks_lifetime=%d "
-        "video_failures_lifetime=%d capture_read_ms=%s segmentation_ms=%s "
+        "video_failures_lifetime=%d video_source_fps=%.3f "
+        "video_visual_update_fps=%.3f video_skip_ratio_pct=%.1f "
+        "capture_read_ms=%s segmentation_ms=%s "
         "background_ms=%s color_correction_ms=%s composite_ms=%s output_send_ms=%s "
         "frame_processing_ms=%s capture_generation=%d camera_geometry=%d "
         "background_geometry=%d corrections_applied=%d corrections_bypassed=%d "
         "color_scene_cuts=%d color_transitions=%d unique_updates=%d "
         "segmentation_updates=%d output_sends=%d safe_base_reuses=%d "
         "safe_base_reuse_pct=%.1f exact_final_repeats=%d capture_gaps=%d "
-        "capture_missing=%d capture_slot_overwrites=%d processing_deadline_misses=%d "
+        "exact_final_repeat_pct=%.1f capture_missing=%d capture_slot_overwrites=%d "
+        "processing_deadline_misses=%d "
         "serialized_deadline_misses=%d sink_pacing_events=%d "
         "sink_recovery_events=%d application_pacing_events=%d "
-        "schedule_late_events=%d matte_resets=%d matte_last_reset=%s",
+        "schedule_late_events=%d matte_resets=%d matte_last_reset=%s "
+        "runtime_schema=%d runtime_state=%s "
+        "cadence_status=%s transport_target_fps=%.3f unique_target_fps=%.3f "
+        "transport_deadline_ms=%.3f processing_deadline_ms=%.3f "
+        "dominant_stage=%s",
         reason,
         exit_code,
         stats["uptime_s"],
@@ -529,6 +695,9 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         stats["background_video_lifetime_frames_reused"],
         stats["background_video_lifetime_seek_count"],
         stats["background_video_lifetime_decode_failures"],
+        float(stats["background_video_source_fps"] or 0.0),
+        float(stats["base_composite_update_fps"]),
+        float(stats["background_video_skip_ratio"]) * 100.0,
         stats["capture_read_ms"],
         stats["segmentation_ms"],
         stats["background_ms"],
@@ -550,6 +719,7 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         stats["base_composite_reuse_ratio"] * 100.0,
         stats["exact_final_output_repeat_count"],
         stats["capture_sequence_gap_count"],
+        stats["exact_final_output_repeat_ratio"] * 100.0,
         stats["capture_missing_input_count"],
         stats["capture_dropped_frames"],
         stats["processing_deadline_misses"],
@@ -560,6 +730,14 @@ def _log_shutdown_summary(hub: FrameHub, reason: str, exit_code: int) -> None:
         stats["output_schedule_late_events"],
         stats["matte_reset_count"],
         stats["matte_last_reset_reason"] or "none",
+        runtime_performance["schema_version"],
+        runtime_performance["state"],
+        runtime_performance["cadence_status"],
+        runtime_performance["transport_target_fps"],
+        runtime_performance["unique_target_fps"],
+        runtime_performance["transport_deadline_ms"],
+        runtime_performance["processing_deadline_ms"],
+        runtime_performance["dominant_stage"] or "none",
     )
 
 
@@ -606,6 +784,7 @@ def run(
     *,
     run_id: str = "",
     matte_recorder: Any = None,
+    profile_startup: Any = None,
 ) -> int:
     hub = FrameHub(run_id=run_id)
     stop = threading.Event()
@@ -660,6 +839,15 @@ def run(
                 matte_monitor = LocalMatteDiagnosticMonitor()
 
         runtime = RuntimeConfig(cfg)
+        profile_service = None
+        if profile_startup is not None:
+            from .profile_service import ProfileService
+
+            profile_service = ProfileService(
+                runtime,
+                profile_startup,
+                runtime_facts=hub.stats_dict,
+            )
         if exit_code == 0 and not stop.is_set():
             pipeline = Pipeline(
                 runtime,
@@ -714,6 +902,7 @@ def run(
                 pipeline,
                 security=security,
                 on_shutdown=request_lifecycle_shutdown,
+                profile_service=profile_service,
             )
             api_runner = _ApiRunner(app, cfg.api)
             try:
@@ -731,6 +920,7 @@ def run(
             selection = ready["segmentation_selection"]
             matte_policy = ready["matte_policy"]
             effective_policy = matte_policy["effective"]
+            runtime_performance = ready["runtime_performance"]
             log.info(
                 "ready api=%s camera_requested=%s/%sx%s@%s "
                 "camera_negotiated=%s/%s %sx%s@%s segmenter=%s/%s output=%s "
@@ -744,7 +934,10 @@ def run(
                 "processing_deadline_misses=%d serialized_deadline_misses=%d "
                 "sink_pacing_events=%d sink_recovery_events=%d "
                 "application_pacing_events=%d schedule_late_events=%d "
-                "matte_resets=%d matte_last_reset=%s visual_policy=%s",
+                "matte_resets=%d matte_last_reset=%s runtime_schema=%d "
+                "cadence_status=%s transport_target_fps=%.3f "
+                "unique_target_fps=%.3f transport_deadline_ms=%.3f "
+                "processing_deadline_ms=%.3f visual_policy=%s",
                 api_address,
                 cfg.camera.pixel_format,
                 cfg.camera.width,
@@ -792,6 +985,12 @@ def run(
                 ready["output_schedule_late_events"],
                 ready["matte_reset_count"],
                 ready["matte_last_reset_reason"] or "none",
+                runtime_performance["schema_version"],
+                runtime_performance["cadence_status"],
+                runtime_performance["transport_target_fps"],
+                runtime_performance["unique_target_fps"],
+                runtime_performance["transport_deadline_ms"],
+                runtime_performance["processing_deadline_ms"],
                 sanitized_config_summary(cfg, list(_VISUAL_POLICY_DIAGNOSTIC_FIELDS)),
             )
 
@@ -907,6 +1106,15 @@ def main(argv: list[str] | None = None) -> int:
             effective_argv[1:],
             prog="custback capture-diagnose",
         )
+    if effective_argv[:1] == ["system-profile-probe"]:
+        # Profile probing is an explicit capture-only matrix. It never starts
+        # the model, API, preview, output sink, or managed-preference service.
+        from .system_profile_probe import main as system_profile_probe_main
+
+        return system_profile_probe_main(
+            effective_argv[1:],
+            prog="custback system-profile-probe",
+        )
     if effective_argv[:1] == ["matte-replay"]:
         # Replay is intentionally independent of normal config, camera, API,
         # virtual output, and durable runtime logs.
@@ -998,8 +1206,18 @@ def main(argv: list[str] | None = None) -> int:
         return list_cameras()
     try:
         try:
-            cfg = config_from_args(args)
+            resolved = resolve_config_from_args(args)
+            cfg = resolved.config
         except (OSError, ValueError) as exc:
+            from .profile_preferences import ProfilePreferencesError
+
+            if isinstance(exc, ProfilePreferencesError):
+                log.error(
+                    "invalid profile preferences: %s; repair the owner-only "
+                    "managed file or rerun with --no-profile-preferences",
+                    format_config_error(exc),
+                )
+                return EXIT_CONFIG
             log.error("invalid configuration: %s", format_config_error(exc))
             return EXIT_CONFIG
         if args.dump_config:
@@ -1079,6 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
                 cfg,
                 run_id=logging_session.run_id,
                 matte_recorder=matte_recorder,
+                profile_startup=resolved.profile_startup,
             )
         except (OSError, ValueError) as exc:
             if matte_recorder is not None:

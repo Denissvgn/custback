@@ -57,6 +57,7 @@ Wrapper subcommands:
 | `custback doctor` | validate the managed venv, versions, dependencies, and selected extras; setup gaps are warnings |
 | `custback extras` | show persisted requested extras, installed extras, and available choices (`--json` is supported) |
 | `custback rebuild [--extras LIST]` | build and validate a new venv generation, then switch to it atomically; an explicit empty list clears extras |
+| `custback purge [--dry-run \| --yes]` | preview or explicitly remove the ownership-validated managed Python runtime before npm uninstall |
 | `custback avatar …` | run the bundled stage-2 avatar service; the npm `custback-avatar` binary is a compatibility alias |
 | `custback avatar config export [PATH]` | print the bundled annotated avatar YAML, or create `PATH` without overwriting it |
 | `custback avatar --smoke` | initialize and tear down the installed idle renderer without camera or network access |
@@ -120,6 +121,36 @@ unowned, cross-filesystem, or colliding targets. Do not run the final `npm
 install` if it reports an error. Upgrades after this bridge preserve the active
 and rollback generations plus selected extras automatically because they live
 outside the replaceable package directory.
+
+### Removing an npm installation
+
+Ordinary `npm uninstall -g custback` removes the npm package and its command
+shims, but intentionally retains Custback's prefix-scoped Python runtime so a
+later reinstall can reuse a healthy environment. To remove that runtime too,
+run the explicit purge **before** npm uninstall:
+
+```bash
+custback purge --dry-run  # `custback purge` is also a preview
+custback purge --yes
+npm uninstall -g custback
+```
+
+Purge removes only the selected, ownership-validated runtime link/direct venv,
+its validated Python generations, and its persisted extras intent. It rejects
+foreign, corrupt, or symlinked metadata and a concurrently held Custback lock
+rather than recursively deleting it. The empty ownership-marked generations
+directory is retained to avoid racing a future rebuild; it contains no Python
+library files.
+Purge does not remove the npm package itself, a linked source checkout,
+OS-level virtual-camera setup, or user configuration, media, models, and
+caches.
+
+For a custom runtime, supply the same target explicitly; purge never searches
+for other `CUSTBACK_VENV` locations:
+
+```bash
+CUSTBACK_VENV=/dedicated/path custback purge --yes
+```
 
 ### Manual (pip)
 
@@ -249,6 +280,12 @@ camera-device source. File and URL streams are rejected. Deterministic tests
 do not qualify physical hardware; without reviewed local evidence the report
 remains `hardware-evidence-required`. See the
 [capture cadence diagnostic contract](docs/capture-cadence-diagnostics.md).
+To compare the exact camera/canvas modes in the server-owned Experimental
+catalog, use `custback system-profile-probe --profile NAME
+--accept-experimental --output NEW_DIR`. It opens and closes requested modes
+sequentially, writes one owner-only pixel-free matrix, and never changes
+preferences or infers full-path qualification. See
+[Experimental system profiles](docs/system-profiles.md).
 
 During a normal run, capture, segmentation, safe-base updates, base reuse,
 exact final-output repeats, and output sends are separate status clocks.
@@ -262,13 +299,15 @@ guarded safe base or byte-identically repeating the last eligible final frame;
 a scheduler reuse never reruns or advances segmentation, refinement,
 compositor, or other temporal image state. A newly processed pixel-identical
 base can also increment the exact-repeat clock, so reuse and byte equality stay
-separate. `GET /status.runtime_performance` schema v1
-therefore reports output attainment and sent-unique-base attainment
-independently, with bounded generation epochs, stage p50/p95 timings,
-deadline/schedule health, and publisher counters. Its config-version-bound
-`recommended_mitigation` is advisory only: review it against a fresh
-config/status pair, save the active config, apply any chosen patch manually,
-and restore the exact saved fields to roll it back. It never changes defaults,
+separate. `GET /status.runtime_performance` schema v2 reports transport and
+configured-unique targets independently. Output attainment and sink deadlines
+use the transport target; unique/base attainment and processing deadlines use
+the unique target. An explicit 15-capture/30-transport configuration can be
+healthy `intentional-repeat`, while an observed 15/30 result from a 30/30
+request remains an `unexpected-shortfall`. Its config-version-bound
+`recommended_mitigation` is advisory only: the dashboard applies it only after
+a user click against a fresh config/status pair and rejects stale advice. It
+never changes defaults,
 qualifies a preset, or advances the `compatibility_hold` matte rollout. The
 [operator guide](docs/matte-operator-mitigations.md#runtime-performance-recommendation)
 defines the review, disable, confirmation, and rollback procedure.
@@ -328,8 +367,11 @@ opening hardware itself. Generated evidence remains pending: qualification
 requires owner-attested physical route observations, independent capture-only
 and fixed-replay runs, sustained and restart/hot-patch/shutdown observations,
 and the exact reviewed platform routes with reactions disabled.
-MATTE-5.4 therefore keeps the schema-1 matte policy and named preset catalog on
-an explicit compatibility hold. The
+MATTE-5.4 therefore keeps the schema-1 matte policy and default on an explicit
+compatibility hold. The separately versioned server catalog exposes only
+acknowledged `experimental` or `locally_screened`, `quality_claim: false`
+concrete profiles; one-host screening cannot promote them to portable
+qualified presets. The
 [matte rollout, migration, and rollback guide](docs/matte-quality-rollout.md)
 links the baseline, ablation, visual, performance, platform, privacy, and
 migration gates; defines sanitized canary counters; and provides the exact
@@ -431,7 +473,7 @@ and MATTE-5.3 fixtures are generated and pending; they do not authorize RVM, a
 higher-detail profile, or any candidate algorithm as a new-install default.
 The executable authority is
 `scripts/release/matte-policy-rollout.json`: it pins the code-owned legacy
-patch and digest, an empty unqualified preset catalog, seven pending promotion
+patch and digest, a non-qualified concrete preset catalog, seven pending promotion
 evidence slots, non-destructive rollback, and reaction exclusion. Release
 checks reject ledger/default/helper/status/catalog drift by recomputing the
 recursively key-sorted JSON/ECMAScript digest and running a dependency-free
@@ -446,8 +488,9 @@ apply/success/failure/rollback counters. Read it together with
 `segmentation_selection`, `matte_policy`, and the matching `config_version`:
 installed capabilities and configured `auto` are not proof of the
 backend/provider actually producing the frame. The WebUI presents the same
-distinction and keeps Performance, Balanced, and Quality disabled while
-qualification is pending.
+distinction. It enables an acknowledged non-qualified row only when its exact
+model, provider, canvas, CLI-lock, and sink requirements are available;
+portable qualification remains pending.
 
 Old, versionless, partial, and schema-1 files retain compatibility semantics;
 ordinary loading does not rewrite them. The one-patch rollback does not delete
@@ -556,8 +599,10 @@ are configured. `Host` and browser `Origin` are checked exactly; wildcard and
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /status` | run ID; capture/segmentation/base/reuse/exact-final-repeat/send cadence; strict runtime-performance v1 health and advisory mitigation; gaps, deadlines, pacing and jitter; stage timings; versioned backend selection/effective matte policy and matte rollout/default/rollback decision |
+| `GET /status` | run ID; capture/segmentation/base/reuse/exact-final-repeat/send cadence; strict runtime-performance v2 dual-target health and advisory mitigation; gaps, deadlines, pacing and jitter; stage timings; versioned backend selection/effective matte policy and matte rollout/default/rollback decision |
 | `GET /config` / `PATCH /config` | read / partially update config live |
+| `GET /profiles` | server-owned Experimental catalog, bounded availability, active/desired matches, revisions, CLI locks, and restart-pending fields |
+| `POST /profiles/apply` / `POST /profiles/reset` | revision-bound staging/reset of concrete managed profile values; never restarts the process |
 | `POST /background/image` | upload static backdrop and switch to it |
 | `POST /background/video` | upload live (video) backdrop and switch to it |
 | `GET /backgrounds` | list uploaded backdrops (with the store directory) |
@@ -589,10 +634,16 @@ auth_header | curl --config - -X POST http://127.0.0.1:8710/background/video \
 
 `GET /config` describes configured intent and carries `X-Config-Version`;
 `GET /status` reports active backend/device, backend-resolved matte controls,
-strict path-free `runtime_performance` v1 health, and the fail-closed
+strict path-free `runtime_performance` v2 health, and the fail-closed
 `matte_rollout` decision. Runtime performance advice is never applied
 automatically, and neither status object claims pixel quality or physical
 evidence.
+Profile selections are different from raw patches: the server expands a
+reviewed quality/framing ID into concrete values, requires explicit
+Experimental acknowledgment, and saves the complete restart-bound row in an
+owner-only managed overlay without rewriting operator YAML. CLI overrides win.
+The UI shows a restart banner but never receives lifecycle-shutdown authority.
+See [Experimental system profiles](docs/system-profiles.md).
 PATCHes are serialized and transactional. Background,
 segmentation, compositing, remote timeout, and remote fallback fields can
 activate live; camera, output, API bind/security, and upload-limit changes
@@ -600,6 +651,10 @@ return `409 restart_required`. Avatar proxy URL, token file, CA bundle, and
 mTLS identity are likewise startup-only. A mixed hot/restart PATCH applies nothing.
 Invalid content returns `422`, activation unavailability returns `503`, and a
 no-op preserves the version.
+Clients that need compare-and-swap semantics may send the optional canonical
+integer `X-Expected-Config-Version` request header; ordinary headerless
+`PATCH /config` remains backward compatible. A stale conditional patch fails
+with `409 config_conflict` without changing live resources.
 
 If a persisted image or video cannot be opened during startup, the service and
 control API remain available without changing that configured intent. Output

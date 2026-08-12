@@ -47,6 +47,9 @@ def test_page_targets_both_control_planes():
         "/avatar/backgrounds",
         "/avatar/video/mjpeg",
         "/avatar/video/snapshot.jpg",
+        "/profiles",
+        "/profiles/apply",
+        "/profiles/reset",
         "/auth/session",
         "/docs",
         "/openapi.json",
@@ -195,7 +198,7 @@ def test_polling_and_external_refreshes_are_race_guarded():
     assert "const snapshot = await loadCoreConfig();" in WEBUI_HTML
     assert "if (snapshot.version < state.coreVersion) return false;" in WEBUI_HTML
     assert "state.coreVersion = snapshot.version;" in WEBUI_HTML
-    assert "refreshCoreConfig().then(() => {\n        renderAll();" in WEBUI_HTML
+    assert "refreshCoreAndProfiles().then(() => {\n        renderAll();" in WEBUI_HTML
     assert "loadAvatar().then((loaded) => {\n        if (!loaded) return;" in WEBUI_HTML
     assert "state.avatarVersion = observedVersion" in WEBUI_HTML
     assert "status.run_id !== state.runId" in WEBUI_HTML
@@ -451,79 +454,138 @@ def test_core_control_failure_restores_effective_config():
     assert quality.count("patchCoreControl(") >= 10
 
 
-def test_matte_presets_are_versioned_evidence_gated_and_atomic():
+def test_system_profiles_are_server_owned_evidence_gated_and_cas_safe():
     script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
-    quality = script.split("// -- camera quality", 1)[1].split(
-        "// -- diagnostics and safe runtime settings", 1
-    )[0]
 
-    assert 'schema: "custback.matte-quality-presets"' in script
-    assert "version: 1" in script
-    assert 'evidenceStatus: "not_qualified"' in script
-    assert "presets: Object.freeze({})" in script
-    assert "checked-in evidence has not qualified portable model-backed profiles" in (
-        script
-    )
-    assert "matte-legacy-v1 policy as one atomic patch" in script
-    assert "not require deleting configuration or the model cache" in script
-    for name in ("performance", "balanced", "quality"):
-        button = re.search(
-            rf'<button[^>]+data-quality-preset="{name}"[^>]*>', WEBUI_HTML
-        )
-        assert button is not None
-        assert "disabled" in button.group()
-        assert f">{name.title()}<" in WEBUI_HTML
-    assert 'data-quality-preset="custom"' in WEBUI_HTML
-    assert 'id="quality-preset-help" role="status"' in WEBUI_HTML
+    # The browser renders only the catalog/status returned by the server. It
+    # neither embeds profile patches nor decides whether a config is a match.
+    assert "MATTE_PRESET_CATALOG" not in script
+    assert "qualityPresetPatch" not in script
+    assert "matchingQualityPreset" not in script
+    assert "data-quality-preset" not in WEBUI_HTML
+    assert 'value.catalog.schema !== "custback.system-profile-catalog"' in script
+    assert 'value.schema !== "custback.system-profiles-status"' in script
+    assert "Object.entries(catalogAxis.profiles)" in script
+    for axis in ("quality", "framing"):
+        assert f'id="profile-options-{axis}"' in WEBUI_HTML
+        assert f'id="profile-state-{axis}" role="status"' in WEBUI_HTML
 
-    # A future qualified definition expands to one detached concrete patch and
-    # uses the same atomic activation/rollback helper as individual controls.
-    assert "return JSON.parse(JSON.stringify(definition.patch));" in quality
-    assert 'withBusy(button, "Applying…", () => patchCoreControl(patch))' in quality
-    assert 'api("PATCH", "/config"' not in quality
+    # Experimental status, requirements and availability are visible rather
+    # than silently treated as a qualified default.
+    assert 'id="profile-experimental-ack"' in WEBUI_HTML
+    assert "make no evidence-qualified quality claim" in WEBUI_HTML
+    assert '["experimental", "locally_screened"].includes(' in script
+    assert "definition.availability_reason" in script
+    assert "Acknowledge non-qualified profiles" in script
+    for label in (
+        "Active",
+        "Saved for restart",
+        "Configured but unavailable",
+        "Custom",
+    ):
+        assert label in script
+
+    # Mutations carry both revisions and use only the dedicated persistence
+    # endpoints; restart remains an operator action outside browser privilege.
+    assert 'mutateProfiles("/profiles/apply"' in script
+    assert 'mutateProfiles("/profiles/reset"' in script
+    assert "expected_config_version: state.profiles.config_version" in script
+    assert "expected_preferences_revision: state.profiles.preference_revision" in script
+    assert 'accept_experimental: $("profile-experimental-ack").checked' in script
+    assert "[409, 422, 503].includes(err.status)" in script
+    assert "This page cannot stop or restart Custback" in WEBUI_HTML
+    assert "/lifecycle/shutdown" not in WEBUI_HTML
+    assert "press <kbd>d</kbd> / <kbd>D</kbd>" in WEBUI_HTML
+    assert "The browser never receives matte frames" in WEBUI_HTML
+    assert "custback matte-replay PRIVATE_BUNDLE" in WEBUI_HTML
+    assert "custback matte-evaluate PRIVATE_BUNDLE" in WEBUI_HTML
+    assert "Stretch to fill (compatibility only)" in WEBUI_HTML
+
+
+def test_stability_mitigation_uses_server_side_config_cas():
+    script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    assert "Apply suggested stability mitigation" in WEBUI_HTML
+    assert '{"X-Expected-Config-Version": expectedVersion}' in script
+    handler = script.split(
+        "$(" + '"runtime-mitigation-apply"' + ").addEventListener", 1
+    )[1].split("$(" + '"quality-color-auto"', 1)[0]
+    assert "await patchCoreControl(action.patch, action.configVersion);" in handler
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
-def test_matte_preset_expansion_matches_concrete_values_without_alias_state():
+def test_system_profile_status_validation_and_server_state_labels():
     script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
-    helpers = (
-        "function plainObject"
-        + script.split("function plainObject", 1)[1].split(
-            "function renderQualityPresets", 1
+    validator = (
+        "function validateProfilesStatus"
+        + script.split("function validateProfilesStatus", 1)[1].split(
+            "async function loadProfilesStatus", 1
         )[0]
     )
+    profile_helpers = (
+        "function profileLabel"
+        + script.split("function profileLabel", 1)[1].split(
+            "function renderProfileAxis", 1
+        )[0]
+    )
+    plain_object = (
+        "function plainObject"
+        + script.split("function plainObject", 1)[1].split("function profileLabel", 1)[
+            0
+        ]
+    )
     harness = r"""
-const MATTE_PRESET_NAMES = ["performance", "balanced", "quality"];
-const catalog = {
-  schema: "custback.matte-quality-presets",
-  version: 1,
-  evidenceStatus: "qualified",
-  presets: {
-    balanced: {patch: {
-      segmentation: {rvm_downsample: 0.5, mask_shift: 0},
-      compositing: {light_wrap: 0.1},
-    }},
+class ApiError extends Error {
+  constructor(status, code, message) {
+    super(message); this.status = status; this.code = code;
+  }
+}
+const PROFILE_AXES = ["quality", "framing"];
+function titleCase(value) { return String(value || "custom"); }
+const definition = (id, label) => ({
+  id, label, description: label + " description",
+  evidence_state: "experimental", selectable: true, quality_claim: false,
+  requirements: {}, lifecycle: "restart", patch_digest: "abc",
+  available: true, availability_reason: "available",
+});
+const axis = (label, id) => ({
+  label, owned_paths: ["output.width"], profiles: {[id]: definition(id, label)},
+});
+const good = {
+  schema: "custback.system-profiles-status", version: 1,
+  catalog: {
+    schema: "custback.system-profile-catalog", version: 1, digest: "digest",
+    quality_claim: false,
+    axes: {quality: axis("Balanced", "balanced"), framing: axis("Fill", "fill")},
+  },
+  config_version: 7, preference_revision: 4,
+  cli_locks: [], pending_restart_fields: [],
+  axes: {
+    quality: {state: "active", active: "balanced", desired: "balanced",
+      pending_restart_fields: []},
+    framing: {state: "custom", active: null, desired: null,
+      pending_restart_fields: []},
   },
 };
-const config = {
-  segmentation: {backend: "auto", rvm_downsample: 0.5, mask_shift: 0},
-  compositing: {light_wrap: 0.1, use_model_foreground: true},
-};
-const patch = qualityPresetPatch("balanced", catalog);
-patch.segmentation.rvm_downsample = 0.9;
+const state = {profiles: good};
+const local = structuredClone(good);
+local.catalog.axes.quality.profiles.balanced.evidence_state = "locally_screened";
+function rejects(value) {
+  try { validateProfilesStatus(value); return false; }
+  catch (error) { return error instanceof ApiError && error.code === "invalid_response"; }
+}
 process.stdout.write(JSON.stringify({
-  detached: catalog.presets.balanced.patch.segmentation.rvm_downsample,
-  matched: matchingQualityPreset(config, catalog),
-  custom: matchingQualityPreset({...config,
-    segmentation: {...config.segmentation, rvm_downsample: 0.4}}, catalog),
-  badVersion: qualityPresetPatch("balanced", {...catalog, version: 2}),
-  badEvidence: qualityPresetPatch("balanced",
-    {...catalog, evidenceStatus: "not_qualified"}),
+  valid: validateProfilesStatus(good) === good,
+  locallyScreened: validateProfilesStatus(local) === local,
+  badVersion: rejects({...good, version: 2}),
+  unknownDesired: rejects({...good, axes: {...good.axes,
+    quality: {...good.axes.quality, desired: "browser-invented"}}}),
+  active: profileStateCopy("quality", good.axes.quality),
+  custom: profileStateCopy("framing", good.axes.framing),
 }));
 """
     result = subprocess.run(
         ["node"],
-        input="const MATTE_PRESET_CATALOG = {};\n" + helpers + harness,
+        input=plain_object + validator + profile_helpers + harness,
         text=True,
         capture_output=True,
         check=False,
@@ -531,11 +593,12 @@ process.stdout.write(JSON.stringify({
     assert result.returncode == 0, result.stderr
     values = json.loads(result.stdout)
     assert values == {
-        "detached": 0.5,
-        "matched": "balanced",
-        "custom": "custom",
-        "badVersion": None,
-        "badEvidence": None,
+        "valid": True,
+        "locallyScreened": True,
+        "badVersion": True,
+        "unknownDesired": True,
+        "active": "Active · Balanced",
+        "custom": "Custom · no named fill profile is saved",
     }
 
 
@@ -688,9 +751,9 @@ def test_backend_aware_matte_control_matrix_and_stale_status_gate():
     script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
     plain_object = (
         "function plainObject"
-        + script.split("function plainObject", 1)[1].split(
-            "function qualityPresetPatch", 1
-        )[0]
+        + script.split("function plainObject", 1)[1].split("function profileLabel", 1)[
+            0
+        ]
     )
     policy = (
         "function currentMattePolicy"
@@ -856,6 +919,12 @@ process.stdout.write(JSON.stringify({
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
 def test_quality_runtime_does_not_call_selected_backend_active_in_passthrough():
     script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    cadence_helper = (
+        "function cadenceShortfallActive"
+        + script.split("function cadenceShortfallActive", 1)[1].split(
+            "function visualCadenceRows", 1
+        )[0]
+    )
     runtime = (
         "function updateFpsText"
         + script.split("function updateFpsText", 1)[1].split(
@@ -900,7 +969,7 @@ process.stdout.write(JSON.stringify({passthrough, active: rendered}));
 """
     result = subprocess.run(
         ["node"],
-        input=runtime + harness,
+        input=cadence_helper + runtime + harness,
         text=True,
         capture_output=True,
         check=False,
@@ -922,9 +991,9 @@ def test_configured_off_is_editable_but_backend_bypass_is_not():
     script = WEBUI_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
     plain_object = (
         "function plainObject"
-        + script.split("function plainObject", 1)[1].split(
-            "function qualityPresetPatch", 1
-        )[0]
+        + script.split("function plainObject", 1)[1].split("function profileLabel", 1)[
+            0
+        ]
     )
     helpers = (
         "function matteReasonCopy"
@@ -1424,11 +1493,12 @@ def test_system_diagnostics_distinguish_visual_cadence_and_exact_repeat_equality
         assert key in script
 
     cadence_rows = (
-        "function visualCadenceRows"
-        + script.split("function visualCadenceRows", 1)[1].split(
+        "function cadenceShortfallActive"
+        + script.split("function cadenceShortfallActive", 1)[1].split(
             "function geometrySummary", 1
         )[0]
     )
+    assert "function visualCadenceRows" in cadence_rows
     harness = r"""
 const rows = visualCadenceRows({
   segmentation_update_count: 541,

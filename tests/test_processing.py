@@ -1286,6 +1286,29 @@ class TestBackdrops:
         finally:
             backdrop.close()
 
+    def test_video_skip_warning_reports_source_visual_and_phase_cadence(
+        self, monkeypatch, caplog
+    ):
+        pytest.importorskip("cv2")
+        capture = FakeVideoCapture(range(120), fps=30.0)
+        monkeypatch.setattr(backgrounds_mod.cv2, "VideoCapture", lambda _path: capture)
+        now = [0.0]
+        backdrop = VideoBackdrop("cadence.avi", clock=lambda: now[0])
+        try:
+            with caplog.at_level("WARNING", logger="custback.backgrounds"):
+                for step in range(31):
+                    now[0] = step / 15.0
+                    backdrop.frame(6, 4)
+        finally:
+            backdrop.close()
+        assert "background video cadence source_fps=30.000" in caplog.text
+        assert "visual_update_fps=" in caplog.text
+        assert "skip_ratio_pct=" in caplog.text
+        assert (
+            "phase preserved; source frames skipped because visual updates are slower"
+            in caplog.text
+        )
+
     def test_video_skip_crossing_loop_resets_even_when_target_is_not_frame_zero(
         self,
         monkeypatch,

@@ -83,7 +83,7 @@ custback-avatar = "custback.avatar.__main__:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"custback" = ["default.yaml"]
+"custback" = ["default.yaml", "system-profile-catalog.json"]
 "custback.avatar" = ["avatar.yaml"]
 
 [tool.pytest.ini_options]

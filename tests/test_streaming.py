@@ -7,11 +7,13 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import pytest
 
 from custback.api.streaming import (
     ConnectionLimiter,
     JpegBroadcaster,
     LeasedStreamingResponse,
+    StreamLifecycleRegistry,
 )
 from custback.hub import FrameHub
 
@@ -233,3 +235,113 @@ def test_stream_lease_releases_when_headers_fail_before_body_iteration():
     asyncio.run(scenario())
     assert body_entered is False
     assert limiter.active == 0
+
+
+def test_stream_lifecycle_shutdown_is_thread_safe_bounded_and_idempotent():
+    registry = StreamLifecycleRegistry()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        registry.bind(loop)
+        started = {
+            kind: asyncio.Event()
+            for kind in (
+                "core_mjpeg",
+                "management_websocket",
+                "renderer_websocket",
+                "avatar_proxy",
+            )
+        }
+        closed: list[str] = []
+
+        async def stream(kind):
+            async def close():
+                closed.append(kind)
+
+            registration = registry.register(kind, close=close)
+            assert registration is not None
+            started[kind].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                registration.release()
+
+        tasks = [asyncio.create_task(stream(kind)) for kind in started]
+        await asyncio.gather(*(event.wait() for event in started.values()))
+        snapshot = registry.snapshot()
+        assert snapshot["active"] == 4
+        assert snapshot["by_kind"] == {
+            **{kind: 1 for kind in started},
+            "avatar_mjpeg": 0,
+        }
+
+        requested = []
+
+        def request_from_coordinator_thread():
+            requested.append(registry.request_shutdown(0.5))
+
+        thread = threading.Thread(target=request_from_coordinator_thread)
+        thread.start()
+        thread.join()
+        assert requested[0] is not None
+        result = await asyncio.wrap_future(requested[0])
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert result.requested == 4
+        assert result.remaining == 0
+        assert result.close_timeouts == 0
+        assert result.task_timeouts == 0
+        assert sorted(closed) == sorted(started)
+        assert registry.snapshot()["active"] == 0
+        assert registry.register("core_mjpeg") is None
+
+        repeated = await registry.shutdown(0.5)
+        assert repeated.requested == 0
+        assert repeated.remaining == 0
+        registry.unbind(loop)
+
+    asyncio.run(scenario())
+
+
+def test_stream_lifecycle_does_not_join_a_cancellation_resistant_closer():
+    registry = StreamLifecycleRegistry()
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def resistant_close():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)
+
+        async def stream():
+            registration = registry.register("core_mjpeg", close=resistant_close)
+            assert registration is not None
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                registration.release()
+
+        stream_task = asyncio.create_task(stream())
+        await started.wait()
+        before = asyncio.get_running_loop().time()
+        result = await registry.shutdown(0.02)
+        elapsed = asyncio.get_running_loop().time() - before
+        await asyncio.gather(stream_task, return_exceptions=True)
+        assert elapsed < 0.1
+        assert result.close_timeouts == 1
+        await asyncio.sleep(0.21)
+
+    asyncio.run(scenario())
+
+
+def test_stream_lifecycle_rejects_synchronous_close_callbacks():
+    registry = StreamLifecycleRegistry()
+
+    async def scenario():
+        with pytest.raises(TypeError, match="close callback must be async"):
+            registry.register("core_mjpeg", close=lambda: None)  # type: ignore[arg-type]
+
+    asyncio.run(scenario())

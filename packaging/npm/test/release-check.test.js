@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -84,6 +85,7 @@ test('matte defaults remain held until every exact release authority changes', (
     'scripts/release/matte-policy-rollout.json',
     'src/custback/api/webui.py',
     'src/custback/default.yaml',
+    'src/custback/system-profile-catalog.json',
   ]) {
     const target = path.join(fixture, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -137,9 +139,28 @@ test('matte defaults remain held until every exact release authority changes', (
   assert.throws(() => verify(privateField), /manifest header is invalid/);
 
   const preset = structuredClone(source);
-  preset.preset_catalog.evidence_status = 'qualified';
-  preset.preset_catalog.preset_ids = ['quality'];
-  assert.throws(() => verify(preset), /preset catalog must remain empty/);
+  preset.preset_catalog.profiles[0].quality_claim = true;
+  assert.throws(() => verify(preset), /catalog or patch digest disagrees/);
+
+  const catalogPath = path.join(
+    fixture, 'src', 'custback', 'system-profile-catalog.json',
+  );
+  const catalogBytes = fs.readFileSync(catalogPath);
+  const locallyScreenedCatalog = JSON.parse(catalogBytes.toString('utf8'));
+  locallyScreenedCatalog.axes.quality.profiles.balanced.evidence_state =
+    'locally_screened';
+  const locallyScreenedBytes = Buffer.from(
+    `${JSON.stringify(locallyScreenedCatalog, null, 2)}\n`,
+  );
+  fs.writeFileSync(catalogPath, locallyScreenedBytes);
+  const locallyScreened = structuredClone(source);
+  locallyScreened.preset_catalog.catalog_sha256 = crypto.createHash('sha256')
+    .update(locallyScreenedBytes).digest('hex');
+  locallyScreened.preset_catalog.profiles.find(
+    (profile) => profile.axis === 'quality' && profile.id === 'balanced',
+  ).evidence_status = 'locally_screened';
+  assert.doesNotThrow(() => verify(locallyScreened));
+  fs.writeFileSync(catalogPath, catalogBytes);
 
   const fabricated = structuredClone(source);
   fabricated.promotion.status = 'qualified';

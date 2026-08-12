@@ -3667,6 +3667,68 @@ def test_slow_processing_counts_deadline_misses_without_send_pacing(monkeypatch)
         pipeline.stop()
 
 
+def test_fifteen_fps_capture_at_thirty_fps_transport_is_intentional_repeat(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        runtime_performance_mod,
+        "RUNTIME_PERFORMANCE_WARMUP_NS",
+        200_000_000,
+    )
+    monkeypatch.setattr(
+        runtime_performance_mod,
+        "RUNTIME_PERFORMANCE_DEGRADE_NS",
+        200_000_000,
+    )
+    monkeypatch.setattr(
+        runtime_performance_mod,
+        "RUNTIME_PERFORMANCE_WINDOW_NS",
+        1_000_000_000,
+    )
+    original_local_composite = Pipeline._local_composite
+
+    def forty_ms_local_composite(self, *args, **kwargs):
+        result = original_local_composite(self, *args, **kwargs)
+        time.sleep(0.04)
+        return result
+
+    monkeypatch.setattr(Pipeline, "_local_composite", forty_ms_local_composite)
+    cfg = (
+        make_runtime(mode="color")
+        .snapshot()
+        .patched({"camera": {"fps": 15}, "output": {"fps": 30}})
+    )
+    pipeline, hub = run_pipeline(RuntimeConfig(cfg))
+    try:
+        stats = wait_for_stats(
+            hub,
+            lambda value: (
+                value["frames_out"] >= 30
+                and value["runtime_performance"]["state"] == "healthy"
+            ),
+            timeout=4.0,
+        )
+        performance = stats["runtime_performance"]
+        assert performance["schema_version"] == 2
+        assert performance["target_fps"] == 30.0
+        assert performance["transport_target_fps"] == 30.0
+        assert performance["unique_target_fps"] == 15.0
+        assert performance["transport_deadline_ms"] == pytest.approx(33.333, abs=0.001)
+        assert performance["processing_deadline_ms"] == pytest.approx(66.667, abs=0.001)
+        assert performance["cadence_status"] == "intentional-repeat"
+        assert performance["output_healthy"] is True
+        assert performance["unique_healthy"] is True
+        assert performance["processing_deadline_miss_ratio"] == 0.0
+        assert stats["processing_deadline_misses"] == 0
+        assert stats["base_composite_reuse_count"] > 0
+        assert (
+            stats["exact_final_output_repeat_count"]
+            >= stats["base_composite_reuse_count"]
+        )
+    finally:
+        pipeline.stop()
+
+
 def test_target_paced_publisher_stays_at_thirty_during_120ms_processing(
     monkeypatch,
     caplog,

@@ -38,6 +38,13 @@ from .security import (
     create_client_ssl_context,
     validate_outbound_endpoint,
 )
+from .streaming import (
+    ConnectionLease,
+    ConnectionLimiter,
+    StreamRegistration,
+    install_stream_lifecycle,
+    stream_lifecycle_for,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,9 +52,18 @@ log = logging.getLogger(__name__)
 class _ClosingStreamingResponse(StreamingResponse):
     """Close the upstream response across the complete ASGI lifecycle."""
 
-    def __init__(self, *args, close: Callable[[], Any], **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        close: Callable[[], Any],
+        registration: StreamRegistration | None = None,
+        lease: ConnectionLease | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._close_upstream = close
+        self._stream_registration = registration
+        self._stream_lease = lease
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -55,7 +71,13 @@ class _ClosingStreamingResponse(StreamingResponse):
         finally:
             # Starlette background tasks are not run when sending response
             # headers raises.  The upstream connection is still ours then.
-            await self._close_upstream()
+            try:
+                if self._stream_registration is not None:
+                    self._stream_registration.release()
+                if self._stream_lease is not None:
+                    self._stream_lease.release()
+            finally:
+                await self._close_upstream()
 
 
 _STATIC_ROUTES = frozenset(
@@ -219,6 +241,7 @@ def register_avatar_proxy(
     app: FastAPI,
     runtime: Any,
     *,
+    stream_connections: ConnectionLimiter,
     client_factory: Callable[[], httpx.AsyncClient] | None = None,
 ) -> None:
     """Mount ``/avatar/{path}`` forwarding on an already-secured app.
@@ -228,6 +251,9 @@ def register_avatar_proxy(
     """
 
     target = _build_proxy_target(_avatar_config(runtime))
+    if not isinstance(stream_connections, ConnectionLimiter):
+        raise TypeError("avatar proxy requires the app stream connection limiter")
+    stream_lifecycle = stream_lifecycle_for(app)
 
     state_lock = asyncio.Lock()
 
@@ -256,6 +282,9 @@ def register_avatar_proxy(
                     await client.aclose()
 
     app.router.lifespan_context = lifespan_with_proxy_client
+    # Install this outermost so app-owned streams close before the shared
+    # upstream client is released by the proxy-client lifespan above.
+    install_stream_lifecycle(app)
 
     @app.api_route(
         "/avatar/{path:path}",
@@ -273,6 +302,29 @@ def register_avatar_proxy(
         if not _is_allowed_avatar_route(request.method, path):
             return _proxy_error(
                 404, "unknown_avatar_path", f"no proxied avatar route: /{path}"
+            )
+        endless = request.method == "GET" and path == "video/mjpeg"
+        lease = stream_connections.try_acquire() if endless else None
+        if endless and lease is None:
+            return _proxy_error(
+                429,
+                "stream_limit",
+                "authenticated stream connection limit reached",
+            )
+        if lease is not None:
+            task = asyncio.current_task()
+            if task is None:  # pragma: no cover - FastAPI always owns a task
+                lease.release()
+                raise RuntimeError("avatar stream requires an asyncio task")
+            task.add_done_callback(lambda _task: lease.release())
+        registration = stream_lifecycle.register("avatar_proxy")
+        if registration is None:
+            if lease is not None:
+                lease.release()
+            return _proxy_error(
+                503,
+                "api_shutting_down",
+                "the API is shutting down",
             )
         try:
             # The path is the immutable, restart-only startup selection, but
@@ -311,7 +363,6 @@ def register_avatar_proxy(
         # The MJPEG stream is intentionally endless; everything else gets the
         # configured read deadline.
         cfg = _avatar_config(runtime)
-        endless = request.method == "GET" and path == "video/mjpeg"
         timeout = httpx.Timeout(
             connect=cfg.connect_timeout_s,
             read=None if endless else cfg.read_timeout_s,
@@ -369,9 +420,12 @@ def register_avatar_proxy(
             for name in _FORWARD_RESPONSE_HEADERS
             if name in upstream.headers
         }
+        registration.set_close(upstream.aclose)
         return _ClosingStreamingResponse(
             upstream.aiter_raw(),
             status_code=upstream.status_code,
             headers=response_headers,
             close=upstream.aclose,
+            registration=registration,
+            lease=lease,
         )

@@ -89,7 +89,12 @@ def test_snapshot_is_strict_path_free_and_separates_startup() -> None:
         "schema_version",
         "state",
         "reason",
+        "cadence_status",
         "target_fps",
+        "transport_target_fps",
+        "unique_target_fps",
+        "transport_deadline_ms",
+        "processing_deadline_ms",
         "window_duration_s",
         "window_sample_count",
         "output_send_fps",
@@ -110,8 +115,13 @@ def test_snapshot_is_strict_path_free_and_separates_startup() -> None:
         "publisher",
         "recommended_mitigation",
     }
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == 2
     assert snapshot["state"] == "warming"
+    assert snapshot["cadence_status"] == "warming"
+    assert snapshot["target_fps"] == snapshot["transport_target_fps"] == 30.0
+    assert snapshot["unique_target_fps"] == 30.0
+    assert snapshot["transport_deadline_ms"] == pytest.approx(33.333, abs=0.001)
+    assert snapshot["processing_deadline_ms"] == pytest.approx(33.333, abs=0.001)
     assert snapshot["startup"] == {
         "processing_completed_count": 1,
         "output_send_count": 1,
@@ -154,6 +164,7 @@ def test_degradation_hysteresis_and_sanitized_mitigation() -> None:
     assert degraded["reason"] == "output-and-unique-attainment"
     assert degraded["output_healthy"] is False
     assert degraded["unique_healthy"] is False
+    assert degraded["cadence_status"] == "unexpected-shortfall"
     assert degraded["recommended_mitigation"] == {
         "config_version": 11,
         "kind": "disable-color-and-light-wrap",
@@ -174,6 +185,7 @@ def test_degradation_hysteresis_and_sanitized_mitigation() -> None:
     assert recovered["reason"] == "none"
     assert recovered["output_send_fps"] == pytest.approx(30.0, abs=0.01)
     assert recovered["sent_unique_base_fps"] == pytest.approx(30.0, abs=0.01)
+    assert recovered["cadence_status"] == "matched"
     assert recovered["recommended_mitigation"] is None
 
 
@@ -207,6 +219,48 @@ def test_output_and_unique_health_are_independent() -> None:
     assert snapshot["unique_healthy"] is False
     assert snapshot["output_attainment"] == pytest.approx(1.0, abs=0.01)
     assert snapshot["unique_attainment"] == pytest.approx(0.25, abs=0.01)
+    assert snapshot["cadence_status"] == "unexpected-shortfall"
+
+
+def test_intentional_repeats_use_the_unique_target_domain() -> None:
+    clock = _Clock()
+    tracker = RuntimePerformanceTracker(
+        30,
+        _key(),
+        unique_target_fps=15,
+        clock_ns=clock,
+    )
+    tracker.mark_ready(at_ns=clock.set_seconds(0.0))
+
+    for index in range(1, 241):
+        at_ns = clock.set_seconds(index / 30.0)
+        unique = index % 2 == 0
+        if unique:
+            tracker.record_processing(
+                at_ns=at_ns,
+                deadline_missed=False,
+                stages_ms={"pipeline.processing_only": 50.0},
+            )
+        tracker.record_output(
+            at_ns=at_ns,
+            unique_base=unique,
+            schedule_late=False,
+        )
+
+    snapshot = tracker.snapshot(at_ns=clock.set_seconds(8.0))
+    assert snapshot["state"] == "healthy"
+    assert snapshot["reason"] == "none"
+    assert snapshot["cadence_status"] == "intentional-repeat"
+    assert snapshot["target_fps"] == snapshot["transport_target_fps"] == 30.0
+    assert snapshot["unique_target_fps"] == 15.0
+    assert snapshot["transport_deadline_ms"] == pytest.approx(33.333, abs=0.001)
+    assert snapshot["processing_deadline_ms"] == pytest.approx(66.667, abs=0.001)
+    assert snapshot["output_send_fps"] == pytest.approx(30.0, abs=0.01)
+    assert snapshot["sent_unique_base_fps"] == pytest.approx(15.0, abs=0.01)
+    assert snapshot["output_attainment"] == pytest.approx(1.0, abs=0.01)
+    assert snapshot["unique_attainment"] == pytest.approx(1.0, abs=0.01)
+    assert snapshot["output_healthy"] is True
+    assert snapshot["unique_healthy"] is True
 
 
 def test_exact_qualification_thresholds_remain_healthy() -> None:

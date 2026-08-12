@@ -76,6 +76,130 @@ function parseRebuildArgs(args) {
   return { extras: installer.parseExtras(extras).join(',') };
 }
 
+function parsePurgeArgs(args) {
+  let dryRun = false;
+  let confirmed = false;
+  for (const arg of args) {
+    if (arg === '--dry-run') {
+      if (dryRun) throw new Error('--dry-run may be specified only once');
+      dryRun = true;
+    } else if (arg === '--yes') {
+      if (confirmed) throw new Error('--yes may be specified only once');
+      confirmed = true;
+    } else {
+      throw new Error(`unknown purge option: ${arg}`);
+    }
+  }
+  if (dryRun && confirmed) {
+    throw new Error('usage: custback purge [--dry-run | --yes]');
+  }
+  return { dryRun: dryRun || !confirmed, confirmed };
+}
+
+function sameIdentity(left, right) {
+  return Boolean(left && right) && left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameOptionalIdentity(left, right) {
+  return left === null ? right === null : right !== null && sameIdentity(left, right);
+}
+
+function inspectPurgeIntent(target) {
+  const intent = installer.readInstallIntent(target);
+  const file = installer.installIntentPath(target);
+  if (!intent) return { file, identity: null };
+  const st = fs.lstatSync(file);
+  return { file, identity: { dev: st.dev, ino: st.ino } };
+}
+
+function planPurge(target, options = {}) {
+  const resolvedTarget = path.resolve(target);
+  return {
+    target: resolvedTarget,
+    runtime: managed.inspectPurgeState(resolvedTarget, options),
+    intent: inspectPurgeIntent(resolvedTarget),
+  };
+}
+
+function samePurgePlan(left, right) {
+  return managed.samePurgeState(left.runtime, right.runtime) &&
+    left.intent.file === right.intent.file &&
+    sameOptionalIdentity(left.intent.identity, right.intent.identity);
+}
+
+function purgeArtifacts(plan) {
+  const paths = [];
+  if (plan.runtime.inspection.kind !== 'absent') paths.push(plan.target);
+  paths.push(...plan.runtime.generations.map((generation) => generation.path));
+  if (plan.intent.identity) paths.push(plan.intent.file);
+  return paths;
+}
+
+function removePlannedIntent(plan) {
+  if (!plan.intent.identity) return;
+  const current = inspectPurgeIntent(plan.target);
+  if (!sameOptionalIdentity(plan.intent.identity, current.identity)) {
+    throw new Error(`custback install intent changed while waiting for purge lock: ${plan.intent.file}`);
+  }
+  managed.retireVerifiedPath(plan.intent.file, current.identity, 'custback install intent');
+}
+
+function resolvePurgeTarget(options = {}) {
+  if (options.target === undefined) return targetPath();
+  return managed.assertSafeTarget(options.target, {
+    pkgRoot: options.pkgRoot || PKG_ROOT,
+    home: options.home,
+    cwd: options.cwd,
+    tmpRoot: options.tmpRoot,
+  });
+}
+
+function purge(args = [], options = {}) {
+  const parsed = parsePurgeArgs(args);
+  const output = options.output || process.stdout;
+  const target = resolvePurgeTarget(options);
+  let plan = planPurge(target);
+  let artifacts = purgeArtifacts(plan);
+
+  if (!artifacts.length) {
+    output.write(`custback purge: no owned managed runtime artifacts found at ${target}\n`);
+    return 0;
+  }
+  if (parsed.dryRun) {
+    output.write(`custback purge would remove owned runtime artifacts for ${target}:\n`);
+    for (const artifact of artifacts) output.write(`  ${artifact}\n`);
+    output.write('dry run only; re-run with --yes to remove them\n');
+    return 0;
+  }
+
+  // A direct/legacy venv may predate the generations root. Create and retain
+  // an owned empty root solely to use the same lock protocol as rebuild.
+  if (!plan.runtime.generationRoot) {
+    managed.ensureGenerationsRoot(target);
+    plan = planPurge(target);
+    artifacts = purgeArtifacts(plan);
+  }
+
+  managed.withInstallLock(plan.runtime.generationRoot, () => {
+    const current = planPurge(target, { allowInstallLock: true });
+    if (!samePurgePlan(plan, current)) {
+      throw new Error(`managed runtime changed while waiting for purge lock: ${target}`);
+    }
+    // Validate every removable path before the first deletion. The managed
+    // helper deliberately retains the now-empty, ownership-marked root so a
+    // restarted installer cannot race recursive root removal.
+    managed.purgeOwnedRuntime(current.runtime);
+    removePlannedIntent(current);
+  });
+
+  output.write(`custback purge removed owned runtime artifacts for ${target}:\n`);
+  for (const artifact of artifacts) output.write(`  ${artifact}\n`);
+  output.write(
+    `retained empty managed coordination directory: ${plan.runtime.generationRoot}\n`,
+  );
+  return 0;
+}
+
 function exportAvatarConfig(args, output = process.stdout) {
   if (args.length > 1) {
     throw new Error('usage: custback avatar config export [destination]');
@@ -373,6 +497,7 @@ function main(argv = process.argv.slice(2), options = {}) {
     if (!avatarAlias && command === 'setup') return setup();
     if (!avatarAlias && command === 'doctor') return doctor();
     if (!avatarAlias && command === 'extras') return extras(argv.slice(1));
+    if (!avatarAlias && command === 'purge') return purge(argv.slice(1), options);
     if (!avatarAlias && command === 'rebuild') {
       const parsed = parseRebuildArgs(argv.slice(1));
       return bootstrap(true, parsed.extras) ? 0 : 1;
@@ -430,7 +555,11 @@ module.exports = {
   main,
   managedAppExists,
   parseRebuildArgs,
+  parsePurgeArgs,
+  planPurge,
+  purge,
   pythonPath,
+  resolvePurgeTarget,
   targetPath,
 };
 

@@ -900,11 +900,15 @@ def test_shutdown_summary_includes_geometry_correction_and_cadence_totals(caplog
         color_correction_scene_cuts=2,
         color_correction_transitions=6,
         base_composite_update_count=541,
+        base_composite_update_fps=15.0,
         segmentation_update_count=541,
         output_send_count=1105,
         base_composite_reuse_count=564,
         base_composite_reuse_ratio=564 / 1105,
         exact_final_output_repeat_count=563,
+        exact_final_output_repeat_ratio=563 / 1105,
+        background_video_source_fps=30.0,
+        background_video_skip_ratio=0.5,
         capture_sequence_gap_count=3,
         capture_missing_input_count=7,
         capture_dropped_frames=9,
@@ -926,7 +930,14 @@ def test_shutdown_summary_includes_geometry_correction_and_cadence_totals(caplog
         "unique_updates=541 segmentation_updates=541 output_sends=1105" in caplog.text
     )
     assert "safe_base_reuses=564 safe_base_reuse_pct=51.0" in caplog.text
-    assert "exact_final_repeats=563 capture_gaps=3 capture_missing=7" in caplog.text
+    assert (
+        "exact_final_repeats=563 capture_gaps=3 exact_final_repeat_pct=50.9"
+        in caplog.text
+    )
+    assert "capture_missing=7" in caplog.text
+    assert "video_source_fps=30.000 video_visual_update_fps=15.000" in caplog.text
+    assert "video_skip_ratio_pct=50.0" in caplog.text
+    assert "dominant_stage=" in caplog.text
     assert "capture_slot_overwrites=9 processing_deadline_misses=11" in caplog.text
     assert "serialized_deadline_misses=13 sink_pacing_events=17" in caplog.text
     assert "sink_recovery_events=19 application_pacing_events=23" in caplog.text

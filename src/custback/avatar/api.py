@@ -36,6 +36,7 @@ from ..api.streaming import (
     ConnectionLimiter,
     JpegBroadcaster,
     LeasedStreamingResponse,
+    install_stream_lifecycle,
 )
 from .audio2face import microphone_available, protocol_available
 from .config import (
@@ -266,6 +267,7 @@ def create_avatar_app(
         docs_url=None,
         redoc_url=None,
     )
+    stream_lifecycle = install_stream_lifecycle(app)
     startup_api = runtime.read().config.api
     stream_connections = ConnectionLimiter(startup_api.max_stream_connections)
     output_jpegs = JpegBroadcaster(service.output, _encode_jpeg)
@@ -709,6 +711,10 @@ def create_avatar_app(
                 "stream_limit",
                 "authenticated stream connection limit reached",
             )
+        registration = stream_lifecycle.register("avatar_mjpeg")
+        if registration is None:
+            lease.release()
+            raise _error(503, "api_shutting_down", "the API is shutting down")
 
         async def gen():
             try:
@@ -732,6 +738,7 @@ def create_avatar_app(
         return LeasedStreamingResponse(
             gen(),
             lease=lease,
+            registration=registration,
             media_type=f"multipart/x-mixed-replace; boundary={boundary}",
         )
 

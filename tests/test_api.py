@@ -743,6 +743,38 @@ def test_hot_patch_returns_committed_version_header(stack):
     assert config.json()["background"]["mode"] == "passthrough"
 
 
+def test_hot_patch_supports_atomic_expected_version(stack):
+    response = stack.patch(
+        "/config",
+        json={"background": {"mode": "passthrough"}},
+        headers={**AUTH, "X-Expected-Config-Version": "0"},
+    )
+    assert response.status_code == 200
+    assert response.json()["config_version"] == 1
+
+    stale = stack.patch(
+        "/config",
+        json={"background": {"mode": "blur"}},
+        headers={**AUTH, "X-Expected-Config-Version": "0"},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "config_conflict"
+    assert stack.runtime.read().version == 1
+    assert stack.runtime.read().config.background.mode == "passthrough"
+
+
+@pytest.mark.parametrize("value", ["00", "-1", "+1", "1.0", "9" * 20])
+def test_hot_patch_rejects_invalid_expected_version_header(stack, value):
+    response = stack.patch(
+        "/config",
+        json={"background": {"mode": "passthrough"}},
+        headers={**AUTH, "X-Expected-Config-Version": value},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_content"
+    assert stack.runtime.read().version == 0
+
+
 def test_noop_patch_preserves_config_version(stack):
     response = stack.patch(
         "/config", json={"background": {"mode": "color"}}, headers=AUTH

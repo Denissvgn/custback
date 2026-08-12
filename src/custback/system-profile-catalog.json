@@ -1,0 +1,225 @@
+{
+  "schema": "custback.system-profile-catalog",
+  "version": 1,
+  "quality_claim": false,
+  "axes": {
+    "quality": {
+      "label": "Quality and performance",
+      "owned_paths": [
+        "camera.width",
+        "camera.height",
+        "camera.fps",
+        "output.width",
+        "output.height",
+        "output.fps",
+        "segmentation.backend",
+        "segmentation.delegate",
+        "segmentation.rvm_downsample",
+        "segmentation.threshold",
+        "segmentation.mask_blur",
+        "segmentation.edge_refine",
+        "segmentation.mask_shift",
+        "segmentation.temporal_smoothing",
+        "segmentation.boundary_stabilization.mode",
+        "segmentation.boundary_stabilization.time_constant_s",
+        "segmentation.boundary_stabilization.max_motion_px_per_s",
+        "segmentation.spatial_edge_refinement.mode",
+        "segmentation.spatial_edge_refinement.reference_short_edge_px",
+        "segmentation.spatial_edge_refinement.radius_at_reference_px",
+        "segmentation.spatial_edge_refinement.min_radius_px",
+        "segmentation.spatial_edge_refinement.max_radius_px",
+        "acceleration.mode",
+        "acceleration.provider",
+        "compositing.light_wrap",
+        "compositing.use_model_foreground",
+        "compositing.blend_space",
+        "compositing.light_wrap_stabilization.mode",
+        "compositing.light_wrap_stabilization.time_constant_s",
+        "compositing.color_correction.mode",
+        "compositing.color_correction.strength",
+        "compositing.color_correction.exposure_limit_ev",
+        "compositing.color_correction.white_balance_strength",
+        "compositing.color_correction.adaptation_time_s"
+      ],
+      "profiles": {
+        "performance": {
+          "label": "Performance",
+          "description": "960x540 at 30 unique and transport frames per second.",
+          "evidence_state": "experimental",
+          "selectable": true,
+          "quality_claim": false,
+          "requirements": {
+            "builtin_rvm_model": true,
+            "provider": "cuda",
+            "output_mode": [960, 540, 30]
+          },
+          "patch": {
+            "camera": {"width": 960, "height": 540, "fps": 30},
+            "output": {"width": 960, "height": 540, "fps": 30},
+            "segmentation": {
+              "backend": "rvm",
+              "delegate": "cpu",
+              "rvm_downsample": 0.4,
+              "threshold": 0.5,
+              "mask_blur": 7,
+              "edge_refine": true,
+              "mask_shift": 0,
+              "temporal_smoothing": 0.35,
+              "boundary_stabilization": {"mode": "off", "time_constant_s": 0.1, "max_motion_px_per_s": 720},
+              "spatial_edge_refinement": {"mode": "legacy_watershed", "reference_short_edge_px": 720, "radius_at_reference_px": 8, "min_radius_px": 2, "max_radius_px": 12}
+            },
+            "acceleration": {"mode": "gpu_required", "provider": "cuda"},
+            "compositing": {
+              "light_wrap": 0,
+              "use_model_foreground": true,
+              "blend_space": "srgb_legacy",
+              "light_wrap_stabilization": {"mode": "off", "time_constant_s": 0.12},
+              "color_correction": {"mode": "off", "strength": 0.5, "exposure_limit_ev": 0.85, "white_balance_strength": 0.5, "adaptation_time_s": 0.8}
+            }
+          }
+        },
+        "balanced": {
+          "label": "Balanced",
+          "description": "720p capture at 15 visual updates with 30 fps transport.",
+          "evidence_state": "experimental",
+          "selectable": true,
+          "quality_claim": false,
+          "requirements": {
+            "builtin_rvm_model": true,
+            "provider": "cuda",
+            "output_mode": [1280, 720, 30]
+          },
+          "patch": {
+            "camera": {"width": 1280, "height": 720, "fps": 15},
+            "output": {"width": 1280, "height": 720, "fps": 30},
+            "segmentation": {
+              "backend": "rvm",
+              "delegate": "cpu",
+              "rvm_downsample": 0,
+              "threshold": 0.5,
+              "mask_blur": 7,
+              "edge_refine": true,
+              "mask_shift": 0,
+              "temporal_smoothing": 0.35,
+              "boundary_stabilization": {"mode": "off", "time_constant_s": 0.1, "max_motion_px_per_s": 720},
+              "spatial_edge_refinement": {"mode": "legacy_watershed", "reference_short_edge_px": 720, "radius_at_reference_px": 8, "min_radius_px": 2, "max_radius_px": 12}
+            },
+            "acceleration": {"mode": "gpu_required", "provider": "cuda"},
+            "compositing": {
+              "light_wrap": 0,
+              "use_model_foreground": true,
+              "blend_space": "srgb_legacy",
+              "light_wrap_stabilization": {"mode": "off", "time_constant_s": 0.12},
+              "color_correction": {"mode": "off", "strength": 0.5, "exposure_limit_ev": 0.85, "white_balance_strength": 0.5, "adaptation_time_s": 0.8}
+            }
+          }
+        },
+        "quality": {
+          "label": "Quality",
+          "description": "720p detail at 15 visual updates with 30 fps transport.",
+          "evidence_state": "experimental",
+          "selectable": true,
+          "quality_claim": false,
+          "requirements": {
+            "builtin_rvm_model": true,
+            "provider": "cuda",
+            "output_mode": [1280, 720, 30]
+          },
+          "patch": {
+            "camera": {"width": 1280, "height": 720, "fps": 15},
+            "output": {"width": 1280, "height": 720, "fps": 30},
+            "segmentation": {
+              "backend": "rvm",
+              "delegate": "cpu",
+              "rvm_downsample": 0.5,
+              "threshold": 0.5,
+              "mask_blur": 7,
+              "edge_refine": true,
+              "mask_shift": 0,
+              "temporal_smoothing": 0.35,
+              "boundary_stabilization": {"mode": "off", "time_constant_s": 0.1, "max_motion_px_per_s": 720},
+              "spatial_edge_refinement": {"mode": "legacy_watershed", "reference_short_edge_px": 720, "radius_at_reference_px": 8, "min_radius_px": 2, "max_radius_px": 12}
+            },
+            "acceleration": {"mode": "gpu_required", "provider": "cuda"},
+            "compositing": {
+              "light_wrap": 0,
+              "use_model_foreground": true,
+              "blend_space": "srgb_legacy",
+              "light_wrap_stabilization": {"mode": "off", "time_constant_s": 0.12},
+              "color_correction": {"mode": "off", "strength": 0.5, "exposure_limit_ev": 0.85, "white_balance_strength": 0.5, "adaptation_time_s": 0.8}
+            }
+          }
+        },
+        "motion_stable": {
+          "label": "Motion stable",
+          "description": "Balanced cadence plus experimental motion-aware matte boundaries.",
+          "evidence_state": "experimental",
+          "selectable": true,
+          "quality_claim": false,
+          "requirements": {
+            "builtin_rvm_model": true,
+            "provider": "cuda",
+            "output_mode": [1280, 720, 30]
+          },
+          "patch": {
+            "camera": {"width": 1280, "height": 720, "fps": 15},
+            "output": {"width": 1280, "height": 720, "fps": 30},
+            "segmentation": {
+              "backend": "rvm",
+              "delegate": "cpu",
+              "rvm_downsample": 0,
+              "threshold": 0.5,
+              "mask_blur": 7,
+              "edge_refine": true,
+              "mask_shift": 0,
+              "temporal_smoothing": 0.35,
+              "boundary_stabilization": {"mode": "motion_aware", "time_constant_s": 0.1, "max_motion_px_per_s": 720},
+              "spatial_edge_refinement": {"mode": "legacy_watershed", "reference_short_edge_px": 720, "radius_at_reference_px": 8, "min_radius_px": 2, "max_radius_px": 12}
+            },
+            "acceleration": {"mode": "gpu_required", "provider": "cuda"},
+            "compositing": {
+              "light_wrap": 0,
+              "use_model_foreground": true,
+              "blend_space": "srgb_legacy",
+              "light_wrap_stabilization": {"mode": "off", "time_constant_s": 0.12},
+              "color_correction": {"mode": "off", "strength": 0.5, "exposure_limit_ev": 0.85, "white_balance_strength": 0.5, "adaptation_time_s": 0.8}
+            }
+          }
+        }
+      }
+    },
+    "framing": {
+      "label": "Person framing",
+      "owned_paths": ["camera.fit_mode", "camera.anchor_x", "camera.anchor_y"],
+      "profiles": {
+        "fill_center": {
+          "label": "Fill center",
+          "description": "Fill the frame without distortion and crop symmetrically.",
+          "evidence_state": "experimental",
+          "selectable": true,
+          "quality_claim": false,
+          "requirements": {},
+          "patch": {"camera": {"fit_mode": "cover", "anchor_x": 0.5, "anchor_y": 0.5}}
+        },
+        "headroom": {
+          "label": "Headroom",
+          "description": "Fill the frame while retaining more space above the subject.",
+          "evidence_state": "experimental",
+          "selectable": true,
+          "quality_claim": false,
+          "requirements": {},
+          "patch": {"camera": {"fit_mode": "cover", "anchor_x": 0.5, "anchor_y": 0.35}}
+        },
+        "show_all": {
+          "label": "Show all",
+          "description": "Preserve the whole camera frame with letterboxing when needed.",
+          "evidence_state": "experimental",
+          "selectable": true,
+          "quality_claim": false,
+          "requirements": {},
+          "patch": {"camera": {"fit_mode": "contain", "anchor_x": 0.5, "anchor_y": 0.5}}
+        }
+      }
+    }
+  }
+}

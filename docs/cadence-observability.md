@@ -1,6 +1,6 @@
 # Visual cadence observability
 
-Status: **MATTE-3.2 live status contract, version 1**
+Status: **MATTE-3.2 live status contract, version 2**
 
 Custback has separate capture, segmentation, safe-base, optional post-base, and
 output-send clocks. A near-target output FPS can therefore be made from repeated
@@ -13,7 +13,7 @@ The contract is scalar-only and constant-space. It contains no pixels, masks,
 frame-derived hashes, wall-clock recording timestamps, device paths, or raw
 monotonic timestamps.
 
-## Target-paced publication and runtime performance v1
+## Target-paced publication and runtime performance v2
 
 The output publisher owns a depth-one handoff and an absolute target-rate
 schedule. At each output opportunity it adopts the newest guarded safe base or
@@ -28,18 +28,21 @@ counter alone is not reuse provenance.
 This makes a smooth consumer-facing output clock possible without relabeling
 repeated pixels as new visual work. In particular, a healthy
 `output_send_fps` can coexist with degraded `sent_unique_base_fps`,
-`base_composite_update_fps`, or `segmentation_update_fps`. The version-1
+`base_composite_update_fps`, or `segmentation_update_fps`. The version-2
 `GET /status.runtime_performance` object exposes that distinction as a strict,
 bounded, path-free contract:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Exact contract version; currently `1`. |
+| `schema_version` | Exact contract version; currently `2`. |
 | `state`, `reason` | `warming`, `healthy`, `degraded`, or `failed`, plus a bounded reason code. |
-| `target_fps` | Output target used for both attainment ratios. |
-| `output_send_fps`, `output_attainment`, `output_healthy` | Successfully accepted sink sends and their fraction of target. Exact repeats count here. |
+| `target_fps` | One-cycle compatibility alias for `transport_target_fps`; new consumers must use the named domains. |
+| `transport_target_fps`, `unique_target_fps` | Sink-publication target and eligible unique-base target. The unique target is `min(camera.fps, output.fps)`, so a requested 15 FPS camera carried by a 30 FPS output is intentional repeat transport, not a 50% unique shortfall. An under-delivering camera remains visible as an unexpected shortfall against its requested target. |
+| `transport_deadline_ms`, `processing_deadline_ms` | Publication/serialized-output budget and processing-only budget. They are respectively `1000 / transport_target_fps` and `1000 / unique_target_fps`. |
+| `cadence_status` | `warming` or `failed` while health is not classifiable; otherwise `matched`, `intentional-repeat`, or `unexpected-shortfall`. |
+| `output_send_fps`, `output_attainment`, `output_healthy` | Successfully accepted sink sends and their fraction of the transport target. Exact repeats count here. |
 | `processing_completed_fps` | Completed processing results, including a result superseded before the depth-one publisher adopts it. |
-| `sent_unique_base_fps`, `unique_attainment`, `unique_healthy` | Sends that adopted a new guarded base and their fraction of target. Repeats do not count here. |
+| `sent_unique_base_fps`, `unique_attainment`, `unique_healthy` | Sends that adopted a new guarded base and their fraction of the unique target. Repeats do not count here. |
 | `processing_deadline_miss_ratio`, `output_schedule_late_ratio` | Independent processing-budget and publication-schedule observations. |
 | `stage_p50_ms`, `stage_p95_ms`, `dominant_stage` | Fixed-name scalar stage summaries and the largest actionable p95 stage. Missing observations stay null. |
 | `publisher` | Publisher mode/state, depth-zero-or-one pending state, output-base config version, and monotonic overwrite/missed-slot/privacy-slate counters. |
@@ -58,9 +61,10 @@ all nine `compositor.*` substage timers (`input_mask_validation`,
 versioned health view; they do not replace the compatibility `timing_ms`
 object below.
 
-Health uses a bounded five-second window and requires both output and unique
-attainment to reach 90% of target, with at most a 5% processing-deadline-miss
-ratio. Measurement warms for three seconds. An unhealthy result must remain
+Health uses a bounded five-second window and requires output attainment to
+reach 90% of the transport target and unique attainment to reach 90% of the
+unique target, with at most a 5% processing-deadline-miss ratio. Measurement
+warms for three seconds. An unhealthy result must remain
 continuous for three further seconds before `degraded`; recovery from an
 already degraded epoch requires five continuous healthy seconds. Publisher or
 pipeline failure reports `failed` immediately. A change to config, capture,
@@ -96,6 +100,15 @@ Background-video playback counters have two scopes. The unqualified
 when it is replaced. Their `background_video_lifetime_*` counterparts
 accumulate the current and retired providers across the run, survive hot
 provider replacement, and are the authoritative run/shutdown evidence.
+`background_video_source_fps` describes the media timeline, while
+`base_composite_update_fps` describes how often a newly captured frame asks the
+provider for a backdrop. When the source timeline advances by more than one
+frame between those requests, `background_video_frames_skipped` advances to
+preserve playback phase; this is intentional source-timeline selection, not an
+output transport failure. A slower source can instead increment
+`background_video_frames_reused`. The WebUI and preview HUD report the source
+rate, visual update rate, and phase-preserving skips together; the WebUI also
+shows decoded-frame reuse, so a skip count is not mistaken for publisher loss.
 
 `capture_frames_read` counts successful capture-worker publications before
 pipeline consumption. `capture_dropped_frames` counts latest-slot overwrites.
@@ -132,8 +145,10 @@ still increments the unique base and segmentation clocks and may also
 increment the exact-repeat clock. A later effect can change final pixels while
 the same base is reused, so the two fields must not be collapsed.
 
-`cadence_mismatch_active` is the bounded rolling health decision used by both
-operator UIs. When active and its rates are available, the preview warns:
+`cadence_mismatch_active` remains the compatibility observation that visual
+updates differ from transport. Version-2 operator UIs combine it with
+`runtime_performance.cadence_status`: an `intentional-repeat` is labelled as
+such without a warning, while an `unexpected-shortfall` warns:
 
 ```text
 VISUAL UPDATES 15 FPS; OUTPUT REPEATS TO 30 FPS
@@ -161,12 +176,15 @@ raw timestamp is serialized.
 
 ## Deadlines, pacing, and recovery
 
-The event classes are independent:
+The event classes are independent and intentionally use different deadline
+domains:
 
-- `processing_deadline_misses` retains its compatibility scope: processing
+- `processing_deadline_misses` retains its compatibility scope and uses the
+  unique-target budget: processing
   from the accepted frame through base construction, before the final guard,
   sink submission, and deliberate pacing;
-- `serialized_new_frame_deadline_misses` covers the complete serialized
+- `serialized_new_frame_deadline_misses` uses the transport-target budget and
+  covers the complete serialized
   unique-frame path through guard/validation, sink submission/copy, and
   application- or sink-owned pacing;
 - `output_sink_pacing_events` counts successful sink-owned pacing events;

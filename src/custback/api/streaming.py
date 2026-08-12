@@ -4,14 +4,339 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
+import logging
 import queue
 import threading
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from starlette.responses import StreamingResponse
 
 from ..hub import _AsyncSlotSubscription, _Slot
+
+
+log = logging.getLogger(__name__)
+
+StreamKind = Literal[
+    "core_mjpeg",
+    "management_websocket",
+    "renderer_websocket",
+    "avatar_proxy",
+    "avatar_mjpeg",
+]
+_STREAM_KINDS: tuple[StreamKind, ...] = (
+    "core_mjpeg",
+    "management_websocket",
+    "renderer_websocket",
+    "avatar_proxy",
+    "avatar_mjpeg",
+)
+_STREAM_SHUTDOWN_TIMEOUT_S = 1.0
+_STREAM_CLOSE_GRACE_S = 0.25
+
+
+@dataclass(frozen=True)
+class StreamShutdownResult:
+    """Content-free result of one bounded stream shutdown request."""
+
+    requested: int
+    remaining: int
+    close_timeouts: int
+    task_timeouts: int
+
+
+@dataclass(frozen=True)
+class _StreamEntry:
+    kind: StreamKind
+    task: asyncio.Task[Any]
+    close: Callable[[], Awaitable[None]] | None
+
+
+class StreamRegistration:
+    """Idempotent ownership token for one app-owned long-lived stream."""
+
+    def __init__(self, registry: "StreamLifecycleRegistry", sequence: int) -> None:
+        self._registry = registry
+        self._sequence = sequence
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._registry._release(self._sequence)
+
+    def set_close(
+        self,
+        close: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Install a closer after a streamed upstream resource is acquired."""
+
+        with self._lock:
+            if self._released:
+                return
+        self._registry._set_close(self._sequence, close)
+
+
+class StreamLifecycleRegistry:
+    """App-owned registry that can interrupt every long-lived API stream.
+
+    Registrations and diagnostics are protected by a normal lock so the main
+    coordination thread can atomically reject new streams before asking the API
+    loop to close existing ones.  No request path, peer address, credential, or
+    frame-derived value is retained.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[int, _StreamEntry] = {}
+        self._next_sequence = 1
+        self._closing = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutdown_future: (
+            concurrent.futures.Future[StreamShutdownResult] | None
+        ) = None
+        self._shutdown_calls = 0
+        self._shutdown_timeouts = 0
+        self._last_result = StreamShutdownResult(0, 0, 0, 0)
+
+    def bind(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind the registry to the live application event loop."""
+
+        with self._lock:
+            current = self._loop
+            if current is not None and current is not loop:
+                raise RuntimeError("stream lifecycle registry is already bound")
+            self._loop = loop
+
+    def unbind(self, loop: asyncio.AbstractEventLoop) -> None:
+        with self._lock:
+            if self._loop is loop:
+                self._loop = None
+
+    @property
+    def closing(self) -> bool:
+        with self._lock:
+            return self._closing
+
+    def register(
+        self,
+        kind: StreamKind,
+        *,
+        close: Callable[[], Awaitable[None]] | None = None,
+    ) -> StreamRegistration | None:
+        """Register the current ASGI task, or reject it during shutdown."""
+
+        if kind not in _STREAM_KINDS:
+            raise ValueError("unknown API stream kind")
+        if close is not None and not inspect.iscoroutinefunction(close):
+            raise TypeError("API stream close callback must be async")
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("API stream registration requires an asyncio task")
+        with self._lock:
+            if self._closing:
+                return None
+            sequence = self._next_sequence
+            self._next_sequence += 1
+            self._entries[sequence] = _StreamEntry(kind, task, close)
+        task.add_done_callback(lambda _task: self._release(sequence))
+        return StreamRegistration(self, sequence)
+
+    def _set_close(
+        self,
+        sequence: int,
+        close: Callable[[], Awaitable[None]],
+    ) -> None:
+        if not inspect.iscoroutinefunction(close):
+            raise TypeError("API stream close callback must be async")
+        with self._lock:
+            entry = self._entries.get(sequence)
+            if entry is not None:
+                self._entries[sequence] = _StreamEntry(entry.kind, entry.task, close)
+
+    def _release(self, sequence: int) -> None:
+        with self._lock:
+            self._entries.pop(sequence, None)
+
+    def snapshot(self) -> dict[str, object]:
+        """Return fixed-schema, content-free lifecycle diagnostics."""
+
+        with self._lock:
+            counts = {kind: 0 for kind in _STREAM_KINDS}
+            for entry in self._entries.values():
+                counts[entry.kind] += 1
+            return {
+                "closing": self._closing,
+                "active": len(self._entries),
+                "active_tasks": len({entry.task for entry in self._entries.values()}),
+                "by_kind": counts,
+                "shutdown_calls": self._shutdown_calls,
+                "shutdown_timeouts": self._shutdown_timeouts,
+                "last_requested": self._last_result.requested,
+                "last_remaining": self._last_result.remaining,
+                "last_close_timeouts": self._last_result.close_timeouts,
+                "last_task_timeouts": self._last_result.task_timeouts,
+            }
+
+    def request_shutdown(
+        self,
+        timeout_s: float = _STREAM_SHUTDOWN_TIMEOUT_S,
+    ) -> concurrent.futures.Future[StreamShutdownResult] | None:
+        """Reject new streams and schedule bounded cleanup on the API loop."""
+
+        if timeout_s <= 0.0:
+            raise ValueError("stream shutdown timeout must be positive")
+        with self._lock:
+            self._closing = True
+            existing = self._shutdown_future
+            if existing is not None and not existing.done():
+                return existing
+            loop = self._loop
+            if loop is None or not loop.is_running():
+                return None
+            future = asyncio.run_coroutine_threadsafe(self.shutdown(timeout_s), loop)
+            self._shutdown_future = future
+            return future
+
+    async def shutdown(
+        self,
+        timeout_s: float = _STREAM_SHUTDOWN_TIMEOUT_S,
+    ) -> StreamShutdownResult:
+        """Close callbacks, then cancel and join registered stream tasks."""
+
+        if timeout_s <= 0.0:
+            raise ValueError("stream shutdown timeout must be positive")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        with self._lock:
+            self._closing = True
+            self._shutdown_calls += 1
+            entries = tuple(self._entries.values())
+
+        close_tasks: list[asyncio.Task[None]] = []
+
+        async def invoke_close(entry: _StreamEntry) -> None:
+            if entry.close is None:
+                return
+            await entry.close()
+
+        for entry in entries:
+            if entry.close is not None:
+                close_tasks.append(asyncio.create_task(invoke_close(entry)))
+
+        close_timeouts = 0
+        if close_tasks:
+            close_budget = min(
+                _STREAM_CLOSE_GRACE_S,
+                max(0.0, deadline - loop.time()),
+            )
+            done_close, pending_close = await asyncio.wait(
+                close_tasks,
+                timeout=close_budget,
+            )
+            close_timeouts = len(pending_close)
+            for task in pending_close:
+                task.cancel()
+                # A closer can suppress cancellation. Never await it without a
+                # second deadline: retain only a callback that consumes its
+                # eventual result while shutdown proceeds to stream-task
+                # cancellation within the original total budget.
+                task.add_done_callback(_consume_task_result)
+            if done_close:
+                await asyncio.gather(*done_close, return_exceptions=True)
+
+        current = asyncio.current_task()
+        stream_tasks = {
+            entry.task
+            for entry in entries
+            if entry.task is not current and not entry.task.done()
+        }
+        for task in stream_tasks:
+            task.cancel("API stream lifecycle shutdown")
+
+        task_timeouts = 0
+        if stream_tasks:
+            _done, pending_tasks = await asyncio.wait(
+                stream_tasks,
+                timeout=max(0.0, deadline - loop.time()),
+            )
+            task_timeouts = len(pending_tasks)
+
+        with self._lock:
+            remaining = len(self._entries)
+            result = StreamShutdownResult(
+                requested=len(entries),
+                remaining=remaining,
+                close_timeouts=close_timeouts,
+                task_timeouts=task_timeouts,
+            )
+            self._last_result = result
+            if close_timeouts or task_timeouts or remaining:
+                self._shutdown_timeouts += 1
+
+        if close_timeouts or task_timeouts or remaining:
+            log.warning(
+                "API stream shutdown incomplete requested=%d remaining=%d "
+                "close_timeouts=%d task_timeouts=%d",
+                len(entries),
+                remaining,
+                close_timeouts,
+                task_timeouts,
+            )
+        return result
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    """Consume a detached cleanup task's terminal exception without blocking."""
+
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def stream_lifecycle_for(app: Any) -> StreamLifecycleRegistry:
+    """Return the one registry owned by ``app``, creating it if necessary."""
+
+    registry = getattr(app.state, "stream_lifecycle", None)
+    if registry is None:
+        registry = StreamLifecycleRegistry()
+        app.state.stream_lifecycle = registry
+    elif not isinstance(registry, StreamLifecycleRegistry):
+        raise TypeError("app stream_lifecycle state has an invalid owner")
+    return registry
+
+
+def install_stream_lifecycle(app: Any) -> StreamLifecycleRegistry:
+    """Compose bounded registry cleanup into an app lifespan exactly once."""
+
+    registry = stream_lifecycle_for(app)
+    if getattr(app.state, "stream_lifecycle_installed", False):
+        return registry
+    previous_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan_with_stream_shutdown(wrapped_app: Any):
+        loop = asyncio.get_running_loop()
+        registry.bind(loop)
+        try:
+            async with previous_lifespan(wrapped_app):
+                try:
+                    yield
+                finally:
+                    await registry.shutdown()
+        finally:
+            registry.unbind(loop)
+
+    app.router.lifespan_context = lifespan_with_stream_shutdown
+    app.state.stream_lifecycle_installed = True
+    return registry
 
 
 class _DaemonExecutor:
@@ -287,9 +612,16 @@ class ConnectionLimiter:
 class LeasedStreamingResponse(StreamingResponse):
     """Hold a stream lease for the response's complete ASGI lifecycle."""
 
-    def __init__(self, *args, lease: ConnectionLease, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        lease: ConnectionLease,
+        registration: StreamRegistration | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._stream_lease = lease
+        self._stream_registration = registration
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -297,4 +629,6 @@ class LeasedStreamingResponse(StreamingResponse):
         finally:
             # This also covers cancellation while sending response headers,
             # before Starlette ever starts or closes the body iterator.
+            if self._stream_registration is not None:
+                self._stream_registration.release()
             self._stream_lease.release()

@@ -35,6 +35,7 @@ else:  # Starlette < 1 uses the original httpx client contract.
 import custback.api.avatar_proxy as avatar_proxy_module
 from custback.api.avatar_proxy import register_avatar_proxy
 from custback.api.security import SecurityPolicy
+from custback.api.streaming import ConnectionLimiter
 from custback.api.server import create_app
 from custback.avatar.api import create_avatar_app
 from custback.avatar.config import AvatarConfig, AvatarRuntime
@@ -206,6 +207,23 @@ def test_proxy_requires_core_auth(stack):
     response = stack.get("/avatar/status")
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_avatar_mjpeg_uses_core_shared_cap_before_upstream(stack):
+    limiter = stack.app.state.stream_connections
+    leases = [limiter.try_acquire() for _ in range(limiter.maximum)]
+    assert all(lease is not None for lease in leases)
+    assert getattr(stack.app.state, "avatar_proxy_client", None) is None
+    try:
+        response = stack.get("/avatar/video/mjpeg", headers=AUTH)
+        assert response.status_code == 429
+        assert response.json()["detail"]["code"] == "stream_limit"
+        # Admission happens before token loading or upstream-client creation.
+        assert getattr(stack.app.state, "avatar_proxy_client", None) is None
+    finally:
+        for lease in leases:
+            lease.release()
+    assert limiter.active == 0
 
 
 def test_proxy_forwards_status_and_config(stack):
@@ -523,7 +541,16 @@ def _proxy_only_app(runtime, handler=None, client_factory=None):
 
         client_factory = mock_client_factory
 
-    register_avatar_proxy(app, runtime, client_factory=client_factory)
+    stream_connections = ConnectionLimiter(
+        runtime.read().config.api.max_stream_connections
+    )
+    app.state.stream_connections = stream_connections
+    register_avatar_proxy(
+        app,
+        runtime,
+        stream_connections=stream_connections,
+        client_factory=client_factory,
+    )
     return app
 
 
@@ -533,6 +560,23 @@ class _AsyncBody(httpx.AsyncByteStream):
 
     async def __aiter__(self):
         yield self.content
+
+
+class _BlockingBody(httpx.AsyncByteStream):
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.released = asyncio.Event()
+        self.close_calls = 0
+
+    async def __aiter__(self):
+        self.started.set()
+        await self.released.wait()
+        if self.close_calls == 0:
+            yield b"unreachable"
+
+    async def aclose(self):
+        self.close_calls += 1
+        self.released.set()
 
 
 def test_proxy_freezes_destination_and_credential_path_at_registration(
@@ -664,6 +708,75 @@ def test_proxy_reads_late_supervised_token_and_same_path_rotation(
         f"Bearer {AVATAR_TOKEN}",
         f"Bearer {AVATAR_TOKEN[:-1] + '2'}",
     ]
+
+
+def test_proxy_registry_closes_blocked_stream_before_lifespan_shutdown(monkeypatch):
+    monkeypatch.setenv("CUSTBACK_AVATAR_API_TOKEN", AVATAR_TOKEN)
+    runtime = RuntimeConfig(
+        AppConfig.from_dict({"avatar": {"url": "https://avatar.example:8711"}})
+    )
+
+    async def scenario():
+        body = _BlockingBody()
+        upstream_calls = 0
+
+        def handler(_request):
+            nonlocal upstream_calls
+            upstream_calls += 1
+            return httpx.Response(
+                200,
+                headers={"content-type": "multipart/x-mixed-replace"},
+                stream=body,
+            )
+
+        app = _proxy_only_app(runtime, handler=handler)
+        async with app.router.lifespan_context(app):
+            async with _async_client(app) as client:
+                request = asyncio.create_task(client.get("/avatar/video/mjpeg"))
+                await asyncio.wait_for(body.started.wait(), 1.0)
+                registry = app.state.stream_lifecycle
+                snapshot = registry.snapshot()
+                assert snapshot["active"] == 1
+                assert snapshot["by_kind"]["avatar_proxy"] == 1
+                assert app.state.stream_connections.active == 1
+
+                result = await registry.shutdown(0.5)
+                outcome = await asyncio.gather(request, return_exceptions=True)
+                assert isinstance(outcome[0], asyncio.CancelledError) or (
+                    getattr(outcome[0], "status_code", None) == 200
+                )
+                assert result.requested == 1
+                assert result.remaining == 0
+                assert body.close_calls >= 1
+                assert app.state.stream_connections.active == 0
+
+                rejected = await client.get("/avatar/status")
+                assert rejected.status_code == 503
+                assert rejected.json()["detail"]["code"] == "api_shutting_down"
+                assert upstream_calls == 1
+
+    run_async(scenario())
+
+
+def test_avatar_mjpeg_upstream_failure_releases_shared_capacity(monkeypatch):
+    monkeypatch.setenv("CUSTBACK_AVATAR_API_TOKEN", AVATAR_TOKEN)
+    runtime = RuntimeConfig(
+        AppConfig.from_dict({"avatar": {"url": "https://avatar.example:8711"}})
+    )
+    upstream_calls = 0
+
+    def handler(request):
+        nonlocal upstream_calls
+        upstream_calls += 1
+        raise httpx.ConnectError("avatar unavailable", request=request)
+
+    app = _proxy_only_app(runtime, handler=handler)
+    response = run_async(_request_proxy_app(app, "/avatar/video/mjpeg"))
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "avatar_unreachable"
+    assert upstream_calls == 1
+    assert app.state.stream_connections.active == 0
 
 
 def _reserve_loopback_port(excluded: int = 0) -> int:
@@ -969,6 +1082,9 @@ def test_proxy_never_follows_upstream_redirects(monkeypatch):
 def test_proxy_stream_closes_upstream_when_sending_headers_fails():
     closed = False
     body_entered = False
+    limiter = ConnectionLimiter(1)
+    lease = limiter.try_acquire()
+    assert lease is not None
 
     async def body():
         nonlocal body_entered
@@ -980,7 +1096,11 @@ def test_proxy_stream_closes_upstream_when_sending_headers_fails():
         closed = True
 
     async def scenario():
-        response = avatar_proxy_module._ClosingStreamingResponse(body(), close=close)
+        response = avatar_proxy_module._ClosingStreamingResponse(
+            body(),
+            close=close,
+            lease=lease,
+        )
         blocked_receive = asyncio.Event()
 
         async def receive():
@@ -1001,3 +1121,4 @@ def test_proxy_stream_closes_upstream_when_sending_headers_fails():
     asyncio.run(scenario())
     assert body_entered is False
     assert closed is True
+    assert limiter.active == 0

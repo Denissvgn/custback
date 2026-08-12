@@ -1,5 +1,10 @@
+import contextlib
+import http.client
 import logging
 import signal
+import socket
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -7,7 +12,9 @@ import pytest
 
 import custback.__main__ as main_mod
 import custback.api.server as server_mod
-from custback.config import AppConfig
+from custback.api.security import SecurityPolicy
+from custback.config import AppConfig, RuntimeConfig
+from custback.hub import FrameHub
 
 
 class FakePipeline:
@@ -44,7 +51,10 @@ def _cfg():
 def _uninitialized_api_runner() -> Any:
     """Build a runner whose lifecycle state is supplied by the test."""
 
-    return object.__new__(main_mod._ApiRunner)
+    runner = object.__new__(main_mod._ApiRunner)
+    runner._stop_lock = threading.Lock()
+    runner._stream_lifecycle = None
+    return runner
 
 
 def _patch_common(monkeypatch):
@@ -292,6 +302,10 @@ def test_api_runner_passes_configured_websocket_size_to_uvicorn():
     cfg = _cfg().api.model_copy(update={"ws_max_bytes": 123456})
     runner = main_mod._ApiRunner(object(), cfg)
     assert runner.server.config.ws_max_size == 123456
+    assert (
+        runner.server.config.timeout_graceful_shutdown
+        == main_mod.API_GRACEFUL_SHUTDOWN_TIMEOUT_S
+    )
 
 
 def test_api_runner_bind_failure_is_api_startup_error():
@@ -341,3 +355,368 @@ def test_api_runner_thread_start_failure_closes_prebound_socket(monkeypatch):
         runner.start()
     assert sock.closed
     assert runner._thread is None
+
+
+def _reserve_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def test_real_api_runner_closes_active_core_streams_and_is_idempotent(tmp_path):
+    from websockets.sync.client import connect
+    from websockets.typing import Origin
+
+    from custback.pipeline import Pipeline as RealPipeline
+
+    token = "real-api-lifecycle-token-which-is-long-enough"
+    renderer_token = "renderer-lifecycle-token-which-is-long-enough"
+    port = _reserve_loopback_port()
+    origin = f"http://127.0.0.1:{port}"
+    websocket_origin = Origin(origin)
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {"synthetic": True, "width": 64, "height": 36},
+            "background": {"mode": "passthrough"},
+            "segmentation": {"backend": "heuristic"},
+            "output": {"backend": "null"},
+            "api": {"host": "127.0.0.1", "port": port},
+        }
+    )
+    runtime = RuntimeConfig(cfg)
+    hub = FrameHub()
+    pipeline = RealPipeline(runtime, hub)
+    security = SecurityPolicy.for_bind(
+        token,
+        "127.0.0.1",
+        port,
+        allowed_origins=[origin],
+        renderer_token=renderer_token,
+    )
+    app = server_mod.create_app(
+        runtime,
+        hub,
+        pipeline,
+        security=security,
+        upload_dir=tmp_path / "uploads",
+    )
+    runner = main_mod._ApiRunner(app, cfg.api)
+    http_stream = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+    management_ws = None
+    renderer_ws = None
+    try:
+        runner.start()
+        http_stream.request(
+            "GET",
+            "/video/mjpeg",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response = http_stream.getresponse()
+        assert response.status == 200
+
+        management_ws = connect(
+            f"ws://127.0.0.1:{port}/ws/frames?stream=output",
+            origin=websocket_origin,
+            additional_headers={"Authorization": f"Bearer {token}"},
+            proxy=None,
+            open_timeout=2.0,
+            close_timeout=1.0,
+        )
+        renderer_ws = connect(
+            f"ws://127.0.0.1:{port}/ws/frames?stream=raw",
+            origin=websocket_origin,
+            additional_headers={"Authorization": f"Bearer {renderer_token}"},
+            proxy=None,
+            open_timeout=2.0,
+            close_timeout=1.0,
+        )
+
+        deadline = time.monotonic() + 2.0
+        while app.state.stream_lifecycle.snapshot()["active"] != 3:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert app.state.stream_connections.active == 3
+        assert hub.stats_dict()["remote_connected"] is True
+
+        started = time.monotonic()
+        assert runner.stop()
+        assert time.monotonic() - started < main_mod.API_STOP_TIMEOUT_S
+        assert runner._thread is not None and not runner._thread.is_alive()
+        assert runner.server.force_exit is False
+        assert app.state.stream_lifecycle.snapshot()["active"] == 0
+        assert app.state.stream_connections.active == 0
+        assert hub.stats_dict()["remote_connected"] is False
+
+        repeated = time.monotonic()
+        assert runner.stop()
+        assert time.monotonic() - repeated < 0.2
+    finally:
+        if management_ws is not None:
+            with contextlib.suppress(Exception):
+                management_ws.close()
+        if renderer_ws is not None:
+            with contextlib.suppress(Exception):
+                renderer_ws.close()
+        http_stream.close()
+        runner.stop()
+
+
+def test_real_api_runner_closes_active_avatar_proxy_stream(monkeypatch, tmp_path):
+    import asyncio
+
+    import httpx
+
+    from custback.pipeline import Pipeline as RealPipeline
+
+    class ObservedUpstream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.closed = threading.Event()
+            self._lock = threading.Lock()
+            self._read_polls = 0
+            self._close_calls = 0
+
+        async def __aiter__(self):
+            self.started.set()
+            while not self.closed.is_set():
+                with self._lock:
+                    self._read_polls += 1
+                await asyncio.sleep(0.01)
+            if False:  # pragma: no cover - keeps this an async byte iterator
+                yield b""
+
+        async def aclose(self) -> None:
+            with self._lock:
+                self._close_calls += 1
+            self.closed.set()
+
+        def snapshot(self) -> tuple[int, int]:
+            with self._lock:
+                return self._read_polls, self._close_calls
+
+    token = "avatar-proxy-lifecycle-token-which-is-long-enough"
+    avatar_token = "avatar-upstream-lifecycle-token-long-enough"
+    monkeypatch.setenv("CUSTBACK_AVATAR_API_TOKEN", avatar_token)
+    port = _reserve_loopback_port()
+    cfg = AppConfig.from_dict(
+        {
+            "camera": {"synthetic": True, "width": 64, "height": 36},
+            "background": {"mode": "passthrough"},
+            "segmentation": {"backend": "heuristic"},
+            "output": {"backend": "null"},
+            "api": {"host": "127.0.0.1", "port": port},
+            "avatar": {"url": "https://avatar.example:8711"},
+        }
+    )
+    runtime = RuntimeConfig(cfg)
+    hub = FrameHub()
+    pipeline = RealPipeline(runtime, hub)
+    body = ObservedUpstream()
+    clients: list[httpx.AsyncClient] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "multipart/x-mixed-replace"},
+            stream=body,
+        )
+
+    def client_factory() -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        clients.append(client)
+        return client
+
+    security = SecurityPolicy.for_bind(token, "127.0.0.1", port)
+    app = server_mod.create_app(
+        runtime,
+        hub,
+        pipeline,
+        security=security,
+        upload_dir=tmp_path / "uploads",
+        avatar_client_factory=client_factory,
+    )
+    runner = main_mod._ApiRunner(app, cfg.api)
+    stream = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+    try:
+        runner.start()
+        stream.request(
+            "GET",
+            "/avatar/video/mjpeg",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response = stream.getresponse()
+        assert response.status == 200
+        assert body.started.wait(2.0)
+
+        deadline = time.monotonic() + 2.0
+        while app.state.stream_lifecycle.snapshot()["active"] != 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert app.state.stream_connections.active == 1
+        assert hub.active_remote_session() is None
+
+        started = time.monotonic()
+        assert runner.stop()
+        assert time.monotonic() - started < 5.0
+        assert runner._thread is not None and not runner._thread.is_alive()
+        assert app.state.stream_lifecycle.snapshot()["active"] == 0
+        assert app.state.stream_lifecycle.snapshot()["active_tasks"] == 0
+        assert app.state.stream_connections.active == 0
+        assert hub.active_remote_session() is None
+        assert body.closed.is_set()
+        assert clients and all(client.is_closed for client in clients)
+
+        reads_after_stop, close_calls = body.snapshot()
+        assert close_calls >= 1
+        time.sleep(0.05)
+        assert body.snapshot()[0] == reads_after_stop
+    finally:
+        stream.close()
+        runner.stop()
+
+
+def test_real_api_runner_closes_active_standalone_avatar_mjpeg(tmp_path):
+    import numpy as np
+
+    from custback.avatar.api import create_avatar_app
+    from custback.avatar.config import AvatarConfig, AvatarRuntime
+    from custback.avatar.service import AvatarService
+
+    token = "standalone-avatar-lifecycle-token-which-is-long-enough"
+    port = _reserve_loopback_port()
+    avatar_runtime = AvatarRuntime(
+        AvatarConfig.from_dict(
+            {
+                "driver": {"backend": "idle"},
+                "storage": {
+                    "rigs_dir": str(tmp_path / "rigs"),
+                    "backgrounds_dir": str(tmp_path / "backgrounds"),
+                },
+                "api": {"host": "127.0.0.1", "port": port},
+            }
+        )
+    )
+    service = AvatarService(avatar_runtime)
+    security = SecurityPolicy.for_bind(token, "127.0.0.1", port)
+    app = create_avatar_app(avatar_runtime, service, security=security)
+    runner = main_mod._ApiRunner(app, avatar_runtime.read().config.api)
+    stream = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+
+    def subscriber_count() -> int:
+        with service.output._cond:
+            return len(service.output._subscribers)
+
+    try:
+        runner.start()
+        stream.request(
+            "GET",
+            "/video/mjpeg",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response = stream.getresponse()
+        assert response.status == 200
+
+        deadline = time.monotonic() + 2.0
+        while (
+            app.state.stream_lifecycle.snapshot()["active"] != 1
+            or subscriber_count() != 1
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert app.state.stream_connections.active == 1
+        assert service.stats_dict()["connected"] is False
+
+        started = time.monotonic()
+        assert runner.stop()
+        assert time.monotonic() - started < 5.0
+        assert runner._thread is not None and not runner._thread.is_alive()
+        assert app.state.stream_lifecycle.snapshot()["active"] == 0
+        assert app.state.stream_lifecycle.snapshot()["active_tasks"] == 0
+        assert app.state.stream_connections.active == 0
+        assert subscriber_count() == 0
+        assert service.stats_dict()["connected"] is False
+
+        # A publication after API teardown must have no surviving stream
+        # subscriber and therefore cannot touch an exited event loop.
+        service.output.put(np.zeros((2, 2, 3), dtype=np.uint8))
+        assert subscriber_count() == 0
+    finally:
+        stream.close()
+        runner.stop()
+        service.close()
+
+
+def test_api_runner_timeout_log_contains_only_stream_counts(caplog):
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout):
+            threading.Event().wait(timeout)
+
+    runner = _uninitialized_api_runner()
+    runner.server = SimpleNamespace(should_exit=False, force_exit=False)
+    runner._thread = AliveThread()
+    runner._socket = None
+    runner._error = None
+    runner._shutdown_requested = False
+    runner._unexpected_exit = False
+    runner._stream_lifecycle = SimpleNamespace(
+        request_shutdown=lambda _timeout: None,
+        snapshot=lambda: {
+            "active": 2,
+            "active_tasks": 2,
+            "request_path": "/private/operator/stream",
+            "credential": "must-not-appear",
+            "by_kind": {
+                "core_mjpeg": 1,
+                "management_websocket": 0,
+                "renderer_websocket": 1,
+                "avatar_proxy": 0,
+            },
+        },
+    )
+
+    with caplog.at_level("ERROR"):
+        started = time.monotonic()
+        assert runner.stop(timeout=0.05) is False
+        assert time.monotonic() - started < 0.2
+
+    assert "API shutdown fallback phase=force-exit reason=forced-timeout" in caplog.text
+    assert "streams_active=2" in caplog.text
+    assert "tasks_active=2" in caplog.text
+    assert "core_mjpeg=1" in caplog.text
+    assert "renderer_websocket=1" in caplog.text
+    assert "/private/operator/stream" not in caplog.text
+    assert "must-not-appear" not in caplog.text
+
+
+def test_api_runner_forced_exit_is_diagnosed_and_latched(caplog):
+    class ForcedThread:
+        def __init__(self):
+            self.alive = True
+            self.joins = 0
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, _timeout):
+            self.joins += 1
+            if self.joins == 2:
+                self.alive = False
+
+    runner = _uninitialized_api_runner()
+    runner.server = SimpleNamespace(should_exit=False, force_exit=False)
+    runner._thread = ForcedThread()
+    runner._socket = None
+    runner._error = None
+    runner._shutdown_requested = False
+    runner._unexpected_exit = False
+
+    with caplog.at_level("ERROR"):
+        assert runner.stop(timeout=0.05) is False
+        assert runner.stop(timeout=0.05) is False
+
+    assert runner.server.force_exit is True
+    assert runner._thread.is_alive() is False
+    assert caplog.text.count("reason=graceful-timeout") == 1

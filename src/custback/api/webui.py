@@ -232,6 +232,20 @@ input[type="checkbox"],input[type="radio"]{width:1.15rem;height:1.15rem;accent-c
 .seg button{flex:1 1 auto;min-width:0;border-color:var(--color-rule);background:var(--color-paper-2);
   color:var(--color-muted);padding-inline:var(--space-sm)}
 .seg button.active{border-color:var(--color-accent);background:var(--color-accent-soft);color:var(--color-accent)}
+.profile-axis{display:grid;gap:var(--space-sm)}
+.profile-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--space-sm)}
+.profile-card{display:grid;align-content:start;gap:var(--space-2xs);min-width:0;min-height:6rem;
+  padding:var(--space-sm);border-color:var(--color-rule);background:var(--color-paper);color:var(--color-ink);
+  text-align:start}
+.profile-card strong{font:650 var(--text-sm)/1.25 var(--font-display)}
+.profile-card small{color:var(--color-muted);font-size:var(--text-xs);font-weight:400}
+.profile-card .profile-reason{color:var(--color-warning)}
+.profile-card.active{border-color:var(--color-accent);background:var(--color-accent-soft);color:var(--color-accent)}
+.profile-card:disabled{opacity:.62}
+.profile-state{color:var(--color-muted);font-size:var(--text-xs)}
+.profile-ack{display:flex;align-items:flex-start;gap:var(--space-sm)}
+.profile-ack label{display:grid;gap:var(--space-2xs);color:var(--color-ink);font-size:var(--text-sm)}
+.profile-ack small{color:var(--color-muted);font-size:var(--text-xs);font-weight:400}
 .modes{display:grid;gap:var(--space-xs)}
 .mode{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:var(--space-sm);
   min-height:3.5rem;padding:var(--space-sm);border:var(--rule-thin) solid var(--color-rule);
@@ -322,6 +336,7 @@ summary{min-height:2.75rem;color:var(--color-ink);font-weight:650;cursor:pointer
   .preview-metric{border-block-end:0;border-inline-end:var(--rule-thin) solid var(--color-graphite-rule)}
   .preview-metric:last-child{border-inline-end:0}
   .field-grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .profile-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .field-grid.uneven{grid-template-columns:minmax(0,1.25fr) minmax(0,.75fr)}
   .tiles{grid-template-columns:repeat(4,minmax(0,1fr))}
 }
@@ -335,6 +350,7 @@ summary{min-height:2.75rem;color:var(--color-ink);font-weight:650;cursor:pointer
   .workbench{grid-template-columns:minmax(0,7fr) minmax(22rem,5fr);align-items:start;gap:var(--space-xl);padding-block:var(--space-xl)}
   .preview-column{position:sticky;inset-block-start:6.5rem}
   .tiles{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .profile-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
 }
 @media (min-width:90rem){.workbench{gap:var(--space-2xl)}.tiles{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media (prefers-reduced-motion:reduce){
@@ -493,18 +509,27 @@ source:
     <div class="view-panel" id="view-quality" data-panel="quality" role="tabpanel" aria-labelledby="tab-quality" hidden>
       <header class="panel-head"><h2>Tune camera quality</h2><p>Match foreground colour, frame the scene, and inspect subject separation. Matte defaults remain on the compatibility policy until physical qualification authorizes a rollout.</p></header>
       <section class="control-section">
-        <div class="section-copy"><h3>Matte quality profile</h3><p>Runtime facts below separate the rollout decision from the active backend and automatic fallback. An installed backend or available control is not a qualified default.</p></div>
-        <fieldset class="field" aria-describedby="quality-preset-help">
-          <legend>Qualified preset</legend>
-          <div class="seg" id="quality-presets">
-            <button type="button" id="quality-preset-custom" data-quality-preset="custom" class="active" aria-pressed="true" disabled>Custom</button>
-            <button type="button" id="quality-preset-performance" data-quality-preset="performance" aria-pressed="false" disabled>Performance</button>
-            <button type="button" id="quality-preset-balanced" data-quality-preset="balanced" aria-pressed="false" disabled>Balanced</button>
-            <button type="button" id="quality-preset-quality" data-quality-preset="quality" aria-pressed="false" disabled>Quality</button>
-          </div>
-          <small id="quality-preset-help" role="status">Checking qualified preset evidence…</small>
-        </fieldset>
+        <div class="section-copy"><h3>Quality and performance profile</h3><p>Named profiles are server-owned, concrete restart settings. They are experimental convenience configurations, not portable quality claims or automatic defaults.</p></div>
+        <div class="profile-axis" id="profile-axis-quality" aria-labelledby="profile-axis-quality-label">
+          <strong id="profile-axis-quality-label">Quality and performance</strong>
+          <div class="profile-grid" id="profile-options-quality" role="group" aria-labelledby="profile-axis-quality-label"></div>
+          <p class="profile-state" id="profile-state-quality" role="status">Loading profile availability…</p>
+        </div>
+        <div class="notice neutral profile-ack" id="profile-experimental-notice">
+          <input type="checkbox" id="profile-experimental-ack" aria-describedby="profile-experimental-help">
+          <label for="profile-experimental-ack">I understand these profiles are experimental
+            <small id="profile-experimental-help">They are selectable for explicit testing, require restart, and make no evidence-qualified quality claim.</small>
+          </label>
+        </div>
+        <div class="notice" id="profile-restart-banner" role="status" aria-live="polite" aria-atomic="true" hidden>
+          <span id="profile-restart-copy"></span>
+        </div>
         <dl class="diagnostic-list" id="quality-runtime"></dl>
+        <div class="notice action-row" id="runtime-mitigation-action" role="status"
+          aria-live="polite" aria-atomic="true" hidden>
+          <span id="runtime-mitigation-copy"></span>
+          <button type="button" id="runtime-mitigation-apply">Apply suggested stability mitigation</button>
+        </div>
       </section>
       <section class="control-section">
         <div class="section-copy"><h3>Colour match</h3><p>Gently adapt the camera foreground to supported image, video, or secondary-camera backgrounds.</p></div>
@@ -517,12 +542,17 @@ source:
       </section>
       <section class="control-section">
         <div class="section-copy"><h3>Scene framing</h3><p>Choose how the camera and backdrop fill the output. Backdrop focal points keep the important area in view when cropping.</p></div>
+        <div class="profile-axis" id="profile-axis-framing" aria-labelledby="profile-axis-framing-label">
+          <strong id="profile-axis-framing-label">Person framing</strong>
+          <div class="profile-grid" id="profile-options-framing" role="group" aria-labelledby="profile-axis-framing-label"></div>
+          <p class="profile-state" id="profile-state-framing" role="status">Loading profile availability…</p>
+        </div>
         <div class="field-grid two">
           <div class="field"><label for="quality-background-fit">Background fit</label>
-            <select id="quality-background-fit"><option value="cover">Fill and crop</option><option value="contain">Fit with padding</option><option value="stretch">Stretch to fill</option></select>
+            <select id="quality-background-fit"><option value="cover">Fill and crop</option><option value="contain">Fit with padding</option><option value="stretch">Stretch to fill (compatibility only)</option></select>
             <small>Applies immediately to image, video, and secondary-camera backgrounds.</small></div>
           <div class="field"><label for="quality-camera-fit">Camera fit <span class="restart-tag">Restart required</span></label>
-            <select id="quality-camera-fit" aria-describedby="quality-camera-fit-help"><option value="cover">Fill and crop</option><option value="contain">Fit with padding</option><option value="stretch">Stretch to fill</option></select>
+            <select id="quality-camera-fit" aria-describedby="quality-camera-fit-help"><option value="cover">Fill and crop</option><option value="contain">Fit with padding</option><option value="stretch">Stretch to fill (compatibility only)</option></select>
             <small id="quality-camera-fit-help">Camera geometry is fixed when capture starts. A rejected change is restored to the effective setting.</small></div>
           <div class="field"><label for="quality-background-anchor-x">Backdrop horizontal focal point</label>
             <div class="range-line"><input type="range" id="quality-background-anchor-x" min="0" max="1" step="0.05" aria-describedby="quality-background-anchor-x-help"><span class="value" id="quality-background-anchor-x-value"></span></div>
@@ -609,6 +639,7 @@ source:
         <div class="section-copy"><h3>Camera pipeline</h3><p>Live measurements update every three seconds.</p></div>
         <dl class="diagnostic-list" id="core-diagnostics"></dl>
         <details><summary>All camera diagnostics</summary><dl class="diagnostic-list" id="core-diagnostics-all"></dl></details>
+        <p class="hint">Private matte views are available only in the local native preview: press <kbd>d</kbd> / <kbd>D</kbd> for next / previous. The browser never receives matte frames. Start with <code>--matte-diagnostics-dir</code> only when you intentionally need a private bounded recording. Reproduce it offline with <code>custback matte-replay PRIVATE_BUNDLE --output-dir NEW_PRIVATE_DIR</code>, then evaluate annotated evidence with <code>custback matte-evaluate PRIVATE_BUNDLE --annotations PRIVATE_ANNOTATIONS --json PRIVATE_REPORT.json</code>. These commands keep private pixels and paths out of the public API.</p>
       </section>
       <section class="control-section" id="avatar-diagnostics-section">
         <div class="section-copy"><h3>Avatar service</h3><p>Control API reachability, camera-frame input, following driver, and render health.</p></div>
@@ -655,21 +686,13 @@ const FOLLOW_DESCRIPTIONS = {
   voice: "Animates from the configured Audio2Face voice service.",
   presence: "Keeps a steady idle pose without following camera or voice.",
 };
-// MATTE-2.5's checked-in evidence is generated proxy/template evidence. It
-// explicitly selects no portable named profiles. Keep the catalog versioned
-// and empty until reviewed model-backed cross-device evidence can supply each
-// preset as one exact merge patch.
-const MATTE_PRESET_CATALOG = Object.freeze({
-  schema: "custback.matte-quality-presets",
-  version: 1,
-  evidenceStatus: "not_qualified",
-  presets: Object.freeze({}),
-});
-const MATTE_PRESET_NAMES = ["performance", "balanced", "quality"];
+const PROFILE_AXES = ["quality", "framing"];
 
 const state = {
   core: null,            // core /config body
   coreVersion: -1,
+  profiles: null,        // server-owned /profiles body
+  profilesError: "",
   avatar: null,          // avatar /config body (via proxy)
   avatarVersion: -1,
   avatarInfo: null,      // /avatar/avatars body
@@ -729,8 +752,13 @@ class ApiError extends Error {
   }
 }
 
-async function api(method, path, body, contentType, responseInfo) {
+async function api(method, path, body, contentType, responseInfo, requestHeaders) {
   const init = {method, headers: {}};
+  if (requestHeaders && typeof requestHeaders === "object") {
+    for (const [name, value] of Object.entries(requestHeaders)) {
+      init.headers[name] = String(value);
+    }
+  }
   if (body !== undefined && body !== null) {
     if (body instanceof Blob || body instanceof FormData) {
       init.body = body;
@@ -842,21 +870,25 @@ $("signout").addEventListener("click", async (event) => {
 
 // -- config patching ---------------------------------------------------------
 
-async function patchCore(patch) {
-  const body = await api("PATCH", "/config", patch);
+async function patchCore(patch, expectedVersion) {
+  const headers = Number.isSafeInteger(expectedVersion) && expectedVersion >= 0
+    ? {"X-Expected-Config-Version": expectedVersion} : null;
+  const body = await api("PATCH", "/config", patch, null, null, headers);
   commitCoreSnapshot({config: body.config, version: body.config_version});
+  await refreshProfilesAfterCoreMutation();
   renderAll();
 }
 
-async function patchCoreControl(patch) {
+async function patchCoreControl(patch, expectedVersion) {
   try {
-    return await patchCore(patch);
+    return await patchCore(patch, expectedVersion);
   } catch (err) {
     let refreshError = null;
     if (err instanceof ApiError && [409, 422, 503].includes(err.status)) {
       try {
         const snapshot = await loadCoreConfig();
         commitCoreSnapshot(snapshot);
+        await refreshProfilesAfterCoreMutation();
       } catch (caught) {
         refreshError = caught;
       }
@@ -910,8 +942,141 @@ async function refreshCoreConfig() {
   return commitCoreSnapshot(snapshot);
 }
 
+function validateProfilesStatus(value) {
+  const fail = () => {
+    throw new ApiError(502, "invalid_response",
+      "custback returned an invalid system profile status");
+  };
+  if (!plainObject(value)
+      || value.schema !== "custback.system-profiles-status"
+      || value.version !== 1
+      || !Number.isSafeInteger(value.config_version)
+      || value.config_version < 0
+      || !Number.isSafeInteger(value.preference_revision)
+      || value.preference_revision < 0
+      || !Array.isArray(value.cli_locks)
+      || !Array.isArray(value.pending_restart_fields)
+      || !plainObject(value.catalog)
+      || value.catalog.schema !== "custback.system-profile-catalog"
+      || value.catalog.version !== 1
+      || typeof value.catalog.digest !== "string"
+      || value.catalog.quality_claim !== false
+      || !plainObject(value.catalog.axes)
+      || !plainObject(value.axes)) fail();
+  const states = new Set([
+    "active", "saved_for_restart", "configured_unavailable", "custom",
+  ]);
+  for (const axis of PROFILE_AXES) {
+    const catalogAxis = value.catalog.axes[axis];
+    const axisStatus = value.axes[axis];
+    if (!plainObject(catalogAxis)
+        || typeof catalogAxis.label !== "string"
+        || !Array.isArray(catalogAxis.owned_paths)
+        || !plainObject(catalogAxis.profiles)
+        || !plainObject(axisStatus)
+        || !states.has(axisStatus.state)
+        || !Array.isArray(axisStatus.pending_restart_fields)) fail();
+    for (const [identifier, profile] of Object.entries(catalogAxis.profiles)) {
+      if (!plainObject(profile)
+          || profile.id !== identifier
+          || typeof profile.label !== "string"
+          || typeof profile.description !== "string"
+          || !["experimental", "locally_screened"].includes(
+            profile.evidence_state)
+          || typeof profile.selectable !== "boolean"
+          || profile.quality_claim !== false
+          || !plainObject(profile.requirements)
+          || profile.lifecycle !== "restart"
+          || typeof profile.patch_digest !== "string"
+          || typeof profile.available !== "boolean"
+          || typeof profile.availability_reason !== "string") fail();
+    }
+    for (const selection of [axisStatus.active, axisStatus.desired]) {
+      if (selection !== null
+          && (typeof selection !== "string"
+            || !Object.prototype.hasOwnProperty.call(
+              catalogAxis.profiles, selection))) fail();
+    }
+  }
+  return value;
+}
+
+async function loadProfilesStatus() {
+  const responseInfo = {};
+  const profiles = validateProfilesStatus(await api(
+    "GET", "/profiles", undefined, undefined, responseInfo
+  ));
+  if (!Number.isSafeInteger(responseInfo.configVersion)
+      || responseInfo.configVersion !== profiles.config_version) {
+    throw new ApiError(502, "invalid_response",
+      "custback returned an unversioned system profile status");
+  }
+  return profiles;
+}
+
+function commitProfilesStatus(profiles) {
+  validateProfilesStatus(profiles);
+  if (profiles.config_version < state.coreVersion) return false;
+  if (state.profiles
+      && profiles.config_version === state.profiles.config_version
+      && profiles.preference_revision < state.profiles.preference_revision) return false;
+  state.profiles = profiles;
+  state.profilesError = "";
+  return true;
+}
+
+async function refreshProfilesStatus() {
+  try {
+    const profiles = await loadProfilesStatus();
+    if (profiles.config_version !== state.coreVersion) {
+      throw new ApiError(409, "stale_profile_status",
+        "system profiles are synchronizing with the effective configuration");
+    }
+    return commitProfilesStatus(profiles);
+  } catch (err) {
+    if (err instanceof ApiError && err.code === "profiles_unavailable") {
+      state.profiles = null;
+      state.profilesError = err.message;
+      return false;
+    }
+    throw err;
+  }
+}
+
+async function refreshCoreAndProfiles() {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await refreshCoreConfig();
+    try {
+      await refreshProfilesStatus();
+      return;
+    } catch (err) {
+      if (!(err instanceof ApiError) || err.code !== "stale_profile_status"
+          || attempt > 0) throw err;
+    }
+  }
+}
+
+async function refreshProfilesAfterCoreMutation() {
+  try {
+    await refreshProfilesStatus();
+  } catch (err) {
+    if (err instanceof ApiError && err.code === "stale_profile_status") {
+      try {
+        await refreshCoreAndProfiles();
+        return;
+      } catch (retryError) {
+        err = retryError;
+      }
+    }
+    state.profiles = null;
+    state.profilesError = err.message
+      || "Managed profile status could not be refreshed.";
+    reportError(err);
+  }
+}
+
 async function loadCore() {
-  await refreshCoreConfig();
+  await refreshCoreAndProfiles();
   state.coreFiles = await api("GET", "/backgrounds");
 }
 
@@ -970,7 +1135,7 @@ function applyStatus(status, avatarStatus) {
     if (status.config_version !== state.coreVersion
         && !state.coreRefreshPending) {
       state.coreRefreshPending = true;
-      refreshCoreConfig().then(() => {
+      refreshCoreAndProfiles().then(() => {
         renderAll();
       }).catch(reportError).finally(() => { state.coreRefreshPending = false; });
     }
@@ -1865,71 +2030,199 @@ function plainObject(value) {
     && !Array.isArray(value));
 }
 
-function qualityPresetPatch(name, catalog = MATTE_PRESET_CATALOG) {
-  if (!plainObject(catalog)
-      || catalog.schema !== "custback.matte-quality-presets"
-      || catalog.version !== 1
-      || catalog.evidenceStatus !== "qualified"
-      || !plainObject(catalog.presets)) return null;
-  const definition = catalog.presets[name];
-  if (!plainObject(definition) || !plainObject(definition.patch)
-      || !Object.keys(definition.patch).length) return null;
-  return JSON.parse(JSON.stringify(definition.patch));
+function profileLabel(axis, identifier) {
+  const profiles = state.profiles
+    && state.profiles.catalog.axes[axis].profiles;
+  const definition = profiles && profiles[identifier];
+  return definition ? definition.label : titleCase(identifier || "custom");
 }
 
-function configContainsPatch(config, patch) {
-  if (Array.isArray(patch)) {
-    return Array.isArray(config)
-      && JSON.stringify(config) === JSON.stringify(patch);
+function makeProfileCard({label, description, reason, selected, disabled,
+  axis, identifier, reset}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "profile-card" + (selected ? " active" : "");
+  button.disabled = disabled;
+  button.setAttribute("aria-pressed", String(selected));
+  button.dataset.profileAxis = axis;
+  if (reset) button.dataset.profileReset = "true";
+  else button.dataset.profileId = identifier;
+  const heading = document.createElement("strong");
+  heading.textContent = label;
+  const copy = document.createElement("small");
+  copy.textContent = description;
+  button.append(heading, copy);
+  if (reason) {
+    const availability = document.createElement("small");
+    availability.className = "profile-reason";
+    availability.textContent = reason;
+    button.appendChild(availability);
   }
-  if (plainObject(patch)) {
-    if (!plainObject(config)) return false;
-    return Object.entries(patch).every(([key, value]) =>
-      Object.prototype.hasOwnProperty.call(config, key)
-      && configContainsPatch(config[key], value));
-  }
-  return Object.is(config, patch);
+  return button;
 }
 
-function matchingQualityPreset(config, catalog = MATTE_PRESET_CATALOG) {
-  for (const name of MATTE_PRESET_NAMES) {
-    const patch = qualityPresetPatch(name, catalog);
-    if (patch && configContainsPatch(config, patch)) return name;
+function profileStateCopy(axis, axisStatus) {
+  const active = axisStatus.active
+    ? profileLabel(axis, axisStatus.active) : "Custom";
+  const desired = axisStatus.desired
+    ? profileLabel(axis, axisStatus.desired) : "Custom";
+  if (axisStatus.state === "active") return "Active · " + active;
+  if (axisStatus.state === "saved_for_restart") {
+    return "Saved for restart · " + desired + " · current output remains "
+      + active;
   }
-  return "custom";
+  if (axisStatus.state === "configured_unavailable") {
+    const definition = state.profiles.catalog.axes[axis].profiles[
+      axisStatus.desired
+    ];
+    const reason = definition && definition.availability_reason;
+    return "Configured but unavailable · " + desired
+      + (reason ? " · " + reason : "");
+  }
+  return "Custom · no named "
+    + state.profiles.catalog.axes[axis].label.toLowerCase()
+    + " profile is saved";
 }
 
-function renderQualityPresets() {
-  if (!state.core) return;
-  const active = matchingQualityPreset(state.core);
-  for (const button of $("quality-presets").querySelectorAll(
-    "[data-quality-preset]"
-  )) {
-    const name = button.dataset.qualityPreset;
-    const available = name === "custom"
-      || qualityPresetPatch(name) !== null;
-    const selected = name === active;
-    // Custom describes unmatched concrete values; it is never an action.
-    button.disabled = name === "custom" || !available;
-    button.classList.toggle("active", selected);
-    button.setAttribute("aria-pressed", String(selected));
-  }
-  const availableNames = MATTE_PRESET_NAMES.filter(
-    (name) => qualityPresetPatch(name) !== null
-  );
-  if (!availableNames.length) {
-    $("quality-preset-help").textContent =
-      "Custom settings · preset catalog v" + MATTE_PRESET_CATALOG.version
-      + ". Performance, Balanced, and Quality remain unavailable because "
-      + "checked-in evidence has not qualified portable model-backed profiles. "
-      + "Rollback uses the matte-legacy-v1 policy as one atomic patch; it does "
-      + "not require deleting configuration or the model cache.";
+function renderProfileAxis(axis) {
+  const container = $("profile-options-" + axis);
+  const statusOutput = $("profile-state-" + axis);
+  container.replaceChildren();
+  if (!state.profiles
+      || state.profiles.config_version !== state.coreVersion) {
+    const unavailable = document.createElement("p");
+    unavailable.className = "hint";
+    unavailable.textContent = state.profilesError
+      || "Managed profiles are synchronizing with the running configuration.";
+    container.appendChild(unavailable);
+    statusOutput.textContent = "Profiles unavailable · manual controls remain active";
     return;
   }
-  $("quality-preset-help").textContent =
-    "Catalog v" + MATTE_PRESET_CATALOG.version
-    + " · each preset expands to one concrete, atomic configuration patch. "
-    + "The matte-legacy-v1 rollback remains one separate atomic patch.";
+  const catalogAxis = state.profiles.catalog.axes[axis];
+  $("profile-axis-" + axis + "-label").textContent = catalogAxis.label;
+  const axisStatus = state.profiles.axes[axis];
+  const experimentalAccepted = $("profile-experimental-ack").checked;
+  container.appendChild(makeProfileCard({
+    label: "Custom",
+    description: "Remove the saved named profile for this section.",
+    reason: axisStatus.active && axisStatus.desired === null
+      ? "Restart retains the current output until then." : "",
+    selected: axisStatus.desired === null,
+    disabled: false,
+    axis,
+    reset: true,
+  }));
+  for (const [identifier, definition] of Object.entries(catalogAxis.profiles)) {
+    let reason = "";
+    if (!definition.selectable) reason = "This profile is not selectable.";
+    else if (!definition.available) {
+      reason = "Unavailable · "
+        + (definition.availability_reason || "runtime requirements are not met");
+    } else if (["experimental", "locally_screened"].includes(
+      definition.evidence_state)
+        && !experimentalAccepted) {
+      reason = "Acknowledge non-qualified profiles to enable this choice.";
+    } else if (definition.lifecycle === "restart") {
+      const evidenceLabel = definition.evidence_state === "locally_screened"
+        ? "Locally screened" : "Experimental";
+      reason = evidenceLabel + " · restart required · no qualified quality claim.";
+    }
+    const disabled = !definition.selectable || !definition.available
+      || (["experimental", "locally_screened"].includes(
+        definition.evidence_state) && !experimentalAccepted);
+    container.appendChild(makeProfileCard({
+      label: definition.label,
+      description: definition.description,
+      reason,
+      selected: axisStatus.desired === identifier,
+      disabled,
+      axis,
+      identifier,
+      reset: false,
+    }));
+  }
+  statusOutput.textContent = profileStateCopy(axis, axisStatus);
+}
+
+function renderProfileRestartBanner() {
+  const banner = $("profile-restart-banner");
+  const fields = state.profiles
+    && state.profiles.config_version === state.coreVersion
+    && state.profiles.pending_restart_fields;
+  banner.hidden = !fields || !fields.length;
+  if (banner.hidden) {
+    $("profile-restart-copy").textContent = "";
+    return;
+  }
+  $("profile-restart-copy").textContent =
+    "Saved settings need restart: " + fields.join(", ")
+    + ". This page cannot stop or restart Custback. Exit and relaunch it from "
+    + "the tray, or stop and rerun the terminal command. Current meeting output "
+    + "remains unchanged until restart.";
+}
+
+function renderSystemProfiles() {
+  for (const axis of PROFILE_AXES) renderProfileAxis(axis);
+  renderProfileRestartBanner();
+}
+
+async function mutateProfiles(path, body) {
+  try {
+    const responseInfo = {};
+    const profiles = validateProfilesStatus(await api(
+      "POST", path, body, undefined, responseInfo
+    ));
+    if (!Number.isSafeInteger(responseInfo.configVersion)
+        || responseInfo.configVersion !== profiles.config_version) {
+      throw new ApiError(502, "invalid_response",
+        "custback returned an unversioned system profile status");
+    }
+    if (profiles.config_version !== state.coreVersion) {
+      await refreshCoreAndProfiles();
+    } else {
+      commitProfilesStatus(profiles);
+    }
+    renderAll();
+    return profiles;
+  } catch (err) {
+    if (err instanceof ApiError && [409, 422, 503].includes(err.status)) {
+      try { await refreshCoreAndProfiles(); } catch (refreshError) {
+        if (refreshError instanceof ApiError && refreshError.status === 401) {
+          throw refreshError;
+        }
+      }
+    }
+    renderAll();
+    throw err;
+  }
+}
+
+function currentProfileRevisions() {
+  if (!state.profiles) {
+    throw new ApiError(503, "profiles_unavailable",
+      state.profilesError || "managed profiles are unavailable");
+  }
+  return {
+    expected_config_version: state.profiles.config_version,
+    expected_preferences_revision: state.profiles.preference_revision,
+  };
+}
+
+async function applySystemProfile(axis, identifier) {
+  const revisions = currentProfileRevisions();
+  return mutateProfiles("/profiles/apply", {
+    selections: {[axis]: identifier},
+    ...revisions,
+    accept_experimental: $("profile-experimental-ack").checked,
+  });
+}
+
+async function resetSystemProfile(axis) {
+  const revisions = currentProfileRevisions();
+  return mutateProfiles("/profiles/reset", {
+    axes: [axis],
+    ...revisions,
+  });
 }
 
 function currentMattePolicy(status, configVersion) {
@@ -2230,7 +2523,7 @@ function renderMatteQualityRuntime() {
     [
       "Unique updates",
       fps,
-      state.status.cadence_mismatch_active ? "warn" : "",
+      cadenceShortfallActive(state.status) ? "warn" : "",
     ],
     summary || ["Effective matte policy", "Unavailable", "warn"],
   );
@@ -2348,19 +2641,54 @@ function renderQuality() {
   $("quality-mask-blur").dataset.canonicalValue = String(segmentation.mask_blur);
   $("quality-edge-refine").checked = segmentation.edge_refine;
   $("quality-model-foreground").checked = compositing.use_model_foreground;
-  renderQualityPresets();
+  renderSystemProfiles();
   renderMatteQualityRuntime();
   renderMatteControlPolicy();
   renderColorCorrectionStatus();
 }
 
-$("quality-presets").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-quality-preset]");
-  if (!button || button.dataset.qualityPreset === "custom") return;
-  const patch = qualityPresetPatch(button.dataset.qualityPreset);
-  if (!patch) return;
-  withBusy(button, "Applying…", () => patchCoreControl(patch))
-    .catch(reportError);
+for (const axis of PROFILE_AXES) {
+  $("profile-options-" + axis).addEventListener("click", (event) => {
+    const button = event.target.closest("[data-profile-axis]");
+    if (!button || button.disabled) return;
+    const action = button.dataset.profileReset === "true"
+      ? () => resetSystemProfile(axis)
+      : () => applySystemProfile(axis, button.dataset.profileId);
+    withBusy(button, "Saving…", action).then(() => {
+      toast(button.dataset.profileReset === "true"
+        ? "Custom settings saved. Restart Custback to apply them."
+        : profileLabel(axis, button.dataset.profileId)
+          + " saved. Restart Custback to apply it.", "good");
+    }).catch(reportError);
+  });
+}
+
+$("profile-experimental-ack").addEventListener("change", () => {
+  for (const axis of PROFILE_AXES) renderProfileAxis(axis);
+});
+
+$("runtime-mitigation-apply").addEventListener("click", (event) => {
+  const action = stabilityMitigationAction(state.status, state.coreVersion);
+  if (!action) {
+    renderStabilityMitigationAction();
+    toast("The stability suggestion changed; review the refreshed status.", "warn");
+    return;
+  }
+  const label = titleCase(action.kind);
+  if (!confirm("Apply " + label + "? This changes only the listed optional "
+      + "compositing controls and starts a new performance warm-up window.")) return;
+  withBusy(event.currentTarget, "Applying…", async () => {
+    const snapshot = await loadCoreConfig();
+    if (snapshot.version !== action.configVersion) {
+      commitCoreSnapshot(snapshot);
+      renderAll();
+      throw new ApiError(409, "stale_mitigation",
+        "the configuration changed; review the refreshed suggestion");
+    }
+    commitCoreSnapshot(snapshot);
+    await patchCoreControl(action.patch, action.configVersion);
+    toast("Applied " + label + ". Runtime performance is warming up again.", "good");
+  }).catch(reportError);
 });
 
 $("quality-color-auto").addEventListener("change", (event) => {
@@ -2729,7 +3057,7 @@ function diagnosticLabel(key) {
     output_sink_recovery_events: "Output-sink recovery events",
     application_pacing_events: "Application pacing events",
     output_schedule_late_events: "Late output schedules",
-    cadence_mismatch_active: "Visual cadence mismatch",
+    cadence_mismatch_active: "Visual cadence differs from transport",
     timing_schema_version: "Timing schema version",
     timing_ms: "Pipeline timing boundaries",
     runtime_performance: "Runtime performance",
@@ -2805,8 +3133,21 @@ function renderDiagnosticList(container, rows) {
 function allDiagnosticRows(object) {
   if (!object) return [["Status", "Waiting for data", "warn"]];
   return Object.entries(object).map(([key, value]) => [
-    diagnosticLabel(key), formatDiagnostic(key, value), diagnosticTone(key, value),
+    diagnosticLabel(key), formatDiagnostic(key, value),
+    key === "cadence_mismatch_active"
+      ? (cadenceShortfallActive(object) ? "warn" : "")
+      : diagnosticTone(key, value),
   ]);
+}
+
+function cadenceShortfallActive(status) {
+  const performance = status && status.runtime_performance;
+  if (performance && performance.schema_version === 2) {
+    return ["unexpected-shortfall", "failed"].includes(
+      performance.cadence_status
+    );
+  }
+  return Boolean(status && status.cadence_mismatch_active);
 }
 
 function visualCadenceRows(status) {
@@ -2820,7 +3161,7 @@ function visualCadenceRows(status) {
     return Number.isFinite(number) && number >= 0
       ? (number * 100).toFixed(1) + "%" : "—";
   };
-  const tone = status.cadence_mismatch_active ? "warn" : "";
+  const tone = cadenceShortfallActive(status) ? "warn" : "";
   return [
     ["Visual updates",
       rate(status.base_composite_update_fps) + " fps · "
@@ -2845,17 +3186,20 @@ function visualCadenceRows(status) {
 
 function runtimePerformanceRows(status) {
   const performance = status && status.runtime_performance;
-  if (!performance || performance.schema_version !== 1) {
+  if (!performance || performance.schema_version !== 2) {
     return [
       ["Output cadence", "Runtime performance status unavailable", "warn"],
       ["Unique visual cadence", "Runtime performance status unavailable", "warn"],
+      ["Cadence interpretation", "Runtime performance status unavailable", "warn"],
+      ["Deadline domains", "Runtime performance status unavailable", "warn"],
       ["Dominant stage", "Not measured", ""],
       ["Suggested patch", "None while status is unavailable", ""],
     ];
   }
   const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
-  const target = number(performance.target_fps);
-  const cadence = (value, attainment) => number(value).toFixed(1) + " / "
+  const transportTarget = number(performance.transport_target_fps);
+  const uniqueTarget = number(performance.unique_target_fps);
+  const cadence = (value, target, attainment) => number(value).toFixed(1) + " / "
     + target.toFixed(1) + " fps · " + (number(attainment) * 100).toFixed(1)
     + "% target";
   const failed = performance.state === "failed";
@@ -2874,16 +3218,89 @@ function runtimePerformanceRows(status) {
       + " · " + JSON.stringify(mitigation.patch)
     : (performance.state === "warming"
       ? "Waiting for the performance window" : "No mitigation suggested");
+  const cadenceText = {
+    warming: "Warming · cadence classification is not yet qualified",
+    matched: "Matched · unique visual and transport targets are both met",
+    "intentional-repeat": "Intentional repeats · " + uniqueTarget.toFixed(1)
+      + " unique fps carried at " + transportTarget.toFixed(1) + " transport fps",
+    "unexpected-shortfall": "Unexpected shortfall · at least one cadence target is below 90%",
+    failed: "Failed · cadence is no longer trustworthy",
+  }[performance.cadence_status] || "Unknown cadence classification";
+  const cadenceTone = performance.cadence_status === "unexpected-shortfall"
+    ? "warn" : (performance.cadence_status === "failed" ? "bad"
+      : (["matched", "intentional-repeat"].includes(performance.cadence_status)
+        ? "good" : ""));
+  const deadlineText = "Processing "
+    + number(performance.processing_deadline_ms).toFixed(1) + " ms @ "
+    + uniqueTarget.toFixed(1) + " fps · transport "
+    + number(performance.transport_deadline_ms).toFixed(1) + " ms @ "
+    + transportTarget.toFixed(1) + " fps";
   return [
     ["Output cadence",
-      cadence(performance.output_send_fps, performance.output_attainment),
+      cadence(performance.output_send_fps, transportTarget,
+        performance.output_attainment),
       outputTone],
     ["Unique visual cadence",
-      cadence(performance.sent_unique_base_fps, performance.unique_attainment),
+      cadence(performance.sent_unique_base_fps, uniqueTarget,
+        performance.unique_attainment),
       uniqueTone],
+    ["Cadence interpretation", cadenceText, cadenceTone],
+    ["Deadline domains", deadlineText, ""],
     ["Dominant stage", stageText, performance.state === "degraded" ? "warn" : ""],
     ["Suggested patch", mitigationText, mitigation ? "warn" : ""],
   ];
+}
+
+function stabilityMitigationAction(status, configVersion) {
+  const performance = status && status.runtime_performance;
+  const mitigation = performance && performance.recommended_mitigation;
+  const epoch = performance && performance.current_epoch;
+  const key = epoch && epoch.key;
+  if (!Number.isSafeInteger(configVersion) || configVersion < 0
+      || !status || status.config_version !== configVersion
+      || !performance || performance.schema_version !== 2
+      || performance.state !== "degraded"
+      || !key || key.config_version !== configVersion
+      || !plainObject(mitigation)
+      || JSON.stringify(Object.keys(mitigation).sort())
+        !== JSON.stringify(["config_version", "kind", "patch"])
+      || mitigation.config_version !== configVersion) return null;
+  const candidates = {
+    "disable-color-and-light-wrap": {
+      compositing: {color_correction: {mode: "off"}, light_wrap: 0},
+    },
+    "disable-color-correction": {
+      compositing: {color_correction: {mode: "off"}},
+    },
+    "disable-light-wrap": {compositing: {light_wrap: 0}},
+  };
+  if (!Object.prototype.hasOwnProperty.call(candidates, mitigation.kind)) {
+    return null;
+  }
+  const expected = candidates[mitigation.kind];
+  if (!expected || JSON.stringify(mitigation.patch) !== JSON.stringify(expected)) {
+    return null;
+  }
+  return {
+    configVersion,
+    kind: mitigation.kind,
+    patch: JSON.parse(JSON.stringify(expected)),
+  };
+}
+
+function renderStabilityMitigationAction() {
+  const container = $("runtime-mitigation-action");
+  const button = $("runtime-mitigation-apply");
+  const action = stabilityMitigationAction(state.status, state.coreVersion);
+  container.hidden = !action;
+  button.disabled = !action;
+  if (!action) {
+    $("runtime-mitigation-copy").textContent = "";
+    return;
+  }
+  $("runtime-mitigation-copy").textContent =
+    "Optional stability action · " + titleCase(action.kind)
+    + ". Review and apply explicitly; custback never applies this automatically.";
 }
 
 function geometrySummary(status) {
@@ -2931,11 +3348,40 @@ function videoColorSummary(status) {
   return [parts.join(" · "), warning ? "warn" : "good"];
 }
 
+function videoCadenceSummary(status) {
+  const source = Number(status && status.background_video_source_fps);
+  if (!Number.isFinite(source) || source <= 0) {
+    return ["Waiting for video timeline measurements", "warn"];
+  }
+  const updates = Number(status.base_composite_update_fps);
+  const skipped = Math.max(0, Number(status.background_video_frames_skipped) || 0);
+  const reused = Math.max(0, Number(status.background_video_frames_reused) || 0);
+  const skipRatio = Number(status.background_video_skip_ratio);
+  const skipText = skipped > 0
+    ? "phase preserved; source frames skipped because visual updates are slower ("
+      + new Intl.NumberFormat().format(skipped)
+      + (Number.isFinite(skipRatio) && skipRatio >= 0
+        ? ", " + (skipRatio * 100).toFixed(1) + "%" : "")
+      + ")"
+    : "phase preserved; no source-frame skips";
+  const reuseText = reused > 0
+    ? " · " + new Intl.NumberFormat().format(reused)
+      + " visual updates reused the current decoded frame"
+    : "";
+  return [
+    "Source " + source.toFixed(1) + " fps · visual updates "
+      + (Number.isFinite(updates) && updates >= 0 ? updates.toFixed(1) : "—")
+      + " fps · " + skipText + reuseText,
+    "",
+  ];
+}
+
 function renderDiagnostics() {
   const status = state.status;
   renderColorCorrectionStatus();
   renderMatteQualityRuntime();
   renderMatteControlPolicy();
+  renderStabilityMitigationAction();
   if (status) {
     const dimensions = status.capture_width && status.capture_height
       ? status.capture_width + " × " + status.capture_height : "Negotiating";
@@ -2972,11 +3418,14 @@ function renderDiagnostics() {
     if (status.background_video_color_status) {
       coreRows.push(["Video colour", ...videoColorSummary(status)]);
     }
+    if (Number(status.background_video_source_fps) > 0) {
+      coreRows.push(["Video cadence", ...videoCadenceSummary(status)]);
+    }
     coreRows.push(
       ["Geometry", geometrySummary(status), ""],
       ["Colour correction", ...colorCorrectionSummary(status)],
       ["Frame processing", formatDiagnostic("frame_processing_ms", status.frame_processing_ms), ""],
-      ["Last unique frame", formatDiagnostic("last_unique_frame_age_ms", status.last_unique_frame_age_ms), status.cadence_mismatch_active ? "warn" : ""],
+      ["Last unique frame", formatDiagnostic("last_unique_frame_age_ms", status.last_unique_frame_age_ms), cadenceShortfallActive(status) ? "warn" : ""],
       ["Serialized deadline misses", new Intl.NumberFormat().format(status.serialized_new_frame_deadline_misses), status.serialized_new_frame_deadline_misses ? "bad" : ""],
       ["Dropped camera frames", new Intl.NumberFormat().format(status.capture_dropped_frames), status.capture_dropped_frames ? "bad" : ""],
       ["Uptime", formatDuration(status.uptime_s), ""],

@@ -1125,7 +1125,8 @@ class VideoBackdrop(BackdropProvider):
                     )
 
     def frame(self, width: int, height: int) -> np.ndarray:
-        self._advance_to_time(self._clock())
+        now = self._clock()
+        self._advance_to_time(now)
         if self._last_raw is None:
             raise RuntimeError("background video has no decodable frame")
         previous = self._last_returned_logical_index
@@ -1145,8 +1146,17 @@ class VideoBackdrop(BackdropProvider):
             and skip_ratio >= 0.10
         ):
             self._skip_warning_emitted = True
+            elapsed_s = max(0.0, now - self._epoch) if self._epoch is not None else 0.0
+            visual_calls = self._frames_displayed + self._frames_reused
+            visual_update_fps = (
+                max(0, visual_calls - 1) / elapsed_s if elapsed_s > 0.0 else 0.0
+            )
             log.warning(
-                "background video is skipping %.1f%% of source frames to retain phase",
+                "background video cadence source_fps=%.3f visual_update_fps=%.3f "
+                "skip_ratio_pct=%.1f phase preserved; source frames skipped because "
+                "visual updates are slower",
+                self._fps,
+                visual_update_fps,
                 skip_ratio * 100.0,
             )
         key = (

@@ -237,23 +237,26 @@ actual selected matte path is MediaPipe. Segmentation controls are marked as
 rebuild/reset changes; model-foreground and light-wrap values remain live
 compositor changes.
 
-The WebUI contains a version-1 preset catalog, but it is intentionally empty.
-The checked-in MATTE-2.5 evidence selects no portable profiles:
+The WebUI consumes the version-1 server-owned system profile catalog. The
+checked-in MATTE evidence still qualifies no portable profiles:
 
 ```text
-performance = unavailable
-balanced = unavailable
-quality = unavailable
+performance = Experimental / no quality claim
+balanced = Experimental / no quality claim
+quality = Experimental / no quality claim
+motion_stable = Experimental / no quality claim
 ```
 
-The panel therefore reports `Custom` and disables those three names instead of
-turning generated proxy evidence into product claims. A future qualified
-catalog entry must set the catalog evidence state to `qualified` and contain
-one non-empty concrete merge patch; definitions otherwise remain inert. The UI
-submits that patch through the existing single transactional `PATCH /config`
-path, so candidate staging, config-versioning, commit, and rollback remain the
-same as manual multi-field activation. A preset name is not persisted
-separately and cannot drift away from its expanded values.
+Each `experimental` or `locally_screened` entry requires explicit
+acknowledgement and remains disabled when its exact CUDA/model/canvas/sink
+requirements are unavailable. An active PyVirtualCam mode is evidence for that
+mode only; cross-canvas selection requires a bounded exact sink-capability fact.
+Because initial entries include restart-only camera/output geometry, the UI
+stages the complete concrete row through `/profiles/apply`; it never applies a
+hot subset against the old canvas. Concrete values, not names, are stored in
+the owner-only managed overlay, so catalog revisions cannot reinterpret a
+saved selection. A future portable promotion must bind second-hardware
+evidence and a new release decision without changing schema-1 defaults.
 
 ## Transactional activation
 

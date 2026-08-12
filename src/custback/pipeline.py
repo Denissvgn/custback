@@ -53,12 +53,13 @@ from .compositor import (
     prepare_static_light_wrap,
 )
 from .config import (
-    AVATAR_PROXY_RESTART_ONLY_FIELDS,
     AppConfig,
     BlendSpace,
     ConfigState,
     ConfigVersionConflictError,
     RuntimeConfig,
+    changed_config_paths,
+    restart_only_config_paths,
     resolved_output_size,
 )
 from .diagnostics import sanitized_config_summary
@@ -88,6 +89,7 @@ from .output_scheduler import (
     thaw_status,
 )
 from .runtime_performance import (
+    RUNTIME_PERFORMANCE_MIN_ATTAINMENT,
     PerformanceEpochKey,
     PublisherTelemetry,
     RuntimePerformanceTracker,
@@ -1719,20 +1721,38 @@ def _log_finalized_performance_epochs(
     for closed in performance.take_finalized_epoch_summaries():
         raw_key = closed.get("key")
         key = raw_key if isinstance(raw_key, Mapping) else {}
+        state = str(closed.get("state", "warming"))
+        output_attainment = cast(float, closed.get("output_attainment", 0.0))
+        unique_attainment = cast(float, closed.get("unique_attainment", 0.0))
+        if state in {"warming", "failed"}:
+            cadence_status = state
+        elif (
+            output_attainment < RUNTIME_PERFORMANCE_MIN_ATTAINMENT
+            or unique_attainment < RUNTIME_PERFORMANCE_MIN_ATTAINMENT
+        ):
+            cadence_status = "unexpected-shortfall"
+        elif performance.unique_target_fps < performance.transport_target_fps:
+            cadence_status = "intentional-repeat"
+        else:
+            cadence_status = "matched"
         log.info(
             "runtime performance epoch finalized config_version=%s "
             "capture_generation=%s segmentation_generation=%s "
-            "backdrop_generation=%s state=%s reason=%s "
+            "backdrop_generation=%s state=%s reason=%s cadence_status=%s "
+            "transport_target_fps=%.3f unique_target_fps=%.3f "
             "output_attainment=%.6f unique_attainment=%.6f "
             "deadline_miss_ratio=%.6f late_send_ratio=%.6f",
             key.get("config_version", 0),
             key.get("capture_generation", 0),
             key.get("segmentation_generation", 0),
             key.get("backdrop_generation", 0),
-            closed.get("state", "warming"),
+            state,
             closed.get("reason", "none"),
-            cast(float, closed.get("output_attainment", 0.0)),
-            cast(float, closed.get("unique_attainment", 0.0)),
+            cadence_status,
+            performance.transport_target_fps,
+            performance.unique_target_fps,
+            output_attainment,
+            unique_attainment,
             cast(float, closed.get("processing_deadline_miss_ratio", 0.0)),
             cast(float, closed.get("output_schedule_late_ratio", 0.0)),
         )
@@ -1801,35 +1821,11 @@ class _MutationRequest:
 
 
 def _changed_paths(old: Any, new: Any, prefix: str = "") -> list[str]:
-    if hasattr(old, "model_dump"):
-        old = old.model_dump(mode="python")
-    if hasattr(new, "model_dump"):
-        new = new.model_dump(mode="python")
-    if isinstance(old, dict) and isinstance(new, dict):
-        changed: list[str] = []
-        for key in sorted(old.keys() | new.keys()):
-            path = f"{prefix}.{key}" if prefix else key
-            if key not in old or key not in new:
-                changed.append(path)
-            else:
-                changed.extend(_changed_paths(old[key], new[key], path))
-        return changed
-    return [] if old == new else [prefix]
+    return changed_config_paths(old, new, prefix)
 
 
 def _restart_only_changes(old: AppConfig, new: AppConfig) -> list[str]:
-    changed = _changed_paths(old, new)
-    return [
-        path
-        for path in changed
-        if path == "schema_version"
-        or path.startswith("camera.")
-        or path.startswith("output.")
-        or (path.startswith("api.") and path != "api.remote_timeout_ms")
-        or path == "background.camera_device"
-        or path.startswith("backdrop_targets.")
-        or path in AVATAR_PROXY_RESTART_ONLY_FIELDS
-    ]
+    return restart_only_config_paths(old, new)
 
 
 class Pipeline:
@@ -2044,20 +2040,37 @@ class Pipeline:
         timeout: float = 5.0,
         *,
         origin: str = "internal",
+        expected_version: int | None = None,
     ) -> ConfigState:
         """Apply one patch and record only sanitized matte rollout outcomes."""
 
         rollout_kind = classify_matte_patch(patch)
         if rollout_kind is None:
-            return self._apply_config_patch(patch, timeout, origin=origin)
-        rollout_attempt = self._matte_rollout.begin(rollout_kind)
-        try:
-            state = self._apply_config_patch(
+            if expected_version is None:
+                return self._apply_config_patch(patch, timeout, origin=origin)
+            return self._apply_config_patch(
                 patch,
                 timeout,
                 origin=origin,
-                rollout_attempt=rollout_attempt,
+                expected_version=expected_version,
             )
+        rollout_attempt = self._matte_rollout.begin(rollout_kind)
+        try:
+            if expected_version is None:
+                state = self._apply_config_patch(
+                    patch,
+                    timeout,
+                    origin=origin,
+                    rollout_attempt=rollout_attempt,
+                )
+            else:
+                state = self._apply_config_patch(
+                    patch,
+                    timeout,
+                    origin=origin,
+                    rollout_attempt=rollout_attempt,
+                    expected_version=expected_version,
+                )
         except BaseException:
             if rollout_attempt.fail():
                 current = self.runtime.read()
@@ -2084,6 +2097,7 @@ class Pipeline:
         *,
         origin: str = "internal",
         rollout_attempt: MatteRolloutAttempt | None = None,
+        expected_version: int | None = None,
     ) -> ConfigState:
         """Validate, activate, commit, and acknowledge a hot configuration patch."""
         if isinstance(patch, dict):
@@ -2102,6 +2116,8 @@ class Pipeline:
                 raise RestartRequiredError(restart_fields, self.runtime.version)
         while True:
             base = self.runtime.read()
+            if expected_version is not None and base.version != expected_version:
+                raise ConfigConflictError(expected_version, base.version)
             candidate = base.config.patched(patch)
             if candidate != base.config:
                 break
@@ -2838,6 +2854,9 @@ class Pipeline:
                 )
             )
             performance = bridge.performance.snapshot()
+            cadence_snapshot = bridge.cadence.snapshot(
+                now_ns=receipt.timing.completed_at_ns
+            )
 
             previous_state = bridge.performance_state
             current_state = str(performance["state"])
@@ -2845,14 +2864,26 @@ class Pipeline:
                 if current_state == "degraded":
                     log.warning(
                         "runtime performance degraded reason=%s output_fps=%.3f "
-                        "unique_fps=%.3f dominant_stage=%s",
+                        "unique_fps=%.3f cadence_status=%s "
+                        "transport_target_fps=%.3f unique_target_fps=%.3f "
+                        "dominant_stage=%s exact_repeat_pct=%.1f",
                         performance["reason"],
                         performance["output_send_fps"],
                         performance["sent_unique_base_fps"],
+                        performance["cadence_status"],
+                        performance["transport_target_fps"],
+                        performance["unique_target_fps"],
                         performance["dominant_stage"] or "none",
+                        cadence_snapshot.exact_final_output_repeat_ratio * 100.0,
                     )
                 elif previous_state == "degraded" and current_state == "healthy":
-                    log.warning("runtime performance recovered")
+                    log.warning(
+                        "runtime performance recovered cadence_status=%s "
+                        "transport_target_fps=%.3f unique_target_fps=%.3f",
+                        performance["cadence_status"],
+                        performance["transport_target_fps"],
+                        performance["unique_target_fps"],
+                    )
                 bridge.performance_state = current_state
 
             status.update(
@@ -2982,9 +3013,17 @@ class Pipeline:
                 else None
             )
             cadence_tracker = CadenceTracker(resources.cfg.output.fps)
+            # A slower requested camera intentionally supplies fewer unique
+            # bases than the transport publishes. Keep that processing domain
+            # distinct from the sink schedule so 15 -> 30 repeats are healthy.
+            unique_target_fps = min(
+                resources.cfg.camera.fps,
+                resources.cfg.output.fps,
+            )
             performance = RuntimePerformanceTracker(
                 resources.cfg.output.fps,
                 self._performance_epoch_key(resources, capture_health),
+                unique_target_fps=unique_target_fps,
                 color_correction_mode=resources.cfg.compositing.color_correction.mode,
                 light_wrap=resources.cfg.compositing.light_wrap,
             )
@@ -3035,9 +3074,11 @@ class Pipeline:
             )
 
             preflight = self._preflight(resources, send_output=False)
-            frame_interval_ms = 1000.0 / resources.cfg.output.fps
+            processing_deadline_ms = 1000.0 / unique_target_fps
             performance.record_processing(
-                deadline_missed=preflight.frame_processing_ms > frame_interval_ms,
+                deadline_missed=(
+                    preflight.frame_processing_ms > processing_deadline_ms
+                ),
                 stages_ms=self._runtime_stage_samples(
                     preflight.timings,
                     preflight.frame_processing_ms,
@@ -3157,7 +3198,7 @@ class Pipeline:
                 policy_epoch=self._publisher_policy.epoch,
                 segmentation_updated=preflight.segmentation_updated,
                 processing_deadline_missed=(
-                    preflight.frame_processing_ms > frame_interval_ms
+                    preflight.frame_processing_ms > processing_deadline_ms
                 ),
                 status=initial_stats,
                 performance_epoch=self._performance_epoch_tuple(
@@ -6363,8 +6404,15 @@ class Pipeline:
         publisher: OutputPublisher | None = None,
         publisher_bridge: _PublisherBridge | None = None,
     ) -> None:
-        frame_interval_ns = round(1_000_000_000 / resources.cfg.output.fps)
-        frame_interval_ms = frame_interval_ns / 1_000_000.0
+        # Publication/reuse remains output-paced. Processing gets the wider
+        # unique-base budget when the requested camera cadence is lower; this
+        # changes only deadline accounting, never exact-repeat scheduling.
+        transport_interval_ns = round(1_000_000_000 / resources.cfg.output.fps)
+        transport_interval_ms = transport_interval_ns / 1_000_000.0
+        processing_deadline_ms = 1000.0 / min(
+            resources.cfg.camera.fps,
+            resources.cfg.output.fps,
+        )
         if cadence_tracker is None:
             cadence_tracker = CadenceTracker(resources.cfg.output.fps)
         if stage_ewma is None:
@@ -6421,10 +6469,10 @@ class Pipeline:
         next_cycle_start_ns = (
             loop_clock_ns
             if preflight is None
-            else preflight.send_timing.submitted_at_ns + frame_interval_ns
+            else preflight.send_timing.submitted_at_ns + transport_interval_ns
         )
         next_output_deadline_ns = (
-            loop_clock_ns + frame_interval_ns
+            loop_clock_ns + transport_interval_ns
             if preflight is None
             else next_cycle_start_ns
         )
@@ -6598,7 +6646,7 @@ class Pipeline:
                         # The publisher already emits its fixed slate after the
                         # fence. Do not manufacture a processed "unique" base
                         # before a response for this exact raw epoch exists.
-                        next_cycle_start_ns = service_started_ns + frame_interval_ns
+                        next_cycle_start_ns = service_started_ns + transport_interval_ns
                         continue
 
                     proof_reader = getattr(
@@ -6623,7 +6671,7 @@ class Pipeline:
                         )
                         remote_probe = (probe_frame, probe_reason, 0, 0, 0)
                     if remote_probe[0] is None and remote_probe[4] == 0:
-                        next_cycle_start_ns = service_started_ns + frame_interval_ns
+                        next_cycle_start_ns = service_started_ns + transport_interval_ns
                         continue
                     if (
                         remote_probe[4] > 0
@@ -6633,7 +6681,7 @@ class Pipeline:
                         # the handoff/publication lane. Do not manufacture a
                         # second unique base with the same capture provenance
                         # while waiting for its first-send receipt.
-                        next_cycle_start_ns = service_started_ns + frame_interval_ns
+                        next_cycle_start_ns = service_started_ns + transport_interval_ns
                         continue
                     assert remote_pending_capture is not None
                     captured = remote_pending_capture
@@ -6726,7 +6774,9 @@ class Pipeline:
                     matte_evidence.timings_ms["frame_processing_ms"] = (
                         frame_processing_ms
                     )
-                processing_deadline_missed = frame_processing_ms > frame_interval_ms
+                processing_deadline_missed = (
+                    frame_processing_ms > processing_deadline_ms
+                )
                 samples = (
                     *timings.items(),
                     ("frame_processing_ms", frame_processing_ms),
@@ -6738,10 +6788,10 @@ class Pipeline:
                     # The publication lane owns exact target-paced reuse.  A
                     # missing capture must never re-enter segmentation,
                     # backdrop, colour, matte, or harmonizer state.
-                    self._stop.wait(min(0.002, frame_interval_ms / 1000.0))
+                    self._stop.wait(min(0.002, transport_interval_ms / 1000.0))
                     continue
                 if last_output is None:
-                    self._stop.wait(min(0.01, frame_interval_ms / 1000.0))
+                    self._stop.wait(min(0.01, transport_interval_ms / 1000.0))
                     continue
                 out_frame = last_output
 
@@ -7059,7 +7109,7 @@ class Pipeline:
                 # must not retain an older output raster/envelope between cycles.
                 del base
                 del out_frame
-                next_cycle_start_ns = service_started_ns + frame_interval_ns
+                next_cycle_start_ns = service_started_ns + transport_interval_ns
                 if publisher.error is not None:
                     raise OutputPublisherError(
                         "output publisher failed"
@@ -7092,7 +7142,7 @@ class Pipeline:
                     (send_timing.completed_at_ns - serialized_started_ns) / 1_000_000.0,
                 )
                 serialized_deadline_missed = (
-                    new_frame_serialized_loop_ms > frame_interval_ms + 1.0
+                    new_frame_serialized_loop_ms > transport_interval_ms + 1.0
                 )
 
             cadence_tracker.record_send(
@@ -7122,8 +7172,10 @@ class Pipeline:
             # starts the next capture immediately instead of adding a full
             # interval of avoidable delay. The wait is carried to the top of
             # the next cycle so capture is sampled after, never before, pacing.
-            next_cycle_start_ns = service_started_ns + frame_interval_ns
-            next_output_deadline_ns = send_timing.submitted_at_ns + frame_interval_ns
+            next_cycle_start_ns = service_started_ns + transport_interval_ns
+            next_output_deadline_ns = (
+                send_timing.submitted_at_ns + transport_interval_ns
+            )
             last_output = out_frame
 
             if matte_evidence is not None:

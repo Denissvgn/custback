@@ -724,14 +724,20 @@ def _status_overlay_lines(
 
     timing_mode = str(stats.get("background_video_timing_mode") or "")
     source_fps = _as_float(stats.get("background_video_source_fps"))
+    video_update_fps = _as_float(stats.get("base_composite_update_fps"))
     video_frames = _as_int(stats.get("background_video_frames_displayed")) or 0
     if timing_mode or source_fps or video_frames:
         skip_ratio = _as_float(stats.get("background_video_skip_ratio")) or 0.0
         status.append(
             "VIDEO "
-            + (f"{source_fps:.1f} fps  " if source_fps else "")
+            + (f"source {source_fps:.1f} fps  " if source_fps else "")
+            + (
+                f"visual updates {video_update_fps:.1f} fps  "
+                if video_update_fps is not None
+                else ""
+            )
             + (f"{timing_mode}  " if timing_mode else "")
-            + f"skip {skip_ratio * 100:.0f}%"
+            + f"skip {skip_ratio * 100:.0f}% (preserves playback phase)"
         )
 
     base_update_fps = _as_float(stats.get("base_composite_update_fps"))
@@ -762,7 +768,26 @@ def _status_overlay_lines(
     elif stats.get("capture_target_met") is False:
         warnings.append("CAPTURE BELOW TARGET")
 
-    if stats.get("cadence_mismatch_active"):
+    performance = stats.get("runtime_performance")
+    cadence_status = (
+        str(performance.get("cadence_status") or "")
+        if isinstance(performance, Mapping)
+        else ""
+    )
+    if stats.get("cadence_mismatch_active") and cadence_status == "intentional-repeat":
+        if not isinstance(performance, Mapping):  # pragma: no cover - derived above
+            raise TypeError("intentional cadence status requires a performance mapping")
+        unique_target = _as_float(performance.get("unique_target_fps"))
+        transport_target = _as_float(performance.get("transport_target_fps"))
+        if unique_target is not None and transport_target is not None:
+            status.append(
+                f"CADENCE INTENTIONAL REPEAT {unique_target:.0f} -> "
+                f"{transport_target:.0f} FPS"
+            )
+    elif stats.get("cadence_mismatch_active") and cadence_status not in {
+        "warming",
+        "matched",
+    }:
         if base_update_fps is not None and output_send_fps is not None:
             warnings.append(
                 f"VISUAL UPDATES {base_update_fps:.0f} FPS; "

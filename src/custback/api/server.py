@@ -70,7 +70,12 @@ from ..runtime_performance import (
 )
 from ..storage_tx import OwnedPath, OwnershipLedger, rename_noreplace
 from .security import SESSION_COOKIE, SecurityPolicy
-from .streaming import ConnectionLimiter, JpegBroadcaster, LeasedStreamingResponse
+from .streaming import (
+    ConnectionLimiter,
+    JpegBroadcaster,
+    LeasedStreamingResponse,
+    stream_lifecycle_for,
+)
 
 try:
     import cv2
@@ -730,6 +735,13 @@ class _MatteRolloutResponse(BaseModel):
 
 
 _RuntimePerformanceState = Literal["warming", "healthy", "degraded", "failed"]
+_RuntimeCadenceStatus = Literal[
+    "warming",
+    "matched",
+    "intentional-repeat",
+    "unexpected-shortfall",
+    "failed",
+]
 _RuntimePerformanceReason = Literal[
     "none",
     "output-attainment",
@@ -974,10 +986,35 @@ _RuntimeMitigationResponse = (
 class _RuntimePerformanceResponse(_RuntimeMetricsResponse):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     state: _RuntimePerformanceState
     reason: _RuntimePerformanceReason
-    target_fps: float = Field(ge=0.0, le=1000.0)
+    cadence_status: _RuntimeCadenceStatus
+    target_fps: float = Field(
+        ge=0.0,
+        le=1000.0,
+        description="Compatibility alias for transport_target_fps.",
+    )
+    transport_target_fps: float = Field(
+        ge=0.0,
+        le=1000.0,
+        description="Target rate for sink publication, including exact repeats.",
+    )
+    unique_target_fps: float = Field(
+        ge=0.0,
+        le=1000.0,
+        description="Target rate for newly adopted guarded bases.",
+    )
+    transport_deadline_ms: float = Field(
+        ge=0.0,
+        le=3_600_000.0,
+        description="Output schedule and serialized transport interval.",
+    )
+    processing_deadline_ms: float = Field(
+        ge=0.0,
+        le=3_600_000.0,
+        description="Processing-only interval in the unique-base domain.",
+    )
     output_healthy: bool
     unique_healthy: bool
     current_epoch: _RuntimeEpochResponse
@@ -1332,11 +1369,45 @@ def _map_apply_error(exc: BaseException) -> HTTPException:
     raise exc
 
 
-def _apply_patch(runtime: RuntimeConfig, coordinator: Any, patch: dict[str, Any]):
+def _apply_patch(
+    runtime: RuntimeConfig,
+    coordinator: Any,
+    patch: dict[str, Any],
+    *,
+    expected_version: int | None = None,
+):
     try:
-        return coordinator.apply_config_patch(patch, timeout=5.0, origin="api")
+        kwargs: dict[str, Any] = {"origin": "api"}
+        if expected_version is not None:
+            kwargs["expected_version"] = expected_version
+        return coordinator.apply_config_patch(patch, timeout=5.0, **kwargs)
     except BaseException as exc:
         raise _map_apply_error(exc) from exc
+
+
+def _conditional_config_version(request: Request) -> int | None:
+    raw = request.headers.get("x-expected-config-version")
+    if raw is None:
+        return None
+    if (
+        len(raw) > 19
+        or not raw.isascii()
+        or not raw.isdecimal()
+        or (len(raw) > 1 and raw.startswith("0"))
+    ):
+        raise _error(
+            422,
+            "invalid_content",
+            "X-Expected-Config-Version must be a canonical non-negative integer",
+        )
+    value = int(raw)
+    if value > 2**63 - 1:
+        raise _error(
+            422,
+            "invalid_content",
+            "X-Expected-Config-Version is outside the supported range",
+        )
+    return value
 
 
 def _version(runtime: RuntimeConfig) -> str:
@@ -2432,6 +2503,7 @@ def create_app(
     upload_dir: Path | None = None,
     avatar_client_factory: Any = None,
     on_shutdown: Callable[[], None] | None = None,
+    profile_service: Any = None,
 ) -> FastAPI:
     """Create the authenticated API bound to the active pipeline coordinator.
 
@@ -2457,6 +2529,7 @@ def create_app(
         docs_url=None,
         redoc_url=None,
     )
+    stream_lifecycle = stream_lifecycle_for(app)
     startup_api = _state(runtime).config.api
     stream_connections = ConnectionLimiter(startup_api.max_stream_connections)
     output_jpegs = JpegBroadcaster(hub.output, _encode_jpeg)
@@ -2467,7 +2540,12 @@ def create_app(
     store.cleanup_staged(_state(runtime).config)
     cleanup_queue = _StagedCleanupQueue(runtime, coordinator, store)
     thumbnails = ThumbnailCache()
-    register_avatar_proxy(app, runtime, client_factory=avatar_client_factory)
+    register_avatar_proxy(
+        app,
+        runtime,
+        stream_connections=stream_connections,
+        client_factory=avatar_client_factory,
+    )
     default_openapi = app.openapi
 
     def authenticated_openapi():
@@ -2703,10 +2781,136 @@ def create_app(
         )
         if not isinstance(patch, dict):
             raise _error(422, "invalid_content", "config patch must be a JSON object")
-        state = await asyncio.to_thread(_apply_patch, runtime, coordinator, patch)
+        expected_version = _conditional_config_version(request)
+        state = await asyncio.to_thread(
+            _apply_patch,
+            runtime,
+            coordinator,
+            patch,
+            expected_version=expected_version,
+        )
         return JSONResponse(
             {"config": _state_body(state), "config_version": state.version},
             headers={"X-Config-Version": str(state.version)},
+        )
+
+    @app.get("/profiles")
+    async def get_profiles() -> JSONResponse:
+        if profile_service is None:
+            raise _error(
+                503,
+                "profiles_unavailable",
+                "managed profile preferences are not available in this process",
+            )
+        try:
+            body = await asyncio.to_thread(profile_service.status)
+        except Exception as exc:
+            from ..profile_service import ProfileServiceError
+
+            if isinstance(exc, ProfileServiceError):
+                raise _error(exc.status, exc.code, str(exc)) from exc
+            log.exception("profile status failed")
+            raise _error(500, "profile_error", "profile status is unavailable") from exc
+        return JSONResponse(
+            body,
+            headers={"X-Config-Version": str(body["config_version"])},
+        )
+
+    @app.post("/profiles/apply")
+    async def apply_profile(request: Request) -> JSONResponse:
+        if profile_service is None:
+            raise _error(
+                503,
+                "profiles_unavailable",
+                "managed profile preferences are not available in this process",
+            )
+        body = await _limited_json(request, CONFIG_REQUEST_MAX_BYTES)
+        if not isinstance(body, dict) or set(body) != {
+            "selections",
+            "expected_config_version",
+            "expected_preferences_revision",
+            "accept_experimental",
+        }:
+            raise _error(422, "invalid_content", "profile apply request is invalid")
+        selections = body["selections"]
+        if (
+            not isinstance(selections, dict)
+            or not selections
+            or len(selections) > 2
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in selections.items()
+            )
+            or type(body["expected_config_version"]) is not int
+            or type(body["expected_preferences_revision"]) is not int
+            or type(body["accept_experimental"]) is not bool
+        ):
+            raise _error(422, "invalid_content", "profile apply request is invalid")
+        try:
+            result = await asyncio.to_thread(
+                profile_service.apply,
+                selections,
+                expected_config_version=body["expected_config_version"],
+                expected_preferences_revision=body["expected_preferences_revision"],
+                accept_experimental=body["accept_experimental"],
+            )
+        except Exception as exc:
+            from ..profile_service import ProfileServiceError
+
+            if isinstance(exc, ProfileServiceError):
+                raise _error(exc.status, exc.code, str(exc)) from exc
+            log.exception("profile apply failed")
+            raise _error(
+                500, "profile_error", "profile selection could not be saved"
+            ) from exc
+        return JSONResponse(
+            result,
+            headers={"X-Config-Version": str(result["config_version"])},
+        )
+
+    @app.post("/profiles/reset")
+    async def reset_profiles(request: Request) -> JSONResponse:
+        if profile_service is None:
+            raise _error(
+                503,
+                "profiles_unavailable",
+                "managed profile preferences are not available in this process",
+            )
+        body = await _limited_json(request, CONFIG_REQUEST_MAX_BYTES)
+        if not isinstance(body, dict) or set(body) != {
+            "axes",
+            "expected_config_version",
+            "expected_preferences_revision",
+        }:
+            raise _error(422, "invalid_content", "profile reset request is invalid")
+        axes = body["axes"]
+        if (
+            not isinstance(axes, list)
+            or not 1 <= len(axes) <= 2
+            or any(not isinstance(axis, str) for axis in axes)
+            or type(body["expected_config_version"]) is not int
+            or type(body["expected_preferences_revision"]) is not int
+        ):
+            raise _error(422, "invalid_content", "profile reset request is invalid")
+        try:
+            result = await asyncio.to_thread(
+                profile_service.reset,
+                axes,
+                expected_config_version=body["expected_config_version"],
+                expected_preferences_revision=body["expected_preferences_revision"],
+            )
+        except Exception as exc:
+            from ..profile_service import ProfileServiceError
+
+            if isinstance(exc, ProfileServiceError):
+                raise _error(exc.status, exc.code, str(exc)) from exc
+            log.exception("profile reset failed")
+            raise _error(
+                500, "profile_error", "profile preferences could not be reset"
+            ) from exc
+        return JSONResponse(
+            result,
+            headers={"X-Config-Version": str(result["config_version"])},
         )
 
     @app.get("/backgrounds", response_model=_BackgroundListResponse)
@@ -2964,6 +3168,10 @@ def create_app(
                 "stream_limit",
                 "authenticated stream connection limit reached",
             )
+        registration = stream_lifecycle.register("core_mjpeg")
+        if registration is None:
+            lease.release()
+            raise _error(503, "api_shutting_down", "the API is shutting down")
 
         async def gen():
             try:
@@ -2991,6 +3199,7 @@ def create_app(
         return LeasedStreamingResponse(
             gen(),
             lease=lease,
+            registration=registration,
             media_type=f"multipart/x-mixed-replace; boundary={boundary}",
         )
 
@@ -3032,8 +3241,24 @@ def create_app(
             )
             return
 
-        remote_session = None
+        accepted = False
+
+        async def close_for_shutdown() -> None:
+            if accepted:
+                with contextlib.suppress(RuntimeError):
+                    await ws.close(code=1012, reason="API shutting down")
+
         renderer_connection = bool(stream == "raw" and renderer_authenticated)
+        registration = stream_lifecycle.register(
+            "renderer_websocket" if renderer_connection else "management_websocket",
+            close=close_for_shutdown,
+        )
+        if registration is None:
+            lease.release()
+            await _deny_ws(ws, 503, 1012, "API shutting down")
+            return
+
+        remote_session = None
         try:
             canvas_width, canvas_height = resolved_output_size(_state(runtime).config)
             await ws.accept(
@@ -3042,6 +3267,7 @@ def create_app(
                     (b"x-custback-frame-height", str(canvas_height).encode("ascii")),
                 ]
             )
+            accepted = True
             remote_session = (
                 hub.remote_client_connected() if renderer_connection else None
             )
@@ -3179,6 +3405,7 @@ def create_app(
         finally:
             if remote_session is not None:
                 hub.remote_client_disconnected(remote_session)
+            registration.release()
             lease.release()
 
     return app

@@ -30,6 +30,7 @@ include docs/matte-rvm-qualification-local-template.json
 include docs/matte-spatial-refinement.md
 include docs/matte-visual-qualification.md
 include docs/matte-visual-qualification-local-template.json
+include docs/system-profiles.md
 include docs/visual-consistency-phase4-qualification-runbook.md
 include docs/visual-consistency-phase4-qualification-template.json
 include docs/visual-consistency-rollout.md
@@ -65,6 +66,7 @@ include tests/test_remote_protocol.py
 include tests/test_runtime_performance.py
 include tests/test_runtime_performance_status.py
 include tests/test_spatial_edge_refinement.py
+include tests/test_system_profiles.py
 include tests/test_vcam_timing.py
 include tests/visual_consistency_evidence.py
 recursive-include tests/fixtures/migration *.json *.yaml

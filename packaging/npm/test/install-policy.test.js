@@ -342,11 +342,167 @@ test('launcher exposes durable extras flags, avatar alias dispatch, and config e
   assert.throws(() => launcher.exportAvatarConfig([destination]), /EEXIST/);
 });
 
+test('purge previews and removes only the selected owned runtime', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-purge-cli-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'runtime');
+  const generationRoot = managed.ensureGenerationsRoot(target);
+  const makeGeneration = () => {
+    const generation = managed.createGeneration(generationRoot);
+    fs.mkdirSync(path.join(generation, 'bin'));
+    fs.writeFileSync(path.join(generation, 'pyvenv.cfg'), 'home = /python\n');
+    fs.writeFileSync(path.join(generation, 'bin', 'python'), '#!/bin/sh\n');
+    fs.writeFileSync(path.join(generation, 'bin', 'custback'), '#!/bin/sh\n');
+    managed.markGeneration(generation, target);
+    return generation;
+  };
+  const rollback = makeGeneration();
+  managed.promoteGeneration({
+    target,
+    generation: rollback,
+    inspection: managed.inspectTarget(target),
+    validateActive() {},
+  });
+  const active = makeGeneration();
+  managed.promoteGeneration({
+    target,
+    generation: active,
+    inspection: managed.inspectTarget(target),
+    validateActive() {},
+  });
+  installer.writeInstallIntent(target, ['gpu']);
+  const sentinel = path.join(root, 'keep-me');
+  fs.writeFileSync(sentinel, 'unrelated');
+
+  const packageRoot = path.join(root, 'package');
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'cwd');
+  const tmpRoot = path.join(root, 'tmp');
+  for (const directory of [packageRoot, home, cwd, tmpRoot]) fs.mkdirSync(directory);
+  let output = '';
+  const options = {
+    target,
+    pkgRoot: packageRoot,
+    home,
+    cwd,
+    tmpRoot,
+    output: { write(chunk) { output += chunk; } },
+  };
+
+  assert.deepEqual(launcher.parsePurgeArgs([]), { dryRun: true, confirmed: false });
+  assert.deepEqual(launcher.parsePurgeArgs(['--dry-run']), { dryRun: true, confirmed: false });
+  assert.deepEqual(launcher.parsePurgeArgs(['--yes']), { dryRun: false, confirmed: true });
+  assert.throws(() => launcher.parsePurgeArgs(['--yes', '--dry-run']), /usage/);
+  assert.throws(() => launcher.parsePurgeArgs(['--yes', '--yes']), /only once/);
+  assert.throws(() => launcher.parsePurgeArgs(['--force']), /unknown purge option/);
+
+  assert.equal(launcher.purge([], options), 0);
+  assert.match(output, /would remove owned runtime artifacts/);
+  assert.match(output, new RegExp(active.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(fs.existsSync(target), true);
+  assert.equal(fs.existsSync(active), true);
+  assert.equal(fs.existsSync(rollback), true);
+  assert.equal(fs.existsSync(installer.installIntentPath(target)), true);
+
+  output = '';
+  assert.equal(launcher.main(['purge'], { ...options, executable: 'custback' }), 0);
+  assert.match(output, /would remove owned runtime artifacts/);
+
+  output = '';
+  assert.equal(launcher.purge(['--yes'], options), 0);
+  assert.match(output, /removed owned runtime artifacts/);
+  assert.equal(fs.existsSync(target), false);
+  assert.equal(fs.existsSync(active), false);
+  assert.equal(fs.existsSync(rollback), false);
+  assert.equal(fs.existsSync(installer.installIntentPath(target)), false);
+  assert.deepEqual(fs.readdirSync(generationRoot), [managed.GENERATIONS_MARKER]);
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'unrelated');
+
+  output = '';
+  assert.equal(launcher.purge(['--yes'], options), 0);
+  assert.match(output, /no owned managed runtime artifacts/);
+});
+
+test('purge refuses foreign managed-root content before removing any runtime artifact', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-purge-foreign-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'runtime');
+  const generationRoot = managed.ensureGenerationsRoot(target);
+  const generation = managed.createGeneration(generationRoot);
+  fs.mkdirSync(path.join(generation, 'bin'));
+  fs.writeFileSync(path.join(generation, 'pyvenv.cfg'), 'home = /python\n');
+  fs.writeFileSync(path.join(generation, 'bin', 'python'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(generation, 'bin', 'custback'), '#!/bin/sh\n');
+  managed.markGeneration(generation, target);
+  managed.promoteGeneration({
+    target,
+    generation,
+    inspection: managed.inspectTarget(target),
+    validateActive() {},
+  });
+  installer.writeInstallIntent(target, []);
+  const foreign = path.join(generationRoot, 'do-not-delete');
+  fs.writeFileSync(foreign, 'foreign');
+
+  const packageRoot = path.join(root, 'package');
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'cwd');
+  const tmpRoot = path.join(root, 'tmp');
+  for (const directory of [packageRoot, home, cwd, tmpRoot]) fs.mkdirSync(directory);
+  assert.throws(
+    () => launcher.purge(['--yes'], {
+      target,
+      pkgRoot: packageRoot,
+      home,
+      cwd,
+      tmpRoot,
+      output: { write() {} },
+    }),
+    /unexpected entry/,
+  );
+  assert.equal(fs.existsSync(target), true);
+  assert.equal(fs.existsSync(generation), true);
+  assert.equal(fs.existsSync(installer.installIntentPath(target)), true);
+  assert.equal(fs.readFileSync(foreign, 'utf8'), 'foreign');
+});
+
+test('purge retires a validated direct legacy venv through the managed lock', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-purge-legacy-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'legacy-runtime');
+  fs.mkdirSync(path.join(target, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(target, 'pyvenv.cfg'), 'home = /python\n');
+  fs.writeFileSync(path.join(target, 'bin', 'python'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(target, 'bin', 'custback'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(target, managed.LEGACY_STAMP), '0.2.0 python3.12 3.12 []\n');
+  installer.writeInstallIntent(target, []);
+
+  const packageRoot = path.join(root, 'package');
+  const home = path.join(root, 'home');
+  const cwd = path.join(root, 'cwd');
+  const tmpRoot = path.join(root, 'tmp');
+  for (const directory of [packageRoot, home, cwd, tmpRoot]) fs.mkdirSync(directory);
+  const generationRoot = managed.generationsRootFor(target);
+  assert.equal(fs.existsSync(generationRoot), false);
+  assert.equal(launcher.purge(['--yes'], {
+    target,
+    pkgRoot: packageRoot,
+    home,
+    cwd,
+    tmpRoot,
+    output: { write() {} },
+  }), 0);
+  assert.equal(fs.existsSync(target), false);
+  assert.equal(fs.existsSync(installer.installIntentPath(target)), false);
+  assert.deepEqual(fs.readdirSync(generationRoot), [managed.GENERATIONS_MARKER]);
+});
+
 test('launcher rebuild delegates to installer and never recursively deletes VENV_DIR', () => {
   const source = fs.readFileSync(path.resolve(__dirname, '..', 'custback.js'), 'utf8');
   assert.match(source, /bootstrap\(true,\s*parsed\.extras\)/);
   assert.doesNotMatch(source, /rmSync\s*\(\s*VENV_DIR/);
   assert.doesNotMatch(source, /rmSync\s*\(\s*targetPath/);
+  assert.ok(source.indexOf("command === 'purge'") < source.indexOf('!managedAppExists(target)'));
 });
 
 test('doctor explains installed backend quality tiers with actionable rebuild commands', () => {

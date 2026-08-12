@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Literal, cast
 
-RUNTIME_PERFORMANCE_SCHEMA_VERSION = 1
+RUNTIME_PERFORMANCE_SCHEMA_VERSION = 2
 RUNTIME_PERFORMANCE_WINDOW_NS = 5_000_000_000
 RUNTIME_PERFORMANCE_SAMPLE_LIMIT = 2048
 RUNTIME_PERFORMANCE_WARMUP_NS = 3_000_000_000
@@ -54,6 +54,13 @@ RUNTIME_STAGE_NAMES = (
 )
 
 PerformanceState = Literal["warming", "healthy", "degraded", "failed"]
+CadenceStatus = Literal[
+    "warming",
+    "matched",
+    "intentional-repeat",
+    "unexpected-shortfall",
+    "failed",
+]
 PerformanceReason = Literal[
     "none",
     "output-attainment",
@@ -77,6 +84,13 @@ _MAX_PUBLIC_COUNT = 2**63 - 1
 _MAX_PUBLIC_RATE = 10_000.0
 _MAX_PUBLIC_RATIO = 10_000.0
 _PERFORMANCE_STATES = {"warming", "healthy", "degraded", "failed"}
+_CADENCE_STATUSES = {
+    "warming",
+    "matched",
+    "intentional-repeat",
+    "unexpected-shortfall",
+    "failed",
+}
 _PERFORMANCE_REASONS = {
     "none",
     "output-attainment",
@@ -143,7 +157,12 @@ _TOP_LEVEL_NAMES = frozenset(
         "schema_version",
         "state",
         "reason",
+        "cadence_status",
         "target_fps",
+        "transport_target_fps",
+        "unique_target_fps",
+        "transport_deadline_ms",
+        "processing_deadline_ms",
         *_METRIC_NAMES,
         "output_healthy",
         "unique_healthy",
@@ -199,7 +218,10 @@ def _strict_mapping(
     name: str,
 ) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or set(value) != fields:
-        raise ValueError(f"{name} must contain exactly the version-1 fields")
+        raise ValueError(
+            f"{name} must contain exactly the version-"
+            f"{RUNTIME_PERFORMANCE_SCHEMA_VERSION} fields"
+        )
     return cast(Mapping[str, object], value)
 
 
@@ -422,7 +444,7 @@ def _validated_mitigation(
 
 
 def empty_runtime_performance_status() -> dict[str, object]:
-    """Return the deterministic pre-ready version-1 public snapshot."""
+    """Return the deterministic pre-ready version-2 public snapshot."""
 
     stages = dict.fromkeys(RUNTIME_STAGE_NAMES)
     metrics: dict[str, object] = {
@@ -452,7 +474,12 @@ def empty_runtime_performance_status() -> dict[str, object]:
         "schema_version": RUNTIME_PERFORMANCE_SCHEMA_VERSION,
         "state": "warming",
         "reason": "none",
+        "cadence_status": "warming",
         "target_fps": 0.0,
+        "transport_target_fps": 0.0,
+        "unique_target_fps": 0.0,
+        "transport_deadline_ms": 0.0,
+        "processing_deadline_ms": 0.0,
         **metrics,
         "output_healthy": False,
         "unique_healthy": False,
@@ -466,7 +493,7 @@ def empty_runtime_performance_status() -> dict[str, object]:
 
 
 def validate_runtime_performance_status(value: object) -> dict[str, object]:
-    """Validate and defensively copy one strict path-free v1 snapshot."""
+    """Validate and defensively copy one strict path-free v2 snapshot."""
 
     raw = _strict_mapping(value, _TOP_LEVEL_NAMES, "runtime performance")
     if raw["schema_version"] != RUNTIME_PERFORMANCE_SCHEMA_VERSION:
@@ -518,16 +545,86 @@ def validate_runtime_performance_status(value: object) -> dict[str, object]:
     ):
         raise ValueError("runtime performance health flags are inconsistent")
 
+    target_fps = _finite_float(
+        raw["target_fps"],
+        "runtime performance target FPS",
+        minimum=0.0,
+        maximum=1000.0,
+    )
+    transport_target_fps = _finite_float(
+        raw["transport_target_fps"],
+        "runtime performance transport target FPS",
+        minimum=0.0,
+        maximum=1000.0,
+    )
+    unique_target_fps = _finite_float(
+        raw["unique_target_fps"],
+        "runtime performance unique target FPS",
+        minimum=0.0,
+        maximum=1000.0,
+    )
+    if target_fps != transport_target_fps:
+        raise ValueError("runtime performance target FPS alias is inconsistent")
+    if unique_target_fps > transport_target_fps:
+        raise ValueError("runtime performance unique target exceeds transport target")
+    if (transport_target_fps == 0.0) != (unique_target_fps == 0.0):
+        raise ValueError(
+            "runtime performance target domains must both be zero or positive"
+        )
+    if transport_target_fps == 0.0 and state != "warming":
+        raise ValueError("zero runtime performance targets are pre-ready only")
+
+    transport_deadline_ms = _finite_float(
+        raw["transport_deadline_ms"],
+        "runtime performance transport deadline",
+        minimum=0.0,
+        maximum=_MAX_PUBLIC_DURATION_MS,
+    )
+    processing_deadline_ms = _finite_float(
+        raw["processing_deadline_ms"],
+        "runtime performance processing deadline",
+        minimum=0.0,
+        maximum=_MAX_PUBLIC_DURATION_MS,
+    )
+    expected_transport_deadline_ms = (
+        0.0 if transport_target_fps == 0.0 else _rounded(1000.0 / transport_target_fps)
+    )
+    expected_processing_deadline_ms = (
+        0.0 if unique_target_fps == 0.0 else _rounded(1000.0 / unique_target_fps)
+    )
+    if (
+        transport_deadline_ms != expected_transport_deadline_ms
+        or processing_deadline_ms != expected_processing_deadline_ms
+    ):
+        raise ValueError("runtime performance deadline domains are inconsistent")
+
+    cadence_status = raw["cadence_status"]
+    if not isinstance(cadence_status, str) or cadence_status not in _CADENCE_STATUSES:
+        raise ValueError("runtime performance cadence status is invalid")
+    expected_cadence_status: CadenceStatus
+    if state == "warming":
+        expected_cadence_status = "warming"
+    elif state == "failed":
+        expected_cadence_status = "failed"
+    elif not output_healthy or not unique_healthy:
+        expected_cadence_status = "unexpected-shortfall"
+    elif unique_target_fps < transport_target_fps:
+        expected_cadence_status = "intentional-repeat"
+    else:
+        expected_cadence_status = "matched"
+    if cadence_status != expected_cadence_status:
+        raise ValueError("runtime performance cadence status is inconsistent")
+
     return {
         "schema_version": RUNTIME_PERFORMANCE_SCHEMA_VERSION,
         "state": state,
         "reason": reason,
-        "target_fps": _finite_float(
-            raw["target_fps"],
-            "runtime performance target FPS",
-            minimum=0.0,
-            maximum=1000.0,
-        ),
+        "cadence_status": cadence_status,
+        "target_fps": target_fps,
+        "transport_target_fps": transport_target_fps,
+        "unique_target_fps": unique_target_fps,
+        "transport_deadline_ms": transport_deadline_ms,
+        "processing_deadline_ms": processing_deadline_ms,
         **metrics,
         "output_healthy": output_healthy,
         "unique_healthy": unique_healthy,
@@ -652,7 +749,8 @@ class RuntimePerformanceTracker:
 
     Callers mark the transition to steady state with :meth:`mark_ready`.
     Processing and output are recorded independently so a paced publisher can
-    remain healthy while unique visual updates correctly report degradation.
+    carry intentional repeats while unique visual updates remain qualified
+    against their own target, or report a real shortfall independently.
     Generation changes must be supplied through :meth:`bind_epoch`. Publisher
     envelopes call :meth:`retain_epoch` before handoff and :meth:`release_epoch`
     exactly once when they leave the depth-one publisher. Closed buckets still
@@ -665,12 +763,21 @@ class RuntimePerformanceTracker:
         target_output_fps: float,
         epoch_key: PerformanceEpochKey,
         *,
+        unique_target_fps: float | None = None,
         color_correction_mode: ColorCorrectionMode = "off",
         light_wrap: float = 0.0,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
-        self._target_fps = _finite_float(
+        self._transport_target_fps = _finite_float(
             target_output_fps, "target output FPS", minimum=0.001, maximum=1000.0
+        )
+        self._unique_target_fps = _finite_float(
+            self._transport_target_fps
+            if unique_target_fps is None
+            else unique_target_fps,
+            "unique target FPS",
+            minimum=0.001,
+            maximum=self._transport_target_fps,
         )
         if not isinstance(epoch_key, PerformanceEpochKey):
             raise TypeError("epoch key must be a PerformanceEpochKey")
@@ -713,6 +820,18 @@ class RuntimePerformanceTracker:
 
         with self._lock:
             return len(self._samples)
+
+    @property
+    def transport_target_fps(self) -> float:
+        """Return the immutable sink-publication target for this run."""
+
+        return self._transport_target_fps
+
+    @property
+    def unique_target_fps(self) -> float:
+        """Return the immutable unique-base target for this run."""
+
+        return self._unique_target_fps
 
     @property
     def current_epoch_key(self) -> PerformanceEpochKey:
@@ -1122,8 +1241,8 @@ class RuntimePerformanceTracker:
             output_fps = output_count / duration_s
             processing_fps = processing_count / duration_s
             unique_fps = unique_count / duration_s
-        output_attainment = output_fps / self._target_fps
-        unique_attainment = unique_fps / self._target_fps
+        output_attainment = output_fps / self._transport_target_fps
+        unique_attainment = unique_fps / self._unique_target_fps
         miss_ratio = deadline_misses / processing_count if processing_count else 0.0
         late_ratio = late_sends / output_count if output_count else 0.0
 
@@ -1240,8 +1359,12 @@ class RuntimePerformanceTracker:
         deadline_misses = sum(sample.processing_deadline_missed for sample in samples)
         output_fps = output_count / duration_s if duration_s > 0.0 else 0.0
         unique_fps = unique_count / duration_s if duration_s > 0.0 else 0.0
-        output_bad = output_fps / self._target_fps < RUNTIME_PERFORMANCE_MIN_ATTAINMENT
-        unique_bad = unique_fps / self._target_fps < RUNTIME_PERFORMANCE_MIN_ATTAINMENT
+        output_bad = (
+            output_fps / self._transport_target_fps < RUNTIME_PERFORMANCE_MIN_ATTAINMENT
+        )
+        unique_bad = (
+            unique_fps / self._unique_target_fps < RUNTIME_PERFORMANCE_MIN_ATTAINMENT
+        )
         miss_ratio = deadline_misses / processing_count if processing_count else 0.0
         deadline_bad = miss_ratio > RUNTIME_PERFORMANCE_MAX_DEADLINE_MISS_RATIO
         failed_gates = int(output_bad) + int(unique_bad) + int(deadline_bad)
@@ -1405,27 +1528,49 @@ class RuntimePerformanceTracker:
         }
 
     def snapshot(self, *, at_ns: int | None = None) -> dict[str, object]:
-        """Return the strict version-1 JSON-compatible public snapshot."""
+        """Return the strict version-2 JSON-compatible public snapshot."""
 
         with self._lock:
             now_ns = self._resolve_time_locked(at_ns)
             self._evaluate_locked(now_ns)
             metrics = self._window_metrics_locked(now_ns)
             current_epoch = self._epoch_summary_locked(now_ns)
+            output_healthy = (
+                cast(float, metrics["output_attainment"])
+                >= RUNTIME_PERFORMANCE_MIN_ATTAINMENT
+            )
+            unique_healthy = (
+                cast(float, metrics["unique_attainment"])
+                >= RUNTIME_PERFORMANCE_MIN_ATTAINMENT
+            )
+            cadence_status: CadenceStatus
+            if self._state == "warming":
+                cadence_status = "warming"
+            elif self._state == "failed":
+                cadence_status = "failed"
+            elif not output_healthy or not unique_healthy:
+                cadence_status = "unexpected-shortfall"
+            elif self._unique_target_fps < self._transport_target_fps:
+                cadence_status = "intentional-repeat"
+            else:
+                cadence_status = "matched"
+            transport_target_fps = _rounded(self._transport_target_fps)
+            unique_target_fps = _rounded(self._unique_target_fps)
             public = {
                 "schema_version": RUNTIME_PERFORMANCE_SCHEMA_VERSION,
                 "state": self._state,
                 "reason": self._reason,
-                "target_fps": _rounded(self._target_fps),
+                "cadence_status": cadence_status,
+                # Compatibility alias for one schema cycle. New consumers use
+                # the named transport and unique target domains below.
+                "target_fps": transport_target_fps,
+                "transport_target_fps": transport_target_fps,
+                "unique_target_fps": unique_target_fps,
+                "transport_deadline_ms": _rounded(1000.0 / transport_target_fps),
+                "processing_deadline_ms": _rounded(1000.0 / unique_target_fps),
                 **metrics,
-                "output_healthy": (
-                    cast(float, metrics["output_attainment"])
-                    >= RUNTIME_PERFORMANCE_MIN_ATTAINMENT
-                ),
-                "unique_healthy": (
-                    cast(float, metrics["unique_attainment"])
-                    >= RUNTIME_PERFORMANCE_MIN_ATTAINMENT
-                ),
+                "output_healthy": output_healthy,
+                "unique_healthy": unique_healthy,
                 "current_epoch": current_epoch,
                 "last_closed_epoch": self._closed_epoch_summary_locked(),
                 "startup": self._startup.as_dict(),
@@ -1445,6 +1590,7 @@ __all__ = [
     "RUNTIME_PERFORMANCE_WARMUP_NS",
     "RUNTIME_PERFORMANCE_WINDOW_NS",
     "RUNTIME_STAGE_NAMES",
+    "CadenceStatus",
     "PerformanceEpochKey",
     "PublisherTelemetry",
     "RuntimePerformanceTracker",
