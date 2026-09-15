@@ -41,6 +41,7 @@ jobs:
       - name: Focused core, security, and recovery regressions
         run: >-
           timeout 180s python -m pytest -q
+          tests/test_package_candidate.py
           tests/test_config.py
           tests/test_config_merge.py
           tests/test_api_security.py

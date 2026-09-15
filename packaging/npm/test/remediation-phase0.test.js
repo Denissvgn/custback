@@ -128,7 +128,8 @@ test(
   () => {
     const pkg = json('package.json');
     const lock = json('package-lock.json');
-    const readme = read('README.md');
+    assert.match(read('README.md'), /\(docs\/user-guide\.md\)/);
+    const readme = read('docs/user-guide.md');
     const expectedBins = {
       custback: 'packaging/npm/custback.js',
       'custback-avatar': 'packaging/npm/custback.js',
@@ -159,9 +160,9 @@ test(
 test(
   'PKG-02: the documented npm pack command is safe for shell command substitution',
   () => {
-    const tarballCommands = read('README.md').split('\n')
+    const tarballCommands = read('docs/user-guide.md').split('\n')
       .filter((line) => line.includes('TARBALL='));
-    assert.ok(tarballCommands.length > 0, 'README must document local tarball installation');
+    assert.ok(tarballCommands.length > 0, 'User guide must document local tarball installation');
     assert.equal(
       tarballCommands.every((line) => line.includes('TARBALL=$(npm pack --silent)')),
       true,
@@ -341,14 +342,15 @@ test(
 test(
   'DEPLOY-01: the remote deployment guide separates renderer and control credentials over WSS/HTTPS',
   () => {
-    const readme = read('README.md');
+    assert.match(read('README.md'), /\(docs\/user-guide\.md\)/);
+    const readme = read('docs/user-guide.md');
     const start = readme.indexOf('### Running the avatar service on another host');
     const next = readme.indexOf('\n### ', start + 4);
     const summary = start >= 0 ? readme.slice(start, next >= 0 ? next : undefined) : '';
     const guide = read('docs/remote-deployment.md');
     const requirements = {
       sectionPresent:
-        start >= 0 && /\(docs\/remote-deployment\.md\)/.test(summary),
+        start >= 0 && /\(remote-deployment\.md\)/.test(summary),
       rendererToken:
         /renderer(?:-scoped)?[- ]+(?:credential|token)|renderer[_ -]token/i.test(guide),
       controlToken:

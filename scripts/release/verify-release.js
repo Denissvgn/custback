@@ -100,6 +100,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/video_decoder.py',
 ];
 const REVIEWED_PYTHON_TESTS = [
+  'tests/test_package_candidate.py',
   'tests/test_acceleration.py',
   'tests/test_api.py',
   'tests/test_api_lifecycle.py',
@@ -189,6 +190,13 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/fixtures/migration/provenance.json',
 ];
 const REVIEWED_PYTHON_SDIST_DATA = [
+  'examples/avatar_client.py',
+  'scripts/release/package-candidate.py',
+  'scripts/release/required-gates.json',
+  '.github/workflows/package-candidate.yml',
+
+  'docs/user-guide.md',
+  'docs/remote-deployment.md',
   'CHANGELOG.md',
   'CONTRIBUTING.md',
   'SECURITY.md',
@@ -237,6 +245,7 @@ const REVIEWED_NPM_PAYLOAD = [
   '.github/workflows/ci.yml',
   '.github/workflows/codeql.yml',
   '.github/workflows/full-ci.yml',
+  '.github/workflows/package-candidate.yml',
   '.github/workflows/release.yml',
   'LICENSE',
   'MANIFEST.in',
@@ -279,6 +288,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'docs/matte-spatial-refinement.md',
   'docs/matte-visual-qualification.md',
   'docs/matte-visual-qualification-local-template.json',
+  'docs/user-guide.md',
   'docs/remote-deployment.md',
   'docs/system-profiles.md',
   'docs/visual-consistency-phase0-baseline.json',
@@ -316,6 +326,7 @@ const REVIEWED_NPM_PAYLOAD = [
   'pyproject.toml',
   'scripts/install_linux.sh',
   'scripts/install_macos.sh',
+  'scripts/release/package-candidate.py',
   'scripts/release/package-smoke.js',
   'scripts/release/assemble-evidence.js',
   'scripts/release/build-candidate.js',
@@ -1176,8 +1187,10 @@ function verifyDocs(root = ROOT) {
   if (/custback-\d+\.\d+\.\d+\.tgz/.test(readme)) {
     fail('README hard-codes a versioned npm tarball');
   }
-  if (!readme.includes('TARBALL=$(npm pack --silent)')) {
-    fail('README local npm tarball capture must use npm pack --silent');
+  const guide = fs.readFileSync(path.join(root, 'docs', 'user-guide.md'), 'utf8');
+  if (!readme.includes('(docs/user-guide.md)') ||
+      !guide.includes('TARBALL=$(npm pack --silent)')) {
+    fail('README must link the user guide with the silent npm tarball command');
   }
   if (!readme.includes('(docs/remote-deployment.md)')) {
     fail('README must link the two-host remote deployment guide');

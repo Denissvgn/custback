@@ -1,3 +1,9 @@
+include examples/avatar_client.py
+include scripts/release/package-candidate.py
+include scripts/release/required-gates.json
+include .github/workflows/package-candidate.yml
+include docs/user-guide.md
+include docs/remote-deployment.md
 include config/default.yaml
 include CHANGELOG.md
 include CONTRIBUTING.md
