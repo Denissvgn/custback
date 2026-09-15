@@ -53,7 +53,7 @@ jobs:
           tests/test_pipeline.py::test_operator_matte_mitigations_apply_confirm_and_rollback
           tests/test_api.py::test_upload_rejects_oversized_part_headers_and_releases_storage
       - run: custback --help
-      - run: custback avatar --smoke --no-file-log
+      - run: custback avatar --smoke
       - name: Remove generated editable-build metadata
         run: python -c "import shutil; shutil.rmtree('src/custback.egg-info', ignore_errors=True)"
       - run: CUSTBACK_SKIP_INSTALL=1 npm ci --ignore-scripts
@@ -86,7 +86,7 @@ jobs:
       - run: python -m pip install . 'pytest>=8,<10' 'pytest-timeout>=2.3,<3'
       - run: python -m pip check
       - run: custback --help
-      - run: custback avatar --smoke --no-file-log
+      - run: custback avatar --smoke
       - name: Check configuration and native filesystem security
         run: >-
           python -m pytest -q
