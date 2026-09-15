@@ -1,15 +1,12 @@
 # custback default configuration
 # Start with: custback -c config/default.yaml
 #
-# This template is the schema-1 compatibility rollout stage. The implemented
-# target profile (camera cover, linear-sRGB blend, automatic correction) is
-# opt-in until VIS-4.2 calibrated and physical approval advances the
-# commit-bound gate in scripts/release/visual-policy-rollout.json. Versionless
-# and schema-1 persisted files always retain the compatibility meanings below.
-# MATTE-5.2/5.3 generated evidence is deliberately non-authorizing, so this
-# release also retains the existing automatic backend selector and exact
-# schema-1 matte/postprocess policy. No quality preset or higher-detail default
-# is promoted without private physical platform qualification.
+# Versionless and schema-1 files retain these compatibility defaults.
+# Camera cover, linear-sRGB blending, automatic color correction, and advanced
+# matte controls require explicit selection. Inspect effective runtime status
+# after changes; optional backends and presets do not establish a quality or
+# physical-camera performance guarantee. See docs/visual-configuration.md and
+# docs/matte-configuration.md for configuration and rollback guidance.
 
 schema_version: 1
 

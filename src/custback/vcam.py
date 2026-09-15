@@ -3,7 +3,7 @@
 Linux (Ubuntu): pyvirtualcam -> v4l2loopback device (see scripts/install_linux.sh).
 macOS:          pyvirtualcam -> OBS Virtual Camera extension (see scripts/install_macos.sh).
 Windows:        pyvirtualcam -> OBS Virtual Camera (install OBS Studio and start
-                the virtual camera once; see WIN-3.7 in WINDOWS_IMPLEMENTATION_PLAN.md).
+                the virtual camera once).
 
 A NullOutput is provided for tests / API-only operation.
 """

@@ -67,3 +67,14 @@ def test_public_markdown_links_resolve_to_present_files():
                 str(path.relative_to(ROOT)),
                 target,
             )
+
+
+def test_distributed_configuration_help_has_no_internal_task_ids():
+    for name in (
+        "config/default.yaml",
+        "config/avatar.yaml",
+        "src/custback/default.yaml",
+        "src/custback/avatar/avatar.yaml",
+    ):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert not re.search(r"\b(?:MATTE|VIS|WIN|MIT|PUB)-\d", text), name
