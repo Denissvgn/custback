@@ -1,17 +1,10 @@
 """Platform filesystem-security seam.
 
-A single OS-specific boundary for the primitives that protect tokens, uploads,
-model caches, and logs.  POSIX keeps the historical behavior byte-for-byte; the
-Windows backend supplies the Win32/NTFS equivalents added in Phase 2 (see
-:mod:`custback._platform.base` for the contract and WINDOWS_IMPLEMENTATION_PLAN.md
-CC-1 / CC-4).
-
-Call sites import this package and use, for example,
-``platform_fs.open_nofollow(path, flags)`` in place of composing
-``os.open(path, flags | O_NOFOLLOW)`` inline, and
-``platform_fs.owner_matches(fd)`` in place of ``st_uid == geteuid()``.  All
-OS-specific filesystem security/identity/durability behavior lives here so the
-storage, token, and migration code contains no ``sys.platform`` branches.
+One OS-specific boundary protects tokens, uploads, model caches, and logs.
+The POSIX and Windows backends implement the same contract defined in
+:mod:`custback._platform.base`. Call sites use this package for ownership,
+private permissions, locking, symlink/reparse-point rejection, and durability.
+Unsupported security operations fail closed.
 """
 
 from __future__ import annotations

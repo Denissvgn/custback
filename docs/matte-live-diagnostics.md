@@ -1,7 +1,5 @@
 # Local live matte diagnostics
 
-Status: **MATTE-4.3 native-preview diagnostic contract**
-
 Custback's normal native preview shows the frame published to the configured
 output. When `--preview` is enabled, `d` and `D` explicitly switch that same
 local HighGUI window into a private matte-diagnostic sink. The diagnostic sink
@@ -65,7 +63,7 @@ The cycle order and the claims made by each view are fixed:
 The three morphology views deliberately say **inferred** in the window. They
 are fast local search tools. Authoritative opaque-core, hole, and halo
 classification requires the private replay annotations described in
-[RVM alpha integrity and opaque-core attribution](matte-alpha-attribution.md).
+[RVM alpha integrity and opaque-core attribution](matte-replay-bundle.md).
 
 The two “only” compositor views are controlled full composites: upstream
 source, refined alpha, backdrop, blend space, and color transform remain held.
@@ -90,7 +88,7 @@ status schema:
 | `TEMP ALPHA` | Local, on-demand raw/refined alpha temporal metrics. These values are not added to `GET /status`. |
 | `TEMP EDGE` | Registered change in the actual downstream contribution on alpha-stable uncertain-edge support, plus an explicit availability state. |
 | `REGISTRATION` | Phase-correlation state, signed displacement, response, and valid-overlap fraction for the current pair. |
-| `EFFECTIVE` | The versioned `GET /status.matte_policy` snapshot: resolved RVM ratio, mask shift, model-foreground state, light-wrap strength, and blend space. Configured-versus-effective states and reasons keep the semantics defined by the [backend-policy contract](matte-backend-policies.md). |
+| `EFFECTIVE` | The versioned `GET /status.matte_policy` snapshot: resolved RVM ratio, mask shift, model-foreground state, light-wrap strength, and blend space. Configured-versus-effective states and reasons keep the semantics defined by the [backend-policy contract](matte-configuration.md). |
 | `RESET` | Existing `matte_reset_count` and `matte_last_reset_reason`; `segmentation_generation` and `config_version` also bound temporal pairing. |
 | `FRAME SEG ms` | Backend inference, applicable RVM preprocess/session/postprocess, refinement, and segmentation-total timings carried by the existing private evidence seam. |
 | `FRAME COMPOSITOR ms` | Backdrop, color correction, compositor preparation, blend, total, and output-validation timings for this frame. |
@@ -168,7 +166,7 @@ tracks, collect compositor-substage maps for this feature, enqueue work, or
 start the rendering worker. The normal preview therefore keeps the ordinary
 production path rather than paying a hidden full-frame diagnostic cost.
 
-## Locating a Run-B-style defect
+## Locating a visible defect
 
 Use the live views to choose the first suspect boundary, not to pronounce a
 pass:
@@ -193,12 +191,12 @@ pass:
    classifier:
 
 ```console
-custback --matte-diagnostics-dir ./private-run-b \
+custback --matte-diagnostics-dir ./private-matte \
   --matte-diagnostics-duration 20
 
-custback matte-diagnose ./private-run-b \
-  --annotations ./private-run-b-annotations \
-  --output ./private-run-b-attribution
+custback matte-diagnose ./private-matte \
+  --annotations ./private-matte-annotations \
+  --output ./private-matte-attribution
 ```
 
 The live result guides where to look; `matte-diagnose` supplies digest-bound

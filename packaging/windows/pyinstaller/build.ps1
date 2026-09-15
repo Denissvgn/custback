@@ -21,7 +21,7 @@
 .PARAMETER Arch
     Target architecture: x64 (default) or arm64 (WIN-6.3).  PyInstaller cannot
     cross-freeze, so the script verifies the running Python matches and trims
-    the default extras to the ARM64 dependency profile (WINDOWS_ARM64.md).
+    the default extras to the ARM64 dependency profile.
 
 .PARAMETER AvatarProfile
     Avatar driver stack for custback-avatar.exe (WIN-6.4): "vision" (default,
@@ -41,7 +41,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 if ($Arch -eq "arm64" -and -not $PSBoundParameters.ContainsKey("Extras")) {
-    # ARM64 dependency profile (WIN-6.3 / WINDOWS_ARM64.md): mediapipe ships
+    # ARM64 dependency profile: mediapipe ships
     # no win_arm64 wheel, so the default trims to RVM CPU + the security
     # backend. The core PEP 508 marker and PyInstaller spec also omit the
     # wheel-less pyvirtualcam package. DirectML may be added explicitly once
@@ -62,7 +62,7 @@ if ($AvatarProfile -eq "audio2face") {
         throw "the audio2face avatar profile cannot include the 'mediapipe' extra (separate supported driver profiles); use -Extras rvm,audio2face,windows"
     }
     if ($Arch -eq "arm64") {
-        throw "the audio2face avatar profile is x64-only (NVIDIA protocol wheels ship no ARM64 build; WINDOWS_ARM64.md)"
+        throw "the audio2face avatar profile is x64-only"
     }
 }
 if ($AvatarProfile -eq "vision" -and ($extraNames -contains "audio2face")) {
@@ -82,10 +82,10 @@ if (($extraNames -contains "gpu") -and ($extraNames -contains "directml")) {
 # clean VM.
 if ($Arch -eq "arm64") {
     if ($extraNames -contains "gpu") {
-        throw "the 'gpu' (CUDA) extra is not available on Windows ARM64; use 'directml' or CPU (WINDOWS_ARM64.md)"
+        throw "the 'gpu' (CUDA) extra is not available on Windows ARM64; use 'directml' or CPU"
     }
     if ($extraNames -contains "mediapipe") {
-        throw "the 'mediapipe' extra has no Windows ARM64 wheel (WINDOWS_ARM64.md)"
+        throw "the 'mediapipe' extra has no Windows ARM64 wheel"
     }
 }
 

@@ -1,11 +1,6 @@
 # Capture cadence diagnosis
 
-- Status: MATTE-3.1 capture-only harness implemented; physical-camera outcome
-  unqualified
-- Date: 2026-08-04
-- Backlog owner: MATTE-3.1
-
-## Current decision
+## Capture-only measurement
 
 `custback capture-diagnose` measures the production OpenCV camera reader and
 canonical normalization path without constructing the normal video pipeline.
@@ -13,11 +8,8 @@ It does not create a segmenter, backdrop, compositor, preview, API, or output
 sink. This makes a slow capture-only result independent of model and
 compositor execution.
 
-The checked-in implementation and tests qualify the harness, schema, timing
-math, privacy boundary, and bounded shutdown behavior. They do **not** qualify
-any physical camera, host, USB path, OpenCV backend, or 1280x720@30 mode. Until
-an operator supplies real local hardware evidence, the project-level
-MATTE-3.1 hardware outcome remains `hardware-evidence-required`.
+Software startup does not establish physical-camera compatibility. Measure the
+actual camera, host, USB path, backend, resolution, and requested rate.
 
 An exit status of zero means that the measured capture-only run reached its
 requested cadence. It is not, by itself, a hardware qualification claim.
@@ -120,7 +112,7 @@ root objects are:
 | `native_comparison` | digest-bound native-tool summary or an explicit absence |
 | `full_runtime_comparison` | selected matched runtime fields or an explicit absence |
 | `diagnosis` | evidence-bounded code, confidence, actions, and non-claims |
-| `qualification` | the separate MATTE-3.1 hardware acceptance result |
+| `qualification` | the separate hardware acceptance result |
 
 Capture cadence includes both successful read-completion intervals and
 full-window availability (`successful reads / measurement seconds`). The
@@ -151,9 +143,9 @@ full run does not, the report establishes only that some excluded workload or
 contention matters; it does not single out segmentation without separate
 stage evidence.
 
-## MATTE-3.1 acceptance
+## acceptance
 
-The backlog's exact acceptance mode is a hardware-verified physical
+The hardware acceptance mode is a hardware-verified physical
 1280x720@30 camera. A sustained result requires at least 27 unique reads/s,
 matching negotiated and delivered dimensions, at least five seconds of
 measurement, and no instability.
@@ -195,7 +187,7 @@ both paths being slow corroborates the symptom, but does not isolate the
 specific actionable limitation required for acceptance.
 
 No physical-camera evidence is committed to this repository. Local reports
-must be reviewed on the target hardware before anyone records MATTE-3.1 as
+must be reviewed on the target hardware before treating the measured mode as
 recovered or as an actionable hardware limitation.
 
 ## Native capture comparison
@@ -217,7 +209,7 @@ Custback never launches the external tool. Record the native run separately
 with output-rate conversion, repetition, and camera-control writes disabled,
 then translate its host read-completion timestamps into an owner-only JSON
 sidecar. Copy
-[`capture-native-evidence-local-template.json`](capture-native-evidence-local-template.json)
+[`capture-native-evidence-local-template.json`](../config/qualification/capture-native-evidence-local-template.json)
 and replace every `REPLACE_` value and illustrative timestamp.
 The checked-in file is deliberately not evidence: its placeholder digests and
 offset strings fail the strict parser until they are replaced with the
@@ -275,7 +267,7 @@ device path, serial number, or inventory text into the report.
 `--runtime-evidence OWNER_ONLY_RUNTIME.json` accepts a strict two-snapshot
 sidecar from a matched normal run. It does not accept one loose `GET /status`
 object. Copy
-[`capture-runtime-evidence-local-template.json`](capture-runtime-evidence-local-template.json),
+[`capture-runtime-evidence-local-template.json`](../config/qualification/capture-runtime-evidence-local-template.json),
 retain it as an owner-only regular file, and replace every `REPLACE_` value
 with two observations from the same uninterrupted full-runtime window. The
 checked-in placeholders deliberately fail the strict parser and are not
@@ -333,8 +325,8 @@ delivered dimensions. An incompatible sidecar stays visible with reason codes
 but cannot support a causal comparison.
 
 This optional evidence can distinguish a capture-only recovery from a matched
-full-run regression, but it cannot replace the per-stage profiling owned by
-MATTE-3.4 or the unique-frame status contract owned by MATTE-3.2.
+full-run regression, but it cannot replace per-stage runtime profiling or the
+[unique-frame status counters](cadence-observability.md).
 
 ## Diagnostic matrix
 
@@ -373,23 +365,3 @@ Although the report contains no pixels, device path, or credentials, keep it
 owner-only because timing, backend, mode, controls, and hardware evidence can
 still fingerprint the local environment. Raw native logs and camera footage
 remain outside this report and must not be committed.
-
-## Executable evidence
-
-The MATTE-3.1 tests cover:
-
-- capture-only resource isolation;
-- strict CLI and owner-only output behavior;
-- full-run timestamp math, warm-up exclusion, gaps, and generation changes;
-- 15 FPS, target-sustained, mode-mismatch, normalization, and native-comparison
-  classifications;
-- strict native evidence parsing and identity/mode compatibility;
-- strict two-snapshot runtime evidence and counter-delta cadence;
-- distinct capture, processing, and output pacing;
-- control-write prohibition and privacy-safe error/report content; and
-- bounded reader recovery and shutdown regressions.
-
-Those deterministic tests establish software behavior only. The first real
-1280x720@30 hardware result must remain local evidence and must state its
-camera, host, lighting, backend, format, and native comparison scope through
-opaque bindings and reviewed records.

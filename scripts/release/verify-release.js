@@ -100,6 +100,7 @@ const REVIEWED_PYTHON_MODULES = [
   'custback/video_decoder.py',
 ];
 const REVIEWED_PYTHON_TESTS = [
+  'tests/test_public_documentation.py',
   'tests/test_package_candidate.py',
   'tests/test_acceleration.py',
   'tests/test_api.py',
@@ -190,6 +191,10 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/fixtures/migration/provenance.json',
 ];
 const REVIEWED_PYTHON_SDIST_DATA = [
+  'tests/fixtures/visual/geometry-color-baseline.json',
+  'tests/fixtures/visual/geometry-color-contact-sheet.png',
+  'docs/visual-configuration.md',
+  'docs/matte-configuration.md',
   'examples/avatar_client.py',
   'scripts/release/package-candidate.py',
   'scripts/release/required-gates.json',
@@ -201,47 +206,30 @@ const REVIEWED_PYTHON_SDIST_DATA = [
   'CONTRIBUTING.md',
   'SECURITY.md',
   'config/default.yaml',
-  'docs/adr/0002-output-rate-matte-interpolation.md',
-  'docs/adr/0003-720p-compositor-budget.md',
-  'docs/adr/0004-matte-quality-rollout.md',
   'docs/cadence-observability.md',
   'docs/capture-cadence-diagnostics.md',
-  'docs/capture-native-evidence-local-template.json',
-  'docs/capture-runtime-evidence-local-template.json',
-  'docs/matte-ablation.md',
-  'docs/matte-ablation-local-reference-template.json',
-  'docs/matte-backend-policies.md',
-  'docs/matte-boundary-stabilization.md',
-  'docs/matte-deterministic-regression-gate.md',
-  'docs/matte-light-wrap.md',
+  'config/qualification/capture-native-evidence-local-template.json',
+  'config/qualification/capture-runtime-evidence-local-template.json',
+  'config/qualification/matte-ablation-local-reference-template.json',
   'docs/matte-live-diagnostics.md',
   'docs/matte-operator-mitigations.md',
-  'docs/matte-performance.md',
-  'docs/matte-performance-local-template.json',
-  'docs/matte-platform-qualification.md',
-  'docs/matte-platform-qualification-local-template.json',
-  'docs/matte-alpha-attribution.md',
-  'docs/matte-alpha-attribution-local-template.json',
-  'docs/matte-quality-baseline.md',
-  'docs/matte-quality-local-qualification-template.json',
-  'docs/matte-quality-metrics.md',
-  'docs/matte-quality-rollout.md',
+  'config/qualification/matte-performance-local-template.json',
+  'config/qualification/matte-platform-qualification-local-template.json',
+  'config/qualification/matte-alpha-attribution-local-template.json',
+  'config/qualification/matte-quality-local-qualification-template.json',
   'docs/matte-replay-bundle.md',
-  'docs/matte-rvm-profiles.md',
-  'docs/matte-rvm-qualification-local-template.json',
-  'docs/matte-spatial-refinement.md',
-  'docs/matte-visual-qualification.md',
-  'docs/matte-visual-qualification-local-template.json',
+  'config/qualification/matte-rvm-qualification-local-template.json',
+  'config/qualification/matte-visual-qualification-local-template.json',
   'docs/system-profiles.md',
-  'docs/visual-consistency-phase4-qualification-runbook.md',
-  'docs/visual-consistency-phase4-qualification-template.json',
-  'docs/visual-consistency-rollout.md',
+  'config/qualification/visual-consistency-qualification-template.json',
   'scripts/release/visual-qualification-manifest.json',
   'scripts/release/visual-policy-rollout.json',
   'scripts/release/matte-policy-rollout.json',
   'scripts/release/visual_consistency_qualification.py',
 ];
 const REVIEWED_NPM_PAYLOAD = [
+  'docs/visual-configuration.md',
+  'docs/matte-configuration.md',
   '.github/workflows/ci.yml',
   '.github/workflows/codeql.yml',
   '.github/workflows/full-ci.yml',
@@ -255,56 +243,26 @@ const REVIEWED_NPM_PAYLOAD = [
   'SECURITY.md',
   'config/avatar.yaml',
   'config/default.yaml',
-  'docs/adr/0001-visual-consistency-contract.md',
-  'docs/adr/0002-output-rate-matte-interpolation.md',
-  'docs/adr/0003-720p-compositor-budget.md',
-  'docs/adr/0004-matte-quality-rollout.md',
-  'docs/camera-control-characterization.md',
   'docs/cadence-observability.md',
   'docs/capture-cadence-diagnostics.md',
-  'docs/capture-native-evidence-local-template.json',
-  'docs/capture-runtime-evidence-local-template.json',
-  'docs/matte-ablation.md',
-  'docs/matte-ablation-local-reference-template.json',
-  'docs/matte-backend-policies.md',
-  'docs/matte-boundary-stabilization.md',
-  'docs/matte-deterministic-regression-gate.md',
-  'docs/matte-light-wrap.md',
+  'config/qualification/capture-native-evidence-local-template.json',
+  'config/qualification/capture-runtime-evidence-local-template.json',
+  'config/qualification/matte-ablation-local-reference-template.json',
   'docs/matte-live-diagnostics.md',
   'docs/matte-operator-mitigations.md',
-  'docs/matte-performance.md',
-  'docs/matte-performance-local-template.json',
-  'docs/matte-platform-qualification.md',
-  'docs/matte-platform-qualification-local-template.json',
-  'docs/matte-alpha-attribution.md',
-  'docs/matte-alpha-attribution-local-template.json',
-  'docs/matte-quality-baseline.md',
-  'docs/matte-quality-local-qualification-template.json',
-  'docs/matte-quality-metrics.md',
-  'docs/matte-quality-rollout.md',
+  'config/qualification/matte-performance-local-template.json',
+  'config/qualification/matte-platform-qualification-local-template.json',
+  'config/qualification/matte-alpha-attribution-local-template.json',
+  'config/qualification/matte-quality-local-qualification-template.json',
   'docs/matte-replay-bundle.md',
-  'docs/matte-rvm-profiles.md',
-  'docs/matte-rvm-qualification-local-template.json',
-  'docs/matte-spatial-refinement.md',
-  'docs/matte-visual-qualification.md',
-  'docs/matte-visual-qualification-local-template.json',
+  'config/qualification/matte-rvm-qualification-local-template.json',
+  'config/qualification/matte-visual-qualification-local-template.json',
   'docs/user-guide.md',
   'docs/remote-deployment.md',
   'docs/system-profiles.md',
-  'docs/visual-consistency-phase0-baseline.json',
-  'docs/visual-consistency-phase0-contact-sheet.png',
-  'docs/visual-consistency-phase0-evidence.md',
-  'docs/visual-consistency-phase0-implementation-review.md',
-  'docs/visual-consistency-phase1-implementation-review.md',
-  'docs/visual-consistency-phase2-implementation-review.md',
-  'docs/visual-consistency-phase3-implementation-review.md',
-  'docs/visual-consistency-phase3-video-color-qualification.md',
-  'docs/visual-consistency-phase4-implementation-review.md',
-  'docs/visual-consistency-phase4-local-observation-contact-sheet.png',
-  'docs/visual-consistency-phase4-local-observation.json',
-  'docs/visual-consistency-phase4-qualification-runbook.md',
-  'docs/visual-consistency-phase4-qualification-template.json',
-  'docs/visual-consistency-rollout.md',
+  'tests/fixtures/visual/geometry-color-baseline.json',
+  'tests/fixtures/visual/geometry-color-contact-sheet.png',
+  'config/qualification/visual-consistency-qualification-template.json',
   'examples/avatar_client.py',
   'package.json',
   'packaging/npm/custback.js',
@@ -445,9 +403,8 @@ const REVIEWED_NPM_METADATA = {
     'tests/fixtures/migration/*',
     'config/*.yaml',
     'docs/*.md',
-    'docs/*.json',
-    'docs/*.png',
-    'docs/adr/*.md',
+    'config/qualification/*.json',
+    'tests/fixtures/visual/*',
     'scripts/*.sh',
     'scripts/release/*.js',
     'scripts/release/*.json',
@@ -1184,116 +1141,61 @@ function staleArtifacts(root = ROOT) {
 
 function verifyDocs(root = ROOT) {
   const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+  const guide = fs.readFileSync(path.join(root, 'docs/user-guide.md'), 'utf8');
   if (/custback-\d+\.\d+\.\d+\.tgz/.test(readme)) {
     fail('README hard-codes a versioned npm tarball');
   }
-  const guide = fs.readFileSync(path.join(root, 'docs', 'user-guide.md'), 'utf8');
-  if (!readme.includes('(docs/user-guide.md)') ||
-      !guide.includes('TARBALL=$(npm pack --silent)')) {
-    fail('README must link the user guide with the silent npm tarball command');
-  }
-  if (!readme.includes('(docs/remote-deployment.md)')) {
-    fail('README must link the two-host remote deployment guide');
-  }
-  if (!readme.includes('(docs/visual-consistency-rollout.md)')) {
-    fail('README must link the visual-consistency rollout and rollback guide');
-  }
-  const deployment = fs.readFileSync(
-    path.join(root, 'docs', 'remote-deployment.md'), 'utf8',
-  );
-  const requirements = [
-    [/renderer-scoped token/i, 'renderer-scoped token'],
-    [/avatar-control token/i, 'avatar-control token'],
-    [/\bwss:\/\//i, 'WSS renderer endpoint'],
-    [/\bhttps:\/\//i, 'HTTPS avatar-control endpoint'],
-    [/source\.tls_ca_file/, 'renderer CA configuration'],
-    [/avatar\.tls_ca_file/, 'avatar-control CA configuration'],
-    [/firewall rule/i, 'firewall direction'],
-    [/\brotation\b/i, 'credential rotation'],
-    [/privacy slate/i, 'renderer-outage privacy behavior'],
-    [/avatar_auth_failed/, 'control-token failure behavior'],
-    [/avatar_unreachable/, 'control-plane outage behavior'],
-  ];
-  for (const [pattern, description] of requirements) {
-    if (!pattern.test(deployment)) {
-      fail(`remote deployment guide is missing ${description}`);
-    }
-  }
-  const rollout = fs.readFileSync(
-    path.join(root, 'docs', 'visual-consistency-rollout.md'), 'utf8',
-  );
-  const rolloutRequirements = [
-    [/active stage is `compatibility`/i, 'active compatibility stage'],
-    [/versionless.*schema-1/is, 'versionless schema-1 migration semantics'],
-    [/camera-cover.*linear-compositing.*automatic-correction/is, 'ordered stages'],
-    [/one clean commit/i, 'one-commit-per-default policy'],
-    [
-      /historical Git tree.*ancestor of\s+the clean release checkout/is,
-      'historical default-change evidence policy',
-    ],
-    [
-      /standalone Git-less archive.*fails closed/is,
-      'Git-less prepack failure policy',
-    ],
-    [/physical-camera/i, 'physical-camera prerequisite'],
-    [/consumer-sink/i, 'consumer-sink prerequisite'],
-    [/external.*full-range.*sRGB.*BGR/is, 'external-frame color assumption'],
-    [/`passthrough`.*`blur`.*`color`.*`remote`/is, 'mode exclusions'],
-    [/subject is cropped/i, 'crop troubleshooting'],
-    [/black bars appear/i, 'contain-bar troubleshooting'],
-    [/low confidence/i, 'low-confidence troubleshooting'],
-    [/auto-exposure\/WB loop/i, 'camera auto-control troubleshooting'],
-    [/tagged media is rejected/i, 'tagged-media troubleshooting'],
-    [/untagged image or video/i, 'untagged-media troubleshooting'],
-    [
-      /does not lower the highest recognized\s+schema version/i,
-      'schema-preserving rollback policy',
-    ],
-  ];
-  for (const [pattern, description] of rolloutRequirements) {
-    if (!pattern.test(rollout)) {
-      fail(`visual-consistency rollout guide is missing ${description}`);
-    }
-  }
-  if (!readme.includes('(docs/matte-quality-rollout.md)') ||
-      !readme.includes('(docs/adr/0004-matte-quality-rollout.md)')) {
-    fail('README must link the MATTE-5.4 rollout guide and ADR');
-  }
-  const matteRollout = fs.readFileSync(
-    path.join(root, 'docs', 'matte-quality-rollout.md'), 'utf8',
-  );
-  const matteAdr = fs.readFileSync(
-    path.join(root, 'docs', 'adr', '0004-matte-quality-rollout.md'), 'utf8',
-  );
-  const matteRolloutRequirements = [
-    [/compatibility hold/i, 'compatibility hold'],
-    [/versionless.*schema-1/is, 'legacy schema semantics'],
-    [/generated.*pending/is, 'generated-evidence limitation'],
-    [/baseline.*ablation.*visual.*performance.*platform.*privacy.*migration/is,
-      'complete release-evidence chain'],
-    [/sanitized rollout telemetry/i, 'sanitized canary telemetry'],
-    [/`matte_rollout`/, 'runtime rollout status'],
-    [/one-patch rollback/i, 'one-patch rollback'],
-    [/does not.*delete.*config/is, 'non-destructive config rollback'],
-    [/model cache/i, 'non-destructive model-cache rollback'],
-    [/Reactions are outside/i, 'reaction separation'],
-    [/27638e419a0dcf5955d52e2eb4ead2dafbdca7f2bbe0535108aa7c56c1f2f60d/,
-      'canonical rollback digest'],
-  ];
-  for (const [pattern, description] of matteRolloutRequirements) {
-    if (!pattern.test(matteRollout)) {
-      fail(`matte-quality rollout guide is missing ${description}`);
-    }
-  }
-  for (const [pattern, description] of [
-    [/timestamp and reset ownership/i, 'timestamp/reset contract'],
-    [/backend-specific effective policy/i, 'backend-effective policies'],
-    [/light-wrap temporal policy/i, 'light-wrap temporal policy'],
-    [/quality tiers and default disposition/i, 'quality/default decision'],
-    [/performance, privacy, and evidence gates/i, 'performance/privacy gates'],
+  for (const name of [
+    'user-guide.md', 'remote-deployment.md', 'visual-configuration.md',
+    'matte-configuration.md',
   ]) {
-    if (!pattern.test(matteAdr)) {
-      fail(`MATTE-5.4 ADR is missing ${description}`);
+    if (!readme.includes(`(docs/${name})`)) fail(`README must link ${name}`);
+  }
+  if (!guide.includes('TARBALL=$(npm pack --silent)')) {
+    fail('User guide must preserve safe npm tarball command substitution');
+  }
+  const requirements = {
+    'remote-deployment.md': [
+      [/renderer-scoped token/i, 'renderer-scoped token'],
+      [/avatar-control token/i, 'avatar-control token'],
+      [/\bwss:\/\//i, 'WSS renderer endpoint'],
+      [/\bhttps:\/\//i, 'HTTPS avatar-control endpoint'],
+      [/source\.tls_ca_file/, 'renderer CA configuration'],
+      [/avatar\.tls_ca_file/, 'avatar-control CA configuration'],
+      [/firewall rule/i, 'firewall direction'],
+      [/\brotation\b/i, 'credential rotation'],
+      [/privacy slate/i, 'renderer-outage privacy behavior'],
+      [/avatar_auth_failed/, 'control-token failure behavior'],
+      [/avatar_unreachable/, 'control-plane outage behavior'],
+    ],
+    'visual-configuration.md': [
+      [/versionless.*schema-1/is, 'versionless compatibility semantics'],
+      [/full-range.*sRGB.*BGR/is, 'input color contract'],
+      [/`passthrough`.*`blur`.*`color`.*`remote`/is, 'mode exclusions'],
+      [/subject is cropped/i, 'crop troubleshooting'],
+      [/black bars appear/i, 'contain troubleshooting'],
+      [/low confidence/i, 'confidence troubleshooting'],
+      [/auto-exposure\/WB loop/i, 'camera auto-control interaction'],
+      [/tagged media is rejected/i, 'tagged-media troubleshooting'],
+      [/untagged image or video/i, 'untagged-media troubleshooting'],
+      [/does not lower the highest recognized\s+schema version/i, 'schema-preserving rollback'],
+    ],
+    'matte-configuration.md': [
+      [/Versionless.*schema-1/is, 'configuration compatibility'],
+      [/sanitized\s+rollout\s+telemetry/i, 'private telemetry boundary'],
+      [/`matte_rollout`/, 'effective runtime status'],
+      [/one-patch rollback/i, 'transactional rollback'],
+      [/does not.*delete.*config/is, 'non-destructive rollback'],
+      [/model cache/i, 'cache-preserving rollback'],
+      [/Reactions are outside/i, 'reaction separation'],
+      [/27638e419a0dcf5955d52e2eb4ead2dafbdca7f2bbe0535108aa7c56c1f2f60d/,
+        'canonical rollback digest'],
+    ],
+  };
+  for (const [name, checks] of Object.entries(requirements)) {
+    const contents = fs.readFileSync(path.join(root, 'docs', name), 'utf8');
+    for (const [pattern, description] of checks) {
+      if (!pattern.test(contents)) fail(`${name} is missing ${description}`);
     }
   }
 }
@@ -2337,9 +2239,7 @@ function verifyPack(version, root = ROOT) {
       'SECURITY.md',
       '.github/workflows/ci.yml',
       'docs/remote-deployment.md',
-      'docs/visual-consistency-phase4-qualification-runbook.md',
-      'docs/visual-consistency-phase4-qualification-template.json',
-      'docs/visual-consistency-rollout.md',
+      'config/qualification/visual-consistency-qualification-template.json',
       'package.json',
       'packaging/npm/custback.js',
       'packaging/npm/install.js',

@@ -1,11 +1,8 @@
 # Immediate matte operator mitigations
 
-Status: **MATTE-0.4 reversible diagnostic guidance**
-
 This guide helps an operator isolate a visible matte defect while formal
 qualification continues. It does not change defaults or publish a production
-preset. The checked-in MATTE-0.3 screen used generated pixels and no real model
-inference: that generated proxy does not qualify `0.67`, a nonzero mask shift,
+preset. A generated proxy does not qualify `0.67`, a nonzero mask shift,
 MediaPipe watershed, or any other setting as a universal fix. Only a reviewed,
 model-backed local ablation report may supply a candidate RVM ratio, mask shift,
 or MediaPipe edge-refine direction.
@@ -178,20 +175,19 @@ sink/application pacing, and sink recovery as independent event classes;
 correlation does not prove causation. See the
 [visual cadence observability contract](cadence-observability.md).
 
-The motion-aware boundary stabilizer is a MATTE-2.1 qualification control, not
+The motion-aware boundary stabilizer is a qualification control, not
 an immediate mitigation. Leave
 `segmentation.boundary_stabilization.mode: off` unless the exact backend,
 scene, cadence, and host have a reviewed model-backed quality and performance
 report. Its rollback is the saved configuration above (or explicitly `off`);
 do not translate `temporal_smoothing` into a time constant.
 
-Likewise, `spatial_edge_refinement.mode: stable_guided` is a MATTE-2.2
-qualification control, not an immediate mitigation. The checked-in
+Likewise, `spatial_edge_refinement.mode: stable_guided` is a qualification control, not an immediate mitigation. The checked-in
 “watershed on” generated row contains pre-generated stable proxy alpha; it did
 not execute either production spatial algorithm and cannot select a default.
 Leave the schema-version-1 `legacy_watershed` policy in place unless a reviewed
 same-source model-backed report explicitly selects the candidate. See the
-[spatial-refinement contract](matte-spatial-refinement.md).
+[spatial-refinement contract](matte-configuration.md).
 
 ## Install or rebuild the RVM backend
 
@@ -289,7 +285,7 @@ jq '{compositing:{
 **Resource effect:** This is hot at a frame boundary and does not rebuild the
 segmenter or refiner.
 
-Do not disable both features in the first comparison. The MATTE-0.3 full
+Do not disable both features in the first comparison. A model-backed full
 factorial exists precisely because their visual and performance effects
 interact.
 
@@ -297,10 +293,10 @@ interact.
 
 ### Reviewed RVM ratio or mask shift
 
-Skip this experiment unless the local MATTE-0.3 reference is reviewed and the
+Skip this experiment unless the local reference is reviewed and the
 selected row is model-backed, same-source, and present in the report's bounded
 RVM shortlist. That shortlist is only admission to the
-[MATTE-2.5 qualification matrix](matte-rvm-profiles.md), not a portable named
+[RVM diagnostic inputs](matte-replay-bundle.md), not a portable named
 profile or default. Generated-proxy rows are insufficient.
 
 **Apply:** Patch exactly one reviewed value, never both together:
@@ -341,7 +337,7 @@ RVM's effective refiner intentionally reports blur zero,
 `effective_edge_refine` false, temporal smoothing zero, and the configured mask
 shift. Do not try to repair RVM with generic blur, edge refinement, or EMA.
 The configured/effective/applicability distinctions for every backend are in
-[the backend-policy contract](matte-backend-policies.md).
+[the backend-policy contract](matte-configuration.md).
 
 ### MediaPipe GPU delegate
 
@@ -376,8 +372,7 @@ and reset their temporal state.
 ### MediaPipe edge refinement
 
 Proceed only while `segmentation_backend` is exactly `MediaPipeSegmenter`.
-RVM always neutralizes this generic control. A real model-backed MATTE-0.3
-off/on result must select the direction; the checked-in generated result is not
+RVM always neutralizes this generic control. A real model-backed off/on result must select the direction; the checked-in generated result is not
 enough. This diagnostic toggles the `edge_refine` gate around the already
 configured spatial mode; it does not change algorithms. Schema-version-1
 configurations use `legacy_watershed`.
@@ -600,7 +595,7 @@ not create alpha or unique camera/model observations.
 It is a diagnosis, not a matte-quality fix. Automatic output-rate matte
 interpolation is deliberately not available; exact repeat remains the runtime
 policy under
-[ADR 0002](adr/0002-output-rate-matte-interpolation.md).
+[output cadence](cadence-observability.md).
 
 ## Privacy and completion rules
 

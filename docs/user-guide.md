@@ -58,7 +58,7 @@ confidence-mask segmentation, but it does not install the RVM/ONNX Runtime
 **matting** tier. When present, MediaPipe is labelled the **segmentation**
 capability tier; that installed-capability label is not an evidence-qualified
 named preset or sustainability claim, and the
-[matte rollout policy](matte-quality-rollout.md) remains on compatibility
+[matte rollout policy](matte-configuration.md) remains on compatibility
 hold. `segmentation.backend: auto` can only prefer RVM when that optional
 runtime is present. Choose one RVM profile explicitly for true-alpha edges:
 
@@ -143,7 +143,7 @@ Geometry, canvas, blend-space, and color-correction policy are configured in
 YAML (or through the authenticated hot API where supported). Start with the
 annotated `config/default.yaml`; the complete policy, migration, mode
 eligibility, troubleshooting, and rollback guide is
-[Visual-consistency configuration and rollout](visual-consistency-rollout.md).
+[Visual-consistency configuration and rollout](visual-configuration.md).
 Camera geometry and output-canvas fields require a restart; backdrop geometry
 and compositing fields activate transactionally at a frame boundary.
 
@@ -191,7 +191,7 @@ Matte views include raw/refined alpha, RVM foreground, the exact backdrop,
 boundary/defect proxies, compositor counterfactuals, and registered temporal
 instability. They are on-demand local inspection tools, not qualification
 evidence; morphology and motion caveats, telemetry meanings, privacy
-boundaries, and the Run-B attribution workflow are documented in
+boundaries, and the local attribution workflow are documented in
 [Local live matte diagnostics](matte-live-diagnostics.md).
 
 Open <http://127.0.0.1:8710/> and enter the local API token for a live
@@ -266,68 +266,16 @@ alpha/detail/performance qualification is the separate, fail-closed
 change the automatic default. See
 [docs/matte-replay-bundle.md](matte-replay-bundle.md) for the privacy,
 format, and command contract, and
-[docs/matte-rvm-profiles.md](matte-rvm-profiles.md) for the formal
+[matte replay bundle](matte-replay-bundle.md) for the formal
 qualification matrix. The separate native-preview-only workflow is described
 in [docs/matte-live-diagnostics.md](matte-live-diagnostics.md); enabling
 it does not persist a bundle.
-End-to-end visual and sink qualification then joins those private reports with
-same-generation HighGUI/API/virtual-camera captures and human review:
-`custback matte-visual-qualify PRIVATE_PLAN --output NEW_DIR`. Start from
-the content-free
-[local template](matte-visual-qualification-local-template.json) and
-follow the [visual qualification runbook](matte-visual-qualification.md). Generated
-or fake route evidence always remains pending; qualification still needs
-consented/licensed representative clips, owner-attested physical preview and
-loopback captures, live-camera/60 FPS/1080p coverage, and a completed human
-review. Matching pixels and declared capture methods do not cryptographically
-prove physical-device origin; retain the private capture record.
-The 720p compositor/service budget is measured separately with
-`custback matte-performance PRIVATE_BUNDLE --output NEW_DIR`. It runs the
-eight-cell compositor matrix without capture or output pacing and remains
-`not_decidable` until a source-matched, model-backed RVM/CUDA full-service
-sidecar is supplied. On qualified local hardware,
-`--collect-full-path --hardware-id TIER --sink-backend pyvirtualcam` produces
-and joins that evidence through the real unpaced sink-submission seam; it
-requires 330 distinct replay frames at default settings and never credits
-repeats. Its fixed-replay background profile measures a resident recorded-frame
-copy, and the cadence sweep includes the synchronous status/publication tail
-after submission. The ratified 22 ms compositor sub-budget is enforced again
-on the full hardware path; signed service headroom, the explicit
-30/27/24/20/15 FPS arrival sweep, and lower-rate classification rules are in
-[docs/matte-performance.md](matte-performance.md) and
-[ADR 0003](adr/0003-720p-compositor-budget.md).
-Cross-platform performance, sink, fallback, and lifecycle evidence is joined
-without changing a preset or default by
-`custback matte-platform-qualify PRIVATE_PLAN --output NEW_DIR`. Start from
-the content-free
-[local platform template](matte-platform-qualification-local-template.json)
-and follow the
-[platform qualification runbook](matte-platform-qualification.md).
-The checked-in JSON is a shape skeleton rather than the full code-owned matrix,
-and v1 validates sidecars from an owner-controlled collector rather than
-opening hardware itself. Generated evidence remains pending: qualification
-requires owner-attested physical route observations, independent capture-only
-and fixed-replay runs, sustained and restart/hot-patch/shutdown observations,
-and the exact reviewed platform routes with reactions disabled.
-The rollout policy therefore keeps the schema-1 matte policy and default on an explicit
-compatibility hold. The separately versioned server catalog exposes only
-acknowledged `experimental` or `locally_screened`, `quality_claim: false`
-concrete profiles; one-host screening cannot promote them to portable
-qualified presets. The
-[matte rollout, migration, and rollback guide](matte-quality-rollout.md)
-links the baseline, ablation, visual, performance, platform, privacy, and
-migration gates; defines sanitized canary counters; and provides the exact
-single transactional rollback patch. That rollback preserves the user config,
-recognized schema, optional packages, and model cache. A future promotion is a
-separate evidence-bound release decision, not an inference from installed RVM
-or generated qualification fixtures. Reactions remain a separate `REACT` lane.
-For reversible, backend-aware troubleshooting while qualification is pending,
-use the
-[immediate matte operator guide](matte-operator-mitigations.md).
-Output-rate matte interpolation remains rejected and exact repeat remains the
-automatic cadence policy; the evidence limits, four-strategy comparison,
-privacy audit, and reconsideration gates are recorded in
-[ADR 0002](adr/0002-output-rate-matte-interpolation.md).
+Use the [matte configuration guide](matte-configuration.md) for current
+defaults and a single transactional rollback that preserves your configuration
+and model cache. For visible defects, use the
+[operator troubleshooting guide](matte-operator-mitigations.md).
+Output pacing repeats the last guarded frame when no new processed frame is
+ready; it does not synthesize intermediate matte frames.
 
 ## Rendering quality & GPU acceleration
 
@@ -353,7 +301,7 @@ listed below; do not assume every available quality policy is enabled:
   soft values and falls back to the exact current matte when support is weak
   or ambiguous. It is available for private replay qualification, not selected
   as a production preset; see
-  [the spatial design and evidence boundary](matte-spatial-refinement.md).
+  [the spatial configuration and limits](matte-configuration.md).
   RVM mattes skip both generic spatial policies.
 * **Halo control** (`segmentation.mask_shift`) — grow/shrink the mask by N
   pixels; `-1`/`-2` removes leftover background fringes.
@@ -366,14 +314,14 @@ listed below; do not assume every available quality policy is enabled:
   policy registers prior alpha with a bounded low-resolution source guide,
   applies real capture `dt`, and blends only a confidence-approved contour
   band. It is available for replay qualification, not selected as a production
-  preset; see [the design and evidence boundary](matte-boundary-stabilization.md).
+  preset; see [the configuration and limits](matte-configuration.md).
 * **Light wrap** (`compositing.light_wrap`) — backdrop light bleeds subtly
   into the person's edge band. The optional
   `compositing.light_wrap_stabilization` policy bounds changes from video or
   camera backdrops using actual backdrop time; it is experimental and
   default-off, while the historical stateless pixels remain the compatibility
   path. See the
-  [light-wrap design and evidence boundary](matte-light-wrap.md).
+  [light-wrap configuration and limits](matte-configuration.md).
 * **Color-spill removal** (`compositing.use_model_foreground`, rvm only) —
   edge pixels contaminated by your real room's colors are replaced with the
   model's clean-foreground prediction.
@@ -386,7 +334,7 @@ listed below; do not assume every available quality policy is enabled:
   Controls are resolved as effective, bypassed, or inapplicable for the actual
   selected backend. `GET /config` reports configured intent, while existing
   `GET /status` fields report effective compatibility values; see the
-  [backend-policy contract](matte-backend-policies.md).
+  [backend-policy contract](matte-configuration.md).
 * **Person-free blur** — in blur mode the person is excluded from the
   background blur (normalized masked convolution), so they leave no smeared
   ghost around their own silhouette. The blur also runs at reduced
@@ -405,70 +353,18 @@ listed below; do not assume every available quality policy is enabled:
   excluded for passthrough, blur, solid color, and remote output; low
   confidence safely holds/decays or uses identity. Schema 1 keeps it `off`.
 
-### Matte-quality rollout status
+### Current defaults and status
 
-The active matte release stage is `compatibility_hold`: schema version 1,
-`backend: auto`, legacy watershed/EMA behavior for applicable non-RVM paths,
-native recurrent RVM alpha with generic postprocessing bypassed, stateless
-light wrap, and no evidence-qualified named preset. The checked-in visual
-and platform fixtures are generated and pending; they do not authorize RVM, a
-higher-detail profile, or any candidate algorithm as a new-install default.
-The executable authority is
-`scripts/release/matte-policy-rollout.json`: it pins the code-owned legacy
-patch and digest, a non-qualified concrete preset catalog, seven pending promotion
-evidence slots, non-destructive rollback, and reaction exclusion. Release
-checks reject ledger/default/helper/status/catalog drift by recomputing the
-recursively key-sorted JSON/ECMAScript digest and running a dependency-free
-Python AST check of the helper/status contracts. Integral floats canonicalize
-as integers; the current patch digest is
-`27638e419a0dcf5955d52e2eb4ead2dafbdca7f2bbe0535108aa7c56c1f2f60d`.
+Compatibility defaults remain active: camera fit `stretch`, blend space
+`srgb_legacy`, foreground color correction `off`, and backend request `auto`.
+Explicit experimental controls do not establish portable quality or frame-rate
+claims. Read `segmentation_selection`, `matte_policy`, and the matching
+`config_version` in `GET /status` to see the backend and policy actually in use.
 
-`GET /status.matte_rollout` reports the bounded rollout stage and decision,
-whether a qualified default is active, the preset catalog's evidence status,
-the code-owned legacy rollback-patch ID, and aggregate
-apply/success/failure/rollback counters. Read it together with
-`segmentation_selection`, `matte_policy`, and the matching `config_version`:
-installed capabilities and configured `auto` are not proof of the
-backend/provider actually producing the frame. The WebUI presents the same
-distinction. It enables an acknowledged non-qualified row only when its exact
-model, provider, canvas, CLI-lock, and sink requirements are available;
-portable qualification remains pending.
-
-Old, versionless, partial, and schema-1 files retain compatibility semantics;
-ordinary loading does not rewrite them. The one-patch rollback does not delete
-configuration or model caches and leaves unrelated output/background/API/
-avatar settings untouched. See the
-[matte rollout guide](matte-quality-rollout.md) and
-[ADR 0004](adr/0004-matte-quality-rollout.md) for the evidence chain,
-canary stop/go rules, sanitized telemetry allowlist, migration behavior, and
-exact rollback patch. Reactions are explicitly excluded.
-
-### Visual-policy rollout status
-
-The active release stage is `compatibility`:
-
-| Policy | Current schema-1 default | Opt-in target |
-| --- | --- | --- |
-| Main-camera fit | `stretch` | `cover` |
-| Composite space | `srgb_legacy` | `linear_srgb` |
-| Foreground correction | `off` | `auto` |
-
-The target values are implemented but are not default claims. Each flip is a
-separate future commit and schema stage after calibrated fixtures,
-physical cameras, consumer sinks, platform performance, privacy, and rollback
-evidence approve it. The executable stage ledger is
-`scripts/release/visual-policy-rollout.json`; release checks reject ledger,
-template, evidence, and commit drift. Existing versionless and schema-1 files
-always retain `stretch` / `srgb_legacy` / `off`.
-
-Use `GET /status` to diagnose the exact output frame: it reports delivered,
-oriented, normalized, and canvas dimensions; crop/pad/scale plans; capture and
-output rates; color-correction state/reason/confidence/EV/WB/timing/counters;
-the external color assumption; video tag/override/assumption status; and
-read-only camera auto-control observations. The preview HUD summarizes the
-same geometry and correction state. See the
-[rollout guide](visual-consistency-rollout.md#troubleshooting) for crop,
-bars, low confidence, camera auto-controls, and tagged/untagged media.
+Old and schema-1 configurations preserve their existing semantics. Loading a
+file does not rewrite it. See [matte configuration](matte-configuration.md) for
+rollback and [visual configuration](visual-configuration.md) for geometry,
+color settings, migration, and troubleshooting.
 
 ### Using the NVIDIA GPU
 
@@ -825,7 +721,7 @@ differs from the canvas, custback emits one upgrade note per capture lifetime
 explaining that a future staged `cover` default would crop rather than
 distort, and how to pin or preview the policy. Later default schemas and their
 rollbacks are defined in the
-[visual-consistency rollout guide](visual-consistency-rollout.md#deterministic-upgrade-behavior).
+[visual-consistency configuration guide](visual-configuration.md).
 
 The same migration materializes the schema-1 matte compatibility policy:
 `backend: auto`, legacy watershed and frame-count EMA where applicable,
@@ -833,7 +729,7 @@ motion-aware stabilization off, temporal light-wrap stabilization off, and
 the existing backend-specific RVM bypass semantics. It never converts
 `temporal_smoothing` into a time constant or promotes a named preset. The
 complete field set and non-destructive rollback are in the
-[matte rollout guide](matte-quality-rollout.md#one-patch-rollback).
+[matte configuration guide](matte-configuration.md).
 
 Storage audit is no-follow and non-mutating. Repair first rejects symlinks,
 special files, foreign ownership, overlapping roots, and inode changes, then

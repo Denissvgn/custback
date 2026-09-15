@@ -22,7 +22,7 @@ writer stops at the duration or byte limit. A one-frame asynchronous queue
 keeps disk stalls out of the live send path; writer backpressure stops evidence
 capture instead of delaying future output. Only unique camera inputs are
 recorded in the frame track—output repeats are never synthesized into model
-inputs. MATTE-0.2 adds a scalar-only `output_timeline` after successful sends.
+inputs. adds a scalar-only `output_timeline` after successful sends.
 It references the unique source/base sequence and records update/reuse and
 exact-repeat equality without duplicating pixels.
 The byte limit must be at least 65,536 bytes so the terminal manifest can
@@ -114,7 +114,7 @@ value, `effective`/`bypassed`/`inapplicable` state, and content-free reason.
 The separate `configured_controls` object remains the persisted-intent
 authority. Older version-1 bundles without the additive snapshot remain valid;
 frozen replay never invents a policy snapshot that was not recorded. See
-[the backend-policy contract](matte-backend-policies.md).
+[the backend-policy contract](matte-configuration.md).
 
 Spatial-refinement controls include the configured
 `spatial_edge_refinement` policy and, where refinement is effective, its
@@ -124,7 +124,7 @@ rerun behavior. `stable_guided` remains an explicit qualification candidate;
 recording it does not make it a production preset. The policy/radius/timing
 scalars are safe manifest metadata, but denoised guides, covariance maps, and
 intermediate candidate alpha are not added as ordinary diagnostic tracks. See
-[the spatial-refinement contract](matte-spatial-refinement.md).
+[the spatial-refinement contract](matte-configuration.md).
 
 Eligible dynamic-backdrop frames may also carry the additive
 `effective_controls.light_wrap_stabilization` snapshot: configured/effective
@@ -138,7 +138,7 @@ optional fields remain valid, but they cannot exercise a stateful frozen
 light-wrap candidate without the generation proof. Intermediate filtered wrap
 rasters are not a normal artifact track; the exact backdrop and composites
 already make the opt-in bundle identifiable. See the
-[dynamic light-wrap contract](matte-light-wrap.md).
+[dynamic light-wrap contract](matte-configuration.md).
 
 When available, `resource_samples.rss_bytes` records process resident memory
 after the complete frame has passed sink submission. An optional
@@ -183,7 +183,7 @@ difference against each recorded final composite. An unchanged frozen run also
 records `baseline_reproduction_passed` against the tolerance below before any
 attribution variant is considered.
 
-MATTE-2.4 qualification uses the recorded backdrop presentation timeline and
+qualification uses the recorded backdrop presentation timeline and
 discontinuity identity as algorithm inputs. `--realtime` may pace replay for
 observation, but wall-clock scheduling must not alter pixels or temporal state.
 The `--light-wrap 0` variant is the same-frame control for a recorded wrap-on
@@ -227,7 +227,7 @@ pixel arrays. JSON and Markdown outputs are owner-only. Annotation arrays
 remain privacy-sensitive because core/background masks can reveal a
 silhouette; keep them beside the private replay rather than in the repository.
 Metric and annotation definitions are frozen in
-[`matte-quality-metrics.md`](matte-quality-metrics.md).
+[annotation format](#annotation-format).
 
 ## RVM alpha/compositor attribution
 
@@ -252,9 +252,7 @@ annotated opaque core remains deficient across at least two unique inputs.
 
 All views and heatmaps are derived identifiable imagery. They have the same
 privacy handling as the replay, are bounded by `--max-output-bytes`, and must
-not be committed or shared without consent. See
-[`matte-alpha-attribution.md`](matte-alpha-attribution.md) for the protocol and
-interpretation contract.
+not be committed or shared without consent. Use the annotation format below to bind each named region to its source frame.
 
 ## Bounded ablation matrix
 
@@ -264,6 +262,43 @@ and joins separately recorded backend/model rows only after source-identity
 validation. It never substitutes an available fallback for a requested
 unavailable backend.
 
-See [`matte-ablation.md`](matte-ablation.md) for plan row types, matrix
-coverage, privacy bounds, contact sheets, performance summaries, and the
-one-host shortlist contract.
+Use `custback matte-ablate --help` for supported input and output options.
+Keep the resulting contact sheets and reports private; a local shortlist does
+not change runtime defaults or establish compatibility on another host.
+
+## Annotation format
+
+Private `annotations.json` files use `custback.matte-quality-annotations`,
+version 1, and bind to the replay manifest SHA-256. Each lossless NPY array
+records its relative path, size, digest, dtype, and shape; pickle loading is
+disabled. Paths cannot escape the owner-only annotation directory.
+
+Each unique input belongs to a `stationary`, `moving`, `fast_motion`, or
+`occlusion` segment. A frame can provide a source-to-source affine transform,
+boolean opaque-core and known-background masks, float32 reference alpha, and
+uint8 BGR reference foreground. Optional named regions use lowercase names
+and trimap kinds `opaque_core`, `background`, or `soft_boundary`. Existing
+annotation files without named regions remain valid.
+
+Annotations and derived heatmaps can identify people. Do not publish them
+without appropriate consent. A changed replay or annotation manifest requires
+a newly matching digest binding. Missing reference data is reported as
+unavailable; it is not a zero error measurement.
+
+## Additional diagnostic commands
+
+These explicit commands consume private inputs and do not change defaults:
+
+| Command | Purpose |
+| --- | --- |
+| `custback matte-rvm-qualify` | Compare recorded RVM model, ratio, and provider evidence. |
+| `custback matte-performance` | Measure replay processing and compositor service time. |
+| `custback matte-visual-qualify` | Validate recorded visual and output-route comparisons. |
+| `custback matte-platform-qualify` | Join platform, lifecycle, and performance reports. |
+
+Run a command with `--help` for its required inputs. Content-free JSON examples
+are in [config/qualification](../config/qualification/). Copy them to an
+owner-only working directory and replace placeholders with real measurements.
+Templates and generated inputs cannot establish physical-camera, provider,
+visual quality, or sustained frame-rate results. Failed, missing, or mismatched
+evidence stays unqualified.

@@ -168,7 +168,8 @@ def test_checked_in_local_template_parses_and_covers_720p_temporal_skeleton(
 ) -> None:
     source = (
         Path(__file__).resolve().parents[1]
-        / "docs"
+        / "config"
+        / "qualification"
         / "matte-visual-qualification-local-template.json"
     )
     private_root = tmp_path / "private-template"

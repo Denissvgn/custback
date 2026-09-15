@@ -2,7 +2,7 @@
   "schema_version": 1,
   "manifest_id": "custback-visual-qualification-v1",
   "baseline": {
-    "path": "docs/visual-consistency-phase0-baseline.json",
+    "path": "tests/fixtures/visual/geometry-color-baseline.json",
     "sha256": "e6ccca5dc8d29b61f60cba5576263864b64823ad3a6f12241c8430a733695c07"
   },
   "reference_runner": {
