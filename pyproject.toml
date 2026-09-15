@@ -65,7 +65,7 @@ audio2face = [
     "grpcio>=1.67,<1.67.2",
     "nvidia-ace==1.0.0",
     "nvidia-audio2face-3d==1.3.0",
-    "protobuf>=5.29.6,<6",
+    "protobuf>=5.29.6,<8",
     "sounddevice>=0.4,<0.6",
 ]
 dev = [
