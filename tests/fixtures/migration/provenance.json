@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "release": "0.3.0",
-  "source_commit": "f01baadfa3b1e2a1ef19eceda315eedf06fbe883",
+  "source_commit": "099001e9f25a3ea1d0c820b066a6318e4172d549",
   "source_path": "config/default.yaml",
   "publication_status": "unpublished-reference-commit",
   "source_sha256": "d060c287b3cd1b0ca23b379b641e9b1df511ead5212c80e90d56502804e93043",

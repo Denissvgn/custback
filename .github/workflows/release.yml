@@ -62,7 +62,7 @@ jobs:
       - name: Build the unpublished 0.3 source-reference artifacts once
         shell: bash
         env:
-          REFERENCE_COMMIT: f01baadfa3b1e2a1ef19eceda315eedf06fbe883
+          REFERENCE_COMMIT: 099001e9f25a3ea1d0c820b066a6318e4172d549
         run: |
           mkdir -p "$RUNNER_TEMP/reference-source" "$RUNNER_TEMP/reference"
           git cat-file -e "${REFERENCE_COMMIT}^{commit}"

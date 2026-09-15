@@ -134,7 +134,7 @@ test('artifact build uses the authorizing path once and attests all exact files'
   assert.match(block, /id-token: write/);
   assert.match(block, /attestations: write/);
   assert.match(block, new RegExp(UPLOAD.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(block, /f01baadfa3b1e2a1ef19eceda315eedf06fbe883/);
+  assert.match(block, /099001e9f25a3ea1d0c820b066a6318e4172d549/);
   assert.match(block, /custback-unpublished-reference-0\.3\.0/);
   assert.match(block, /npm pack[^\n]*--ignore-scripts/);
 

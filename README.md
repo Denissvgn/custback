@@ -911,6 +911,9 @@ frame.
 
 ## Migrating from 0.3 to 0.4
 
+Migration fixtures use an unpublished 0.3 source reference; no published 0.3
+registry package is assumed.
+
 Run the installed migrator before starting 0.4 with an existing configuration:
 
 ```bash

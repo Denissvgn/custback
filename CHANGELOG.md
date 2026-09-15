@@ -10,6 +10,8 @@
 - Add repository metadata, contribution guidance, private security reporting,
   and automated repository security checks.
 - Keep package publishing separate from ordinary CI and manual qualification.
+- Use fast required CI for the first source publication; retain the full matrix,
+  performance checks, CodeQL, and Windows frozen builds as manual workflows.
 
 Compatibility rendering defaults remain in place. Experimental presets require
 explicit selection. Registry packages and signed Windows installers have not

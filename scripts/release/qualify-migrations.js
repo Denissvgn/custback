@@ -16,7 +16,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const CANDIDATE_VERSION = JSON.parse(
   fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'),
 ).version;
-const REFERENCE_COMMIT = 'f01baadfa3b1e2a1ef19eceda315eedf06fbe883';
+const REFERENCE_COMMIT = '099001e9f25a3ea1d0c820b066a6318e4172d549';
 const REFERENCE_VERSION = '0.3.0';
 const REPORT_ID = 'custback-phase6-migration-qualification-v1';
 const COMMAND_TIMEOUT_MS = 30 * 60 * 1000;

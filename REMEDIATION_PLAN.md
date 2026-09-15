@@ -751,7 +751,7 @@ full release check fail. Only the exact fully validated commit can publish.
 - Added artifact-only migration qualification. Direct npm and PyPI registry
   checks found no published 0.3 `custback` artifacts, so the workflow rebuilds
   explicitly unpublished references once from reviewed commit
-  `f01baadfa3b1e2a1ef19eceda315eedf06fbe883`; reports and documentation never
+  `099001e9f25a3ea1d0c820b066a6318e4172d549`; reports and documentation never
   describe those source reconstructions as released bytes.
 - Added the packaged two-host WSS/HTTPS harness with isolated container
   addresses, independent ephemeral CAs and secrets, real hostname verification,

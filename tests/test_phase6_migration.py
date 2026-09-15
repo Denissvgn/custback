@@ -35,7 +35,7 @@ def test_migration_fixtures_are_bound_to_the_0_3_0_source_commit():
     provenance = json.loads((FIXTURES / "provenance.json").read_text())
 
     assert provenance["release"] == "0.3.0"
-    assert provenance["source_commit"] == ("f01baadfa3b1e2a1ef19eceda315eedf06fbe883")
+    assert provenance["source_commit"] == ("099001e9f25a3ea1d0c820b066a6318e4172d549")
     assert provenance["source_path"] == "config/default.yaml"
     assert provenance["publication_status"] == "unpublished-reference-commit"
     assert provenance["source_sha256"] == (
