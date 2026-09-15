@@ -43,7 +43,7 @@
   <ItemGroup>
     <!-- Evergreen WebView2 loader; the runtime itself is a first-class
          installer prerequisite (WIN-5.6), not bundled here. -->
-    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2792.45" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4191.47" />
   </ItemGroup>
 
 </Project>
