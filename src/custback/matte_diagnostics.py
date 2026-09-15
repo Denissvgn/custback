@@ -20,12 +20,14 @@ import json
 import math
 import os
 import queue
+import re
 import stat
 import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
@@ -57,6 +59,7 @@ MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MIN_BUNDLE_BYTES = 64 * 1024
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
 _QUEUE_DEPTH = 1
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 CaptureMode = Literal["full", "composite_only"]
 ReplayMode = Literal["frozen", "rerun", "reference"]
@@ -1121,15 +1124,64 @@ def _read_private_file(path: Path, *, max_bytes: int) -> bytes:
         os.close(descriptor)
 
 
+@lru_cache(maxsize=256)
+def _canonical_npy_header(dtype: str, shape: tuple[int, ...]) -> bytes:
+    stream = io.BytesIO()
+    np.lib.format.write_array_header_1_0(
+        stream, {"descr": dtype, "fortran_order": False, "shape": shape}
+    )
+    return stream.getvalue()
+
+
+def _decode_npy(payload: bytes, dtype: object, shape: object) -> Any:
+    """Decode canonical numeric arrays without reparsing identical headers.
+
+    Callers still verify file ownership, byte bounds and digests on every read.
+    Only shape/dtype headers are cached; pixels are never retained in a cache.
+    Other valid NPY encodings use NumPy's ordinary pickle-disabled reader.
+    """
+    if (
+        isinstance(dtype, str)
+        and dtype in {"|u1", "<f4", "<f8", "|b1"}
+        and isinstance(shape, list)
+        and len(shape) in (2, 3)
+        and all(type(dimension) is int and dimension > 0 for dimension in shape)
+    ):
+        array_dtype = np.dtype(dtype)
+        count = math.prod(shape)
+        if count * array_dtype.itemsize < len(payload):
+            dimensions = tuple(shape)
+            header = _canonical_npy_header(dtype, dimensions)
+            if len(payload) == len(
+                header
+            ) + count * array_dtype.itemsize and payload.startswith(header):
+                return (
+                    np.frombuffer(payload, dtype=array_dtype, offset=len(header))
+                    .reshape(dimensions)
+                    .copy()
+                )
+    return np.load(io.BytesIO(payload), allow_pickle=False)
+
+
 def _safe_relative_path(value: object) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         raise MatteDiagnosticsError("bundle artifact path is malformed")
+    if len(value) > 1024:
+        return _parsed_frame_path.__wrapped__(str(value))
+    return _parsed_frame_path(str(value))
+
+
+@lru_cache(maxsize=4096)
+def _parsed_frame_path(value: str) -> PurePosixPath:
+    """Cache only immutable path syntax, never file contents or permissions."""
     relative = PurePosixPath(value)
+    parts = relative.parts
     if (
         relative.is_absolute()
-        or any(part in ("", ".", "..") for part in relative.parts)
-        or relative.parts[0] != "frames"
-        or len(relative.parts) != 3
+        or any(part in ("", ".", "..") for part in parts)
+        or not parts
+        or parts[0] != "frames"
+        or len(parts) != 3
     ):
         raise MatteDiagnosticsError("bundle artifact path escapes the bundle")
     return relative
@@ -1340,11 +1392,7 @@ class MatteReplayBundle:
                 type(descriptor.get("bytes")) is not int
                 or int(descriptor["bytes"]) <= 0
                 or not isinstance(descriptor.get("sha256"), str)
-                or len(str(descriptor["sha256"])) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in str(descriptor["sha256"])
-                )
+                or _SHA256.fullmatch(descriptor["sha256"]) is None
                 or not isinstance(descriptor.get("shape"), list)
                 or not isinstance(descriptor.get("dtype"), str)
             ):
@@ -1412,7 +1460,7 @@ class MatteReplayBundle:
                 "bundle artifact digest does not match manifest"
             )
         try:
-            array = np.load(io.BytesIO(payload), allow_pickle=False)
+            array = _decode_npy(payload, descriptor["dtype"], descriptor["shape"])
         except (OSError, ValueError) as exc:
             raise MatteDiagnosticsError("bundle NumPy artifact is malformed") from exc
         if (

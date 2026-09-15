@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import json
 import math
 import os
@@ -18,6 +17,7 @@ import platform
 import re
 import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping, Sequence, cast
 
@@ -30,6 +30,7 @@ from .matte_diagnostics import (
     MatteDiagnosticsError,
     MatteReplayBundle,
     _atomic_private_write,
+    _decode_npy,
     _json_bytes,
     _npy_bytes,
     _private_directory,
@@ -43,6 +44,7 @@ REPORT_SCHEMA = "custback.matte-quality-report"
 REPORT_VERSION = 1
 POST_BASE_SCHEMA = "custback.matte-post-base-output-provenance"
 METRIC_TOLERANCE = 1e-6
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 AnnotationKind = Literal[
     "opaque_core",
@@ -146,12 +148,13 @@ def _summary(values: Sequence[float]) -> dict[str, float | int | None]:
             "max": None,
         }
     array = np.asarray(values, dtype=np.float64)
+    p05, p50, p95 = np.percentile(array, [5, 50, 95])
     return {
         "count": int(array.size),
         "mean": _round(float(np.mean(array, dtype=np.float64))),
-        "p05": _round(float(np.percentile(array, 5))),
-        "p50": _round(float(np.percentile(array, 50))),
-        "p95": _round(float(np.percentile(array, 95))),
+        "p05": _round(float(p05)),
+        "p50": _round(float(p50)),
+        "p95": _round(float(p95)),
         "min": _round(float(np.min(array))),
         "max": _round(float(np.max(array))),
     }
@@ -160,12 +163,21 @@ def _summary(values: Sequence[float]) -> dict[str, float | int | None]:
 def _safe_annotation_path(value: object) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         raise MatteQualityError("annotation artifact path is malformed")
+    if len(value) > 1024:
+        return _parsed_annotation_path.__wrapped__(str(value))
+    return _parsed_annotation_path(str(value))
+
+
+@lru_cache(maxsize=4096)
+def _parsed_annotation_path(value: str) -> PurePosixPath:
+    """Cache path syntax while retaining integrity checks on every file read."""
     relative = PurePosixPath(value)
+    parts = relative.parts
     if (
         relative.is_absolute()
-        or len(relative.parts) != 2
-        or relative.parts[0] != "arrays"
-        or any(part in ("", ".", "..") for part in relative.parts)
+        or len(parts) != 2
+        or parts[0] != "arrays"
+        or any(part in ("", ".", "..") for part in parts)
     ):
         raise MatteQualityError("annotation artifact path escapes the bundle")
     return relative
@@ -518,11 +530,7 @@ class MatteQualityAnnotations:
                 or int(descriptor["bytes"]) <= 0
                 or int(descriptor["bytes"]) > MAX_ARTIFACT_BYTES
                 or not isinstance(descriptor.get("sha256"), str)
-                or len(str(descriptor["sha256"])) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in str(descriptor["sha256"])
-                )
+                or _SHA256.fullmatch(descriptor["sha256"]) is None
                 or not isinstance(descriptor.get("dtype"), str)
                 or not isinstance(descriptor.get("shape"), list)
             ):
@@ -555,11 +563,7 @@ class MatteQualityAnnotations:
                 or int(descriptor["bytes"]) <= 0
                 or int(descriptor["bytes"]) > MAX_ARTIFACT_BYTES
                 or not isinstance(descriptor.get("sha256"), str)
-                or len(str(descriptor["sha256"])) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in str(descriptor["sha256"])
-                )
+                or _SHA256.fullmatch(descriptor["sha256"]) is None
                 or descriptor.get("dtype") != np.dtype(np.uint8).str
                 or not isinstance(descriptor.get("shape"), list)
             ):
@@ -589,7 +593,7 @@ class MatteQualityAnnotations:
         ):
             raise MatteQualityError("annotation artifact integrity check failed")
         try:
-            array = np.load(io.BytesIO(payload), allow_pickle=False)
+            array = _decode_npy(payload, descriptor["dtype"], descriptor["shape"])
         except (OSError, ValueError) as exc:
             raise MatteQualityError(
                 "annotation artifact is not a safe NPY array"
@@ -632,7 +636,7 @@ class MatteQualityAnnotations:
                     "annotation named region integrity check failed"
                 )
             try:
-                array = np.load(io.BytesIO(payload), allow_pickle=False)
+                array = _decode_npy(payload, descriptor["dtype"], descriptor["shape"])
             except (OSError, ValueError) as exc:
                 raise MatteQualityError(
                     "annotation named region is not a safe NPY array"
@@ -733,9 +737,10 @@ def _contour_displacement(
     delta = np.abs(
         _signed_distance(current_binary) - _signed_distance(previous_binary)
     )[band]
+    p50, p95 = np.percentile(delta, [50, 95])
     return (
-        _round(float(np.percentile(delta, 50))),
-        _round(float(np.percentile(delta, 95))),
+        _round(float(p50)),
+        _round(float(p95)),
     )
 
 
@@ -802,10 +807,11 @@ def _region_metrics(
     }
     if opaque is not None and bool(np.any(opaque)):
         values = _region_values(alpha, opaque)
+        p05, p50 = np.percentile(values, [5, 50])
         metrics.update(
             {
-                "opaque_core_alpha_p05": _round(float(np.percentile(values, 5))),
-                "opaque_core_alpha_p50": _round(float(np.percentile(values, 50))),
+                "opaque_core_alpha_p05": _round(float(p05)),
+                "opaque_core_alpha_p50": _round(float(p50)),
                 "opaque_core_mean_deficit": _round(float(np.mean(1.0 - values))),
                 "opaque_core_fraction_below_0_95": _round(
                     float(np.mean(values < 0.95))

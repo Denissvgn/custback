@@ -9,7 +9,6 @@ as qualification results or represented as a real RVM benchmark.
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -118,7 +117,7 @@ def _expanded_evidence(
     provider: str,
     send_delay_ms: float,
     slow_cadence: bool,
-) -> None:
+) -> MatteReplayBundle:
     """Expand a small physical fixture into a long, reference-reusing run."""
 
     target_count = 660 if cadence == "native30" else 330
@@ -130,7 +129,9 @@ def _expanded_evidence(
     first_timestamp = int(base_frames[0]["capture_monotonic_ns"])
     frames: list[dict[str, Any]] = []
     for sequence in range(target_count):
-        frame = copy.deepcopy(base_frames[sequence % len(base_frames)])
+        # Only the outer fields change before serialization. Nested descriptors
+        # remain read-only, and JSON loading restores independent frame objects.
+        frame = dict(base_frames[sequence % len(base_frames)])
         frame["sequence"] = sequence
         frame["capture_sequence"] = stride * sequence
         frame["capture_monotonic_ns"] = (
@@ -181,7 +182,7 @@ def _expanded_evidence(
     segments, labels = _segments(target_count, capture_stride=stride)
     expanded_annotations: list[dict[str, Any]] = []
     for sequence in range(target_count):
-        frame = copy.deepcopy(base_annotations[sequence % len(base_annotations)])
+        frame = dict(base_annotations[sequence % len(base_annotations)])
         frame["sequence"] = sequence
         frame["segment"] = labels[sequence]
         expanded_annotations.append(frame)
@@ -192,6 +193,7 @@ def _expanded_evidence(
     annotation_manifest["frames"] = expanded_annotations
     annotation_manifest["frame_count"] = target_count
     _write_private(annotations_path, annotation_manifest)
+    return bundle
 
 
 def _qualification_segmentation_sha256(segmentation: dict[str, Any]) -> str:
@@ -754,7 +756,7 @@ def _bundle_and_run(
         )
     )
     if sustainable:
-        _expanded_evidence(
+        bundle = _expanded_evidence(
             bundle_root,
             annotation_root,
             cadence=cadence,
@@ -764,7 +766,8 @@ def _bundle_and_run(
             ),
             slow_cadence=fault == "slow_cadence",
         )
-    bundle = MatteReplayBundle(bundle_root)
+    else:
+        bundle = MatteReplayBundle(bundle_root)
     frame_count = len(bundle.frames)
     capture_span = (
         bundle.frames[-1]["capture_monotonic_ns"]

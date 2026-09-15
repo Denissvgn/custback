@@ -26,8 +26,8 @@
 .PARAMETER AvatarProfile
     Avatar driver stack for custback-avatar.exe (WIN-6.4): "vision" (default,
     MediaPipe) or "audio2face" (gRPC client).  The two are mutually exclusive
-    per payload because their protobuf requirements conflict; the spec excludes
-    the other stack accordingly.
+    per payload so each supported driver profile is qualified independently;
+    the spec excludes the other stack accordingly.
 #>
 [CmdletBinding()]
 param(
@@ -55,12 +55,11 @@ if ($AvatarProfile -eq "audio2face" -and -not $PSBoundParameters.ContainsKey("Ex
 
 $extraNames = $Extras.Split(",") | ForEach-Object { $_.Trim().ToLowerInvariant() }
 
-# WIN-6.4 driver-stack exclusivity: nvidia protocol wheels need protobuf>=5.29
-# while mediapipe needs protobuf<5 (see pyproject audio2face extra); a venv
-# holding both cannot resolve, so refuse before pip discovers it slowly.
+# Keep separate supported driver profiles; a combined frozen payload has not
+# been qualified and must not be inferred from dependency compatibility alone.
 if ($AvatarProfile -eq "audio2face") {
     if ($extraNames -contains "mediapipe") {
-        throw "the audio2face avatar profile cannot include the 'mediapipe' extra (protobuf conflict); use -Extras rvm,audio2face,windows"
+        throw "the audio2face avatar profile cannot include the 'mediapipe' extra (separate supported driver profiles); use -Extras rvm,audio2face,windows"
     }
     if ($Arch -eq "arm64") {
         throw "the audio2face avatar profile is x64-only (NVIDIA protocol wheels ship no ARM64 build; WINDOWS_ARM64.md)"

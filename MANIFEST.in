@@ -1,4 +1,7 @@
 include config/default.yaml
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
 include docs/cadence-observability.md
 include docs/capture-cadence-diagnostics.md
 include docs/capture-native-evidence-local-template.json

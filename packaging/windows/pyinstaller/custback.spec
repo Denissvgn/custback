@@ -46,11 +46,8 @@ from PyInstaller.utils.hooks import (
 )
 
 # --------------------------------------------------------------------------- #
-# Avatar driver profile (WIN-6.4).  The `mediapipe` (vision driver) and
-# `audio2face` (gRPC driver) extras cannot share one environment — NVIDIA's
-# protocol wheels require protobuf>=5.29 while mediapipe requires protobuf<5 —
-# so one frozen payload carries exactly one driver stack.  `vision` is the
-# shipped default (D7 / driver `auto`); `audio2face` is the opt-in second
+# One frozen payload carries exactly one independently supported driver stack.
+# `vision` is the default; `audio2face` is the opt-in second
 # flavor built from a venv holding the audio2face extra instead of mediapipe.
 # --------------------------------------------------------------------------- #
 AVATAR_PROFILE = os.environ.get("CUSTBACK_AVATAR_PROFILE", "vision").strip().lower()

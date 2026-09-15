@@ -28,10 +28,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-try:  # python-multipart >= 0.0.12 canonical namespace
+try:
     from python_multipart.exceptions import FormParserError, MultipartParseError
     from python_multipart.multipart import MultipartParser, parse_options_header
-except ImportError:  # python-multipart 0.0.9 minimum compatibility
+except ImportError:  # Legacy namespace for downstream compatibility.
     from multipart.exceptions import FormParserError, MultipartParseError
     from multipart.multipart import MultipartParser, parse_options_header
 

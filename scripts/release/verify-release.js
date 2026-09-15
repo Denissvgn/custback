@@ -189,6 +189,9 @@ const REVIEWED_PYTHON_TESTS = [
   'tests/fixtures/migration/provenance.json',
 ];
 const REVIEWED_PYTHON_SDIST_DATA = [
+  'CHANGELOG.md',
+  'CONTRIBUTING.md',
+  'SECURITY.md',
   'config/default.yaml',
   'docs/adr/0002-output-rate-matte-interpolation.md',
   'docs/adr/0003-720p-compositor-budget.md',
@@ -232,11 +235,15 @@ const REVIEWED_PYTHON_SDIST_DATA = [
 ];
 const REVIEWED_NPM_PAYLOAD = [
   '.github/workflows/ci.yml',
+  '.github/workflows/codeql.yml',
+  '.github/workflows/full-ci.yml',
   '.github/workflows/release.yml',
   'LICENSE',
   'MANIFEST.in',
   'README.md',
-  'REMEDIATION_PLAN.md',
+  'CHANGELOG.md',
+  'CONTRIBUTING.md',
+  'SECURITY.md',
   'config/avatar.yaml',
   'config/default.yaml',
   'docs/adr/0001-visual-consistency-contract.md',
@@ -332,21 +339,23 @@ const REVIEWED_NPM_PAYLOAD = [
 const REVIEWED_BUILD_REQUIREMENTS = ['setuptools>=77,<84'];
 const REVIEWED_CORE_DEPENDENCIES = [
   'numpy>=1.24,<3',
-  'opencv-contrib-python>=4.8,<6',
+  'opencv-contrib-python>=4.8.1.78,<6',
   "av>=17,<18; python_version < '3.11'",
   "av>=18,<19; python_version >= '3.11'",
-  'pillow>=10,<13',
-  'pydantic>=2.7,<3',
+  'pillow>=12.3,<13',
+  'pydantic>=2.9,<3',
   "pyvirtualcam>=0.11,<1; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64')",
-  'fastapi>=0.110,<1',
+  'fastapi>=0.139,<1',
+  'starlette>=1.3.1,<2',
   'uvicorn>=0.29,<1',
   'pyyaml>=6.0,<7',
   'websockets>=12.0,<17',
-  'python-multipart>=0.0.9,<1',
+  'python-multipart>=0.0.32,<1',
   'httpx>=0.27,<0.29',
+  "pywin32>=306; sys_platform == 'win32'",
 ];
 const REVIEWED_OPTIONAL_DEPENDENCIES = {
-  mediapipe: ['mediapipe>=0.10.14,<0.11'],
+  mediapipe: ['mediapipe>=0.10.35,<0.11'],
   rvm: ['onnxruntime>=1.17,<2'],
   gpu: ['onnxruntime-gpu>=1.17,<1.27'],
   // Windows-only DirectML acceleration profile (WIN-6.2). Mutually exclusive
@@ -360,7 +369,7 @@ const REVIEWED_OPTIONAL_DEPENDENCIES = {
     'grpcio>=1.67,<1.67.2',
     'nvidia-ace==1.0.0',
     'nvidia-audio2face-3d==1.3.0',
-    'protobuf>=5.29.3,<6',
+    'protobuf>=5.29.6,<6',
     'sounddevice>=0.4,<0.6',
   ],
   dev: [
@@ -390,11 +399,14 @@ const REVIEWED_ACTIONS = new Set([
 ]);
 const REVIEWED_LICENSE_COPYRIGHT = 'Copyright (c) 2026 Bramen';
 const REVIEWED_REMEDIATION_CONTRACT_SHA256 =
-  'daf3165058e28fbbd91a7d90aac8804cd67fa2a9e8af2e1b69fa67d5a8a91db0';
+  'f0d35cfbc559953cee2edea0b1b87cbf7f1fbe9887f6e39f065afe5eec671c02';
 const REVIEWED_NPM_METADATA = {
   name: 'custback',
-  description: 'Virtual camera with background replacement for meeting apps (Ubuntu / Debian / macOS)',
+  description: 'Launcher for Custback virtual camera on Ubuntu/Debian and macOS',
   license: 'MIT',
+  repository: { type: 'git', url: 'git+https://github.com/Denissvgn/custback.git' },
+  homepage: 'https://github.com/Denissvgn/custback#readme',
+  bugs: { url: 'https://github.com/Denissvgn/custback/issues' },
   bin: {
     custback: 'packaging/npm/custback.js',
     'custback-avatar': 'packaging/npm/custback.js',
@@ -410,7 +422,9 @@ const REVIEWED_NPM_METADATA = {
   files: [
     '.github/workflows/*.yml',
     'LICENSE',
-    'REMEDIATION_PLAN.md',
+    'CHANGELOG.md',
+    'CONTRIBUTING.md',
+    'SECURITY.md',
     'packaging/npm/*.js',
     'packaging/npm/test/*.test.js',
     'src/**/*.json',
@@ -815,7 +829,7 @@ function verifyNoReleaseBlockers(root = ROOT) {
   if (open.length) {
     fail(
       `release blocked by ${open.length} open remediation blocker(s): ` +
-      `${open.map((entry) => entry.id).join(', ')}; see REMEDIATION_PLAN.md`,
+      `${open.map((entry) => entry.id).join(', ')}; see scripts/release/remediation-blockers.json`,
     );
   }
 }
@@ -2057,7 +2071,27 @@ print(json.dumps(contract, sort_keys=True, separators=(",", ":")))`,
 }
 
 function verifyCiWorkflow(root = ROOT) {
-  const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'full-ci.yml'), 'utf8');
+  const fast = fs.readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
+  for (const required of [
+    'python -m ruff check src tests examples scripts/release',
+    'python -m ruff format --check src tests examples scripts/release',
+    'tests/test_api_security.py',
+    'tests/test_remediation_security.py',
+    'tests/test_platform_seam.py',
+    'tests/test_pipeline.py::test_operator_matte_mitigations_apply_confirm_and_rollback',
+    'npm test',
+    'npm run release:check -- --quick',
+    'python -m pip_audit --strict --skip-editable',
+    'gitleaks',
+    'os: [windows-2022, macos-latest]',
+  ]) {
+    if (!fast.includes(required)) fail(`fast CI is missing required coverage: ${required}`);
+  }
+  const trigger = workflow.slice(workflow.indexOf('on:'), workflow.indexOf('\npermissions:'));
+  if (trigger.trim() !== 'on:\n  workflow_dispatch:') {
+    fail('extended CI must remain manually available during initial source publication');
+  }
   const uses = [...workflow.matchAll(/^\s*-\s+uses:\s+([^\s#]+)/gm)]
     .map((match) => match[1]);
   if (!uses.length || uses.some((action) => !REVIEWED_ACTIONS.has(action))) {
@@ -2192,6 +2226,9 @@ function verifyReleaseWorkflow(root = ROOT, manifest = phase6Evidence.loadManife
     'needs: [release-gate]',
     'python -m twine upload --non-interactive "$wheel" "$sdist"',
     'npm publish "$tarball" --access public --provenance',
+    'node scripts/release/phase6-evidence.js authorize-publication',
+    'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+    "vars.CUSTBACK_PUBLISH_ENABLED == 'true'",
   ];
   const missing = requiredSnippets.filter((snippet) => !source.includes(snippet));
   if (missing.length) {
@@ -2281,7 +2318,9 @@ function verifyPack(version, root = ROOT) {
     for (const required of [
       'LICENSE',
       'README.md',
-      'REMEDIATION_PLAN.md',
+      'CHANGELOG.md',
+      'CONTRIBUTING.md',
+      'SECURITY.md',
       '.github/workflows/ci.yml',
       'docs/remote-deployment.md',
       'docs/visual-consistency-phase4-qualification-runbook.md',
@@ -2385,25 +2424,15 @@ function installAndProbeExtra(python, temporaryRoot, artifact, profile, source) 
   });
 }
 
-function stageCleanSource(root, destination) {
-  const excludedNames = new Set([
-    '.agents', '.codex', '.git', '.venv', '.pytest_cache', 'build', 'dist', '__pycache__',
-    'debug.txt', 'uninstall.log',
-  ]);
-  fs.cpSync(root, destination, {
-    recursive: true,
-    filter(source) {
-      const relative = path.relative(root, source);
-      if (relative === '') return true;
-      const parts = relative.split(path.sep);
-      if (parts.some((part) => excludedNames.has(part) || part.endsWith('.egg-info') ||
-          part.endsWith('.custback-generations'))) return false;
-      if (relative.endsWith('.tgz') || relative.endsWith('.whl') ||
-          relative.endsWith('.tar.gz') || relative.endsWith('.pyc') ||
-          /(^|[\\/])onnxruntime_profile__.*\.json$/.test(relative)) return false;
-      return true;
-    },
-  });
+function stageCleanSource(root, destination, names) {
+  // Stage only the reviewed build inputs. Local environments and diagnostic
+  // directories must not be copied merely because they have a new name.
+  fs.mkdirSync(destination, { recursive: true });
+  for (const name of names) {
+    const target = path.join(destination, name);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(root, name), target);
+  }
 }
 
 function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
@@ -2411,7 +2440,7 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
   const source = path.join(temporaryRoot, 'source');
   const output = path.join(temporaryRoot, 'python-dist');
   const buildTools = path.join(temporaryRoot, 'build-tools-venv');
-  verifyReviewedSourceFiles(root, [
+  const sourceNames = [
     'LICENSE',
     'MANIFEST.in',
     'README.md',
@@ -2419,8 +2448,9 @@ function verifyPythonArtifacts(version, temporaryRoot, root = ROOT) {
     ...REVIEWED_PYTHON_MODULES.map((name) => `src/${name}`),
     ...REVIEWED_PYTHON_TESTS,
     ...REVIEWED_PYTHON_SDIST_DATA,
-  ]);
-  stageCleanSource(root, source);
+  ];
+  verifyReviewedSourceFiles(root, sourceNames);
+  stageCleanSource(root, source, sourceNames);
   fs.mkdirSync(output);
   withDisposableDirectory(buildTools, () => {
     runChecked(python, ['-m', 'venv', buildTools]);

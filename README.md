@@ -1,7 +1,7 @@
 # custback
 
 Local virtual camera with background replacement for meeting apps and
-browsers, on **Ubuntu / Debian** and **macOS**.
+browsers, with source installation for **Windows**, **Ubuntu / Debian**, and **macOS**.
 
 ```
 real camera ──► segmentation ──► compositor ──► virtual camera ──► Zoom/Meet/Teams/browser
@@ -26,16 +26,104 @@ real camera ──► segmentation ──► compositor ──► virtual camera
   an animated avatar — expression tracking (MediaPipe) or NVIDIA
   Audio2Face-3D lip sync, selectable visible parts, scale/position, and its
   own backdrop — locally or from another GPU host. See
-  [Avatar stage (stage 2)](#avatar-stage-stage-2).
+  [Avatar service](#avatar-service).
 * **API**: control everything at runtime, preview in a browser, and forward
   frames to an external service — the integration point the avatar stage
   builds on.
 * **Local-first**: everything runs on your machine; the API binds to
   `127.0.0.1` by default.
 
-## Install
+## Installation status
 
-### Via npm (recommended)
+**0.4.0 is currently available as source.** npm/PyPI packages and signed Windows
+installers have not been published. Use the source instructions below.
+
+| Platform | Source installation | Virtual-camera prerequisite |
+| --- | --- | --- |
+| Windows 11 x64 | Python 3.12 and the `windows` extra | OBS Virtual Camera |
+| Ubuntu / Debian | Python 3.10–3.14; 3.12 recommended for optional vision | v4l2loopback |
+| macOS | Python 3.10–3.14; 3.12 recommended for optional vision | OBS Virtual Camera |
+
+Windows ARM64, Windows 10, the native Windows camera, and signed installers
+have separate qualification requirements. They are not implied by the Windows
+x64 source-install path. GPU and camera performance depend on the actual host;
+experimental presets do not establish a sustainable frame-rate guarantee.
+
+## Install from source
+
+```bash
+git clone https://github.com/Denissvgn/custback.git
+cd custback
+```
+
+### Ubuntu / Debian and macOS
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[mediapipe]'
+custback avatar --smoke
+```
+
+For a core-only environment, install `-e .` instead. Without an optional
+segmentation backend, Custback uses its heuristic fallback. Optional models
+are downloaded and hash-verified when needed; model acquisition needs network
+access even though local camera processing stays on the machine.
+
+Set up the virtual camera for your OS:
+
+```bash
+# Ubuntu / Debian
+./scripts/install_linux.sh
+
+# macOS
+./scripts/install_macos.sh
+```
+
+On macOS, open OBS once, start its virtual camera to register the extension,
+then stop it before starting Custback. The Linux script configures
+`exclusive_caps=1` so compatible Chrome/Electron applications can find the device.
+
+### Windows 11 x64 (PowerShell)
+
+Install Python 3.12 and [OBS Studio](https://obsproject.com/download), including
+its virtual camera. Then, from the cloned repository:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e '.[windows,mediapipe]'
+.\.venv\Scripts\custback.exe avatar --smoke
+.\.venv\Scripts\custback.exe --mode blur
+```
+
+Stop OBS's virtual-camera output before Custback uses it. Choose **OBS Virtual
+Camera** in the meeting application. Use the browser control UI for preview.
+The npm launcher and the Linux/macOS setup scripts are not Windows installers.
+
+### Check the result
+
+```bash
+custback --mode blur
+```
+
+Open `http://127.0.0.1:8710` for the authenticated control UI. Retrieve your local
+management token with `custback --show-api-token` and enter it in the UI; keep
+that token out of URLs, shared logs, and public reports. On Windows, use
+`.\.venv\Scripts\custback.exe` unless the environment is activated.
+
+For a camera-free preview, run `custback --synthetic --no-vcam --mode passthrough`
+and open the same UI. Stop the process with Ctrl+C. The finite
+`custback avatar --smoke` command checks startup without camera or virtual-camera
+access.
+
+## npm launcher (Ubuntu / Debian and macOS)
+
+The registry commands below apply after a package is published. Until then,
+use source installation or a locally built candidate tarball.
+
+### Install a published package or local candidate
 
 ```bash
 npm install -g custback
@@ -58,7 +146,7 @@ Wrapper subcommands:
 | `custback extras` | show persisted requested extras, installed extras, and available choices (`--json` is supported) |
 | `custback rebuild [--extras LIST]` | build and validate a new venv generation, then switch to it atomically; an explicit empty list clears extras |
 | `custback purge [--dry-run \| --yes]` | preview or explicitly remove the ownership-validated managed Python runtime before npm uninstall |
-| `custback avatar …` | run the bundled stage-2 avatar service; the npm `custback-avatar` binary is a compatibility alias |
+| `custback avatar …` | run the bundled avatar service; the npm `custback-avatar` binary is a compatibility alias |
 | `custback avatar config export [PATH]` | print the bundled annotated avatar YAML, or create `PATH` without overwriting it |
 | `custback avatar --smoke` | initialize and tear down the installed idle renderer without camera or network access |
 | `custback-npm-migrate --prefix PREFIX` | pre-upgrade bridge for a package-local npm venv created by custback 0.3 |
@@ -74,8 +162,8 @@ the same comma-separated selection. When the variable and flag are absent the
 last successful intent is preserved; an explicitly empty value clears it.
 Requested extras are never silently discarded. MediaPipe is attempted by
 default and may fall back to the core heuristic backend when it was not
-explicitly requested; `audio2face` and `mediapipe` cannot be combined because
-their published protobuf constraints conflict. See
+explicitly requested; the supported installers keep `audio2face` and
+`mediapipe` in separate driver profiles. See
 [Rendering quality & GPU](#rendering-quality--gpu-acceleration).
 Each installer subprocess is bounded to 15 minutes by default
 (`CUSTBACK_INSTALL_TIMEOUT_MS` accepts a positive millisecond override); doctor
@@ -86,7 +174,7 @@ confidence-mask segmentation, but it does not install the RVM/ONNX Runtime
 **matting** tier. When present, MediaPipe is labelled the **segmentation**
 capability tier; that installed-capability label is not an evidence-qualified
 named preset or sustainability claim, and the
-[MATTE-5.4 authority](docs/matte-quality-rollout.md) remains on compatibility
+[matte rollout policy](docs/matte-quality-rollout.md) remains on compatibility
 hold. `segmentation.backend: auto` can only prefer RVM when that optional
 runtime is present. Choose one RVM profile explicitly for true-alpha edges:
 
@@ -109,7 +197,7 @@ stamp, moves the venv to the prefix-scoped target, rewrites its absolute launche
 paths, and persists the explicit extras intent. For a global install:
 
 ```bash
-CANDIDATE=custback@0.4.0  # or an absolute path to the candidate .tgz
+CANDIDATE=/absolute/path/to/candidate.tgz  # use custback@0.4.0 after publication
 PREFIX=$(npm prefix --global)
 CUSTBACK_SKIP_INSTALL=1 npx --yes --package "$CANDIDATE" \
   custback-npm-migrate --prefix "$PREFIX"
@@ -151,36 +239,6 @@ for other `CUSTBACK_VENV` locations:
 ```bash
 CUSTBACK_VENV=/dedicated/path custback purge --yes
 ```
-
-### Manual (pip)
-
-#### Ubuntu / Debian
-
-```bash
-./scripts/install_linux.sh      # installs v4l2loopback, creates "custback Camera" (/dev/video10)
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[mediapipe,dev]'   # add ,gpu (NVIDIA) or ,rvm for matting — see below
-```
-
-`exclusive_caps=1` is preconfigured so Chrome/Electron apps (Zoom, Teams,
-Slack) list the device.
-
-#### macOS
-
-```bash
-./scripts/install_macos.sh      # installs OBS, which provides the virtual camera extension
-# open OBS once, click "Start Virtual Camera" to register the extension, then quit OBS
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[mediapipe,dev]'
-```
-
-The device appears as **OBS Virtual Camera** in meeting apps.
-
-> MediaPipe wheels lag new Python releases; if `pip install -e '.[mediapipe,dev]'`
-> fails to resolve mediapipe, install without the extra (`pip install -e '.[dev]'`)
-> — custback then uses the heuristic quality tier and logs a warning.
-> Use a Python version with MediaPipe wheels (3.11/3.12) for the confidence-mask
-> segmentation tier, or install `rvm`/`gpu` for the true-alpha matting tier.
 
 ## Run
 
@@ -333,7 +391,7 @@ same-generation HighGUI/API/virtual-camera captures and human review:
 `custback matte-visual-qualify PRIVATE_PLAN --output NEW_DIR`. Start from
 the content-free
 [local template](docs/matte-visual-qualification-local-template.json) and
-follow the [MATTE-5.2 runbook](docs/matte-visual-qualification.md). Generated
+follow the [visual qualification runbook](docs/matte-visual-qualification.md). Generated
 or fake route evidence always remains pending; qualification still needs
 consented/licensed representative clips, owner-attested physical preview and
 loopback captures, live-camera/60 FPS/1080p coverage, and a completed human
@@ -358,7 +416,7 @@ Cross-platform performance, sink, fallback, and lifecycle evidence is joined
 without changing a preset or default by
 `custback matte-platform-qualify PRIVATE_PLAN --output NEW_DIR`. Start from
 the content-free
-[local MATTE-5.3 template](docs/matte-platform-qualification-local-template.json)
+[local platform template](docs/matte-platform-qualification-local-template.json)
 and follow the
 [platform qualification runbook](docs/matte-platform-qualification.md).
 The checked-in JSON is a shape skeleton rather than the full code-owned matrix,
@@ -367,7 +425,7 @@ opening hardware itself. Generated evidence remains pending: qualification
 requires owner-attested physical route observations, independent capture-only
 and fixed-replay runs, sustained and restart/hot-patch/shutdown observations,
 and the exact reviewed platform routes with reactions disabled.
-MATTE-5.4 therefore keeps the schema-1 matte policy and default on an explicit
+The rollout policy therefore keeps the schema-1 matte policy and default on an explicit
 compatibility hold. The separately versioned server catalog exposes only
 acknowledged `experimental` or `locally_screened`, `quality_claim: false`
 concrete profiles; one-host screening cannot promote them to portable
@@ -468,8 +526,8 @@ listed below; do not assume every available quality policy is enabled:
 The active matte release stage is `compatibility_hold`: schema version 1,
 `backend: auto`, legacy watershed/EMA behavior for applicable non-RVM paths,
 native recurrent RVM alpha with generic postprocessing bypassed, stateless
-light wrap, and no evidence-qualified named preset. The checked-in MATTE-5.2
-and MATTE-5.3 fixtures are generated and pending; they do not authorize RVM, a
+light wrap, and no evidence-qualified named preset. The checked-in visual
+and platform fixtures are generated and pending; they do not authorize RVM, a
 higher-detail profile, or any candidate algorithm as a new-install default.
 The executable authority is
 `scripts/release/matte-policy-rollout.json`: it pins the code-owned legacy
@@ -496,7 +554,7 @@ Old, versionless, partial, and schema-1 files retain compatibility semantics;
 ordinary loading does not rewrite them. The one-patch rollback does not delete
 configuration or model caches and leaves unrelated output/background/API/
 avatar settings untouched. See the
-[MATTE-5.4 guide](docs/matte-quality-rollout.md) and
+[matte rollout guide](docs/matte-quality-rollout.md) and
 [ADR 0004](docs/adr/0004-matte-quality-rollout.md) for the evidence chain,
 canary stop/go rules, sanitized telemetry allowlist, migration behavior, and
 exact rollback patch. Reactions are explicitly excluded.
@@ -512,7 +570,7 @@ The active release stage is `compatibility`:
 | Foreground correction | `off` | `auto` |
 
 The target values are implemented but are not default claims. Each flip is a
-separate future commit and schema stage after VIS-4.2 calibrated fixtures,
+separate future commit and schema stage after calibrated fixtures,
 physical cameras, consumer sinks, platform performance, privacy, and rollback
 evidence approve it. The executable stage ledger is
 `scripts/release/visual-policy-rollout.json`; release checks reject ledger,
@@ -689,7 +747,7 @@ backend, provider, fallback, and matte policy for the current config version.
 Its rollout row says when defaults are held pending physical qualification;
 named presets remain disabled until their concrete patches are evidence
 qualified. Advanced controls remain useful for private diagnosis, but their
-availability is not a recommendation. Use the MATTE-5.4 one-patch rollback
+availability is not a recommendation. Use the documented one-patch rollback
 instead of deleting a config or model cache.
 
 The page talks to this origin only. Avatar controls go through the
@@ -708,7 +766,7 @@ The header's **Avatar** toggle is plain config: enabling patches
 While remote mode is active, renderer stalls always show the fixed privacy
 slate; the remembered local mode is used only when Avatar is disabled.
 
-## Avatar stage (stage 2)
+## Avatar service
 
 Avatar replacement plugs in through the WebSocket frame API — no pipeline
 changes needed:
@@ -944,104 +1002,37 @@ This release intentionally breaks the old unauthenticated control plane:
 | `matte_diagnostics.py` | opt-in private bounded matte recorder and offline frozen/model replay |
 | `matte_live_diagnostics.py` | on-demand, native-preview-only matte views and frame-paired temporal telemetry |
 | `matte_quality.py` / `matte_attribution.py` / `matte_ablation.py` | digest-bound metrics, four-boundary RVM attribution, and bounded same-source screening |
-| `matte_visual_qualification.py` | fail-closed MATTE-5.2 taxonomy, route-parity, artifact, and human-review qualification |
-| `matte_platform_qualification.py` | fail-closed MATTE-5.3 platform, performance, sink, fallback, and lifecycle evidence join |
-| `matte_rollout.py` | fail-closed MATTE-5.4 default disposition plus path-free canary and rollback telemetry |
+| `matte_visual_qualification.py` | fail-closed visual taxonomy, route-parity, artifact, and human-review qualification |
+| `matte_platform_qualification.py` | fail-closed platform, performance, sink, fallback, and lifecycle evidence join |
+| `matte_rollout.py` | fail-closed default disposition plus path-free canary and rollback telemetry |
 | `gpu_probe.py` | real CUDA inference/profile capability probe for installer and doctor |
 | `vcam.py` | virtual camera output (pyvirtualcam → v4l2loopback / OBS extension) |
 | `hub.py` | thread-safe frame exchange between pipeline and API |
 | `preview.py` | interactive on-screen output verification and explicit local matte-diagnostic sink |
 | `pipeline.py` | main loop; transactional frame-boundary reconfiguration |
 | `api/server.py` | authenticated FastAPI control, uploads, MJPEG, and WebSockets |
-| `avatar/` | stage-2 avatar service (`custback avatar`): drivers (`drivers.py`, `audio2face.py`), rigs (`rig.py`), composition (`renderer.py`), WS client loop (`service.py`), control API (`api.py`) |
+| `avatar/` | avatar service (`custback avatar`): drivers (`drivers.py`, `audio2face.py`), rigs (`rig.py`), composition (`renderer.py`), WS client loop (`service.py`), control API (`api.py`) |
 
-## Tests
+## Contributing and support
 
-The whole pipeline is testable without a camera, virtual camera, or mediapipe:
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, verification,
+and pull-request guidance. Report reproducible bugs through
+[GitHub Issues](https://github.com/Denissvgn/custback/issues). Use
+[private security reporting](https://github.com/Denissvgn/custback/security/advisories/new)
+for vulnerabilities; see [SECURITY.md](SECURITY.md).
 
-```bash
-pytest
-npm test
-npm run release:check -- --quick
-```
+The maintainer is [Denissvgn](https://github.com/Denissvgn).
+See [CHANGELOG.md](CHANGELOG.md) for changes and publication status.
 
-The focused temporal/matte subset, its generated-fixture contract, and the
-boundary between fast CI regression coverage and private visual/hardware
-qualification are documented in the
-[deterministic matte regression gate](docs/matte-deterministic-regression-gate.md).
-`tests/test_output_scheduler.py`, `tests/test_runtime_performance.py`,
-`tests/test_runtime_performance_status.py`, and
-`tests/test_remote_protocol.py`, `tests/test_background_video_lifetime.py`, plus
-`tests/test_background_asset_fallback.py` deterministically cover absolute
-target pacing and exact repeats, independent output/unique health and
-hysteresis, strict bounded status/OpenAPI projection, truthful WebUI rows, and
-fail-closed recovery from unavailable persisted image/video assets.
-They do not qualify a physical sink, camera, backend, or sustainable host
-profile.
-The separate owner-only end-to-end workflow and its intentionally pending
-checked-in template are documented in the
-[matte visual qualification runbook](docs/matte-visual-qualification.md).
-The independent capture, fixed-replay, platform-route, and lifecycle evidence
-required for MATTE-5.3 is documented in the
-[matte platform qualification runbook](docs/matte-platform-qualification.md).
-The held default decision, old-config semantics, canary telemetry, complete
-release-evidence chain, and non-destructive rollback drill required for
-MATTE-5.4 are documented in the
-[matte rollout guide](docs/matte-quality-rollout.md).
+Initial CI covers focused security/runtime regressions, lint, Node checks,
+dependency/secret scanning, and source startup on all three target platforms.
+Full compatibility, performance, optional-backend, CodeQL, and frozen-installer
+checks are retained as manual workflows; their deferral does not establish
+physical-camera compatibility or performance guarantees.
 
-Geometry and color contracts run in every supported Python version, minimum
-and newest dependency profiles, the OpenCV/NumPy compatibility matrix, and
-the optional MediaPipe/RVM profiles. Artifact smoke installs the clean wheel,
-sdist, and npm tarball; Windows jobs build the exact native camera and frozen
-engine and exercise tagged-video normalization. Workflow definitions are
-coverage commitments until their exact external runs are attached as
-evidence—local green tests are not represented as physical-device approval.
+## License
 
-No remediation blocker currently prevents `prepack` or `release:check` from
-proceeding to their normal qualification checks. Windows production evidence is
-deferred and is not required by the current release manifest.
-
-The full artifact gate creates and installs several isolated Python environments.
-Point it at a pre-existing disk-backed directory so those environments do not
-consume tmpfs/RAM; each environment is removed as soon as its profile finishes:
-
-```bash
-mkdir -p "$HOME/.cache/custback-release"
-CUSTBACK_RELEASE_TMPDIR="$HOME/.cache/custback-release" npm run release:check
-```
-
-The full gate rejects Linux tmpfs/ramfs storage by default. Override that guard
-only when the host has measured headroom with
-`CUSTBACK_RELEASE_ALLOW_TMPFS=1`. Native dependency builds default to two
-parallel jobs; set `CUSTBACK_RELEASE_BUILD_JOBS` from 1 through 32 only when the
-host has measured headroom. Release-gate subprocesses have a 15-minute default
-bound; set `CUSTBACK_RELEASE_TIMEOUT_MS` to a positive millisecond value for
-slower build hosts. A force-killed gate cannot run its cleanup handler and may
-leave a `custback-release-*` directory in the configured base; after confirming
-that no gate is running, inspect and remove that exact abandoned directory
-before retrying.
-
-### Phase 6 release qualification
-
-The reviewed gate inventory lives in
-`scripts/release/required-gates.json`. The production
-`.github/workflows/release.yml` workflow builds the wheel, sdist, and npm
-tarball once from one clean commit, records their SHA-256 digests, and passes
-those files unchanged to every runtime, optional-backend, migration, stress,
-clean-tree, and two-host job. Migration and isolated-host jobs emit strict
-artifact-bound reports; evidence assembly rejects a missing, duplicated,
-wrong-runtime, wrong-host-class, or substituted report.
-
-No `custback` 0.3 artifact is available from the npm or PyPI registries. The
-migration gate therefore rebuilds explicitly unpublished reference artifacts
-once from reviewed commit `f01baadfa3b1e2a1ef19eceda315eedf06fbe883` and labels
-them as source reconstructions. It does not represent them as previously
-published bytes.
-
-`REL-01` is resolved: the production workflow and reviewed gate manifest enforce
-the exact Phase 6 evidence contract. Windows production evidence remains
-deferred and is temporarily outside the blocker registry and required-gate
-manifest. The aggregate gate and publish job reverify the exact GitHub run
-context, commit, artifact digests, report bindings, candidate attestations, and
-the attestation on the evidence document itself; the publish job uploads those
-qualified files without rebuilding them.
+Custback source is distributed under the [MIT license](LICENSE). Optional
+libraries, model downloads, OBS, and other external components retain their
+own upstream licenses. No model weights or Windows installer are distributed
+by this source publication.

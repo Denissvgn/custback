@@ -1,7 +1,7 @@
 {
   "name": "custback",
   "version": "0.4.0",
-  "description": "Virtual camera with background replacement for meeting apps (Ubuntu / Debian / macOS)",
+  "description": "Launcher for Custback virtual camera on Ubuntu/Debian and macOS",
   "license": "MIT",
   "bin": {
     "custback": "packaging/npm/custback.js",
@@ -18,7 +18,9 @@
   "files": [
     ".github/workflows/*.yml",
     "LICENSE",
-    "REMEDIATION_PLAN.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
     "packaging/npm/*.js",
     "packaging/npm/test/*.test.js",
     "src/**/*.json",
@@ -54,5 +56,13 @@
     "webcam",
     "v4l2loopback",
     "obs"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Denissvgn/custback.git"
+  },
+  "homepage": "https://github.com/Denissvgn/custback#readme",
+  "bugs": {
+    "url": "https://github.com/Denissvgn/custback/issues"
+  }
 }

@@ -365,6 +365,20 @@ def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
         .patched({"segmentation": {"backend": "rvm"}})
     )
     runtime = RuntimeConfig(baseline)
+    post_commit_processing = threading.Event()
+    release_processing = threading.Event()
+    original_local_composite = Pipeline._local_composite
+
+    def hold_first_new_backend_frame(self, *args, **kwargs):
+        if (
+            runtime.snapshot().segmentation.backend == "mediapipe"
+            and not release_processing.is_set()
+        ):
+            post_commit_processing.set()
+            assert release_processing.wait(2.0)
+        return original_local_composite(self, *args, **kwargs)
+
+    monkeypatch.setattr(Pipeline, "_local_composite", hold_first_new_backend_frame)
 
     class FakeRvm:
         produces_matte = True
@@ -404,7 +418,26 @@ def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
     pipeline, hub = run_pipeline(runtime)
 
     def patch(value):
+        previous_frames = hub.stats_dict()["frames_out"]
         state = pipeline.apply_config_patch(value)
+        if (
+            value.get("segmentation", {}).get("backend") == "mediapipe"
+            and not release_processing.is_set()
+        ):
+            assert post_commit_processing.wait(1.0)
+            repeated = wait_for_stats(
+                hub,
+                lambda stats: (
+                    stats["frames_out"] > previous_frames
+                    and stats["config_version"] == state.version
+                    and stats["output_base_config_version"] < state.version
+                ),
+            )
+            assert repeated["segmentation_selection"]["selected_backend"] == "mediapipe"
+            assert repeated["matte_policy"]["selected_backend_kind"] == (
+                MatteBackendKind.CONFIDENCE_MASK_VIDEO
+            )
+            release_processing.set()
         return wait_for_stats(
             hub,
             lambda stats: (
@@ -573,6 +606,7 @@ def test_operator_matte_mitigations_apply_confirm_and_rollback(monkeypatch):
         assert stats["effective_edge_refinement_radius_px"] == 2
         assert stats["segmentation_generation"] == 8
     finally:
+        release_processing.set()
         pipeline.stop()
 
 

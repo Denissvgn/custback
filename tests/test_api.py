@@ -2172,6 +2172,27 @@ def _multipart_request(data: bytes, *, filename: str = "exact.png") -> Request:
     return Request(scope, receive)
 
 
+def test_upload_rejects_oversized_part_headers_and_releases_storage(tmp_path):
+    store = _UploadStore(
+        tmp_path / "headers",
+        _UploadLimits(image_max_bytes=64_000, storage_max_bytes=128_000, max_files=1),
+    )
+    with pytest.raises(HTTPException) as caught:
+        run_async(
+            store.save(
+                _multipart_request(b"image", filename="a" * 8_000 + ".png"), "image"
+            )
+        )
+    assert caught.value.status_code == 422
+    assert _error_code(caught.value) == "invalid_multipart"
+    assert not list(store.directory.glob(".upload-*"))
+
+    ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
+    assert ok
+    saved = run_async(store.save(_multipart_request(encoded.tobytes()), "image"))
+    assert saved.size == len(encoded)
+
+
 def test_upload_store_enforces_exact_byte_limit_and_private_mode(tmp_path):
     ok, encoded = cv2.imencode(".png", np.zeros((2, 2, 3), np.uint8))
     assert ok

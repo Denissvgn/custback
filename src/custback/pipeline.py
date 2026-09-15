@@ -1680,6 +1680,7 @@ _COMMITTED_OUTPUT_STATUS_NAMES = (
     "mode",
     "matte_rollout",
     "matte_policy",
+    "segmentation_selection",
     "color_correction_mode",
     "effective_rvm_downsample_ratio",
     "effective_mask_blur",

@@ -82,6 +82,21 @@ test('release qualification triggers only manually or from version tags', () => 
   assert.doesNotMatch(trigger, /pull_request|schedule|branches|release:/);
 });
 
+test('manual qualification cannot publish and tagged publication checks its main ancestry', () => {
+  const block = jobs.get('publish');
+  assert.match(block, /github\.event_name == 'push'/);
+  assert.match(block, /github\.ref_type == 'tag'/);
+  assert.match(block, /github\.ref_protected/);
+  assert.match(block, /vars\.CUSTBACK_PUBLISH_ENABLED == 'true'/);
+  assert.match(block, /fetch-depth: 0/);
+  const guard = block.indexOf('phase6-evidence.js authorize-publication');
+  const upload = block.indexOf('twine upload');
+  assert.ok(guard >= 0 && guard < upload);
+  assert.match(block, /git merge-base --is-ancestor "\$GITHUB_SHA" origin\/main/);
+  assert.match(jobs.get('artifact-build'), /github\.repository == 'Denissvgn\/custback'/);
+  assert.match(jobs.get('artifact-build'), /refs\/heads\/main/);
+});
+
 test('workflow job IDs exactly match the reviewed manifest plus aggregate and publish', () => {
   const expected = [
     ...manifest.workflow.required_job_ids,
@@ -311,7 +326,7 @@ test('release gate and publish reverify exact-repository GitHub attestations', (
 test('publish depends only on a successful release-gate and uploads exact files', () => {
   const block = jobs.get('publish');
   assert.deepEqual(needsFrom(block), ['release-gate']);
-  assert.match(block, /if: \$\{\{ needs\.release-gate\.result == 'success' \}\}/);
+  assert.match(block, /if: \$\{\{ needs\.release-gate\.result == 'success' &&/);
   assert.match(block, /phase6-evidence\.js validate-trusted/);
   assert.match(block, /python -m twine upload --non-interactive "\$wheel" "\$sdist"/);
   assert.match(block, /npm publish "\$tarball" --access public --provenance/);

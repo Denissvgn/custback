@@ -41,7 +41,7 @@ test('release metadata versions and required compatibility bounds agree', () => 
 
 test('CI vision compatibility profiles retain integrated qualification coverage', () => {
   const workflow = fs.readFileSync(
-    path.join(root, '.github', 'workflows', 'ci.yml'),
+    path.join(root, '.github', 'workflows', 'full-ci.yml'),
     'utf8',
   );
   const jobBlock = (id) => {
@@ -733,15 +733,16 @@ test('remediation registry records every registered blocker resolved', () => {
   const blockers = release.remediationBlockers(root);
   assert.equal(registry.phase, 6);
   assert.equal(registry.release_blocked, false);
-  assert.equal(blockers.length, 28);
+  assert.equal(blockers.length, 31);
   assert.deepEqual(blockers.map((entry) => entry.id), [
     'SEC-01', 'TOKEN-01', 'TRANS-01', 'PRIV-01', 'A2F-01',
     'CFG-01', 'CFG-02', 'LIFE-01', 'LIFE-02', 'STOR-01', 'STOR-02',
     'SEG-01', 'SEG-02', 'SEG-03', 'RENDER-01', 'RENDER-02', 'API-01',
     'NPM-01', 'PKG-01', 'PKG-02', 'DEPLOY-01', 'MISC-01', 'MISC-02',
-    'LICENSE-01', 'PLATFORM-01', 'HYGIENE-01', 'SEC-02', 'REL-01',
+    'LICENSE-01', 'PLATFORM-01', 'HYGIENE-01', 'SEC-02', 'REL-01', 'DEP-01',
+    'STATUS-01', 'LOCK-01',
   ]);
-  assert.equal(blockers.filter((entry) => entry.status === 'resolved').length, 28);
+  assert.equal(blockers.filter((entry) => entry.status === 'resolved').length, 31);
   assert.deepEqual(
     blockers.filter((entry) => entry.status === 'open').map((entry) => entry.id),
     [],

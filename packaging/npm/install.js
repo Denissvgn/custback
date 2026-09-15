@@ -101,7 +101,7 @@ function parseExtras(raw = '') {
   if (extras.includes('audio2face') && extras.includes('mediapipe')) {
     throw new Error(
       'CUSTBACK_EXTRAS cannot combine audio2face and mediapipe ' +
-      '(conflicting protobuf requirements)'
+      '(separate supported driver profiles)'
     );
   }
   return extras;

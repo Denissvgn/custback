@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/Denissvgn/custback/security/advisories/new
+    about: Do not disclose vulnerabilities or credentials in public issues.
+  - name: Maintainer
+    url: https://github.com/Denissvgn
+    about: Public maintainer profile.

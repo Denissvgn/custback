@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible problem with Custback.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report vulnerabilities through the private security link, not this form.
+        Remove tokens, private paths, raw camera frames, and personal data from diagnostics.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS/version, CPU/GPU, Python version, Custback version or commit, and installation method.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Use synthetic inputs where possible; include relevant redacted configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include relevant errors and status output. Never paste API tokens.

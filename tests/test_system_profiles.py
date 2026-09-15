@@ -416,9 +416,7 @@ def test_installed_cuda_provider_does_not_substitute_for_active_cuda(tmp_path):
         },
     }
     service, _runtime, _store = _service(tmp_path, facts=facts)
-    definition = service.status()["catalog"]["axes"]["quality"]["profiles"][
-        "balanced"
-    ]
+    definition = service.status()["catalog"]["axes"]["quality"]["profiles"]["balanced"]
     assert definition["available"] is False
     assert "CUDA execution has not been proven" in definition["availability_reason"]
 

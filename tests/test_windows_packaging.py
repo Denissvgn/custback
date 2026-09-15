@@ -265,15 +265,14 @@ def test_spec_freezes_avatar_second_executable() -> None:
 
 
 def test_spec_avatar_profiles_are_mutually_exclusive() -> None:
-    # The mediapipe (vision) and audio2face driver stacks conflict on
-    # protobuf; the spec must carry exactly one per payload (WIN-6.4).
+    # Each payload carries one independently supported avatar driver profile.
     text = _spec_text()
     assert "CUSTBACK_AVATAR_PROFILE" in text
     assert '_excludes += ["mediapipe"]' in text
     assert '_excludes += ["custback.avatar.audio2face"]' in text
     build = _build_script()
     assert "-AvatarProfile" in build or "AvatarProfile" in build
-    assert "protobuf conflict" in build
+    assert "separate supported driver profiles" in build
 
 
 def test_build_script_smokes_frozen_avatar() -> None:

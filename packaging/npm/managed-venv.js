@@ -1063,6 +1063,10 @@ function withInstallLock(generationRoot, callback, options = {}) {
         if (err.code !== 'EEXIST') {
           throw new Error(`cannot atomically publish custback install lock: ${err.message}`);
         }
+        // A breaker can restore our canonical hard link after the loop's
+        // inode check but before its barrier scan. Recheck ownership before
+        // treating EEXIST as contention or applying the acquisition deadline.
+        if (sameInode(lock, privateOwner.file)) continue;
         const current = inspectInstallLock(lock, generationRoot, staleMs);
         if (current && current.owned && current.stale) {
           reclaimStaleLock(generationRoot, lock, staleMs, settleMs);

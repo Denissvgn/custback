@@ -59,7 +59,7 @@ test('extras are normalized and invalid/conflicting requests fail', () => {
   assert.throws(() => installer.parseExtras('gpu,rvm'), /cannot combine rvm and gpu/);
   assert.throws(
     () => installer.parseExtras('audio2face,mediapipe'),
-    /conflicting protobuf requirements/,
+    /separate supported driver profiles/,
   );
 });
 

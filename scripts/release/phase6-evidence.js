@@ -659,9 +659,31 @@ function artifactPathsFromDirectory(evidence, directory) {
   );
 }
 
+function validatePublicationContext(version, env = process.env) {
+  if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_REPOSITORY !== 'Denissvgn/custback') {
+    fail('publication requires the canonical GitHub Actions repository');
+  }
+  if (env.CUSTBACK_PUBLISH_ENABLED !== 'true') fail('package publication is disabled');
+  if (env.GITHUB_EVENT_NAME !== 'push' || env.GITHUB_REF_TYPE !== 'tag' ||
+      env.GITHUB_REF_PROTECTED !== 'true') {
+    fail('publication requires a protected version-tag push');
+  }
+  if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version) ||
+      env.GITHUB_REF !== `refs/tags/v${version}` || env.GITHUB_REF_NAME !== `v${version}`) {
+    fail('publication tag must exactly match the package version');
+  }
+  return true;
+}
+
 function main(argv = process.argv.slice(2)) {
   try {
     const [command, ...args] = argv;
+    if (command === 'authorize-publication' && args.length === 0) {
+      const pkg = readJsonFile(path.join(ROOT, 'package.json'), 'package metadata');
+      validatePublicationContext(pkg.version);
+      process.stdout.write('protected version-tag publication context verified\n');
+      return 0;
+    }
     if (command === 'manifest-digest' && args.length <= 1) {
       const manifest = loadManifest(args[0] || DEFAULT_MANIFEST);
       process.stdout.write(`${manifestDigest(manifest)}\n`);
@@ -693,7 +715,7 @@ function main(argv = process.argv.slice(2)) {
     fail(
       'usage: phase6-evidence.js manifest-digest [MANIFEST] | ' +
       'validate EVIDENCE [MANIFEST] | ' +
-      'validate-trusted EVIDENCE ARTIFACT_DIR [MANIFEST]',
+      'validate-trusted EVIDENCE ARTIFACT_DIR [MANIFEST] | authorize-publication',
     );
   } catch (err) {
     process.stderr.write(`[custback phase6 evidence] ${err.message}\n`);
@@ -714,6 +736,7 @@ module.exports = {
   validateEvidence,
   validateGithubContext,
   validateManifest,
+  validatePublicationContext,
   verifyArtifactFiles,
   verifyGithubAttestations,
 };

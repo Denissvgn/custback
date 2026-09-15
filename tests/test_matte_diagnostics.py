@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import stat
@@ -21,9 +22,34 @@ from custback.matte_diagnostics import (
     MatteFrameEvidence,
     MatteReplayBundle,
     ReplayOptions,
+    _decode_npy,
     replay_bundle,
 )
 from custback.segmentation import SegmentationFrameContext, TemporalResetReason
+
+
+@pytest.mark.parametrize("order", ["C", "F"])
+@pytest.mark.parametrize("version", [(1, 0), (2, 0), (3, 0)])
+@pytest.mark.parametrize("dtype", ["uint8", "float32", ">f4"])
+def test_numeric_replay_decoding_preserves_numpy_formats(order, version, dtype):
+    expected = np.asarray(np.arange(18).reshape(2, 3, 3), dtype=dtype, order=order)
+    stream = io.BytesIO()
+    np.lib.format.write_array(stream, expected, version=version, allow_pickle=False)
+    payload = stream.getvalue()
+    first = _decode_npy(payload, expected.dtype.str, list(expected.shape))
+    np.testing.assert_array_equal(first, expected)
+    assert first.dtype == expected.dtype
+    first.fill(0)
+    np.testing.assert_array_equal(
+        _decode_npy(payload, expected.dtype.str, list(expected.shape)), expected
+    )
+
+
+def test_replay_decoding_keeps_pickle_disabled():
+    stream = io.BytesIO()
+    np.save(stream, np.asarray([[{"private": "value"}]], dtype=object))
+    with pytest.raises(ValueError, match="allow_pickle=False"):
+        _decode_npy(stream.getvalue(), "|O", [1, 1])
 
 
 def _mode(path: Path) -> int:
@@ -588,6 +614,21 @@ def test_bundle_and_artifact_permissions_are_owner_only(tmp_path):
     assert all(
         _mode(path) == 0o600 for path in (bundle_dir / "frames" / "00000000").iterdir()
     )
+
+
+def test_repeated_artifact_reads_recheck_contents_after_warming_path_cache(tmp_path):
+    bundle_dir = tmp_path / "bundle"
+    evidence, rendered = _evidence(0, 1)
+    with MatteDiagnosticRecorder(bundle_dir, max_bytes=2_000_000) as recorder:
+        assert recorder.submit(evidence, rendered)
+    bundle = MatteReplayBundle(bundle_dir)
+    frame = bundle.frames[0]
+    bundle.load_array(frame, "raw_frame")
+    path = bundle_dir / frame["artifacts"]["raw_frame"]["path"]
+    original = path.read_bytes()
+    path.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+    with pytest.raises(MatteDiagnosticsError, match="digest"):
+        bundle.load_array(frame, "raw_frame")
 
 
 def test_interrupted_write_and_partial_manifest_are_rejected(tmp_path, monkeypatch):

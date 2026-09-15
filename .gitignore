@@ -13,3 +13,13 @@ debug.txt
 uninstall.log
 onnxruntime_profile__*.json
 logs/custback.log
+logs/custback.log.*
+.env
+.env.*
+!.env.example
+node_modules/
+.ruff_cache/
+.llm-wiki/
+docs/llm_wiki/
+PUBLISH_PREPARATION_PLAN.md
+.publication/

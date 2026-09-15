@@ -1763,6 +1763,10 @@ def _stable_evidence(
     output_sink_backend: str | None = None
     background_contract: bytes | None = None
     background_mode: str | None = None
+    expected_policy_key: tuple[float | None, bool] | None = None
+    expected_refiner: dict[str, Any] = {}
+    expected_flat: dict[str, object] = {}
+    expected_policy_dict: dict[str, Any] = {}
     for frame in bundle.frames:
         artifacts = frame.get("artifacts")
         clean_foreground = (
@@ -1902,41 +1906,46 @@ def _stable_evidence(
         else:
             resolved_ratio = float(ratio)
             ratios.append(resolved_ratio)
-        expected_policy = resolve_matte_policy(
-            candidate_segmentation,
-            expected_compositor,
-            MatteBackendKind.TRUE_ALPHA_RECURRENT,
-            resolved_rvm_ratio=resolved_ratio,
-            passthrough=False,
-            canvas_shape=(height, width),
-            light_wrap_stabilization_eligible=frame_background_mode
-            in {"video", "camera"},
-        )
-        expected_refiner = expected_policy.effective_refiner_config(
-            candidate_segmentation
-        ).model_dump(mode="json")
+        policy_key = (resolved_ratio, frame_background_mode in {"video", "camera"})
+        if policy_key != expected_policy_key:
+            # The candidate, compositor, backend and canvas are constant here.
+            # Reuse only derived expectations; inspect every recorded frame.
+            expected_policy = resolve_matte_policy(
+                candidate_segmentation,
+                expected_compositor,
+                MatteBackendKind.TRUE_ALPHA_RECURRENT,
+                resolved_rvm_ratio=resolved_ratio,
+                passthrough=False,
+                canvas_shape=(height, width),
+                light_wrap_stabilization_eligible=policy_key[1],
+            )
+            expected_refiner = expected_policy.effective_refiner_config(
+                candidate_segmentation
+            ).model_dump(mode="json")
+            expected_refiner.pop("model_path", None)
+            expected_flat = {
+                "produces_matte": True,
+                "edge_refinement_mode": expected_policy.effective.edge_refinement_mode,
+                "edge_refinement_radius_px": (
+                    expected_policy.effective.edge_refinement_radius_px
+                ),
+                "mask_shift": expected_policy.effective.mask_shift,
+                "use_model_foreground": expected_policy.effective.use_model_foreground,
+                "light_wrap": expected_policy.effective.light_wrap,
+                "blend_space": expected_compositor.blend_space,
+            }
+            expected_policy_dict = expected_policy.to_dict()
+            expected_policy_key = policy_key
         recorded_refiner = effective.get("refiner")
         refiner_matches = isinstance(recorded_refiner, Mapping)
         if refiner_matches:
             projected_refiner = dict(cast(Mapping[str, object], recorded_refiner))
             projected_refiner.pop("model_path", None)
-            expected_refiner.pop("model_path", None)
             refiner_matches = projected_refiner == expected_refiner
-        expected_flat = {
-            "produces_matte": True,
-            "edge_refinement_mode": expected_policy.effective.edge_refinement_mode,
-            "edge_refinement_radius_px": (
-                expected_policy.effective.edge_refinement_radius_px
-            ),
-            "mask_shift": expected_policy.effective.mask_shift,
-            "use_model_foreground": expected_policy.effective.use_model_foreground,
-            "light_wrap": expected_policy.effective.light_wrap,
-            "blend_space": expected_compositor.blend_space,
-        }
         if (
             any(effective.get(name) != value for name, value in expected_flat.items())
             or not refiner_matches
-            or effective.get("matte_policy") != expected_policy.to_dict()
+            or effective.get("matte_policy") != expected_policy_dict
         ):
             reasons.append(
                 {

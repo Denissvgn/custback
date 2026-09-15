@@ -8,6 +8,34 @@ const test = require('node:test');
 
 const phase6 = require('../../../scripts/release/phase6-evidence');
 
+test('publication requires an enabled protected matching tag in the canonical repository', () => {
+  const env = {
+    GITHUB_ACTIONS: 'true',
+    GITHUB_REPOSITORY: 'Denissvgn/custback',
+    CUSTBACK_PUBLISH_ENABLED: 'true',
+    GITHUB_EVENT_NAME: 'push',
+    GITHUB_REF_TYPE: 'tag',
+    GITHUB_REF_PROTECTED: 'true',
+    GITHUB_REF: 'refs/tags/v0.4.0',
+    GITHUB_REF_NAME: 'v0.4.0',
+  };
+  assert.equal(phase6.validatePublicationContext('0.4.0', env), true);
+  for (const change of [
+    { GITHUB_ACTIONS: 'false' },
+    { GITHUB_REPOSITORY: 'fork/custback' },
+    { CUSTBACK_PUBLISH_ENABLED: undefined },
+    { CUSTBACK_PUBLISH_ENABLED: 'false' },
+    { GITHUB_EVENT_NAME: 'workflow_dispatch' },
+    { GITHUB_REF_TYPE: 'branch' },
+    { GITHUB_REF_PROTECTED: 'false' },
+    { GITHUB_REF: 'refs/heads/main' },
+    { GITHUB_REF_NAME: 'v0.4.1' },
+  ]) {
+    assert.throws(() => phase6.validatePublicationContext('0.4.0', { ...env, ...change }));
+  }
+  assert.throws(() => phase6.validatePublicationContext('0.4.1', env));
+});
+
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }

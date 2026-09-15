@@ -648,6 +648,44 @@ try {
   );
 });
 
+test('lock owner recognizes its restored inode after the barrier scan', (t) => {
+  const root = sandbox(t);
+  const generationRoot = managed.ensureGenerationsRoot(path.join(root, 'venv'));
+  const lock = path.join(generationRoot, '.install-lock');
+  const quarantine = path.join(generationRoot, '.install-lock-quarantine-controlled');
+  const realLink = fs.linkSync;
+  const realReadDir = fs.readdirSync;
+  let quarantined = false;
+  let restored = false;
+  fs.linkSync = (source, destination) => {
+    const result = realLink(source, destination);
+    if (destination === lock && !restored) {
+      fs.renameSync(lock, quarantine);
+      quarantined = true;
+    }
+    return result;
+  };
+  fs.readdirSync = (directory, ...args) => {
+    if (directory === generationRoot && quarantined) {
+      fs.renameSync(quarantine, lock);
+      quarantined = false;
+      restored = true;
+    }
+    return realReadDir(directory, ...args);
+  };
+  try {
+    assert.equal(managed.withInstallLock(
+      generationRoot, () => 'entered', { waitMs: 0, staleMs: 1000, settleMs: 0 },
+    ), 'entered');
+  } finally {
+    fs.linkSync = realLink;
+    fs.readdirSync = realReadDir;
+  }
+  assert.equal(restored, true);
+  assert.equal(fs.existsSync(lock), false);
+  assert.equal(fs.existsSync(quarantine), false);
+});
+
 test('a live owner is never reclaimed even with zero stale threshold', async (t) => {
   const root = sandbox(t);
   const target = path.join(root, 'custback-venv');

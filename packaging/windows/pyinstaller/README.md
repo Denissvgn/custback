@@ -10,7 +10,7 @@ installer (`../installer/`, WIN-5.6) wraps the whole `dist/custback/` tree.
 
 | File | Purpose |
 | --- | --- |
-| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects PyAV and its sibling `av.libs` FFmpeg bundle, OpenCV/ONNX Runtime/MediaPipe natives plus pyvirtualcam where supported, `custback` package data (`default.yaml`, `avatar.yaml`, and `system-profile-catalog.json`), and pywin32; excludes model weights and GUI toolkits. Windows ARM64 omits pyvirtualcam collection/hidden import to match its PEP 508 dependency marker. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face swaps stacks — protobuf conflict makes them one-per-payload). |
+| `custback.spec` | The onedir PyInstaller spec. Two console executables (engine + avatar) over one shared payload; collects PyAV and its sibling `av.libs` FFmpeg bundle, OpenCV/ONNX Runtime/MediaPipe natives plus pyvirtualcam where supported, `custback` package data (`default.yaml`, `avatar.yaml`, and `system-profile-catalog.json`), and pywin32; excludes model weights and GUI toolkits. Windows ARM64 omits pyvirtualcam collection/hidden import to match its PEP 508 dependency marker. Avatar driver stack chosen by `CUSTBACK_AVATAR_PROFILE` (vision default; audio2face uses a separately supported payload). |
 | `entry_custback.py` | Frozen entry script → `custback.__main__:main` with `multiprocessing.freeze_support()`. |
 | `entry_custback_avatar.py` | Frozen entry script → `custback.avatar.__main__:main` (WIN-6.4). |
 | `hooks/hook-custback.py` | Analysis hook: hidden imports for `custback._platform.*` and segmentation delegates; packaged YAML data. |
@@ -58,8 +58,8 @@ plus their shared onedir payload.
   import, and static analysis. `WINDOWS_ARM64.md` records the current
   `NullOutput` default and the explicit native-camera gate-build opt-in.
 * **Both avatar driver stacks at once.** One payload carries either the
-  vision (MediaPipe) or the audio2face (gRPC) driver — their protobuf
-  requirements conflict (see the `audio2face` extra in `pyproject.toml`), so
+  vision (MediaPipe) or the audio2face (gRPC) driver. These are independently
+  supported profiles, so
   `-AvatarProfile` selects exactly one and `driver: auto` degrades cleanly in
   the other flavor. The installer additionally ships `custback-avatar.exe`
   only with `-IncludeAvatar` (D7: core first).
