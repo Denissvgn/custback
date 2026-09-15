@@ -15,9 +15,9 @@ camera/audio stream.
 
 ## Install
 
-**0.4.0 package publication is in preparation.** Use source installation until
-packages appear on the [Releases page](https://github.com/Denissvgn/custback/releases).
-Signed Windows installers are not available.
+**Version 0.4.0.** Install from source below, or check the
+[Releases page](https://github.com/Denissvgn/custback/releases) for available
+packaged builds. Signed Windows installers are outside the initial release scope.
 
 | Platform | Recommended runtime | Virtual camera |
 | --- | --- | --- |

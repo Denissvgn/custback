@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 0.4.0 candidate
+## 0.4.0
 
 - Shorten the quick start and preserve detailed usage in a separate user guide.
 - Verify immutable core packages on Ubuntu, Windows, and macOS through a manual
@@ -17,5 +17,6 @@
   performance checks, CodeQL, and Windows frozen builds as manual workflows.
 
 Compatibility rendering defaults remain in place. Experimental presets require
-explicit selection. Registry packages and signed Windows installers have not
-been published as part of this preparation work.
+explicit selection. Signed Windows installers are outside this release scope. See
+[GitHub Releases](https://github.com/Denissvgn/custback/releases) for publication
+status and available downloads.
