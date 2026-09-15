@@ -1061,7 +1061,8 @@ def test_markdown_keeps_headroom_and_repeat_truth_explicit() -> None:
 def test_checked_in_full_path_template_matches_the_strict_schema() -> None:
     template_path = (
         Path(__file__).resolve().parents[1]
-        / "docs"
+        / "config"
+        / "qualification"
         / "matte-performance-local-template.json"
     )
     template = cast(

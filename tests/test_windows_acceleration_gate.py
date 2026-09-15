@@ -110,7 +110,7 @@ def test_unproven_adapter_is_no_go(gate) -> None:
 
 def test_alpha_drift_beyond_tolerance_is_no_go(gate) -> None:
     # The thresholds are the published gate contract; changing them must be a
-    # deliberate edit here and in WINDOWS_ACCELERATION_SPIKE.md.
+    # deliberate update to these reviewed limits.
     assert gate.ALPHA_DELTA_MEAN_MAX == 0.005
     assert gate.ALPHA_DELTA_MAX_MAX == 0.02
     drifted = _adapter(gate, "AMD")

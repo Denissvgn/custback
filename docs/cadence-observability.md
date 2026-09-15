@@ -1,7 +1,5 @@
 # Visual cadence observability
 
-Status: **MATTE-3.2 live status contract, version 2**
-
 Custback has separate capture, segmentation, safe-base, optional post-base, and
 output-send clocks. A near-target output FPS can therefore be made from repeated
 safe bases while the camera, matte, and base composite update more slowly.

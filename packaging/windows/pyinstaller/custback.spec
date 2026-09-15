@@ -1,37 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller onedir spec for the frozen Windows custback engine (WIN-5.1).
+"""Build the engine and avatar executables in one PyInstaller onedir payload.
 
-Produces a self-contained one-directory build of the ``custback`` engine that
-runs on a clean Windows 11 x64 machine with no Python, Node, pip, or CUDA
-toolkit on ``PATH``.  The C# WebView2/tray shell (WIN-5.2) supervises the
-``custback.exe`` produced here; the signed per-user installer (WIN-5.6) wraps
-the whole ``dist/custback/`` directory.
-
-Design decisions (see WINDOWS_DECISIONS.md / WINDOWS_IMPLEMENTATION_PLAN.md):
-
-* ``onedir``, never ``onefile``.  A one-file build unpacks native DLLs (OpenCV,
-  ONNX Runtime, MediaPipe, pyvirtualcam) into a fresh temp directory on every
-  launch, which is slower, defeats CUDA DLL discovery (the provider looks beside
-  the loaded ``onnxruntime`` module), and reliably trips SmartScreen/antivirus.
-  D5 commits to onedir.
-
-* RVM / MediaPipe model weights are **not** bundled.  They are GPL-3 / separately
-  licensed (WIN-0.4, D6) and are fetched on first run with checksum verification
-  by :mod:`custback.segmentation`.  Bundling is gated on legal sign-off; until it
-  clears, the frozen app downloads to ``%LOCALAPPDATA%`` on first use exactly as
-  the source build does.  ``excludes``/``datas`` below therefore ship no
-  ``*.onnx`` / ``*.tflite`` weights.
-
-* CUDA / cuDNN provider DLLs are discovered at runtime by
-  :func:`custback.acceleration.preload_acceleration_dlls` from ``CUDA_PATH`` /
-  ``PATH``; the installer (WIN-5.6) places the exact pinned onnxruntime-gpu /
-  CUDA components.  Whatever ``onnxruntime`` ships inside its own wheel (the CPU
-  provider plus the CUDA provider shim) is collected here so a CPU-only clean VM
-  still runs.
-
-This file is executed by PyInstaller (``pyinstaller custback.spec``); the names
-``Analysis``, ``PYZ``, ``EXE``, ``COLLECT`` and ``SPECPATH`` are injected by the
-tool and are intentionally undefined to a plain interpreter.
+Native dependencies stay beside the executables for runtime discovery. Model
+weights are downloaded separately and are excluded from this payload. One build
+selects one avatar driver profile. PyInstaller supplies Analysis, PYZ, EXE,
+COLLECT, and SPECPATH when evaluating this spec.
 """
 
 import os

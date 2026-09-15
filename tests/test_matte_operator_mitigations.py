@@ -1,4 +1,4 @@
-"""Publication contract for MATTE-0.4 operator guidance."""
+"""Public operator troubleshooting contract."""
 
 from pathlib import Path
 

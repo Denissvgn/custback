@@ -76,8 +76,8 @@
           DetectCondition="VCppRuntimeInstalled" />
 
       <!-- WebView2 Evergreen bootstrapper (tiny online installer). Skipped when
-           the runtime is already present. Microsoft permits redistribution of
-           this bootstrapper (verified in WINDOWS_LICENSING.md). -->
+           the runtime is already present. Review the redistributable terms
+           for the exact bootstrapper shipped in a distribution. -->
       <ExePackage
           Id="WebView2Runtime"
           SourceFile="redist\MicrosoftEdgeWebview2Setup.exe"

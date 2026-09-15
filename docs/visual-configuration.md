@@ -1,31 +1,9 @@
-# Visual-consistency configuration, rollout, and rollback
+# Visual configuration and rollback
 
-This is the operator and release-owner guide for camera geometry, linear
-compositing, and automatic foreground color correction. It describes both the
-currently shipped compatibility policy and the separately qualified target
-policy. The target values are not current defaults.
-
-The machine-readable rollout authority is
-`scripts/release/visual-policy-rollout.json`. The release verifier rejects a
-distributed default that differs from its active stage. At this revision the
-active stage is `compatibility`:
-
-| Policy | Schema-1 and current new-install default | Available opt-in | Target after approval |
-| --- | --- | --- | --- |
-| Main-camera fit | `stretch` | `cover`, `contain` | `cover` |
-| Backdrop fit | `cover` | `contain`, `stretch` | `cover` |
-| Composite space | `srgb_legacy` | `linear_srgb` | `linear_srgb` |
-| Foreground correction | `off` | `auto` | `auto` |
-
-No current checkout or package may claim that `cover`, `linear_srgb`, or
-`auto` is the default unless the corresponding stage has calibrated-fixture,
-physical-camera, consumer-sink, performance, privacy, and rollback approval
-from VIS-4.2. A target stage also needs its own 40-character source commit and
-an approval record bound to that commit. A template, simulated run, workflow
-definition, or uncalibrated screenshot is not approval.
-
-Release owners collect and validate that evidence with the
-[VIS-4.2 qualification runbook](visual-consistency-phase4-qualification-runbook.md).
+Use [config/default.yaml](../config/default.yaml) as the full configuration
+reference. Current compatibility defaults are camera fit `stretch`, backdrop
+fit `cover`, blend space `srgb_legacy`, and foreground color correction `off`.
+The alternatives below are explicit options; they are not default changes.
 
 ## Configure the visual policies
 
@@ -84,7 +62,7 @@ Examples for one policy at a time:
 # camera:
 #   fit_mode: cover
 
-# Hot: use the authenticated helper from README.md.
+# Hot: use the authenticated helper in user-guide.md.
 auth_header | curl --config - -X PATCH http://127.0.0.1:8710/config \
   -H 'content-type: application/merge-patch+json' \
   -d '{"background":{"fit_mode":"contain","anchor_y":0.25}}'
@@ -141,7 +119,7 @@ Camera-control reporting is read-only. `GET /status.camera_controls` reports
 what OpenCV can observe for auto white balance, WB temperature, auto exposure,
 exposure, gain, and gamma. Zero may mean either a legitimate value or an
 unsupported property, so it is reported as `indeterminate-zero`. Custback does
-not write these controls in this rollout; physical qualification must account
+not write these controls automatically; comparisons must account
 for the camera's own exposure/WB loop.
 
 ## Deterministic upgrade behavior
@@ -180,70 +158,12 @@ cannot migrate schema semantics.
 
 While schema 1 remains active, a negotiated camera frame whose aspect differs
 from the output canvas emits one path-free upgrade note per capture lifetime:
-legacy `stretch` preserves the old distortion, whereas the staged `cover`
-default would crop proportionally. Pin `camera.fit_mode: stretch` to retain
-the old framing, or preview an explicit `cover` selection and anchors before a
-future schema migration.
+legacy `stretch` preserves the old distortion, whereas explicit `cover`
+selection crops proportionally. Pin `camera.fit_mode: stretch` to retain
+the old framing, or preview an explicit `cover` selection and anchors before saving the changed configuration.
 
 Later target-default schemas must not reinterpret a versionless or schema-1
 omission. Each migration is explicit, atomic, and separately reviewed.
-
-## Staged rollout gate
-
-Default changes proceed in this exact order:
-
-1. `compatibility`: helpers and telemetry, with
-   `stretch` / `srgb_legacy` / `off`.
-2. `camera-cover`: proportional main-camera `cover`; explicit `stretch`
-   remains accepted.
-3. `linear-compositing`: `linear_srgb`, after golden and physical sink
-   approval.
-4. `automatic-correction`: conservative `auto`, after calibrated color,
-   temporal, camera-auto-control, platform-performance, physical sink, and
-   privacy approval.
-5. Legacy switches may be deprecated only in a later documented release,
-   after at least one stable release with the final target stage.
-
-Every flip is one clean commit. The default-change commit updates the
-new-install schema and distributed template, keeps all earlier persisted
-schema semantics, and contains only that one default change plus its
-migration/release note. Qualify that exact commit before a later,
-evidence-only commit attaches the VIS-4.2 JSON report and advances
-`scripts/release/visual-policy-rollout.json`; the ledger's `change_commit`
-continues to name the qualified default-change commit. Release validation
-reads the recorded historical Git tree and requires it to be an ancestor of
-the clean release checkout, so evidence remains verifiable after later
-stages. The release verifier rejects skipped stages, a missing or reused
-commit, missing physical approval, unsafe or reused evidence paths, fabricated
-evidence on a pending stage, and any mismatch between the active ledger entry
-and `config/default.yaml`.
-
-An active target stage is accepted only when this strict release claim accepts
-its report and referenced artifacts:
-
-```bash
-python scripts/release/visual_consistency_qualification.py \
-  --manifest scripts/release/visual-qualification-manifest.json \
-  validate --report REPORT --claim release \
-  --evidence-root EVIDENCE_DIR --expected-commit COMMIT
-```
-
-That validator
-requires the complete calibrated and physical matrices, checked budgets,
-hashed artifacts, a clean source snapshot, and `release_qualified: true`.
-The report's `source.commit` must exactly equal the stage's `change_commit`;
-matching words in a narrative document are never evidence.
-
-The authorizing candidate builder validates the ledger in the clean Git
-checkout before creating its source archive. Its prepack subprocess receives
-an internal, overwritten bridge to that same repository and exact HEAD/tree;
-the staged ledger, templates, report, and every referenced evidence artifact
-must byte-match the trusted commit. A standalone Git-less archive has no
-historical authority and fails closed for an approved target stage.
-
-The compatibility stage is intentionally still active in this revision. The
-target stages in the ledger are plans, not claims that a CI workflow or
-physical qualification has run.
 
 ## Rollback
 

@@ -288,8 +288,12 @@ def test_wb_confidence_includes_neutral_availability():
 
 def test_committed_baseline_and_contact_sheet_match_the_generator(tmp_path):
     root = Path(__file__).resolve().parents[1]
-    baseline_path = root / "docs" / "visual-consistency-phase0-baseline.json"
-    contact_path = root / "docs" / "visual-consistency-phase0-contact-sheet.png"
+    baseline_path = (
+        root / "tests" / "fixtures" / "visual" / "geometry-color-baseline.json"
+    )
+    contact_path = (
+        root / "tests" / "fixtures" / "visual" / "geometry-color-contact-sheet.png"
+    )
     assert json.loads(baseline_path.read_text(encoding="utf-8")) == (
         evidence.deterministic_evidence()
     )

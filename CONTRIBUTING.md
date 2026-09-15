@@ -58,10 +58,6 @@ failure and runtime if a check exceeds its budget; do not remove coverage or
 relax correctness thresholds to obtain a passing result. Camera, GPU, and
 virtual-camera claims need evidence from the relevant devices and applications.
 Synthetic tests cannot establish physical-device compatibility or visual quality.
-The large cross-device qualification and two 720p wall-clock sanity checks have
-unresolved timing failures on the initial development host; keep their thresholds
-and resolve them as part of extended qualification.
-
 The quick release check verifies metadata and package contents. Full release
 qualification additionally verifies the exact built artifacts and authenticated
 workflow evidence. It is not an ordinary local build command.

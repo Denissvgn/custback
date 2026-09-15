@@ -217,8 +217,8 @@ def test_installed_artifact_smoke_also_normalizes_tagged_video_in_memory() -> No
     assert "bt709/limited/bt709/srgb" in release
 
 
-def test_ci_runs_bounded_windows_frozen_engine_smoke() -> None:
-    workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+def test_manual_ci_runs_bounded_windows_frozen_engine_smoke() -> None:
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "full-ci.yml").read_text(
         encoding="utf-8"
     )
     marker = "\n  windows-frozen-engine:\n"

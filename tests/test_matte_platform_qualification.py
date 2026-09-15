@@ -17,7 +17,8 @@ from custback import matte_platform_qualification as qualification
 
 LOCAL_TEMPLATE = (
     Path(__file__).resolve().parents[1]
-    / "docs"
+    / "config"
+    / "qualification"
     / "matte-platform-qualification-local-template.json"
 )
 

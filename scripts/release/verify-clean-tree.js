@@ -14,7 +14,6 @@ const REQUIRED_TRACKED = [
   'LICENSE',
   'MANIFEST.in',
   'README.md',
-  'REMEDIATION_PLAN.md',
   'docs/remote-deployment.md',
   'package-lock.json',
   'package.json',

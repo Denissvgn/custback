@@ -97,8 +97,8 @@ authentication configuration.
 | --- | --- |
 | npm setup, camera troubleshooting, API, avatars, upgrades and removal | [User guide](docs/user-guide.md) |
 | Full configuration | [Annotated YAML](config/default.yaml) |
-| Rendering geometry and rollback | [Visual configuration](docs/visual-consistency-rollout.md) |
-| Matte backends and current defaults | [Matte guide](docs/matte-quality-rollout.md) · [Policy rationale](docs/adr/0004-matte-quality-rollout.md) |
+| Rendering geometry and rollback | [Visual configuration](docs/visual-configuration.md) |
+| Matte backends and current defaults | [Matte guide](docs/matte-configuration.md) |
 | Changes and upgrade status | [Changelog](CHANGELOG.md) |
 
 Compatibility defaults remain active. Advanced presets, optional GPU paths,

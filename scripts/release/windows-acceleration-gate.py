@@ -1,37 +1,13 @@
 #!/usr/bin/env python3
-"""WIN-6.2 generic-GPU (DirectML) release-gate harness and checker.
+"""Collect and validate Windows DirectML acceleration evidence.
 
-The WIN-4.7 spike (``WINDOWS_ACCELERATION_SPIKE.md``) defined *what* evidence
-justifies a "GPU-capable on all Windows hardware" claim; this script makes
-that evidence reproducible and its evaluation deterministic:
-
-``run``
-    Executes on Windows hardware with ``onnxruntime-directml`` installed:
-    proves real RVM node execution on ``DmlExecutionProvider`` (the same
-    profiling standard CUDA must meet, via ``custback.acceleration``),
-    measures per-pixel alpha drift against the CPU reference on a fixed
-    synthetic sequence, times 720p/1080p inference, and writes one evidence
-    JSON per machine.  Its default exit code reports collection success even
-    for a local NO-GO; ``--strict`` makes that verdict fail the command.  CI
-    must gate on ``check``, never on ``run``'s default exit code.
-
-``check``
-    Runs anywhere (stdlib only): validates an evidence file against the exact
-    schema and the go/no-go criteria below.  Exit 0 = **go** (the WIN-6.2
-    claim may be advertised for the tested adapters); exit 1 = **no-go** with
-    reasons.  This checker is the validator the ``windows-acceleration`` gate
-    slot (WINDOWS_DECISIONS.md Part B, item 3) will invoke once WIN-1.8 wires
-    a windows evidence source; until then it gates nothing and the feature
-    matrix keeps DirectML unadvertised.
-
-Go criteria (from the spike, encoded here so they cannot drift in prose):
-    * every listed adapter proves real RVM execution on DirectML,
-    * at least one AMD *and* one Intel adapter are covered,
-    * alpha drift vs CPU stays within tolerance (worst per-frame mean <=
-      0.005, max <= 0.02),
-    * 720p sustains the configured target FPS (median),
-    * the CUDA and DirectML wheels are not co-installed (either-or, mirroring
-      the CPU/CUDA rule in packaging/npm/install.js).
+``run`` requires Windows and onnxruntime-directml. It records actual RVM node
+execution, alpha differences from CPU, and inference timing. Its default exit
+status indicates collection success; use ``--strict`` to reject a local no-go.
+``check`` validates the schema and all reviewed adapter, accuracy, performance,
+and dependency-isolation requirements. Only that result supports an acceleration
+claim, and only for the measured adapters. The numerical limits are defined by
+the constants below and covered by executable regressions.
 """
 
 from __future__ import annotations
