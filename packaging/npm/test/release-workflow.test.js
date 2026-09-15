@@ -76,9 +76,9 @@ function matrixEntryBlock(block, id) {
 
 const jobs = jobBlocks(source);
 
-test('release qualification triggers only manually or from version tags', () => {
+test('extended release qualification is retained for manual execution', () => {
   const trigger = source.slice(source.indexOf('on:'), source.indexOf('\npermissions:'));
-  assert.match(trigger, /^on:\n  workflow_dispatch:\n  push:\n    tags:\n      - "v\*\.\*\.\*"\n$/);
+  assert.equal(trigger, "on:\n  workflow_dispatch:\n");
   assert.doesNotMatch(trigger, /pull_request|schedule|branches|release:/);
 });
 
