@@ -2082,7 +2082,8 @@ function verifyCiWorkflow(root = ROOT) {
     'tests/test_pipeline.py::test_operator_matte_mitigations_apply_confirm_and_rollback',
     'npm test',
     'npm run release:check -- --quick',
-    'python -m pip_audit --strict --skip-editable',
+    'python -m pip freeze --all --exclude-editable',
+    'python -m pip_audit --strict --no-deps --disable-pip',
     'gitleaks',
     'os: [windows-2022, macos-latest]',
   ]) {

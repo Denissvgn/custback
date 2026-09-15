@@ -205,7 +205,7 @@ def _translate_open_flags(flags: int) -> tuple[int, int, bool]:
     if appended:
         # Append writes must target EOF; FILE_APPEND_DATA plus the CRT O_APPEND
         # flag on the wrapped descriptor give os.write append semantics.
-        access = (access & ~win32con.GENERIC_WRITE) | win32con.FILE_APPEND_DATA
+        access = (access & ~win32con.GENERIC_WRITE) | ntsecuritycon.FILE_APPEND_DATA
         if accmode == os.O_RDWR:
             access |= win32con.GENERIC_READ
     access |= _SECURITY_ACCESS
@@ -226,6 +226,24 @@ def _translate_open_flags(flags: int) -> tuple[int, int, bool]:
     return access, disposition, appended
 
 
+def _private_file_security() -> Any:
+    """Create files for this user, including under an elevated default owner."""
+    user_sid = _current_user_sid()
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAceEx(
+        win32security.ACL_REVISION, 0, ntsecuritycon.FILE_ALL_ACCESS, user_sid
+    )
+    attributes = win32security.SECURITY_ATTRIBUTES()
+    descriptor = attributes.SECURITY_DESCRIPTOR
+    descriptor.SetSecurityDescriptorOwner(user_sid, False)
+    descriptor.SetSecurityDescriptorDacl(True, dacl, False)
+    descriptor.SetSecurityDescriptorControl(
+        win32security.SE_DACL_PROTECTED, win32security.SE_DACL_PROTECTED
+    )
+    attributes.bInheritHandle = False
+    return attributes
+
+
 def open_nofollow(
     path: os.PathLike[str] | str,
     flags: int,
@@ -243,12 +261,13 @@ def open_nofollow(
     """
 
     access, disposition, appended = _translate_open_flags(flags)
-    attributes = win32con.FILE_FLAG_OPEN_REPARSE_POINT
+    attributes = win32file.FILE_FLAG_OPEN_REPARSE_POINT
     if directory:
-        attributes |= win32con.FILE_FLAG_BACKUP_SEMANTICS
+        attributes |= win32file.FILE_FLAG_BACKUP_SEMANTICS
+    security = _private_file_security() if flags & os.O_CREAT else None
     try:
         handle = win32file.CreateFile(
-            str(path), access, _SHARE_ALL, None, disposition, attributes, None
+            str(path), access, _SHARE_ALL, security, disposition, attributes, None
         )
     except pywintypes.error as exc:
         if exc.winerror in (winerror.ERROR_ALREADY_EXISTS, winerror.ERROR_FILE_EXISTS):
@@ -288,6 +307,11 @@ def is_reparse(path: os.PathLike[str] | str) -> bool:
         ):
             return False
         raise _oserror(exc, path) from exc
+    if attributes in (-1, 0xFFFFFFFF):
+        error = win32api.GetLastError()
+        if error in (winerror.ERROR_FILE_NOT_FOUND, winerror.ERROR_PATH_NOT_FOUND):
+            return False
+        raise OSError(0, "cannot read path attributes", str(path), error)
     return bool(attributes & win32con.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
@@ -324,7 +348,7 @@ def owner_matches(fd: int) -> bool:
     owner_sid = descriptor.GetSecurityDescriptorOwner()
     if owner_sid is None:
         return False
-    return bool(win32security.EqualSid(owner_sid, _current_user_sid()))
+    return bool(owner_sid == _current_user_sid())
 
 
 def stat_owner_matches(metadata: os.stat_result) -> bool:
@@ -359,7 +383,7 @@ def is_private_to_owner(fd: int) -> bool:
         raise _oserror(exc) from exc
     user_sid = _current_user_sid()
     owner_sid = descriptor.GetSecurityDescriptorOwner()
-    if owner_sid is None or not win32security.EqualSid(owner_sid, user_sid):
+    if owner_sid is None or owner_sid != user_sid:
         return False
     dacl = descriptor.GetSecurityDescriptorDacl()
     if dacl is None:
@@ -367,7 +391,7 @@ def is_private_to_owner(fd: int) -> bool:
         return False
     for index in range(dacl.GetAceCount()):
         ace_sid = dacl.GetAce(index)[-1]
-        if not win32security.EqualSid(ace_sid, user_sid):
+        if ace_sid != user_sid:
             return False
     return True
 
@@ -383,7 +407,8 @@ def fsync_dir(path: os.PathLike[str] | str) -> None:
             _SHARE_ALL,
             None,
             win32con.OPEN_EXISTING,
-            win32con.FILE_FLAG_BACKUP_SEMANTICS | win32con.FILE_FLAG_OPEN_REPARSE_POINT,
+            win32file.FILE_FLAG_BACKUP_SEMANTICS
+            | win32file.FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
     except pywintypes.error as exc:
@@ -392,6 +417,8 @@ def fsync_dir(path: os.PathLike[str] | str) -> None:
         file_attributes = win32file.GetFileInformationByHandle(handle)[0]
         if file_attributes & win32con.FILE_ATTRIBUTE_REPARSE_POINT:
             raise OSError(errno.ELOOP, "refusing to sync a reparse point", str(path))
+        if not file_attributes & win32con.FILE_ATTRIBUTE_DIRECTORY:
+            raise NotADirectoryError(errno.ENOTDIR, "not a directory", str(path))
         try:
             win32file.FlushFileBuffers(handle)
         except pywintypes.error as exc:

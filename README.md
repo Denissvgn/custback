@@ -88,7 +88,8 @@ then stop it before starting Custback. The Linux script configures
 ### Windows 11 x64 (PowerShell)
 
 Install Python 3.12 and [OBS Studio](https://obsproject.com/download), including
-its virtual camera. Then, from the cloned repository:
+its virtual camera. Use an ordinary, non-elevated PowerShell session for the
+per-user application and its managed storage. Then, from the cloned repository:
 
 ```powershell
 py -3.12 -m venv .venv
