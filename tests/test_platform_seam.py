@@ -194,6 +194,16 @@ def test_is_reparse_distinguishes_symlinks(tmp_path):
     assert platform_fs.is_reparse(link) is True
 
 
+@pytest.mark.skipif(not WINDOWS, reason="Windows attribute error contract")
+def test_is_reparse_propagates_access_denied(tmp_path, monkeypatch):
+    from custback._platform import windows
+
+    monkeypatch.setattr(windows.win32file, "GetFileAttributes", lambda _path: -1)
+    monkeypatch.setattr(windows.win32api, "GetLastError", lambda: 5)
+    with pytest.raises(PermissionError):
+        platform_fs.is_reparse(tmp_path / "unreadable")
+
+
 # --- WIN-2.6 / WIN-2.3: ownership and privacy --------------------------------
 
 
@@ -257,7 +267,7 @@ def test_private_dacl_is_owner_only_and_protected(tmp_path):
     dacl = descriptor.GetSecurityDescriptorDacl()
     assert dacl is not None and dacl.GetAceCount() >= 1
     for index in range(dacl.GetAceCount()):
-        assert win32security.EqualSid(dacl.GetAce(index)[-1], owner)
+        assert dacl.GetAce(index)[-1] == owner
 
 
 # --- WIN-2.5: stable file identity -------------------------------------------

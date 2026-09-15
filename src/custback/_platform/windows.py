@@ -288,6 +288,11 @@ def is_reparse(path: os.PathLike[str] | str) -> bool:
         ):
             return False
         raise _oserror(exc, path) from exc
+    if attributes in (-1, 0xFFFFFFFF):
+        error = win32api.GetLastError()
+        if error in (winerror.ERROR_FILE_NOT_FOUND, winerror.ERROR_PATH_NOT_FOUND):
+            return False
+        raise OSError(0, "cannot read path attributes", str(path), error)
     return bool(attributes & win32con.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
@@ -324,7 +329,7 @@ def owner_matches(fd: int) -> bool:
     owner_sid = descriptor.GetSecurityDescriptorOwner()
     if owner_sid is None:
         return False
-    return bool(win32security.EqualSid(owner_sid, _current_user_sid()))
+    return bool(owner_sid == _current_user_sid())
 
 
 def stat_owner_matches(metadata: os.stat_result) -> bool:
@@ -359,7 +364,7 @@ def is_private_to_owner(fd: int) -> bool:
         raise _oserror(exc) from exc
     user_sid = _current_user_sid()
     owner_sid = descriptor.GetSecurityDescriptorOwner()
-    if owner_sid is None or not win32security.EqualSid(owner_sid, user_sid):
+    if owner_sid is None or owner_sid != user_sid:
         return False
     dacl = descriptor.GetSecurityDescriptorDacl()
     if dacl is None:
@@ -367,7 +372,7 @@ def is_private_to_owner(fd: int) -> bool:
         return False
     for index in range(dacl.GetAceCount()):
         ace_sid = dacl.GetAce(index)[-1]
-        if not win32security.EqualSid(ace_sid, user_sid):
+        if ace_sid != user_sid:
             return False
     return True
 
@@ -393,6 +398,8 @@ def fsync_dir(path: os.PathLike[str] | str) -> None:
         file_attributes = win32file.GetFileInformationByHandle(handle)[0]
         if file_attributes & win32con.FILE_ATTRIBUTE_REPARSE_POINT:
             raise OSError(errno.ELOOP, "refusing to sync a reparse point", str(path))
+        if not file_attributes & win32con.FILE_ATTRIBUTE_DIRECTORY:
+            raise NotADirectoryError(errno.ENOTDIR, "not a directory", str(path))
         try:
             win32file.FlushFileBuffers(handle)
         except pywintypes.error as exc:
