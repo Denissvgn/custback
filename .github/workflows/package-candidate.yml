@@ -59,6 +59,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-2022, macos-latest]
     steps:
+      - name: Preserve committed bytes for artifact comparisons
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
         with:
           persist-credentials: false

@@ -225,6 +225,10 @@ def test_candidate_workflow_is_manual_and_cannot_publish():
     assert "needs.artifact-smoke.result == 'success'" in source
     assert "--signer-digest" in source and "--source-digest" in source
     assert "--deny-self-hosted-runners" in source
+    smoke_job = source.split("  artifact-smoke:\n", 1)[1].split("  qualify:\n", 1)[0]
+    assert smoke_job.index("git config --global core.autocrlf false") < smoke_job.index(
+        "uses: actions/checkout@"
+    )
 
 
 def test_avatar_template_uses_committed_bytes_despite_checkout_line_endings(tmp_path):
