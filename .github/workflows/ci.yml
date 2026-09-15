@@ -59,7 +59,11 @@ jobs:
       - run: CUSTBACK_SKIP_INSTALL=1 npm ci --ignore-scripts
       - run: npm test
       - run: npm run release:check -- --quick
-      - run: python -m pip_audit --strict --skip-editable
+      - name: Audit every installed third-party dependency
+        shell: bash
+        run: |
+          python -m pip freeze --all --exclude-editable > "$RUNNER_TEMP/audit-requirements.txt"
+          python -m pip_audit --strict --no-deps --disable-pip --requirement "$RUNNER_TEMP/audit-requirements.txt"
       - name: Scan complete Git history for credentials
         shell: bash
         run: |

@@ -205,7 +205,7 @@ def _translate_open_flags(flags: int) -> tuple[int, int, bool]:
     if appended:
         # Append writes must target EOF; FILE_APPEND_DATA plus the CRT O_APPEND
         # flag on the wrapped descriptor give os.write append semantics.
-        access = (access & ~win32con.GENERIC_WRITE) | win32con.FILE_APPEND_DATA
+        access = (access & ~win32con.GENERIC_WRITE) | ntsecuritycon.FILE_APPEND_DATA
         if accmode == os.O_RDWR:
             access |= win32con.GENERIC_READ
     access |= _SECURITY_ACCESS
@@ -243,9 +243,9 @@ def open_nofollow(
     """
 
     access, disposition, appended = _translate_open_flags(flags)
-    attributes = win32con.FILE_FLAG_OPEN_REPARSE_POINT
+    attributes = win32file.FILE_FLAG_OPEN_REPARSE_POINT
     if directory:
-        attributes |= win32con.FILE_FLAG_BACKUP_SEMANTICS
+        attributes |= win32file.FILE_FLAG_BACKUP_SEMANTICS
     try:
         handle = win32file.CreateFile(
             str(path), access, _SHARE_ALL, None, disposition, attributes, None
@@ -383,7 +383,7 @@ def fsync_dir(path: os.PathLike[str] | str) -> None:
             _SHARE_ALL,
             None,
             win32con.OPEN_EXISTING,
-            win32con.FILE_FLAG_BACKUP_SEMANTICS | win32con.FILE_FLAG_OPEN_REPARSE_POINT,
+            win32file.FILE_FLAG_BACKUP_SEMANTICS | win32file.FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
     except pywintypes.error as exc:

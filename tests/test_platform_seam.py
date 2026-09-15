@@ -122,6 +122,18 @@ def test_open_nofollow_opens_and_reads_a_regular_file(tmp_path):
         os.close(fd)
 
 
+def test_open_nofollow_append_preserves_existing_bytes(tmp_path):
+    target = tmp_path / "append"
+    _make_private_file(target, b"first")
+    fd = platform_fs.open_nofollow(target, os.O_WRONLY | os.O_APPEND)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, b"second")
+    finally:
+        os.close(fd)
+    assert target.read_bytes() == b"firstsecond"
+
+
 def test_open_nofollow_rejects_a_final_symlink(tmp_path):
     target = tmp_path / "target"
     _make_private_file(target, b"secret")
