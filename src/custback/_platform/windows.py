@@ -226,6 +226,24 @@ def _translate_open_flags(flags: int) -> tuple[int, int, bool]:
     return access, disposition, appended
 
 
+def _private_file_security() -> Any:
+    """Create files for this user, including under an elevated default owner."""
+    user_sid = _current_user_sid()
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAceEx(
+        win32security.ACL_REVISION, 0, ntsecuritycon.FILE_ALL_ACCESS, user_sid
+    )
+    attributes = win32security.SECURITY_ATTRIBUTES()
+    descriptor = attributes.SECURITY_DESCRIPTOR
+    descriptor.SetSecurityDescriptorOwner(user_sid, False)
+    descriptor.SetSecurityDescriptorDacl(True, dacl, False)
+    descriptor.SetSecurityDescriptorControl(
+        win32security.SE_DACL_PROTECTED, win32security.SE_DACL_PROTECTED
+    )
+    attributes.bInheritHandle = False
+    return attributes
+
+
 def open_nofollow(
     path: os.PathLike[str] | str,
     flags: int,
@@ -246,9 +264,10 @@ def open_nofollow(
     attributes = win32file.FILE_FLAG_OPEN_REPARSE_POINT
     if directory:
         attributes |= win32file.FILE_FLAG_BACKUP_SEMANTICS
+    security = _private_file_security() if flags & os.O_CREAT else None
     try:
         handle = win32file.CreateFile(
-            str(path), access, _SHARE_ALL, None, disposition, attributes, None
+            str(path), access, _SHARE_ALL, security, disposition, attributes, None
         )
     except pywintypes.error as exc:
         if exc.winerror in (winerror.ERROR_ALREADY_EXISTS, winerror.ERROR_FILE_EXISTS):
