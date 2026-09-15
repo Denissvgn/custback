@@ -78,7 +78,7 @@ dev = [
     # single version before 1.0, so `ruff format --check` is a deterministic
     # gate only when the version is fixed. Bump deliberately (reformat + repin
     # required-version + the release-gate allowlist in the same commit).
-    "ruff==0.15.22",
+    "ruff==0.16.7",
     # Exact pin keeps Pyright's diagnostics stable across CI runs. Bump only
     # after running the new version across the complete pyrightconfig include.
     "pyright==1.1.411",
