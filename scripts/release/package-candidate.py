@@ -142,6 +142,13 @@ def command(args, cwd, env=None):
     )
 
 
+def committed_avatar_template(commit, root=ROOT):
+    require(re.fullmatch(r"[0-9a-f]{40}", commit), "Invalid template source commit")
+    return subprocess.check_output(
+        ["git", "-C", str(root), "show", f"{commit}:config/avatar.yaml"], timeout=30
+    )
+
+
 def smoke(directory, report):
     candidate = verify(directory)
     runner_os = os.environ["RUNNER_OS"]
@@ -226,7 +233,8 @@ def smoke(directory, report):
                     [launcher, "avatar", "config", "export", exported], scratch, env
                 )
                 require(
-                    exported.read_bytes() == (ROOT / "config/avatar.yaml").read_bytes(),
+                    exported.read_bytes()
+                    == committed_avatar_template(candidate["source"]["commit"]),
                     "Installed avatar configuration differs",
                 )
                 command(

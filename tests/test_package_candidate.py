@@ -225,3 +225,35 @@ def test_candidate_workflow_is_manual_and_cannot_publish():
     assert "needs.artifact-smoke.result == 'success'" in source
     assert "--signer-digest" in source and "--source-digest" in source
     assert "--deny-self-hosted-runners" in source
+
+
+def test_avatar_template_uses_committed_bytes_despite_checkout_line_endings(tmp_path):
+    import subprocess
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(tmp_path), *args])
+
+    git("init", "--quiet")
+    (tmp_path / "config").mkdir()
+    template = tmp_path / "config/avatar.yaml"
+    original = b"driver:\n  backend: idle\n"
+    template.write_bytes(original)
+    git("-c", "core.autocrlf=false", "add", "config/avatar.yaml")
+    git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    )
+    commit = git("rev-parse", "HEAD").decode().strip()
+    template.write_bytes(original.replace(b"\n", b"\r\n"))
+    assert template.read_bytes() != original
+    assert candidate_tools.committed_avatar_template(commit, tmp_path) == original
+    with pytest.raises(ValueError, match="Invalid template source commit"):
+        candidate_tools.committed_avatar_template("main:other-file", tmp_path)
