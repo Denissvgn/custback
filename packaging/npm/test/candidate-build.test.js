@@ -109,3 +109,31 @@ test('candidate output must stay outside the checkout and start empty', (t) => {
   fs.writeFileSync(path.join(output, 'existing'), 'collision');
   assert.throws(() => candidate.prepareOutput(output), /empty real directory/);
 });
+
+test('Python build products cannot contaminate the npm source snapshot', (t) => {
+  const { execFileSync } = require('node:child_process');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-build-snapshots-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const repository = path.join(directory, 'repository');
+  const scratch = path.join(directory, 'scratch');
+  fs.mkdirSync(repository);
+  fs.mkdirSync(scratch);
+  const git = (...args) => execFileSync('git', ['-C', repository, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' },
+  }).trim();
+  git('init', '--quiet');
+  fs.writeFileSync(path.join(repository, 'source.py'), 'committed source\n');
+  git('add', 'source.py');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'fixture');
+  const commit = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repository, 'source.py'), 'uncommitted source\n');
+  const sources = candidate.stageBuildSources(repository, commit, scratch);
+  fs.mkdirSync(path.join(sources.python, 'build'));
+  fs.mkdirSync(path.join(sources.python, 'src', 'custback.egg-info'), { recursive: true });
+  fs.writeFileSync(path.join(sources.python, 'source.py'), 'modified by a build\n');
+  assert.deepEqual(fs.readdirSync(sources.npm), ['source.py']);
+  assert.equal(fs.readFileSync(path.join(sources.npm, 'source.py'), 'utf8'), 'committed source\n');
+  assert.equal(fs.readFileSync(path.join(repository, 'source.py'), 'utf8'), 'uncommitted source\n');
+});
