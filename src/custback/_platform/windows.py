@@ -383,7 +383,8 @@ def fsync_dir(path: os.PathLike[str] | str) -> None:
             _SHARE_ALL,
             None,
             win32con.OPEN_EXISTING,
-            win32file.FILE_FLAG_BACKUP_SEMANTICS | win32file.FILE_FLAG_OPEN_REPARSE_POINT,
+            win32file.FILE_FLAG_BACKUP_SEMANTICS
+            | win32file.FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
     except pywintypes.error as exc:
