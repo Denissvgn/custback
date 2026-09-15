@@ -215,6 +215,17 @@ function stageCommit(root, commit, destination) {
   }
 }
 
+function stageBuildSources(root, commit, scratch) {
+  const sources = {
+    python: path.join(scratch, 'python-source'),
+    npm: path.join(scratch, 'npm-source'),
+  };
+  for (const destination of Object.values(sources)) {
+    stageCommit(root, commit, destination);
+  }
+  return sources;
+}
+
 function buildCandidate(options = {}) {
   const root = path.resolve(options.root || ROOT);
   const output = prepareOutput(options.output);
@@ -232,14 +243,15 @@ function buildCandidate(options = {}) {
   const manifest = evidence.loadManifest(options.manifest);
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'custback-candidate-'));
   try {
-    const staged = path.join(scratch, 'source');
-    stageCommit(root, source.commit, staged);
+    const staged = stageBuildSources(root, source.commit, scratch);
     const python = options.python || process.env.CUSTBACK_RELEASE_PYTHON || 'python3';
-    run(python, ['-m', 'build', '--sdist', '--wheel', '--outdir', output], { cwd: staged });
+    run(python, ['-m', 'build', '--sdist', '--wheel', '--outdir', output], {
+      cwd: staged.python,
+    });
     const npmArguments = ['pack', '--pack-destination', output];
     if (diagnostic) npmArguments.push('--ignore-scripts');
     run('npm', npmArguments, {
-      cwd: staged,
+      cwd: staged.npm,
       env: trustedPrepackEnvironment(root, source, buildEnv),
     });
     const artifacts = artifactRecords(output, manifest);
@@ -293,6 +305,7 @@ module.exports = {
   main,
   prepareOutput,
   sha256File,
+  stageBuildSources,
   trustedPrepackEnvironment,
   withoutReleaseSourceBridge,
 };
